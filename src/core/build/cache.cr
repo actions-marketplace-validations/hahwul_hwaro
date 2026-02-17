@@ -51,17 +51,15 @@ module Hwaro
             return true
           end
 
-          # Check modification time first (fast check)
+          # Check modification time (fast and sufficient check)
+          # mtime match is reliable enough — skip expensive MD5 re-read.
+          # Uses millisecond precision to detect sub-second changes.
           begin
-            current_mtime = File.info(file_path).modification_time.to_unix
-            return true if current_mtime != entry.mtime
+            current_mtime = File.info(file_path).modification_time.to_unix_ms
+            return current_mtime != entry.mtime
           rescue
             return true
           end
-
-          # If mtime matches, verify with hash for safety
-          current_hash = compute_hash(file_path)
-          current_hash != entry.hash
         end
 
         # Check multiple files for changes (returns changed files)
@@ -71,13 +69,23 @@ module Hwaro
         end
 
         # Update cache entry for a file
+        # Uses mtime as primary change indicator; hash is stored lazily
+        # (only computed when explicitly needed, not on every update).
         def update(file_path : String, output_path : String = "")
           return unless @enabled
           return unless File.exists?(file_path)
 
           begin
-            mtime = File.info(file_path).modification_time.to_unix
-            hash = compute_hash(file_path)
+            mtime = File.info(file_path).modification_time.to_unix_ms
+
+            # Reuse existing hash if mtime hasn't changed to avoid File.read
+            existing = @entries[file_path]?
+            hash = if existing && existing.mtime == mtime
+                     existing.hash
+                   else
+                     compute_hash(file_path)
+                   end
+
             @entries[file_path] = CacheEntry.new(
               path: file_path,
               mtime: mtime,

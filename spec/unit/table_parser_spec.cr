@@ -2,8 +2,8 @@ require "../spec_helper"
 
 describe Hwaro::Content::Processors::TableParser do
   describe ".has_table?" do
-    it "returns true when content contains pipe characters" do
-      Hwaro::Content::Processors::TableParser.has_table?("| a | b |").should be_true
+    it "returns false for pipe-only header without separator row" do
+      Hwaro::Content::Processors::TableParser.has_table?("| a | b |").should be_false
     end
 
     it "returns false when content has no pipe characters" do
@@ -14,8 +14,23 @@ describe Hwaro::Content::Processors::TableParser do
       Hwaro::Content::Processors::TableParser.has_table?("").should be_false
     end
 
-    it "returns true for a single pipe character" do
-      Hwaro::Content::Processors::TableParser.has_table?("a | b").should be_true
+    it "returns false for a pipe without separator row" do
+      Hwaro::Content::Processors::TableParser.has_table?("a | b").should be_false
+    end
+
+    it "returns true when content has a separator row with pipes" do
+      content = "Header 1 | Header 2\n---------|--------\nCell 1   | Cell 2"
+      Hwaro::Content::Processors::TableParser.has_table?(content).should be_true
+    end
+
+    it "returns true when content has a separator row with leading pipes" do
+      content = "| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |"
+      Hwaro::Content::Processors::TableParser.has_table?(content).should be_true
+    end
+
+    it "returns true when separator has alignment colons" do
+      content = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a    | b      | c     |"
+      Hwaro::Content::Processors::TableParser.has_table?(content).should be_true
     end
   end
 

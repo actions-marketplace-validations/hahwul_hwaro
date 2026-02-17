@@ -55,6 +55,7 @@ module Hwaro
         @context : Lifecycle::BuildContext?
         @profiler : Profiler?
         @crinja_env : Crinja?
+        @compiled_templates_cache : Hash(UInt64, Crinja::Template) = {} of UInt64 => Crinja::Template
 
         # Regex constants for HTML minification
         private REGEX_PRE_OPEN       = /<pre([^>]*)>\s*<code/
@@ -105,8 +106,9 @@ module Hwaro
           profile : Bool = false,
           debug : Bool = false,
         )
-          # Load config early to get build hooks
+          # Load config once and reuse throughout the build
           config = Models::Config.load
+          @config = config
           pre_hooks = config.build.hooks.pre
           post_hooks = config.build.hooks.post
 
@@ -143,9 +145,10 @@ module Hwaro
           ctx.stats.start_time = Time.instant
           @context = ctx
 
-          # Reset internal caches
+          # Reset internal caches (preserve @config loaded above)
           @site = nil
           @templates = nil
+          @compiled_templates_cache.clear
 
           # Execute build phases through lifecycle
           result = execute_phases(ctx, profiler)
@@ -228,10 +231,10 @@ module Hwaro
               Logger.info "  Cache enabled (#{stats[:valid]} valid entries)"
             end
 
-            setup_output_dir(output_dir)
-            copy_static_files(output_dir, verbose)
+            setup_output_dir(output_dir, cache_enabled)
+            copy_static_files(output_dir, verbose, cache_enabled)
 
-            config = Models::Config.load
+            config = @config.not_nil!
             if url = ctx.options.base_url
               override = url.strip
               config.base_url = override unless override.empty?
@@ -719,70 +722,121 @@ module Hwaro
           nil
         end
 
-        # Default parsing when no hooks are registered
+        # Default parsing when no hooks are registered.
+        # File reads and frontmatter parsing are parallelized using fibers to
+        # overlap I/O waits across many files.  Each fiber operates on a
+        # distinct Page object so there are no data races.
         private def parse_content_default(ctx : Lifecycle::BuildContext)
-          ctx.all_pages.each do |page|
-            source_path = File.join("content", page.path)
-            next unless File.exists?(source_path)
+          pages = ctx.all_pages
+          parallel = ctx.options.parallel && pages.size > 1
 
-            raw_content = File.read(source_path)
-            data = Processor::Markdown.parse(raw_content, source_path)
-
-            page.title = data[:title]
-            page.description = data[:description]
-            page.image = data[:image]
-            page.raw_content = data[:content]
-            page.draft = data[:draft]
-            page.template = data[:template]
-            page.in_sitemap = data[:in_sitemap]
-            page.toc = data[:toc]
-            page.date = data[:date]
-            page.updated = data[:updated]
-            page.render = data[:render]
-            page.slug = data[:slug]
-            page.custom_path = data[:custom_path]
-            page.aliases = data[:aliases]
-            page.tags = data[:tags]
-            page.taxonomies = data[:taxonomies]
-            page.front_matter_keys = data[:front_matter_keys]
-            page.taxonomy_name = nil
-            page.taxonomy_term = nil
-
-            # New fields assignment
-            page.authors = data[:authors]
-            page.extra = data[:extra]
-            page.in_search_index = data[:in_search_index]
-            page.insert_anchor_links = data[:insert_anchor_links]
-            page.weight = data[:weight]
-
-            # Calculate word count and reading time
-            page.calculate_word_count
-            page.calculate_reading_time
-
-            # Extract summary from <!-- more --> marker
-            page.extract_summary
-
-            if page.is_a?(Models::Section)
-              page.transparent = data[:transparent]
-              page.generate_feeds = data[:generate_feeds]
-              page.paginate = data[:paginate]
-              page.pagination_enabled = data[:pagination_enabled]
-              page.sort_by = data[:sort_by]
-              page.reverse = data[:reverse]
-              page.page_template = data[:page_template]
-              page.paginate_path = data[:paginate_path]
-              page.redirect_to = data[:redirect_to]
-            end
-
-            # Calculate URL
-            calculate_page_url(page)
+          if parallel
+            parse_content_parallel(pages)
+          else
+            parse_content_sequential(pages)
           end
 
-          # Filter drafts
+          # Filter drafts (must be sequential — mutates shared arrays)
           unless ctx.options.drafts
             ctx.pages.reject! { |p| p.draft }
             ctx.sections.reject! { |s| s.draft }
           end
+        end
+
+        # Parse a single page: read file, parse frontmatter, assign properties
+        private def parse_single_page(page : Models::Page)
+          source_path = File.join("content", page.path)
+          return unless File.exists?(source_path)
+
+          raw_content = File.read(source_path)
+          data = Processor::Markdown.parse(raw_content, source_path)
+
+          page.title = data[:title]
+          page.description = data[:description]
+          page.image = data[:image]
+          page.raw_content = data[:content]
+          page.draft = data[:draft]
+          page.template = data[:template]
+          page.in_sitemap = data[:in_sitemap]
+          page.toc = data[:toc]
+          page.date = data[:date]
+          page.updated = data[:updated]
+          page.render = data[:render]
+          page.slug = data[:slug]
+          page.custom_path = data[:custom_path]
+          page.aliases = data[:aliases]
+          page.tags = data[:tags]
+          page.taxonomies = data[:taxonomies]
+          page.front_matter_keys = data[:front_matter_keys]
+          page.taxonomy_name = nil
+          page.taxonomy_term = nil
+
+          # New fields assignment
+          page.authors = data[:authors]
+          page.extra = data[:extra]
+          page.in_search_index = data[:in_search_index]
+          page.insert_anchor_links = data[:insert_anchor_links]
+          page.weight = data[:weight]
+
+          # Calculate word count and reading time
+          page.calculate_word_count
+          page.calculate_reading_time
+
+          # Extract summary from <!-- more --> marker
+          page.extract_summary
+
+          if page.is_a?(Models::Section)
+            page.transparent = data[:transparent]
+            page.generate_feeds = data[:generate_feeds]
+            page.paginate = data[:paginate]
+            page.pagination_enabled = data[:pagination_enabled]
+            page.sort_by = data[:sort_by]
+            page.reverse = data[:reverse]
+            page.page_template = data[:page_template]
+            page.paginate_path = data[:paginate_path]
+            page.redirect_to = data[:redirect_to]
+          end
+
+          # Calculate URL
+          calculate_page_url(page)
+        end
+
+        private def parse_content_sequential(pages : Array(Models::Page))
+          pages.each { |page| parse_single_page(page) }
+        end
+
+        # Parallel file reading + frontmatter parsing using fibers.
+        # Each fiber works on a distinct Page object so mutations are safe.
+        # File.read yields the fiber, allowing other fibers to proceed with
+        # their I/O — this overlaps disk reads and significantly reduces
+        # wall-clock time for large numbers of content files.
+        private def parse_content_parallel(pages : Array(Models::Page))
+          config = ParallelConfig.new(enabled: true)
+          worker_count = config.calculate_workers(pages.size)
+
+          done = Channel(Nil).new(pages.size)
+          work_queue = Channel(Models::Page).new(pages.size)
+
+          # Enqueue all pages
+          pages.each { |page| work_queue.send(page) }
+          work_queue.close
+
+          # Spawn workers
+          worker_count.times do
+            spawn do
+              while page = work_queue.receive?
+                begin
+                  parse_single_page(page)
+                rescue ex
+                  Logger.warn "  [WARN] Failed to parse #{page.path}: #{ex.message}"
+                end
+                done.send(nil)
+              end
+            end
+          end
+
+          # Wait for all pages to finish
+          pages.size.times { done.receive }
         end
 
         # Link lower/higher page navigation for previous/next page links
@@ -960,18 +1014,51 @@ module Hwaro
           File.join(output_dir, url_path, "index.html")
         end
 
-        private def setup_output_dir(output_dir : String)
+        private def setup_output_dir(output_dir : String, incremental : Bool = false)
           if Dir.exists?(output_dir)
-            FileUtils.rm_rf(output_dir)
+            # In incremental mode (--cache), keep existing output to avoid
+            # re-generating unchanged pages and re-copying unchanged static files.
+            unless incremental
+              FileUtils.rm_rf(output_dir)
+            end
           end
           FileUtils.mkdir_p(output_dir)
         end
 
-        private def copy_static_files(output_dir : String, verbose : Bool)
-          if Dir.exists?("static")
+        private def copy_static_files(output_dir : String, verbose : Bool, incremental : Bool = false)
+          return unless Dir.exists?("static")
+
+          if incremental
+            # Incremental mode: only copy files that are newer than their destination
+            copy_static_files_incremental("static", output_dir, verbose)
+          else
             FileUtils.cp_r("static/.", "#{output_dir}/")
             Logger.action :copy, "static files", :blue if verbose
           end
+        end
+
+        # Copy only changed static files by comparing mtime
+        private def copy_static_files_incremental(src_dir : String, output_dir : String, verbose : Bool)
+          copied = 0
+          Dir.glob(File.join(src_dir, "**", "*")) do |src_path|
+            next if File.directory?(src_path)
+
+            relative = Path[src_path].relative_to(src_dir).to_s
+            dest_path = File.join(output_dir, relative)
+
+            needs_copy = if File.exists?(dest_path)
+                           File.info(src_path).modification_time > File.info(dest_path).modification_time
+                         else
+                           true
+                         end
+
+            if needs_copy
+              FileUtils.mkdir_p(File.dirname(dest_path))
+              FileUtils.cp(src_path, dest_path)
+              copied += 1
+            end
+          end
+          Logger.action :copy, "static files (#{copied} updated)", :blue if verbose && copied > 0
         end
 
         private def load_templates : Hash(String, String)
@@ -1090,11 +1177,20 @@ module Hwaro
             return
           end
 
-          # Build initial context for shortcodes (without content/toc)
-          shortcode_context = build_template_variables(page, site, "", "", "", "", nil, nil, global_vars)
-
+          # Only build shortcode context and process shortcodes if content actually
+          # contains shortcode syntax ({{ or {%).  This avoids the expensive
+          # build_template_variables call for the majority of pages that have no
+          # shortcodes.
           shortcode_results = {} of String => String
-          processed_content = process_shortcodes_jinja(page.raw_content, templates, shortcode_context, shortcode_results)
+          raw = page.raw_content
+          has_shortcodes = raw.includes?("{{") || raw.includes?("{%")
+
+          processed_content = if has_shortcodes
+                                shortcode_context = build_template_variables(page, site, "", "", "", "", nil, nil, global_vars)
+                                process_shortcodes_jinja(raw, templates, shortcode_context, shortcode_results)
+                              else
+                                raw
+                              end
 
           lazy_loading = site.config.markdown.lazy_loading
 
@@ -1107,6 +1203,10 @@ module Hwaro
 
           # Replace shortcode placeholders with their rendered HTML content
           html_content = replace_shortcode_placeholders(html_content, shortcode_results)
+
+          # Store rendered HTML in page.content for reuse by Feed/Search generators
+          # (avoids expensive re-rendering of Markdown in Generate phase)
+          page.content = html_content
 
           toc_html = if page.toc && !toc_headers.empty?
                        generate_toc_html(toc_headers)
@@ -1342,7 +1442,15 @@ module Hwaro
           processed_template = process_shortcodes_jinja(template, templates, vars)
 
           begin
-            crinja_template = env.from_string(processed_template)
+            # Cache compiled Crinja templates by content hash.
+            # Most pages share the same base template string, so this avoids
+            # re-parsing the template AST on every page render.
+            cache_key = processed_template.hash
+            crinja_template = @compiled_templates_cache[cache_key]? || begin
+              compiled = env.from_string(processed_template)
+              @compiled_templates_cache[cache_key] = compiled
+              compiled
+            end
             crinja_template.render(vars)
           rescue ex : Crinja::TemplateError
             Logger.warn "  [WARN] Template error for #{page.path}: #{ex.message}"
@@ -1449,6 +1557,28 @@ module Hwaro
             "authors"     => Crinja::Value.new(site.authors),
           }
           vars["site"] = Crinja::Value.new(site_obj)
+
+          # Site-wide constant variables — computed once, shared across all pages
+          # (These were previously recomputed in build_template_variables for every page)
+          vars["site_title"] = Crinja::Value.new(config.title)
+          vars["site_description"] = Crinja::Value.new(config.description || "")
+          vars["base_url"] = Crinja::Value.new(config.base_url)
+
+          # Highlight tags
+          vars["highlight_css"] = Crinja::Value.new(config.highlight.css_tag)
+          vars["highlight_js"] = Crinja::Value.new(config.highlight.js_tag)
+          vars["highlight_tags"] = Crinja::Value.new(config.highlight.tags)
+
+          # Auto includes
+          vars["auto_includes_css"] = Crinja::Value.new(config.auto_includes.css_tags(config.base_url))
+          vars["auto_includes_js"] = Crinja::Value.new(config.auto_includes.js_tags(config.base_url))
+          vars["auto_includes"] = Crinja::Value.new(config.auto_includes.all_tags(config.base_url))
+
+          # Time-related variables (fixed per build, not per page)
+          now = Time.local
+          vars["current_year"] = Crinja::Value.new(now.year)
+          vars["current_date"] = Crinja::Value.new(now.to_s("%Y-%m-%d"))
+          vars["current_datetime"] = Crinja::Value.new(now.to_s("%Y-%m-%d %H:%M:%S"))
 
           vars
         end
@@ -1596,9 +1726,9 @@ module Hwaro
           vars["page_weight"] = Crinja::Value.new(page.weight)
 
           # Site variables (flat for convenience)
-          vars["site_title"] = Crinja::Value.new(config.title)
-          vars["site_description"] = Crinja::Value.new(config.description || "")
-          vars["base_url"] = Crinja::Value.new(config.base_url)
+          # NOTE: site_title, site_description, base_url are now in global_vars
+          # (computed once in build_global_vars). We skip them here to avoid
+          # redundant Crinja::Value allocations per page.
 
           # Section variables
           section_title = ""
@@ -1752,17 +1882,10 @@ module Hwaro
             vars["paginator"] = Crinja::Value.new(paginator_obj)
           end
 
-          # Highlight tags
-          vars["highlight_css"] = Crinja::Value.new(config.highlight.css_tag)
-          vars["highlight_js"] = Crinja::Value.new(config.highlight.js_tag)
-          vars["highlight_tags"] = Crinja::Value.new(config.highlight.tags)
+          # NOTE: highlight_css/js/tags and auto_includes_css/js are now in
+          # global_vars (computed once in build_global_vars).
 
-          # Auto includes
-          vars["auto_includes_css"] = Crinja::Value.new(config.auto_includes.css_tags(config.base_url))
-          vars["auto_includes_js"] = Crinja::Value.new(config.auto_includes.js_tags(config.base_url))
-          vars["auto_includes"] = Crinja::Value.new(config.auto_includes.all_tags(config.base_url))
-
-          # OG/Twitter tags
+          # OG/Twitter tags (page-specific — depend on page title/description/url/image)
           og_tags = config.og.og_tags(page.title, page.description, effective_url, page.image, config.base_url)
           twitter_tags = config.og.twitter_tags(page.title, page.description, page.image, config.base_url)
           og_all_tags = config.og.all_tags(page.title, page.description, effective_url, page.image, config.base_url)
@@ -1776,11 +1899,8 @@ module Hwaro
           vars["canonical_tag"] = Crinja::Value.new(canonical_tag)
           vars["hreflang_tags"] = Crinja::Value.new(hreflang_tags)
 
-          # Time-related variables
-          now = Time.local
-          vars["current_year"] = Crinja::Value.new(now.year)
-          vars["current_date"] = Crinja::Value.new(now.to_s("%Y-%m-%d"))
-          vars["current_datetime"] = Crinja::Value.new(now.to_s("%Y-%m-%d %H:%M:%S"))
+          # NOTE: current_year/current_date/current_datetime are now in
+          # global_vars (computed once in build_global_vars).
 
           if global_vars
             vars.merge!(global_vars)

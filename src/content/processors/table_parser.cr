@@ -132,9 +132,15 @@ module Hwaro
           result.join("\n")
         end
 
-        # Quick check if content might contain tables
+        # Quick check if content might contain tables.
+        # Detects the separator row pattern which is the definitive marker of a
+        # markdown table (e.g. `|---|---|` or `---|---`).  This avoids false
+        # positives from random `|` in code blocks, URLs, or inline code while
+        # still catching tables with or without leading/trailing pipes.
+        TABLE_SEPARATOR_CHECK = /^\s*\|?\s*:?-{2,}:?\s*\|/m
+
         def has_table?(content : String) : Bool
-          content.includes?("|")
+          TABLE_SEPARATOR_CHECK.matches?(content)
         end
 
         # Check if a line looks like a table row (contains pipe characters)

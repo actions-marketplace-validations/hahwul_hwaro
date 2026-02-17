@@ -23,6 +23,17 @@ module Hwaro
       class Markdown < Base
         # Regex for matching h1-h6 tags with IDs to insert anchor links
         ANCHOR_LINK_REGEX = /<(h[1-6])([^>]*id="([^"]+)"[^>]*)>(.*?)<\/\1>/m
+
+        # Regex for post_process_html — lightweight replacements for XML.parse_html
+        # Matches <h1>…</h1> through <h6>…</h6>, capturing tag name, level digit, attributes, and inner HTML
+        HEADING_TAG_REGEX = /<(h([1-6]))(\s[^>]*)?>(.+?)<\/h\2>/mi
+        # Matches <img ...> tags that do NOT already have a loading= attribute
+        IMG_LAZY_REGEX = /<img(?![^>]*\bloading\s*=)([^>]*?)\s*\/?>/i
+        # Extracts id="value" from an attribute string
+        ID_ATTR_REGEX = /\bid\s*=\s*["']([^"']+)["']/
+        # Strips HTML tags to get plain text
+        HTML_TAG_STRIP_REGEX = /<[^>]+>/
+
         # Regex for TOML front matter
         TOML_FRONT_MATTER_REGEX = /\A\+\+\+\s*\n(.*?\n?)^\+\+\+\s*$\n?(.*)\z/m
 
@@ -404,43 +415,55 @@ module Hwaro
           result
         end
 
+        # Lightweight regex-based post-processing.
+        # Replaces the previous XML.parse_html approach which constructed a full
+        # DOM tree for every page — very expensive for large sites.
         private def post_process_html(html : String, generate_toc : Bool, process_images : Bool) : Tuple(String, Array(Models::TocHeader))
-          # XML.parse_html wraps content in <html><body>...</body></html>
-          doc = XML.parse_html(html)
-          body = doc.xpath_node("//body")
+          result = html
 
-          return {html, [] of Models::TocHeader} unless body
-
+          # 1. Lazy-load images: add loading="lazy" to <img> tags missing it
           if process_images
-            body.xpath_nodes("//img").each do |node|
-              unless node["loading"]?
-                node["loading"] = "lazy"
-              end
+            result = result.gsub(IMG_LAZY_REGEX) do |match|
+              attrs = $1
+              # Insert loading="lazy" before the closing /> or >
+              "<img loading=\"lazy\"#{attrs} />"
             end
           end
 
+          # 2. Extract TOC headers and inject missing id attributes
           roots = [] of Models::TocHeader
 
           if generate_toc
             stack = [] of Models::TocHeader
+            used_ids = Set(String).new
 
-            # Iterate through h1-h6 tags
-            body.xpath_nodes("//*[starts-with(name(), 'h') and string-length(name()) = 2]").each do |node|
-              # Optimization: Avoid regex for simple char check.
-              # XPath already ensures starts with 'h' and length 2.
-              c = node.name[1]
-              next unless c >= '1' && c <= '6'
+            result = result.gsub(HEADING_TAG_REGEX) do |match|
+              tag_name = $1     # e.g. "h2"
+              level = $2.to_i   # e.g. 2
+              attrs = $3? || "" # existing attributes (may be empty)
+              inner_html = $4   # inner content (may contain inline HTML)
 
-              level = c.to_i
-              title = node.content
+              # Extract plain text for TOC title
+              title = inner_html.gsub(HTML_TAG_STRIP_REGEX, "").strip
 
-              # Generate ID
-              existing_id = node["id"]?
+              # Use existing id or generate one
+              existing_id = if id_match = attrs.match(ID_ATTR_REGEX)
+                              id_match[1]
+                            else
+                              nil
+                            end
+
               id = existing_id || Utils::TextUtils.slugify(title)
 
-              unless existing_id
-                node["id"] = id
+              # Ensure uniqueness
+              if used_ids.includes?(id)
+                suffix = 1
+                while used_ids.includes?("#{id}-#{suffix}")
+                  suffix += 1
+                end
+                id = "#{id}-#{suffix}"
               end
+              used_ids << id
 
               permalink = "##{id}"
 
@@ -451,7 +474,7 @@ module Hwaro
                 permalink: permalink
               )
 
-              # Build Tree
+              # Build tree structure
               while stack.any? && stack.last.level >= level
                 stack.pop
               end
@@ -462,12 +485,17 @@ module Hwaro
                 stack.last.children << toc_item
               end
               stack.push(toc_item)
+
+              # Rebuild the tag, injecting id if it was missing
+              if existing_id
+                match # Return unchanged
+              else
+                "<#{tag_name}#{attrs} id=\"#{id}\">#{inner_html}</#{tag_name}>"
+              end
             end
           end
 
-          final_html = body.children.map(&.to_xml).join
-
-          {final_html, roots}
+          {result, roots}
         end
 
         private def parse_time(time_str : String?) : Time?

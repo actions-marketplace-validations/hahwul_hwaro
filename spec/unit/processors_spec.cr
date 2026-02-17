@@ -2,9 +2,14 @@ require "../spec_helper"
 
 describe Hwaro::Content::Processors::TableParser do
   describe "has_table?" do
-    it "returns true when content contains pipe character" do
-      content = "| Header 1 | Header 2 |"
+    it "returns true when content contains a table with separator row" do
+      content = "| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |"
       Hwaro::Content::Processors::TableParser.has_table?(content).should be_true
+    end
+
+    it "returns false for pipe-only header without separator row" do
+      content = "| Header 1 | Header 2 |"
+      Hwaro::Content::Processors::TableParser.has_table?(content).should be_false
     end
 
     it "returns false when content has no pipe character" do
@@ -579,7 +584,7 @@ describe Hwaro::Processor::Markdown do
     it "preserves existing loading attribute" do
       content = "<img src='image.jpg' loading='eager'>"
       html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
-      html.should contain("loading=\"eager\"")
+      html.should contain("loading='eager'")
       html.should_not contain("loading=\"lazy\"")
     end
 
