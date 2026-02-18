@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build (e.g., 1.0.0)"
+        description: "Version to build (e.g., 0.0.13)"
         required: true
         type: string
+      upload_to_release:
+        description: "Upload .deb to GitHub Release (requires existing tag)"
+        required: false
+        type: boolean
+        default: false
   release:
     types: [published]
 permissions:
@@ -22,17 +27,22 @@ jobs:
         uses: crystal-lang/install-crystal@v1
       - name: Checkout source code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref }}
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Get Version
         id: get_version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+            RAW_VERSION="${{ github.event.inputs.version }}"
           else
-            VERSION="${GITHUB_REF#refs/tags/v}"
+            RAW_VERSION="${GITHUB_REF#refs/tags/}"
           fi
+          # Strip leading 'v' if present
+          VERSION="${RAW_VERSION#v}"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Resolved version: $VERSION"
       - name: Build hwaro Binary
         run: |
           docker run --rm --platform linux/${{ matrix.arch }} -v $(pwd):/hwaro -w /hwaro --entrypoint="" 84codes/crystal:latest-alpine sh -c "
@@ -65,10 +75,12 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: hwaro_${{ env.VERSION }}_${{ matrix.arch }}.deb
-          path: ./
+          path: hwaro_${{ env.VERSION }}_${{ matrix.arch }}.deb
       - name: Upload .deb to Release
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload_to_release)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
           files: |
             hwaro_${{ env.VERSION }}_${{ matrix.arch }}.deb
         env:
