@@ -67,6 +67,13 @@ module Hwaro
           page.taxonomy_term = nil
           page.redirect_to = data[:redirect_to]
 
+          # New fields — keep in sync with Builder#parse_single_page
+          page.authors = data[:authors]
+          page.extra = data[:extra]
+          page.in_search_index = data[:in_search_index]
+          page.insert_anchor_links = data[:insert_anchor_links]
+          page.weight = data[:weight]
+
           if page.is_a?(Models::Section)
             page.transparent = data[:transparent]
             page.generate_feeds = data[:generate_feeds]
@@ -74,7 +81,14 @@ module Hwaro
             page.pagination_enabled = data[:pagination_enabled]
             page.sort_by = data[:sort_by]
             page.reverse = data[:reverse]
+            page.page_template = data[:page_template]
+            page.paginate_path = data[:paginate_path]
           end
+
+          # Calculate derived fields
+          page.calculate_word_count
+          page.calculate_reading_time
+          page.extract_summary
         end
 
         private def filter_drafts(ctx : Core::Lifecycle::BuildContext)

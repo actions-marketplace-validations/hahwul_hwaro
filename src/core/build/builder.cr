@@ -902,6 +902,9 @@ module Hwaro
           page.insert_anchor_links = data[:insert_anchor_links]
           page.weight = data[:weight]
 
+          # Redirect support — applies to both regular pages and sections
+          page.redirect_to = data[:redirect_to]
+
           # Calculate word count and reading time
           page.calculate_word_count
           page.calculate_reading_time
@@ -918,7 +921,6 @@ module Hwaro
             page.reverse = data[:reverse]
             page.page_template = data[:page_template]
             page.paginate_path = data[:paginate_path]
-            page.redirect_to = data[:redirect_to]
           end
 
           # Calculate URL

@@ -1,0 +1,1328 @@
+require "../spec_helper"
+
+# =============================================================================
+# Front matter parsing tests
+#
+# These tests verify that the Markdown processor correctly parses front matter
+# in both TOML (+++) and YAML (---) formats, including edge cases that could
+# cause site breakage if mishandled (extra fields, missing fields, malformed
+# input, special characters, etc.).
+# =============================================================================
+
+describe Hwaro::Content::Processors::Markdown do
+  processor = Hwaro::Content::Processors::Markdown.new
+
+  # ---------------------------------------------------------------------------
+  # TOML front matter
+  # ---------------------------------------------------------------------------
+  describe "TOML front matter parsing" do
+    it "parses basic TOML fields" do
+      raw = <<-MD
+      +++
+      title = "My Post"
+      draft = false
+      +++
+      Content here
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("My Post")
+      result[:draft].should eq(false)
+      result[:content].should contain("Content here")
+    end
+
+    it "parses description and image" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      description = "A brief summary"
+      image = "/images/hero.jpg"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:description].should eq("A brief summary")
+      result[:image].should eq("/images/hero.jpg")
+    end
+
+    it "parses tags array" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      tags = ["crystal", "programming", "web"]
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq(["crystal", "programming", "web"])
+    end
+
+    it "parses aliases array" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      aliases = ["/old-url/", "/legacy/page/"]
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:aliases].should eq(["/old-url/", "/legacy/page/"])
+    end
+
+    it "parses date field" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      date = "2024-06-15"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+    end
+
+    it "parses updated field" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      date = "2024-01-01"
+      updated = "2024-06-15"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:updated].should_not be_nil
+    end
+
+    it "parses toc field" do
+      raw = <<-MD
+      +++
+      title = "Doc"
+      toc = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:toc].should eq(true)
+    end
+
+    it "parses render = false" do
+      raw = <<-MD
+      +++
+      title = "Hidden"
+      render = false
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:render].should eq(false)
+    end
+
+    it "parses in_sitemap = false" do
+      raw = <<-MD
+      +++
+      title = "NoSitemap"
+      in_sitemap = false
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:in_sitemap].should eq(false)
+    end
+
+    it "parses slug field" do
+      raw = <<-MD
+      +++
+      title = "Original Title"
+      slug = "custom-slug"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:slug].should eq("custom-slug")
+    end
+
+    it "parses path field (custom path)" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      path = "/archive/2024/my-post/"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:custom_path].should eq("/archive/2024/my-post/")
+    end
+
+    it "parses template field" do
+      raw = <<-MD
+      +++
+      title = "Special"
+      template = "landing"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:template].should eq("landing")
+    end
+
+    it "parses redirect_to field" do
+      raw = <<-MD
+      +++
+      title = "Redirect"
+      redirect_to = "/new-location/"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:redirect_to].should eq("/new-location/")
+    end
+
+    it "parses weight field" do
+      raw = <<-MD
+      +++
+      title = "Weighted"
+      weight = 42
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:weight].should eq(42)
+    end
+
+    it "parses authors array" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      authors = ["alice", "bob"]
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:authors].should eq(["alice", "bob"])
+    end
+
+    it "parses in_search_index = false" do
+      raw = <<-MD
+      +++
+      title = "NoSearch"
+      in_search_index = false
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:in_search_index].should eq(false)
+    end
+
+    it "parses insert_anchor_links = true" do
+      raw = <<-MD
+      +++
+      title = "Anchored"
+      insert_anchor_links = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:insert_anchor_links].should eq(true)
+    end
+
+    it "parses transparent = true (section property)" do
+      raw = <<-MD
+      +++
+      title = "2024"
+      transparent = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:transparent].should eq(true)
+    end
+
+    it "parses generate_feeds = true" do
+      raw = <<-MD
+      +++
+      title = "Blog"
+      generate_feeds = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:generate_feeds].should eq(true)
+    end
+
+    it "parses paginate and pagination_enabled" do
+      raw = <<-MD
+      +++
+      title = "Section"
+      paginate = 10
+      pagination_enabled = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:paginate].should eq(10)
+      result[:pagination_enabled].should eq(true)
+    end
+
+    it "parses sort_by and reverse" do
+      raw = <<-MD
+      +++
+      title = "Section"
+      sort_by = "weight"
+      reverse = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:sort_by].should eq("weight")
+      result[:reverse].should eq(true)
+    end
+
+    it "parses page_template field" do
+      raw = <<-MD
+      +++
+      title = "Section"
+      page_template = "blog_post"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:page_template].should eq("blog_post")
+    end
+
+    it "parses paginate_path field" do
+      raw = <<-MD
+      +++
+      title = "Section"
+      paginate_path = "p"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:paginate_path].should eq("p")
+    end
+
+    it "extracts extra fields from [extra] table" do
+      raw = <<-MD
+      +++
+      title = "Post"
+
+      [extra]
+      custom_field = "hello"
+      custom_bool = true
+      custom_int = 99
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:extra].has_key?("extra").should be_true
+      extra = result[:extra]["extra"]
+      # The extra should contain "custom_field" within the nested structure
+      # Since [extra] is parsed as a TOML subtable, it becomes extra["extra"]
+    end
+
+    it "extracts top-level extra fields not in known keys" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      my_custom_key = "custom_value"
+      another_key = true
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:extra].has_key?("my_custom_key").should be_true
+      result[:extra].has_key?("another_key").should be_true
+    end
+
+    it "extracts taxonomies from front matter" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      tags = ["crystal", "web"]
+      categories = ["tech", "programming"]
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:taxonomies].has_key?("tags").should be_true
+      result[:taxonomies]["tags"].should eq(["crystal", "web"])
+      result[:taxonomies].has_key?("categories").should be_true
+      result[:taxonomies]["categories"].should eq(["tech", "programming"])
+    end
+
+    it "returns front_matter_keys" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      draft = false
+      tags = ["a"]
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:front_matter_keys].should contain("title")
+      result[:front_matter_keys].should contain("draft")
+      result[:front_matter_keys].should contain("tags")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # YAML front matter
+  # ---------------------------------------------------------------------------
+  describe "YAML front matter parsing" do
+    it "parses basic YAML fields" do
+      raw = <<-MD
+      ---
+      title: My Post
+      draft: false
+      ---
+      Content here
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("My Post")
+      result[:draft].should eq(false)
+      result[:content].should contain("Content here")
+    end
+
+    it "parses description and image" do
+      raw = <<-MD
+      ---
+      title: Post
+      description: A brief summary
+      image: /images/hero.jpg
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:description].should eq("A brief summary")
+      result[:image].should eq("/images/hero.jpg")
+    end
+
+    it "parses tags array" do
+      raw = <<-MD
+      ---
+      title: Post
+      tags:
+        - crystal
+        - programming
+        - web
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq(["crystal", "programming", "web"])
+    end
+
+    it "parses inline tags array" do
+      raw = <<-MD
+      ---
+      title: Post
+      tags: [crystal, web]
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq(["crystal", "web"])
+    end
+
+    it "parses aliases array" do
+      raw = <<-MD
+      ---
+      title: Post
+      aliases:
+        - /old-url/
+        - /legacy/page/
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:aliases].should eq(["/old-url/", "/legacy/page/"])
+    end
+
+    it "parses date field" do
+      raw = <<-MD
+      ---
+      title: Post
+      date: "2024-06-15"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+    end
+
+    it "parses toc field" do
+      raw = <<-MD
+      ---
+      title: Doc
+      toc: true
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:toc].should eq(true)
+    end
+
+    it "parses render: false" do
+      raw = <<-MD
+      ---
+      title: Hidden
+      render: false
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:render].should eq(false)
+    end
+
+    it "parses slug field" do
+      raw = <<-MD
+      ---
+      title: Original
+      slug: custom-slug
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:slug].should eq("custom-slug")
+    end
+
+    it "parses redirect_to field" do
+      raw = <<-MD
+      ---
+      title: Redirect
+      redirect_to: /new-location/
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:redirect_to].should eq("/new-location/")
+    end
+
+    it "parses weight field" do
+      raw = <<-MD
+      ---
+      title: Weighted
+      weight: 42
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:weight].should eq(42)
+    end
+
+    it "parses authors array" do
+      raw = <<-MD
+      ---
+      title: Post
+      authors:
+        - alice
+        - bob
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:authors].should eq(["alice", "bob"])
+    end
+
+    it "parses transparent and generate_feeds" do
+      raw = <<-MD
+      ---
+      title: Section
+      transparent: true
+      generate_feeds: true
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:transparent].should eq(true)
+      result[:generate_feeds].should eq(true)
+    end
+
+    it "parses paginate and pagination_enabled" do
+      raw = <<-MD
+      ---
+      title: Section
+      paginate: 5
+      pagination_enabled: true
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:paginate].should eq(5)
+      result[:pagination_enabled].should eq(true)
+    end
+
+    it "parses sort_by and reverse" do
+      raw = <<-MD
+      ---
+      title: Section
+      sort_by: title
+      reverse: true
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:sort_by].should eq("title")
+      result[:reverse].should eq(true)
+    end
+
+    it "extracts YAML extra fields not in known keys" do
+      raw = <<-MD
+      ---
+      title: Post
+      my_custom_key: custom_value
+      another_key: true
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:extra].has_key?("my_custom_key").should be_true
+      result[:extra].has_key?("another_key").should be_true
+    end
+
+    it "extracts taxonomies from YAML front matter" do
+      raw = <<-MD
+      ---
+      title: Post
+      tags:
+        - crystal
+        - web
+      categories:
+        - tech
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:taxonomies].has_key?("tags").should be_true
+      result[:taxonomies]["tags"].should eq(["crystal", "web"])
+      result[:taxonomies].has_key?("categories").should be_true
+      result[:taxonomies]["categories"].should eq(["tech"])
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Default values (no front matter or missing fields)
+  # ---------------------------------------------------------------------------
+  describe "default values" do
+    it "uses 'Untitled' when title is missing" do
+      raw = <<-MD
+      ---
+      draft: false
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Untitled")
+    end
+
+    it "defaults draft to false" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:draft].should eq(false)
+    end
+
+    it "defaults render to true" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:render].should eq(true)
+    end
+
+    it "defaults in_sitemap to true" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:in_sitemap].should eq(true)
+    end
+
+    it "defaults toc to false" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:toc].should eq(false)
+    end
+
+    it "defaults weight to 0" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:weight].should eq(0)
+    end
+
+    it "defaults in_search_index to true" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:in_search_index].should eq(true)
+    end
+
+    it "defaults insert_anchor_links to false" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:insert_anchor_links].should eq(false)
+    end
+
+    it "defaults paginate_path to 'page'" do
+      raw = <<-MD
+      ---
+      title: Section
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:paginate_path].should eq("page")
+    end
+
+    it "defaults tags to empty array" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq([] of String)
+    end
+
+    it "defaults aliases to empty array" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:aliases].should eq([] of String)
+    end
+
+    it "defaults authors to empty array" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:authors].should eq([] of String)
+    end
+
+    it "defaults extra to empty hash" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:extra].empty?.should be_true
+    end
+
+    it "defaults description to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:description].should be_nil
+    end
+
+    it "defaults image to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:image].should be_nil
+    end
+
+    it "defaults date to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+    end
+
+    it "defaults slug to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:slug].should be_nil
+    end
+
+    it "defaults custom_path to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:custom_path].should be_nil
+    end
+
+    it "defaults redirect_to to nil" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:redirect_to].should be_nil
+    end
+
+    it "defaults transparent to false" do
+      raw = <<-MD
+      ---
+      title: Section
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:transparent].should eq(false)
+    end
+
+    it "defaults generate_feeds to false" do
+      raw = <<-MD
+      ---
+      title: Section
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:generate_feeds].should eq(false)
+    end
+
+    it "defaults paginate to nil" do
+      raw = <<-MD
+      ---
+      title: Section
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:paginate].should be_nil
+    end
+
+    it "defaults pagination_enabled to nil" do
+      raw = <<-MD
+      ---
+      title: Section
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:pagination_enabled].should be_nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # No front matter at all
+  # ---------------------------------------------------------------------------
+  describe "content without front matter" do
+    it "returns default values and treats entire content as body" do
+      raw = "# Hello World\n\nJust content, no front matter."
+
+      result = processor.parse(raw)
+      result[:title].should eq("Untitled")
+      result[:draft].should eq(false)
+      result[:content].should contain("# Hello World")
+      result[:content].should contain("Just content, no front matter.")
+    end
+
+    it "handles empty string input" do
+      result = processor.parse("")
+      result[:title].should eq("Untitled")
+      result[:content].should eq("")
+    end
+
+    it "handles whitespace-only input" do
+      result = processor.parse("   \n\n  \n")
+      result[:title].should eq("Untitled")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Malformed front matter recovery
+  # ---------------------------------------------------------------------------
+  describe "malformed front matter" do
+    it "recovers from invalid TOML and returns defaults" do
+      raw = <<-MD
+      +++
+      title = "Valid"
+      invalid_syntax :::
+      +++
+      Body content
+      MD
+
+      result = processor.parse(raw, "test.md")
+      # Should not crash; falls back to defaults for fields it can't parse
+      result[:content].should contain("Body content")
+    end
+
+    it "recovers from invalid YAML and returns defaults" do
+      raw = <<-MD
+      ---
+      title: Valid
+      invalid: [unterminated
+      ---
+      Body content
+      MD
+
+      result = processor.parse(raw, "test.md")
+      # Should not crash; falls back to defaults
+      result[:content].should contain("Body content")
+    end
+
+    it "handles TOML front matter with empty body" do
+      raw = <<-MD
+      +++
+      title = "Empty Body"
+      +++
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Empty Body")
+    end
+
+    it "handles YAML front matter with empty body" do
+      raw = <<-MD
+      ---
+      title: Empty Body
+      ---
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Empty Body")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Special characters and Unicode
+  # ---------------------------------------------------------------------------
+  describe "special characters in front matter" do
+    it "handles Unicode title in YAML" do
+      raw = <<-MD
+      ---
+      title: 안녕하세요
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("안녕하세요")
+    end
+
+    it "handles Unicode title in TOML" do
+      raw = <<-MD
+      +++
+      title = "日本語のタイトル"
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("日本語のタイトル")
+    end
+
+    it "handles title with quotes in YAML" do
+      raw = <<-MD
+      ---
+      title: "Title with 'single' and inner quotes"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should contain("single")
+    end
+
+    it "handles title with special markdown characters" do
+      raw = <<-MD
+      ---
+      title: "Title with # and * and [brackets]"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should contain("#")
+      result[:title].should contain("*")
+    end
+
+    it "handles description with HTML entities" do
+      raw = <<-MD
+      ---
+      title: Post
+      description: "Desc with <b>bold</b> & ampersands"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:description].not_nil!.should contain("<b>bold</b>")
+      result[:description].not_nil!.should contain("&")
+    end
+
+    it "handles empty tags array in YAML" do
+      raw = <<-MD
+      ---
+      title: Post
+      tags: []
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq([] of String)
+    end
+
+    it "handles empty tags array in TOML" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      tags = []
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq([] of String)
+    end
+
+    it "handles empty authors array in YAML" do
+      raw = <<-MD
+      ---
+      title: Post
+      authors: []
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:authors].should eq([] of String)
+    end
+
+    it "handles empty aliases array in TOML" do
+      raw = <<-MD
+      +++
+      title = "Post"
+      aliases = []
+      +++
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:aliases].should eq([] of String)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Content body extraction
+  # ---------------------------------------------------------------------------
+  describe "content body extraction" do
+    it "separates TOML front matter from content body" do
+      raw = "+++\ntitle = \"Test\"\n+++\nLine 1\nLine 2\nLine 3"
+
+      result = processor.parse(raw)
+      result[:title].should eq("Test")
+      result[:content].should contain("Line 1")
+      result[:content].should contain("Line 2")
+      result[:content].should contain("Line 3")
+      result[:content].should_not contain("+++")
+      result[:content].should_not contain("title")
+    end
+
+    it "separates YAML front matter from content body" do
+      raw = "---\ntitle: Test\n---\nLine 1\nLine 2\nLine 3"
+
+      result = processor.parse(raw)
+      result[:title].should eq("Test")
+      result[:content].should contain("Line 1")
+      result[:content].should contain("Line 2")
+      result[:content].should contain("Line 3")
+      result[:content].should_not contain("---")
+    end
+
+    it "preserves markdown formatting in content body" do
+      raw = <<-MD
+      ---
+      title: Test
+      ---
+      # Heading
+
+      **Bold** and *italic* text.
+
+      - List item 1
+      - List item 2
+
+      ```
+      code block
+      ```
+      MD
+
+      result = processor.parse(raw)
+      result[:content].should contain("# Heading")
+      result[:content].should contain("**Bold**")
+      result[:content].should contain("- List item 1")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Combined fields (comprehensive TOML)
+  # ---------------------------------------------------------------------------
+  describe "comprehensive TOML front matter" do
+    it "parses all supported fields together" do
+      raw = <<-MD
+      +++
+      title = "Complete Post"
+      description = "Full description"
+      image = "/img/cover.jpg"
+      draft = false
+      date = "2024-06-15"
+      updated = "2024-07-01"
+      toc = true
+      render = true
+      in_sitemap = true
+      slug = "complete"
+      weight = 10
+      tags = ["crystal", "test"]
+      aliases = ["/old/"]
+      authors = ["alice"]
+      in_search_index = true
+      insert_anchor_links = true
+      redirect_to = ""
+      +++
+      Full body content here.
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Complete Post")
+      result[:description].should eq("Full description")
+      result[:image].should eq("/img/cover.jpg")
+      result[:draft].should eq(false)
+      result[:date].should_not be_nil
+      result[:updated].should_not be_nil
+      result[:toc].should eq(true)
+      result[:render].should eq(true)
+      result[:in_sitemap].should eq(true)
+      result[:slug].should eq("complete")
+      result[:weight].should eq(10)
+      result[:tags].should eq(["crystal", "test"])
+      result[:aliases].should eq(["/old/"])
+      result[:authors].should eq(["alice"])
+      result[:in_search_index].should eq(true)
+      result[:insert_anchor_links].should eq(true)
+      result[:content].should contain("Full body content here.")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Combined fields (comprehensive YAML)
+  # ---------------------------------------------------------------------------
+  describe "comprehensive YAML front matter" do
+    it "parses all supported fields together" do
+      raw = <<-MD
+      ---
+      title: Complete Post
+      description: Full description
+      image: /img/cover.jpg
+      draft: false
+      date: "2024-06-15"
+      updated: "2024-07-01"
+      toc: true
+      render: true
+      in_sitemap: true
+      slug: complete
+      weight: 10
+      tags:
+        - crystal
+        - test
+      aliases:
+        - /old/
+      authors:
+        - alice
+      in_search_index: true
+      insert_anchor_links: true
+      ---
+      Full body content here.
+      MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Complete Post")
+      result[:description].should eq("Full description")
+      result[:image].should eq("/img/cover.jpg")
+      result[:draft].should eq(false)
+      result[:date].should_not be_nil
+      result[:updated].should_not be_nil
+      result[:toc].should eq(true)
+      result[:render].should eq(true)
+      result[:in_sitemap].should eq(true)
+      result[:slug].should eq("complete")
+      result[:weight].should eq(10)
+      result[:tags].should eq(["crystal", "test"])
+      result[:aliases].should eq(["/old/"])
+      result[:authors].should eq(["alice"])
+      result[:in_search_index].should eq(true)
+      result[:insert_anchor_links].should eq(true)
+      result[:content].should contain("Full body content here.")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Date parsing edge cases
+  # ---------------------------------------------------------------------------
+  describe "date parsing" do
+    it "parses ISO 8601 date" do
+      raw = <<-MD
+      ---
+      title: Post
+      date: "2024-01-15"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+      result[:date].not_nil!.month.should eq(1)
+      result[:date].not_nil!.day.should eq(15)
+    end
+
+    it "parses date with time component" do
+      raw = <<-MD
+      ---
+      title: Post
+      date: "2024-06-15T10:30:00"
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+    end
+
+    it "handles nil date gracefully" do
+      raw = <<-MD
+      ---
+      title: Post
+      ---
+      Body
+      MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+    end
+  end
+end
