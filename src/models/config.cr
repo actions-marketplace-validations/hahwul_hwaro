@@ -538,7 +538,8 @@ module Hwaro
         if sitemap_bool = config.raw["sitemap"]?.try(&.as_bool?)
           config.sitemap.enabled = sitemap_bool
         elsif s = config.raw["sitemap"]?.try(&.as_h?)
-          config.sitemap.enabled = s["enabled"]?.try(&.as_bool?) || config.sitemap.enabled
+          enabled_val = s["enabled"]?.try(&.as_bool?)
+          config.sitemap.enabled = enabled_val unless enabled_val.nil?
           config.sitemap.filename = s["filename"]?.try(&.as_s?) || config.sitemap.filename
           config.sitemap.changefreq = s["changefreq"]?.try(&.as_s?) || config.sitemap.changefreq
           config.sitemap.priority = s["priority"]?.try { |v| v.as_f? || v.as_i?.try(&.to_f) } || config.sitemap.priority
@@ -551,7 +552,8 @@ module Hwaro
       private def self.load_robots(config : Config)
         return unless s = config.raw["robots"]?.try(&.as_h?)
 
-        config.robots.enabled = s["enabled"]?.try(&.as_bool?) || config.robots.enabled
+        enabled_val = s["enabled"]?.try(&.as_bool?)
+        config.robots.enabled = enabled_val unless enabled_val.nil?
         config.robots.filename = s["filename"]?.try(&.as_s?) || config.robots.filename
 
         if rules = s["rules"]?.try(&.as_a?)
@@ -586,10 +588,12 @@ module Hwaro
       private def self.load_llms(config : Config)
         return unless s = config.raw["llms"]?.try(&.as_h?)
 
-        config.llms.enabled = s["enabled"]?.try(&.as_bool?) || config.llms.enabled
+        enabled_val = s["enabled"]?.try(&.as_bool?)
+        config.llms.enabled = enabled_val unless enabled_val.nil?
         config.llms.filename = s["filename"]?.try(&.as_s?) || config.llms.filename
         config.llms.instructions = s["instructions"]?.try(&.as_s?) || config.llms.instructions
-        config.llms.full_enabled = s["full_enabled"]?.try(&.as_bool?) || config.llms.full_enabled
+        full_enabled_val = s["full_enabled"]?.try(&.as_bool?)
+        config.llms.full_enabled = full_enabled_val unless full_enabled_val.nil?
         config.llms.full_filename = s["full_filename"]?.try(&.as_s?) || config.llms.full_filename
       end
 
@@ -618,7 +622,8 @@ module Hwaro
       private def self.load_search(config : Config)
         return unless s = config.raw["search"]?.try(&.as_h?)
 
-        config.search.enabled = s["enabled"]?.try(&.as_bool?) || config.search.enabled
+        enabled_val = s["enabled"]?.try(&.as_bool?)
+        config.search.enabled = enabled_val unless enabled_val.nil?
         config.search.format = s["format"]?.try(&.as_s?) || config.search.format
         config.search.filename = s["filename"]?.try(&.as_s?) || config.search.filename
         if fields = s["fields"]?.try(&.as_a?)
@@ -670,7 +675,8 @@ module Hwaro
       private def self.load_pagination(config : Config)
         return unless s = config.raw["pagination"]?.try(&.as_h?)
 
-        config.pagination.enabled = s["enabled"]?.try(&.as_bool?) || config.pagination.enabled
+        enabled_val = s["enabled"]?.try(&.as_bool?)
+        config.pagination.enabled = enabled_val unless enabled_val.nil?
         config.pagination.per_page = s["per_page"]?.try { |v| v.as_i? || v.as_f?.try(&.to_i) } || config.pagination.per_page
       end
 
@@ -691,7 +697,8 @@ module Hwaro
       private def self.load_auto_includes(config : Config)
         return unless s = config.raw["auto_includes"]?.try(&.as_h?)
 
-        config.auto_includes.enabled = s["enabled"]?.try(&.as_bool?) || config.auto_includes.enabled
+        enabled_val = s["enabled"]?.try(&.as_bool?)
+        config.auto_includes.enabled = enabled_val unless enabled_val.nil?
         if dirs = s["dirs"]?.try(&.as_a?)
           config.auto_includes.dirs = dirs.compact_map(&.as_s?)
         end
@@ -719,8 +726,10 @@ module Hwaro
           next unless name
 
           taxonomy = TaxonomyConfig.new(name)
-          taxonomy.feed = taxonomy_hash["feed"]?.try(&.as_bool?) || taxonomy.feed
-          taxonomy.sitemap = taxonomy_hash["sitemap"]?.try(&.as_bool?) || taxonomy.sitemap
+          feed_val = taxonomy_hash["feed"]?.try(&.as_bool?)
+          taxonomy.feed = feed_val unless feed_val.nil?
+          sitemap_val = taxonomy_hash["sitemap"]?.try(&.as_bool?)
+          taxonomy.sitemap = sitemap_val unless sitemap_val.nil?
           taxonomy.paginate_by = taxonomy_hash["paginate_by"]?.try { |v| v.as_i? || v.as_f?.try(&.to_i) }
           taxonomy
         end
@@ -735,8 +744,10 @@ module Hwaro
           lang_config = LanguageConfig.new(lang_code)
           lang_config.language_name = lang_hash["language_name"]?.try(&.as_s?) || lang_code
           lang_config.weight = lang_hash["weight"]?.try { |v| v.as_i? || v.as_f?.try(&.to_i) } || lang_config.weight
-          lang_config.generate_feed = lang_hash["generate_feed"]?.try(&.as_bool?) || lang_config.generate_feed
-          lang_config.build_search_index = lang_hash["build_search_index"]?.try(&.as_bool?) || lang_config.build_search_index
+          generate_feed_val = lang_hash["generate_feed"]?.try(&.as_bool?)
+          lang_config.generate_feed = generate_feed_val unless generate_feed_val.nil?
+          build_search_val = lang_hash["build_search_index"]?.try(&.as_bool?)
+          lang_config.build_search_index = build_search_val unless build_search_val.nil?
 
           if taxonomies = lang_hash["taxonomies"]?.try(&.as_a?)
             lang_config.taxonomies = taxonomies.compact_map(&.as_s?)

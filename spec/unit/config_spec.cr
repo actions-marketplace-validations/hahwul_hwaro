@@ -383,6 +383,185 @@ describe Hwaro::Models::Config do
     end
   end
 
+  describe "loading boolean false values from TOML" do
+    it "respects llms.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [llms]
+      enabled = false
+      filename = "llms.txt"
+      instructions = "Do not use"
+      full_enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.llms.enabled.should be_false
+        config.llms.full_enabled.should be_false
+        config.llms.filename.should eq("llms.txt")
+        config.llms.instructions.should eq("Do not use")
+      end
+    end
+
+    it "respects robots.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [robots]
+      enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.robots.enabled.should be_false
+      end
+    end
+
+    it "respects sitemap.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [sitemap]
+      enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.sitemap.enabled.should be_false
+      end
+    end
+
+    it "respects search.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [search]
+      enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.search.enabled.should be_false
+      end
+    end
+
+    it "respects pagination.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [pagination]
+      enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.pagination.enabled.should be_false
+      end
+    end
+
+    it "respects auto_includes.enabled = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [auto_includes]
+      enabled = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.auto_includes.enabled.should be_false
+      end
+    end
+
+    it "respects taxonomy feed = false and sitemap = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [[taxonomies]]
+      name = "tags"
+      feed = false
+      sitemap = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.taxonomies.size.should eq(1)
+        config.taxonomies[0].name.should eq("tags")
+        config.taxonomies[0].feed.should be_false
+        config.taxonomies[0].sitemap.should be_false
+      end
+    end
+
+    it "respects language generate_feed = false and build_search_index = false" do
+      toml = <<-TOML
+      title = "Test"
+
+      [languages.ko]
+      language_name = "Korean"
+      generate_feed = false
+      build_search_index = false
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.languages["ko"].generate_feed.should be_false
+        config.languages["ko"].build_search_index.should be_false
+      end
+    end
+
+    it "still respects boolean true values" do
+      toml = <<-TOML
+      title = "Test"
+
+      [llms]
+      enabled = true
+      full_enabled = true
+
+      [robots]
+      enabled = true
+
+      [search]
+      enabled = true
+      TOML
+
+      File.tempfile("hwaro-config") do |file|
+        file.print(toml)
+        file.flush
+
+        config = Hwaro::Models::Config.load(file.path)
+        config.llms.enabled.should be_true
+        config.llms.full_enabled.should be_true
+        config.robots.enabled.should be_true
+        config.search.enabled.should be_true
+      end
+    end
+  end
+
   describe "deployment configuration" do
     it "loads deployment targets from config.toml" do
       toml = <<-TOML
