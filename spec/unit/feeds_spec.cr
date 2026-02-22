@@ -139,7 +139,7 @@ describe Hwaro::Content::Seo::Feeds do
       end
     end
 
-    it "excludes index pages" do
+    it "excludes section index pages (_index.md)" do
       config = Hwaro::Models::Config.new
       config.feeds.enabled = true
       config.feeds.type = "rss"
@@ -155,20 +155,146 @@ describe Hwaro::Content::Seo::Feeds do
       regular.is_index = false
       regular.raw_content = "Post content"
 
-      index = Hwaro::Models::Page.new("blog/_index.md")
-      index.title = "Blog Index"
-      index.url = "/blog/"
-      index.draft = false
-      index.render = true
-      index.is_index = true
-      index.raw_content = "Index content"
+      # Section index (_index.md) should be excluded from feeds
+      section_index = Hwaro::Models::Section.new("blog/_index.md")
+      section_index.title = "Blog Index"
+      section_index.url = "/blog/"
+      section_index.section = "blog"
+      section_index.draft = false
+      section_index.render = true
+      section_index.is_index = true
+      section_index.raw_content = "Index content"
 
       Dir.mktmpdir do |output_dir|
-        Hwaro::Content::Seo::Feeds.generate([regular, index], config, output_dir)
+        Hwaro::Content::Seo::Feeds.generate([regular, section_index.as(Hwaro::Models::Page)], config, output_dir)
 
         content = File.read(File.join(output_dir, "rss.xml"))
         content.should contain("Regular Post")
         content.should_not contain("Blog Index")
+      end
+    end
+
+    it "includes page bundle (index.md) pages in feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      # Page bundle (index.md) — this is a content page, NOT a section index
+      page_bundle = Hwaro::Models::Page.new("blog/my-post/index.md")
+      page_bundle.title = "My Post"
+      page_bundle.url = "/blog/my-post/"
+      page_bundle.section = "blog"
+      page_bundle.draft = false
+      page_bundle.render = true
+      page_bundle.is_index = true # index.md sets is_index = true
+      page_bundle.raw_content = "Page bundle content"
+
+      # Section index (_index.md) — should be excluded
+      section_index = Hwaro::Models::Section.new("blog/_index.md")
+      section_index.title = "Blog Index"
+      section_index.url = "/blog/"
+      section_index.section = "blog"
+      section_index.draft = false
+      section_index.render = true
+      section_index.is_index = true
+      section_index.raw_content = "Index content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page_bundle, section_index.as(Hwaro::Models::Page)], config, output_dir)
+
+        content = File.read(File.join(output_dir, "rss.xml"))
+        content.should contain("My Post")
+        content.should_not contain("Blog Index")
+      end
+    end
+
+    it "includes nested subsection pages when parent section is in sections filter" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.sections = ["posts"]
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      # Page in a nested subsection (e.g., content/posts/2026/10years/index.md)
+      nested_post = Hwaro::Models::Page.new("posts/2026/10years/index.md")
+      nested_post.title = "Nested Post"
+      nested_post.url = "/posts/2026/10years/"
+      nested_post.section = "posts/2026"
+      nested_post.draft = false
+      nested_post.render = true
+      nested_post.is_index = true
+      nested_post.raw_content = "Nested content"
+
+      # Page in a different section
+      docs_page = Hwaro::Models::Page.new("docs/guide.md")
+      docs_page.title = "Docs Guide"
+      docs_page.url = "/docs/guide/"
+      docs_page.section = "docs"
+      docs_page.draft = false
+      docs_page.render = true
+      docs_page.is_index = false
+      docs_page.raw_content = "Docs content"
+
+      # Page directly in the posts section
+      direct_post = Hwaro::Models::Page.new("posts/hello.md")
+      direct_post.title = "Direct Post"
+      direct_post.url = "/posts/hello/"
+      direct_post.section = "posts"
+      direct_post.draft = false
+      direct_post.render = true
+      direct_post.is_index = false
+      direct_post.raw_content = "Direct content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([nested_post, docs_page, direct_post], config, output_dir)
+
+        content = File.read(File.join(output_dir, "rss.xml"))
+        content.should contain("Nested Post")
+        content.should contain("Direct Post")
+        content.should_not contain("Docs Guide")
+      end
+    end
+
+    it "does not include pages from unrelated sections with similar prefixes" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.sections = ["post"]
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      # "posts" should NOT match section filter "post" (no false prefix match)
+      posts_page = Hwaro::Models::Page.new("posts/hello.md")
+      posts_page.title = "Posts Hello"
+      posts_page.url = "/posts/hello/"
+      posts_page.section = "posts"
+      posts_page.draft = false
+      posts_page.render = true
+      posts_page.is_index = false
+      posts_page.raw_content = "Content"
+
+      # "post" should match section filter "post"
+      post_page = Hwaro::Models::Page.new("post/hello.md")
+      post_page.title = "Post Hello"
+      post_page.url = "/post/hello/"
+      post_page.section = "post"
+      post_page.draft = false
+      post_page.render = true
+      post_page.is_index = false
+      post_page.raw_content = "Content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([posts_page, post_page], config, output_dir)
+
+        content = File.read(File.join(output_dir, "rss.xml"))
+        content.should contain("Post Hello")
+        content.should_not contain("Posts Hello")
       end
     end
 

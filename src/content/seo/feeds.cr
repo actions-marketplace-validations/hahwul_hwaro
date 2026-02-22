@@ -14,11 +14,13 @@ module Hwaro
         def self.generate(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false)
           # 1. Generate Main Site Feed
           if config.feeds.enabled
-            site_pages = pages.reject { |p| p.draft || !p.render || p.is_index }
+            site_pages = pages.reject { |p| p.draft || !p.render || p.is_a?(Models::Section) }
 
             # Filter by section if configured for main feed
             if !config.feeds.sections.empty?
-              site_pages.select! { |p| config.feeds.sections.includes?(p.section) }
+              site_pages.select! { |p|
+                config.feeds.sections.any? { |s| p.section == s || p.section.starts_with?("#{s}/") }
+              }
             end
 
             process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose)
@@ -31,7 +33,7 @@ module Hwaro
               # Section feed only includes pages from that specific section (shallow)
               # It does not include subsections or pages from other sections
               section_pages = pages.select { |p|
-                !p.draft && p.render && !p.is_index && p.section == page.section
+                !p.draft && p.render && !p.is_a?(Models::Section) && p.section == page.section
               }
 
               # Construct output path for section feed

@@ -458,7 +458,7 @@ describe Hwaro::Content::Seo::Feeds do
       end
     end
 
-    it "excludes index pages from feed" do
+    it "excludes section index pages from feed" do
       config = Hwaro::Models::Config.new
       config.feeds.enabled = true
       config.feeds.type = "rss"
@@ -473,20 +473,47 @@ describe Hwaro::Content::Seo::Feeds do
       page1.is_index = false
       page1.raw_content = "Post content"
 
-      page2 = Hwaro::Models::Page.new("index.md")
-      page2.title = "Index"
-      page2.url = "/"
-      page2.draft = false
-      page2.render = true
-      page2.is_index = true
-      page2.raw_content = "Index content"
+      # Section index (_index.md) creates a Section object — should be excluded
+      section_index = Hwaro::Models::Section.new("blog/_index.md")
+      section_index.title = "Blog Index"
+      section_index.url = "/blog/"
+      section_index.section = "blog"
+      section_index.draft = false
+      section_index.render = true
+      section_index.is_index = true
+      section_index.raw_content = "Index content"
 
       Dir.mktmpdir do |output_dir|
-        Hwaro::Content::Seo::Feeds.generate([page1, page2], config, output_dir)
+        Hwaro::Content::Seo::Feeds.generate([page1, section_index.as(Hwaro::Models::Page)], config, output_dir)
 
         content = File.read(File.join(output_dir, "rss.xml"))
         content.should contain("<title>Post</title>")
-        content.should_not contain("<title>Index</title>")
+        content.should_not contain("<title>Blog Index</title>")
+      end
+    end
+
+    it "includes page bundle (index.md) pages in feed" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      # Page bundle (index.md) is a Page object with is_index=true — should be included
+      page_bundle = Hwaro::Models::Page.new("blog/my-post/index.md")
+      page_bundle.title = "My Post"
+      page_bundle.url = "/blog/my-post/"
+      page_bundle.section = "blog"
+      page_bundle.draft = false
+      page_bundle.render = true
+      page_bundle.is_index = true
+      page_bundle.raw_content = "Page bundle content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page_bundle], config, output_dir)
+
+        content = File.read(File.join(output_dir, "rss.xml"))
+        content.should contain("<title>My Post</title>")
       end
     end
 

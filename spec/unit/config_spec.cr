@@ -1385,7 +1385,7 @@ describe Hwaro::Models::Config do
       TOML
 
       # All booleans should remain at their defaults
-      config.sitemap.enabled.should be_false      # default: false
+      config.sitemap.enabled.should be_false       # default: false
       config.robots.enabled.should be_true         # default: true
       config.llms.enabled.should be_true           # default: true
       config.llms.full_enabled.should be_false     # default: false
