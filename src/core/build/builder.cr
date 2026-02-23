@@ -141,6 +141,8 @@ module Hwaro
 
             changed_pages << page
             affected_sections << page.section
+            # Also include ancestor sections that may list this page
+            page.ancestors.each { |ancestor| affected_sections << ancestor.section }
           end
 
           if changed_pages.empty?

@@ -875,6 +875,87 @@ describe "Incremental build integration" do
     end
   end
 
+  it "re-renders ancestor sections when a page in a nested section changes" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "content", "blog", "posts"))
+      FileUtils.mkdir_p(File.join(dir, "templates"))
+
+      File.write(File.join(dir, "config.toml"), <<-TOML
+        title = "Nested Section Test"
+        base_url = "http://localhost"
+        TOML
+      )
+      File.write(File.join(dir, "templates", "page.html"), "<p>{{ content }}</p>")
+      File.write(File.join(dir, "templates", "section.html"), "<div>{{ content }}</div>")
+
+      File.write(File.join(dir, "content", "blog", "_index.md"), <<-MD
+        ---
+        title: Blog
+        ---
+        Blog index
+        MD
+      )
+      File.write(File.join(dir, "content", "blog", "posts", "_index.md"), <<-MD
+        ---
+        title: Posts
+        ---
+        Posts section
+        MD
+      )
+      File.write(File.join(dir, "content", "blog", "posts", "post1.md"), <<-MD
+        ---
+        title: Post One
+        date: 2025-06-01
+        ---
+        Post one body
+        MD
+      )
+
+      Dir.cd(dir) do
+        builder = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder.register(h) }
+        options = Hwaro::Config::Options::BuildOptions.new
+
+        builder.run(options)
+
+        blog_section_path = File.join(dir, "public", "blog", "index.html")
+        posts_section_path = File.join(dir, "public", "blog", "posts", "index.html")
+        post_path = File.join(dir, "public", "blog", "posts", "post1", "index.html")
+
+        File.exists?(blog_section_path).should be_true
+        File.exists?(posts_section_path).should be_true
+        File.exists?(post_path).should be_true
+
+        # Record mtimes to verify re-rendering
+        blog_mtime_before = File.info(blog_section_path).modification_time
+        posts_mtime_before = File.info(posts_section_path).modification_time
+
+        # Modify post
+        sleep 0.05.seconds
+        File.write(File.join(dir, "content", "blog", "posts", "post1.md"), <<-MD
+          ---
+          title: Post One Updated
+          date: 2025-06-01
+          ---
+          Post one UPDATED body
+          MD
+        )
+
+        builder.run_incremental(["content/blog/posts/post1.md"], options)
+
+        # Post should be updated
+        File.read(post_path).should contain("Post one UPDATED body")
+
+        # Both ancestor sections should be re-rendered
+        blog_mtime_after = File.info(blog_section_path).modification_time
+        posts_mtime_after = File.info(posts_section_path).modification_time
+
+        blog_mtime_after.should be > blog_mtime_before
+        posts_mtime_after.should be > posts_mtime_before
+      end
+    end
+  end
+
   it "re-renders with updated template via run_rerender" do
     Dir.mktmpdir do |dir|
       FileUtils.mkdir_p(File.join(dir, "content"))
