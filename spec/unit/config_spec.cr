@@ -300,6 +300,7 @@ describe Hwaro::Models::Config do
       config.feeds.truncate.should eq(0)
       config.feeds.limit.should eq(10)
       config.feeds.sections.should eq([] of String)
+      config.feeds.default_language_only.should be_true
     end
 
     it "can update feeds settings" do
@@ -309,12 +310,14 @@ describe Hwaro::Models::Config do
       config.feeds.truncate = 200
       config.feeds.limit = 50
       config.feeds.sections = ["blog", "news"]
+      config.feeds.default_language_only = false
 
       config.feeds.enabled.should be_true
       config.feeds.type.should eq("atom")
       config.feeds.truncate.should eq(200)
       config.feeds.limit.should eq(50)
       config.feeds.sections.should eq(["blog", "news"])
+      config.feeds.default_language_only.should be_false
     end
 
     it "loads all feeds settings from TOML" do
@@ -328,6 +331,7 @@ describe Hwaro::Models::Config do
       truncate = 100
       limit = 25
       sections = ["blog", "news"]
+      default_language_only = false
       TOML
 
       config.feeds.enabled.should be_true
@@ -336,6 +340,30 @@ describe Hwaro::Models::Config do
       config.feeds.truncate.should eq(100)
       config.feeds.limit.should eq(25)
       config.feeds.sections.should eq(["blog", "news"])
+      config.feeds.default_language_only.should be_false
+    end
+
+    it "loads default_language_only as true from TOML" do
+      config = load_config(<<-TOML)
+      title = "Test"
+
+      [feeds]
+      enabled = true
+      default_language_only = true
+      TOML
+
+      config.feeds.default_language_only.should be_true
+    end
+
+    it "defaults default_language_only to true when not specified in TOML" do
+      config = load_config(<<-TOML)
+      title = "Test"
+
+      [feeds]
+      enabled = true
+      TOML
+
+      config.feeds.default_language_only.should be_true
     end
 
     it "loads feeds enabled = false from TOML" do
@@ -1202,7 +1230,9 @@ describe Hwaro::Models::Config do
       #   robots.enabled               true  -> false
       #   llms.enabled                 true  -> false
       #   llms.full_enabled            false -> true
-      #   feeds.enabled                false -> true
+      #   feeds.enabled                false -> true (identity: false)
+      #   feeds.default_language_only  true  -> true (identity: true)
+      #   feeds.default_language_only  true  -> false
       #   search.enabled               false -> true
       #   pagination.enabled           false -> true
       #   highlight.enabled            true  -> false
@@ -1230,6 +1260,7 @@ describe Hwaro::Models::Config do
 
       [feeds]
       enabled = true
+      default_language_only = false
 
       [search]
       enabled = true
@@ -1267,6 +1298,7 @@ describe Hwaro::Models::Config do
       config.llms.enabled.should be_false
       config.llms.full_enabled.should be_true
       config.feeds.enabled.should be_true
+      config.feeds.default_language_only.should be_false
       config.search.enabled.should be_true
       config.pagination.enabled.should be_true
       config.highlight.enabled.should be_false
@@ -1300,6 +1332,7 @@ describe Hwaro::Models::Config do
 
       [feeds]
       enabled = false
+      default_language_only = true
 
       [search]
       enabled = false
@@ -1337,6 +1370,7 @@ describe Hwaro::Models::Config do
       config.llms.enabled.should be_true
       config.llms.full_enabled.should be_false
       config.feeds.enabled.should be_false
+      config.feeds.default_language_only.should be_true
       config.search.enabled.should be_false
       config.pagination.enabled.should be_false
       config.highlight.enabled.should be_true

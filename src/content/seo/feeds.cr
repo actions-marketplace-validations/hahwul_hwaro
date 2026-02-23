@@ -23,6 +23,17 @@ module Hwaro
               }
             end
 
+            # When multilingual and default_language_only is true,
+            # the main feed only contains default language pages.
+            # When false, the main feed includes all languages (original behavior).
+            if config.multilingual? && config.feeds.default_language_only
+              default_lang = config.default_language
+              site_pages.select! { |p|
+                lang = p.language || default_lang
+                lang == default_lang
+              }
+            end
+
             process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose)
           end
 
@@ -46,6 +57,53 @@ module Hwaro
               process_feed(section_pages, config, section_output_dir, "", feed_title, page.url, verbose)
             end
           end
+
+          # 3. Generate Language-specific Feeds (for non-default languages)
+          if config.multilingual?
+            generate_language_feeds(pages, config, output_dir, verbose)
+          end
+        end
+
+        # Generate per-language feeds for non-default languages.
+        # Each language with generate_feed=true gets its own feed at /{lang}/rss.xml (or atom.xml).
+        private def self.generate_language_feeds(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false)
+          default_lang = config.default_language
+
+          config.languages.each do |lang_code, lang_config|
+            # Skip the default language — it's already covered by the main feed
+            next if lang_code == default_lang
+
+            # Respect per-language generate_feed setting
+            next unless lang_config.generate_feed
+
+            # Filter pages for this language
+            lang_pages = pages.reject { |p|
+              p.draft || !p.render || p.is_a?(Models::Section)
+            }.select { |p|
+              p.language == lang_code
+            }
+
+            # Apply section filter if configured on the main feed
+            if !config.feeds.sections.empty?
+              lang_pages.select! { |p|
+                config.feeds.sections.any? { |s| p.section == s || p.section.starts_with?("#{s}/") }
+              }
+            end
+
+            # Build the output directory: output_dir/{lang}/
+            lang_output_dir = File.join(output_dir, lang_code)
+            FileUtils.mkdir_p(lang_output_dir)
+
+            # Build a language-specific feed title
+            lang_name = lang_config.language_name
+            feed_title = "#{config.title} (#{lang_name})"
+
+            # base_path corresponds to the URL prefix for this language feed
+            # e.g., "/ko/" so the self-referencing link becomes base_url/ko/rss.xml
+            base_path = "/#{lang_code}/"
+
+            process_feed(lang_pages, config, lang_output_dir, "", feed_title, base_path, verbose, lang_code)
+          end
         end
 
         def self.process_feed(
@@ -56,6 +114,7 @@ module Hwaro
           feed_title : String,
           base_path : String = "",
           verbose : Bool = false,
+          language : String? = nil,
         )
           # Determine feed type and filename
           feed_type = config.feeds.type.downcase
@@ -80,9 +139,9 @@ module Hwaro
           # Generate feed content
           feed_content = case feed_type
                          when "atom"
-                           generate_atom(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path)
+                           generate_atom(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path, language)
                          else
-                           generate_rss(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path)
+                           generate_rss(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path, language)
                          end
 
           # Write feed file
@@ -98,6 +157,7 @@ module Hwaro
           is_text : Bool,
           feed_title : String,
           base_path : String,
+          language : String? = nil,
         ) : String
           String.build do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -106,6 +166,11 @@ module Hwaro
             str << "    <title>#{Utils::TextUtils.escape_xml(feed_title)}</title>\n"
             str << "    <link>#{Utils::TextUtils.escape_xml(config.base_url)}</link>\n"
             str << "    <description>#{Utils::TextUtils.escape_xml(config.description)}</description>\n"
+
+            # Include language tag for language-specific feeds
+            if language
+              str << "    <language>#{Utils::TextUtils.escape_xml(language)}</language>\n"
+            end
 
             # Self-referencing link
             base_url = config.base_url.rstrip('/')
@@ -148,12 +213,20 @@ module Hwaro
           is_text : Bool,
           feed_title : String,
           base_path : String,
+          language : String? = nil,
         ) : String
           now = Time.utc
 
           String.build do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            str << "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+
+            # Include xml:lang attribute for language-specific feeds
+            if language
+              str << "<feed xmlns=\"http://www.w3.org/2005/Atom\" xml:lang=\"#{Utils::TextUtils.escape_xml(language)}\">\n"
+            else
+              str << "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+            end
+
             str << "  <title>#{Utils::TextUtils.escape_xml(feed_title)}</title>\n"
             str << "  <link href=\"#{Utils::TextUtils.escape_xml(config.base_url)}\" />\n"
 

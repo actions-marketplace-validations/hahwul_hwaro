@@ -78,12 +78,51 @@ Generates `/blog/rss.xml`.
 - `/rss.xml` — Site-wide feed
 - `/blog/rss.xml` — Section feed (if enabled)
 
+### Multilingual Feeds
+
+When the site is multilingual, feeds are generated per language automatically:
+
+| Language | Feed Path | Contents |
+|----------|-----------|----------|
+| Default (e.g., `en`) | `/rss.xml` | Default language pages only (configurable) |
+| Non-default (e.g., `ko`) | `/ko/rss.xml` | Only Korean pages |
+| Non-default (e.g., `ja`) | `/ja/rss.xml` | Only Japanese pages |
+
+By default, the main site feed includes **only default language pages** (`default_language_only = true`). Set `default_language_only = false` to include all languages in the main feed. Each non-default language with `generate_feed = true` gets its own separate feed regardless of this setting.
+
+```toml
+[feeds]
+enabled = true
+default_language_only = true   # true (default): main feed = default language only
+                               # false: main feed includes all languages
+```
+
+Per-language feed control:
+
+```toml
+[languages.ko]
+language_name = "한국어"
+generate_feed = true    # Generates /ko/rss.xml (default: true)
+
+[languages.ja]
+language_name = "日本語"
+generate_feed = false   # No /ja/rss.xml will be generated
+```
+
+Language feeds share the same `sections`, `limit`, and `truncate` settings from `[feeds]` config. RSS language feeds include a `<language>` tag, and Atom feeds include an `xml:lang` attribute. The feed title includes the language name (e.g., `"My Site (한국어)"`).
+
 ### Template Links
 
 ```jinja
 <link rel="alternate" type="application/rss+xml" 
       href="{{ base_url }}/rss.xml" 
       title="{{ site.title }}">
+
+{% if page.language and page.language != "en" %}
+<link rel="alternate" type="application/rss+xml"
+      href="{{ base_url }}/{{ page.language }}/rss.xml"
+      title="{{ site.title }} ({{ page.language }})">
+{% endif %}
 ```
 
 ---

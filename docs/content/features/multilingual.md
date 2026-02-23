@@ -34,7 +34,7 @@ weight = 3
 | default_language | string | "en" | Default language code |
 | language_name | string | — | Human-readable language name |
 | weight | int | 0 | Sort order (lower = first) |
-| generate_feed | bool | false | Generate RSS feed for this language |
+| generate_feed | bool | true | Generate RSS/Atom feed for this language |
 | build_search_index | bool | false | Include in search index |
 | taxonomies | array | [] | Taxonomies for this language |
 
@@ -253,8 +253,82 @@ This generates the configuration and sample content files for each specified lan
 </html>
 ```
 
+## Per-Language Feeds
+
+When the site is multilingual, Hwaro automatically generates separate RSS/Atom feeds for each language:
+
+| Language | Feed Path | Contents |
+|----------|-----------|----------|
+| Default (e.g., `en`) | `/rss.xml` | Default language pages only (configurable) |
+| Non-default (e.g., `ko`) | `/ko/rss.xml` | Only Korean pages |
+| Non-default (e.g., `ja`) | `/ja/rss.xml` | Only Japanese pages |
+
+By default, the main site feed (`/rss.xml` or `/atom.xml`) includes **only default language pages**. You can change this behavior with the `default_language_only` option. Each non-default language with `generate_feed = true` gets its own feed under its language prefix regardless of this setting.
+
+### Configuration
+
+#### Main Feed Language Control
+
+```toml
+[feeds]
+enabled = true
+default_language_only = true   # true (default): main feed = default language only
+                               # false: main feed includes all languages
+```
+
+#### Per-Language Feed Control
+
+```toml
+[languages.ko]
+language_name = "한국어"
+generate_feed = true    # Generates /ko/rss.xml (default: true)
+
+[languages.ja]
+language_name = "日本語"
+generate_feed = false   # No /ja/rss.xml will be generated
+```
+
+Language feeds share the same `sections`, `limit`, and `truncate` settings from the global `[feeds]` config:
+
+```toml
+[feeds]
+enabled = true
+type = "rss"       # or "atom"
+limit = 20
+truncate = 0
+sections = []      # empty = all sections
+default_language_only = true
+```
+
+### Feed Details
+
+- **RSS feeds** include a `<language>` tag (e.g., `<language>ko</language>`)
+- **Atom feeds** include an `xml:lang` attribute (e.g., `<feed xmlns="..." xml:lang="ko">`)
+- Feed title includes the language name: `"My Site (한국어)"`
+- Self-referencing links point to the correct language path (e.g., `https://example.com/ko/rss.xml`)
+- Draft pages and section index pages are excluded
+- Language feeds are generated independently of the main feed's `enabled` setting
+
+### Template Links
+
+Add language-specific feed links in your templates:
+
+```jinja
+{# Main feed (default language) #}
+<link rel="alternate" type="application/rss+xml"
+      href="{{ base_url }}/rss.xml"
+      title="{{ site.title }}">
+
+{# Language-specific feed #}
+{% if page.language and page.language != "en" %}
+<link rel="alternate" type="application/rss+xml"
+      href="{{ base_url }}/{{ page.language }}/rss.xml"
+      title="{{ site.title }} ({{ page.language }})">
+{% endif %}
+```
+
 ## See Also
 
 - [Configuration](/start/config/) — Full configuration reference
-- [SEO](/features/seo/) — SEO features including canonical and hreflang
+- [SEO](/features/seo/) — SEO features including feeds, canonical and hreflang
 - [Data Model](/templates/data-model/) — Translation link properties
