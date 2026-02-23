@@ -211,11 +211,52 @@ To add new hooks:
 #### 4. SEO Features
 
 SEO-related features live in `src/content/seo/`:
-- `feeds.cr` - RSS/Atom feed generation
+- `feeds.cr` - RSS/Atom feed generation (including multilingual per-language feeds)
 - `sitemap.cr` - Sitemap XML generation
 - `robots.cr` - Robots.txt generation
 - `llms.cr` - LLM instructions file generator for AI/LLM crawler instructions
 - `tags.cr` - Canonical URL and hreflang tag generation for multilingual sites
+
+**Multilingual Feed Generation:**
+
+When the site is multilingual (`[languages]` configured in `config.toml`), feeds are generated per language:
+
+| Language | Feed Path | Contents |
+|---|---|---|
+| Default (e.g., `en`) | `/rss.xml` | Default language pages only (configurable) |
+| Non-default (e.g., `ko`) | `/ko/rss.xml` | Only Korean pages |
+| Non-default (e.g., `ja`) | `/ja/rss.xml` | Only Japanese pages |
+
+Behavior details:
+- By default the main site feed (`/rss.xml` or `/atom.xml`) includes **only default language pages** (`default_language_only = true`). Set `default_language_only = false` to include all languages in the main feed.
+- Each non-default language with `generate_feed = true` gets its own feed at `/{lang}/rss.xml` (or `atom.xml`)
+- Language feeds respect the same `sections`, `limit`, and `truncate` settings from `[feeds]` config
+- RSS language feeds include a `<language>` tag (e.g., `<language>ko</language>`)
+- Atom language feeds include an `xml:lang` attribute (e.g., `<feed xmlns="..." xml:lang="ko">`)
+- Feed title includes the language name: `"Site Title (한국어)"`
+- Draft pages and section index pages are excluded from language feeds
+- Language feeds are generated independently of the main feed's `enabled` setting — they are produced whenever the site is multilingual and the language has `generate_feed = true`
+
+Main feed language control in `config.toml`:
+```toml
+[feeds]
+enabled = true
+default_language_only = true   # true (default): main feed has default language only
+                               # false: main feed includes all languages
+```
+
+Per-language feed control in `config.toml`:
+```toml
+[languages.ko]
+language_name = "한국어"
+generate_feed = true    # true by default; set to false to skip this language's feed
+
+[languages.ja]
+language_name = "日本語"
+generate_feed = false   # No /ja/rss.xml will be generated
+```
+
+Implementation: `src/content/seo/feeds.cr` — `generate_language_feeds()` private method called from `generate()`. Main feed filtering controlled by `FeedConfig.default_language_only` (`src/models/config.cr`).
 
 #### 5. Search Feature
 
@@ -952,6 +993,7 @@ content/
 **Implementation details:**
 - `src/content/multilingual.cr` - Translation key generation, language detection, translation linking
 - `src/content/seo/tags.cr` - Canonical URLs and hreflang tag generation
+- `src/content/seo/feeds.cr` - Per-language feed generation (`generate_language_feeds()`)
 - `src/models/config.cr` - `LanguageConfig` class, `multilingual?`, `sorted_languages` methods
 - `src/models/page.cr` - `language`, `translations` properties, `TranslationLink` struct
 
@@ -961,6 +1003,24 @@ content/
 - `Multilingual.language_code` - Determines the language code for a page
 - `Seo::Tags.canonical_tag` - Generates `<link rel="canonical">` tag
 - `Seo::Tags.hreflang_tags` - Generates `<link rel="alternate" hreflang="...">` tags
+- `Seo::Feeds.generate_language_feeds` - Generates per-language RSS/Atom feeds
+
+**Per-language feed generation:**
+
+When the site is multilingual, feeds are generated per language automatically:
+
+| Language | Feed Path | Contents |
+|---|---|---|
+| Default (e.g., `en`) | `/rss.xml` | Default language pages only (configurable) |
+| Non-default (e.g., `ko`) | `/ko/rss.xml` | Only Korean pages |
+| Non-default (e.g., `ja`) | `/ja/rss.xml` | Only Japanese pages |
+
+- By default the main site feed includes **only default language pages** (`default_language_only = true`). Set to `false` to include all languages.
+- Each non-default language with `generate_feed = true` gets its own feed at `/{lang}/rss.xml` (or `atom.xml`)
+- Language feeds respect the same `sections`, `limit`, and `truncate` settings from `[feeds]` config
+- RSS feeds include `<language>ko</language>` tag; Atom feeds include `xml:lang="ko"` attribute
+- Feed title includes language name: `"Site Title (한국어)"`
+- Language feeds are generated independently of the main feed's `enabled` setting
 
 **Template variables for multilingual:**
 - `{{ page.language }}` - Current page language code
@@ -998,7 +1058,38 @@ hwaro init mysite  # defaults to simple
 - Common templates (header, footer, page, section, 404, taxonomy)
 - Base CSS styles
 - Navigation template
-- Config sections (plugins, pagination, content files, highlight, OG, search, sitemap, robots, llms, taxonomies, feeds, auto includes, markdown, build hooks, deployment)
+- Config sections (plugins, pagination, content files, highlight, OG, search, sitemap, robots, llms, taxonomies, feeds, auto includes, markdown, build hooks, deployment, permalinks, multilingual)
+
+**Config generation methods in `base.cr`:**
+
+Each config section has a dedicated protected method that scaffolds compose via `config_content()`:
+
+| Method | Config Section |
+|---|---|
+| `base_config` | `title`, `description`, `base_url` |
+| `multilingual_config` | `default_language`, `[languages]` (commented out) |
+| `plugins_config` | `[plugins]` |
+| `content_files_config` | `[content.files]` |
+| `highlight_config` | `[highlight]` |
+| `og_config` | `[og]` |
+| `search_config` | `[search]` |
+| `pagination_config` | `[pagination]` |
+| `taxonomies_config` | `[[taxonomies]]` |
+| `sitemap_config` | `[sitemap]` |
+| `robots_config` | `[robots]` |
+| `llms_config` | `[llms]` |
+| `feeds_config` | `[feeds]` |
+| `permalinks_config` | `[permalinks]` (commented out) |
+| `auto_includes_config` | `[auto_includes]` (commented out) |
+| `markdown_config` | `[markdown]` |
+| `build_hooks_config` | `[build]` hooks (commented out) |
+| `deployment_config` | `[deployment]` (commented out) |
+
+> **IMPORTANT — When adding a new config option:**
+> If the option belongs to an existing section, update the corresponding method in `base.cr`.
+> If it's an entirely new section, add a new protected method and call it from `config_content()` in all three scaffolds (simple, blog, docs).
+> Also update the default configs in `src/services/defaults/config.cr` (`config`, `config_without_taxonomies`, `config_multilingual`).
+> See the [Config Change Checklist](#config-change-checklist) in the Contributing section for the full list.
 
 #### 22. Content Files Publishing
 
@@ -1101,7 +1192,11 @@ Implementation:
 
 ### Configuration
 
-Configuration is managed through TOML files (`config.toml`). The structure is defined in `src/models/config.cr` with support for:
+Configuration is managed through TOML files (`config.toml`). The structure is defined in `src/models/config.cr`.
+
+> **See also:** [Config Change Checklist](#config-change-checklist) in the Contributing section — follow this checklist whenever you add or modify a config option.
+
+Supported configuration areas:
 - Site metadata (title, description, base_url)
 - SEO features (sitemap, robots, llms, feeds)
 - Search configuration
@@ -1118,6 +1213,7 @@ Configuration is managed through TOML files (`config.toml`). The structure is de
 - Deployment targets and options
 - Permalinks (URL path rewriting)
 - Data directory (auxiliary data files)
+- Feed language control (`default_language_only`)
 
 #### Markdown Configuration
 
@@ -1383,6 +1479,39 @@ When contributing:
 4. Consider backward compatibility
 5. Think about extensibility for future features
 6. Keep changes focused and atomic
+7. **When adding or changing config options, follow the [Config Change Checklist](#config-change-checklist) below**
+
+### Config Change Checklist
+
+Whenever a new configuration option is added or an existing one is modified, **all of the following files must be reviewed and updated**. This is easy to overlook — every item in this list is required, not optional.
+
+#### 1. Model & Parsing (required)
+- [ ] `src/models/config.cr` — Add the property to the relevant `*Config` class, set a sensible default in `initialize`, and parse it in the corresponding `load_*` method.
+
+#### 2. Init / Scaffold defaults (required)
+These files generate `config.toml` when users run `hwaro init`. If the new option is not added here, newly created projects will never see it.
+
+- [ ] `src/services/scaffolds/base.cr` — Update the relevant `*_config` protected method (e.g., `feeds_config`, `search_config`). If the option is niche, add it as a comment so users can discover it. If it's a brand-new config section, create a new protected method and wire it into `config_content()` of all three scaffolds.
+- [ ] `src/services/scaffolds/simple.cr` — If a new config method was added in `base.cr`, call it from `config_content()`.
+- [ ] `src/services/scaffolds/blog.cr` — Same as above.
+- [ ] `src/services/scaffolds/docs.cr` — Same as above.
+- [ ] `src/services/defaults/config.cr` — Update **all three** template methods: `config`, `config_without_taxonomies`, and `config_multilingual`.
+
+#### 3. Tests (required)
+- [ ] `spec/unit/config_spec.cr` — Test default value, setting via property, and loading from TOML. Also update the **boolean round-trip** tests if the option is a `Bool`.
+- [ ] Feature-specific spec (e.g., `spec/unit/feeds_spec.cr`) — Test that the feature respects the new option.
+- [ ] `spec/unit/defaults_config_spec.cr` — If the option should appear in default configs, verify it.
+
+#### 4. Documentation (required)
+- [ ] `AGENTS.md` — Update the relevant feature section and the Configuration summary list.
+- [ ] `docs/content/start/config.md` — Add the option to the config reference page.
+- [ ] `docs/content/features/*.md` — Update the relevant feature documentation page.
+
+#### 5. Quick self-check
+- [ ] Run `crystal spec` — all tests pass.
+- [ ] Run `hwaro init /tmp/test-site && cat /tmp/test-site/config.toml` — verify the new option appears (or is commented out) in the generated config.
+
+> **Why is this important?** Users discover configuration options primarily through the generated `config.toml` from `hwaro init`. If a config option only exists in code but not in the init output, it is effectively invisible.
 
 ## Documentation Site
 

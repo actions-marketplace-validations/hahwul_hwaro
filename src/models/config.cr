@@ -82,6 +82,7 @@ module Hwaro
       property truncate : Int32
       property limit : Int32
       property sections : Array(String)
+      property default_language_only : Bool
 
       def initialize
         @enabled = false
@@ -90,6 +91,7 @@ module Hwaro
         @truncate = 0
         @limit = 10
         @sections = [] of String
+        @default_language_only = true
       end
     end
 
@@ -622,6 +624,7 @@ module Hwaro
         if sections = s["sections"]?.try(&.as_a?)
           config.feeds.sections = sections.compact_map(&.as_s?)
         end
+        config.feeds.default_language_only = bool_value(s["default_language_only"]?, config.feeds.default_language_only)
       end
 
       private def self.load_search(config : Config)

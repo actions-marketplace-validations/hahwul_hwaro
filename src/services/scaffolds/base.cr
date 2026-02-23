@@ -467,6 +467,8 @@ module Hwaro
           truncate = 0              # Truncate content to N characters (0 = full content)
           limit = 10                # Maximum number of items in feed
           sections = #{sections_str}   # Limit to specific sections, e.g., ["posts"]
+          # default_language_only = true  # Multilingual: true = main feed has default language only
+          #                               #              false = main feed includes all languages
 
           TOML
         end

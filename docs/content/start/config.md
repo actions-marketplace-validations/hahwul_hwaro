@@ -82,6 +82,7 @@ Rewrite content directory paths to custom URL paths. Useful for site restructuri
 [feeds]
 enabled = true
 limit = 20
+default_language_only = true   # true: main feed = default language only, false: all languages
 ```
 
 ### Sitemap

@@ -43,6 +43,7 @@ module Hwaro
           truncate = 0
           limit = 10
           sections = []   # Optional: e.g. ["blog"]
+          default_language_only = true  # true: main feed = default language only, false: all languages
 
           # Plugins Configuration
           [plugins]
@@ -126,6 +127,7 @@ module Hwaro
           truncate = 0
           limit = 10
           sections = []   # Optional: e.g. ["blog"]
+          default_language_only = true  # true: main feed = default language only, false: all languages
 
           # Plugins Configuration
           [plugins]
@@ -220,7 +222,8 @@ module Hwaro
             str << "type = \"rss\"\n"
             str << "truncate = 0\n"
             str << "limit = 10\n"
-            str << "sections = []   # Optional: e.g. [\"blog\"]\n\n"
+            str << "sections = []   # Optional: e.g. [\"blog\"]\n"
+            str << "default_language_only = true  # true: main feed = default language only, false: all languages\n\n"
             str << "# Plugins Configuration\n"
             str << "[plugins]\n"
             str << "processors = [\"markdown\"]  # List of enabled processors\n\n"

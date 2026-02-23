@@ -1,6 +1,850 @@
 require "../spec_helper"
 
 describe Hwaro::Content::Seo::Feeds do
+  describe "multilingual feeds" do
+    it "filters main feed to default language pages when default_language_only is true (default)" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.description = "A test site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello World"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil # default language
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English content"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page], config, output_dir)
+
+        # Main feed should only contain default language pages
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Hello World")
+        main_feed.should_not contain("안녕하세요")
+      end
+    end
+
+    it "generates per-language feed for non-default languages" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.description = "A test site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello World"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English content"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page], config, output_dir)
+
+        # Korean feed should exist at /ko/rss.xml
+        ko_feed_path = File.join(output_dir, "ko", "rss.xml")
+        File.exists?(ko_feed_path).should be_true
+
+        ko_feed = File.read(ko_feed_path)
+        ko_feed.should contain("안녕하세요")
+        ko_feed.should_not contain("Hello World")
+      end
+    end
+
+    it "generates atom feed per language when feed type is atom" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        ko_feed_path = File.join(output_dir, "ko", "atom.xml")
+        File.exists?(ko_feed_path).should be_true
+
+        ko_feed = File.read(ko_feed_path)
+        ko_feed.should contain("<feed xmlns=\"http://www.w3.org/2005/Atom\" xml:lang=\"ko\">")
+        ko_feed.should contain("안녕하세요")
+      end
+    end
+
+    it "does not generate language feed when generate_feed is false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+
+      ko_config = Hwaro::Models::LanguageConfig.new("ko")
+      ko_config.generate_feed = false
+      config.languages["ko"] = ko_config
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        File.exists?(File.join(output_dir, "ko", "rss.xml")).should be_false
+      end
+    end
+
+    it "generates feeds for multiple non-default languages" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+      config.languages["ja"] = Hwaro::Models::LanguageConfig.new("ja")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어"
+
+      ja_page = Hwaro::Models::Page.new("posts/hello.ja.md")
+      ja_page.title = "こんにちは"
+      ja_page.url = "/ja/posts/hello/"
+      ja_page.language = "ja"
+      ja_page.draft = false
+      ja_page.render = true
+      ja_page.is_index = false
+      ja_page.raw_content = "日本語"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page, ja_page], config, output_dir)
+
+        # Main feed = English only
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Hello")
+        main_feed.should_not contain("안녕하세요")
+        main_feed.should_not contain("こんにちは")
+
+        # Korean feed
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("안녕하세요")
+        ko_feed.should_not contain("Hello")
+        ko_feed.should_not contain("こんにちは")
+
+        # Japanese feed
+        ja_feed = File.read(File.join(output_dir, "ja", "rss.xml"))
+        ja_feed.should contain("こんにちは")
+        ja_feed.should_not contain("Hello")
+        ja_feed.should_not contain("안녕하세요")
+      end
+    end
+
+    it "includes language tag in RSS for language-specific feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.description = "A test site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("<language>ko</language>")
+      end
+    end
+
+    it "does not include language tag in main RSS feed" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page], config, output_dir)
+
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should_not contain("<language>")
+      end
+    end
+
+    it "uses language name in feed title" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "My Site"
+      config.default_language = "en"
+
+      ko_config = Hwaro::Models::LanguageConfig.new("ko")
+      ko_config.language_name = "한국어"
+      config.languages["ko"] = ko_config
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("<title>My Site (한국어)</title>")
+      end
+    end
+
+    it "generates correct self-referencing link for language feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("atom:link href=\"https://example.com/ko/rss.xml\"")
+      end
+    end
+
+    it "excludes draft pages from language feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      published = Hwaro::Models::Page.new("posts/hello.ko.md")
+      published.title = "Published Korean"
+      published.url = "/ko/posts/hello/"
+      published.language = "ko"
+      published.draft = false
+      published.render = true
+      published.is_index = false
+      published.raw_content = "Published"
+
+      draft = Hwaro::Models::Page.new("posts/draft.ko.md")
+      draft.title = "Draft Korean"
+      draft.url = "/ko/posts/draft/"
+      draft.language = "ko"
+      draft.draft = true
+      draft.render = true
+      draft.is_index = false
+      draft.raw_content = "Draft"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([published, draft], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("Published Korean")
+        ko_feed.should_not contain("Draft Korean")
+      end
+    end
+
+    it "excludes section pages from language feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      section = Hwaro::Models::Section.new("posts/_index.ko.md")
+      section.title = "게시물"
+      section.url = "/ko/posts/"
+      section.section = "posts"
+      section.language = "ko"
+      section.draft = false
+      section.render = true
+      section.is_index = true
+      section.raw_content = ""
+
+      post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      post.title = "안녕하세요"
+      post.url = "/ko/posts/hello/"
+      post.language = "ko"
+      post.draft = false
+      post.render = true
+      post.is_index = false
+      post.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([section.as(Hwaro::Models::Page), post], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("안녕하세요")
+        ko_feed.should_not contain("게시물")
+      end
+    end
+
+    it "applies section filter to language feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.sections = ["posts"]
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      blog_post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      blog_post.title = "Blog Korean"
+      blog_post.url = "/ko/posts/hello/"
+      blog_post.section = "posts"
+      blog_post.language = "ko"
+      blog_post.draft = false
+      blog_post.render = true
+      blog_post.is_index = false
+      blog_post.raw_content = "Blog content"
+
+      docs_page = Hwaro::Models::Page.new("docs/guide.ko.md")
+      docs_page.title = "Docs Korean"
+      docs_page.url = "/ko/docs/guide/"
+      docs_page.section = "docs"
+      docs_page.language = "ko"
+      docs_page.draft = false
+      docs_page.render = true
+      docs_page.is_index = false
+      docs_page.raw_content = "Docs content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([blog_post, docs_page], config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("Blog Korean")
+        ko_feed.should_not contain("Docs Korean")
+      end
+    end
+
+    it "does not generate language feeds when site is not multilingual" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      # No additional languages configured
+
+      page = Hwaro::Models::Page.new("posts/hello.md")
+      page.title = "Hello"
+      page.url = "/posts/hello/"
+      page.draft = false
+      page.render = true
+      page.is_index = false
+      page.raw_content = "Content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+
+        # Main feed should exist
+        File.exists?(File.join(output_dir, "rss.xml")).should be_true
+
+        # No language subdirectories should be created
+        Dir.exists?(File.join(output_dir, "en")).should be_false
+      end
+    end
+
+    it "does not generate language feeds when main feed is disabled" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = false
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
+
+        # Language feeds should still be generated even when main feed is disabled,
+        # because the multilingual block runs independently
+        File.exists?(File.join(output_dir, "ko", "rss.xml")).should be_true
+      end
+    end
+
+    it "includes xml:lang attribute in atom feed for language-specific feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ja"] = Hwaro::Models::LanguageConfig.new("ja")
+
+      ja_page = Hwaro::Models::Page.new("posts/hello.ja.md")
+      ja_page.title = "こんにちは"
+      ja_page.url = "/ja/posts/hello/"
+      ja_page.language = "ja"
+      ja_page.draft = false
+      ja_page.render = true
+      ja_page.is_index = false
+      ja_page.raw_content = "日本語コンテンツ"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ja_page], config, output_dir)
+
+        ja_feed = File.read(File.join(output_dir, "ja", "atom.xml"))
+        ja_feed.should contain("xml:lang=\"ja\"")
+        ja_feed.should contain("こんにちは")
+      end
+    end
+
+    it "does not include xml:lang in main atom feed" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page], config, output_dir)
+
+        main_feed = File.read(File.join(output_dir, "atom.xml"))
+        main_feed.should_not contain("xml:lang=")
+      end
+    end
+
+    it "respects feed limit for language feeds" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.limit = 2
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      pages = (1..5).map do |i|
+        page = Hwaro::Models::Page.new("posts/post#{i}.ko.md")
+        page.title = "Korean Post #{i}"
+        page.url = "/ko/posts/post#{i}/"
+        page.language = "ko"
+        page.date = Time.utc(2024, i, 1)
+        page.draft = false
+        page.render = true
+        page.is_index = false
+        page.raw_content = "Content #{i}"
+        page
+      end
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate(pages, config, output_dir)
+
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.scan(/<item>/).size.should eq(2)
+        # Should include the 2 newest (Post 5 and Post 4)
+        ko_feed.should contain("Korean Post 5")
+        ko_feed.should contain("Korean Post 4")
+      end
+    end
+
+    it "treats pages with nil language as default language in multilingual mode" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      # Page with nil language (should be treated as default "en")
+      page_nil = Hwaro::Models::Page.new("posts/hello.md")
+      page_nil.title = "Nil Language Page"
+      page_nil.url = "/posts/hello/"
+      page_nil.language = nil
+      page_nil.draft = false
+      page_nil.render = true
+      page_nil.is_index = false
+      page_nil.raw_content = "Content"
+
+      # Page with explicit default language
+      page_en = Hwaro::Models::Page.new("posts/world.md")
+      page_en.title = "Explicit EN Page"
+      page_en.url = "/posts/world/"
+      page_en.language = "en"
+      page_en.draft = false
+      page_en.render = true
+      page_en.is_index = false
+      page_en.raw_content = "Content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page_nil, page_en], config, output_dir)
+
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Nil Language Page")
+        main_feed.should contain("Explicit EN Page")
+      end
+    end
+  end
+
+  describe "default_language_only option" do
+    it "defaults to true" do
+      config = Hwaro::Models::Config.new
+      config.feeds.default_language_only.should be_true
+    end
+
+    it "includes all languages in main feed when default_language_only is false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.default_language_only = false
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.description = "A test site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello World"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English content"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page], config, output_dir)
+
+        # Main feed should contain ALL languages
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Hello World")
+        main_feed.should contain("안녕하세요")
+      end
+    end
+
+    it "still generates per-language feeds when default_language_only is false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.default_language_only = false
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello World"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English content"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어 콘텐츠"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page], config, output_dir)
+
+        # Per-language feed should still exist
+        ko_feed_path = File.join(output_dir, "ko", "rss.xml")
+        File.exists?(ko_feed_path).should be_true
+
+        ko_feed = File.read(ko_feed_path)
+        ko_feed.should contain("안녕하세요")
+        ko_feed.should_not contain("Hello World")
+      end
+    end
+
+    it "includes all languages in main feed with multiple languages when false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.default_language_only = false
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+      config.languages["ja"] = Hwaro::Models::LanguageConfig.new("ja")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English"
+
+      ko_page = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_page.title = "안녕하세요"
+      ko_page.url = "/ko/posts/hello/"
+      ko_page.language = "ko"
+      ko_page.draft = false
+      ko_page.render = true
+      ko_page.is_index = false
+      ko_page.raw_content = "한국어"
+
+      ja_page = Hwaro::Models::Page.new("posts/hello.ja.md")
+      ja_page.title = "こんにちは"
+      ja_page.url = "/ja/posts/hello/"
+      ja_page.language = "ja"
+      ja_page.draft = false
+      ja_page.render = true
+      ja_page.is_index = false
+      ja_page.raw_content = "日本語"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page, ko_page, ja_page], config, output_dir)
+
+        # Main feed should contain all three languages
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Hello")
+        main_feed.should contain("안녕하세요")
+        main_feed.should contain("こんにちは")
+        main_feed.scan(/<item>/).size.should eq(3)
+
+        # Per-language feeds still separate
+        ko_feed = File.read(File.join(output_dir, "ko", "rss.xml"))
+        ko_feed.should contain("안녕하세요")
+        ko_feed.should_not contain("Hello")
+
+        ja_feed = File.read(File.join(output_dir, "ja", "rss.xml"))
+        ja_feed.should contain("こんにちは")
+        ja_feed.should_not contain("Hello")
+      end
+    end
+
+    it "has no effect on non-multilingual sites" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.default_language_only = true
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      # No additional languages — not multilingual
+
+      page = Hwaro::Models::Page.new("posts/hello.md")
+      page.title = "Hello"
+      page.url = "/posts/hello/"
+      page.draft = false
+      page.render = true
+      page.is_index = false
+      page.raw_content = "Content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("Hello")
+      end
+    end
+
+    it "applies section filter together with default_language_only false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.default_language_only = false
+      config.feeds.sections = ["posts"]
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      en_post = Hwaro::Models::Page.new("posts/hello.md")
+      en_post.title = "EN Post"
+      en_post.url = "/posts/hello/"
+      en_post.section = "posts"
+      en_post.language = nil
+      en_post.draft = false
+      en_post.render = true
+      en_post.is_index = false
+      en_post.raw_content = "English"
+
+      ko_post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_post.title = "KO Post"
+      ko_post.url = "/ko/posts/hello/"
+      ko_post.section = "posts"
+      ko_post.language = "ko"
+      ko_post.draft = false
+      ko_post.render = true
+      ko_post.is_index = false
+      ko_post.raw_content = "한국어"
+
+      ko_docs = Hwaro::Models::Page.new("docs/guide.ko.md")
+      ko_docs.title = "KO Docs"
+      ko_docs.url = "/ko/docs/guide/"
+      ko_docs.section = "docs"
+      ko_docs.language = "ko"
+      ko_docs.draft = false
+      ko_docs.render = true
+      ko_docs.is_index = false
+      ko_docs.raw_content = "문서"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_post, ko_post, ko_docs], config, output_dir)
+
+        # Main feed includes both languages but only "posts" section
+        main_feed = File.read(File.join(output_dir, "rss.xml"))
+        main_feed.should contain("EN Post")
+        main_feed.should contain("KO Post")
+        main_feed.should_not contain("KO Docs")
+      end
+    end
+  end
+
   describe ".generate" do
     it "does not generate feeds when disabled" do
       config = Hwaro::Models::Config.new
