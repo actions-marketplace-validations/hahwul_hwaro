@@ -50,6 +50,8 @@ runs:
         REF="${{ github.action_ref }}"
         # Strip leading 'v' prefix (v0.1.0 -> 0.1.0, main -> main)
         TAG="${REF#v}"
+        # Fallback to 'latest' if the ref is empty
+        TAG="${TAG:-latest}"
         echo "image=ghcr.io/hahwul/hwaro:${TAG}" >> "$GITHUB_OUTPUT"
         echo "Using Hwaro image: ghcr.io/hahwul/hwaro:${TAG}"
 
