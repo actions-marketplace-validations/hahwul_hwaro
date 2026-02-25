@@ -648,7 +648,7 @@ module Hwaro
         private def collect_raw_files(ctx : Lifecycle::BuildContext)
           seen = Set(String).new
           config = ctx.config
-          content_files_enabled = config && config.content_files.enabled?
+          content_files_enabled = config.try(&.content_files.enabled?) || false
 
           # Single pass: collect JSON/XML directly, and content files if enabled
           Dir.glob("content/**/*") do |file_path|
