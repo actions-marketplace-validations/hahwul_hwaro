@@ -231,7 +231,6 @@ module Hwaro
           minify = options.minify
           highlight = options.highlight && site.config.highlight.enabled
           verbose = options.verbose
-          safe = site.config.markdown.safe
 
           all_pages = (site.pages + site.sections).as(Array(Models::Page))
           renderable_pages = all_pages.select(&.render)
@@ -1189,20 +1188,33 @@ module Hwaro
           # Ensure destination directories exist (must be sequential to avoid races)
           files_to_copy.each { |_, dest| FileUtils.mkdir_p(File.dirname(dest)) }
 
-          # Second pass: copy files in parallel
-          done = Channel(Nil).new(files_to_copy.size)
-          files_to_copy.each do |src, dest|
+          # Second pass: copy files in parallel using worker pool
+          config = ParallelConfig.new(enabled: true)
+          worker_count = config.calculate_workers(files_to_copy.size)
+
+          work_queue = Channel({String, String}).new(files_to_copy.size)
+          done = Channel(Nil).new(worker_count)
+
+          files_to_copy.each { |pair| work_queue.send(pair) }
+          work_queue.close
+
+          worker_count.times do
             spawn do
               begin
-                FileUtils.cp(src, dest)
-              rescue ex
-                Log.error { "Copy failed: #{ex}" }
+                while pair = work_queue.receive?
+                  src, dest = pair
+                  begin
+                    FileUtils.cp(src, dest)
+                  rescue ex
+                    Log.error { "Copy failed: #{ex}" }
+                  end
+                end
               ensure
                 done.send(nil)
               end
             end
           end
-          files_to_copy.size.times { done.receive }
+          worker_count.times { done.receive }
 
           Logger.action :copy, "static files (#{files_to_copy.size} updated)", :blue if verbose
         end
