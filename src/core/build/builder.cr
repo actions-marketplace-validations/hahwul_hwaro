@@ -1279,6 +1279,18 @@ module Hwaro
           @crinja_env ||= setup_crinja_env
         end
 
+        # Create a fresh, independent Crinja environment for parallel workers.
+        # Each worker fiber gets its own env to avoid shared mutable state in
+        # Crinja's `with_scope` (which mutates @context on the environment).
+        private def create_fresh_crinja_env : Crinja
+          engine = Content::Processors::TemplateEngine.new
+          env = engine.env
+          if Dir.exists?("templates")
+            env.loader = Crinja::Loader::FileSystemLoader.new("templates/")
+          end
+          env
+        end
+
         private def process_files_parallel(
           pages : Array(Models::Page),
           site : Models::Site,
@@ -1290,19 +1302,51 @@ module Hwaro
           verbose : Bool,
           global_vars : Hash(String, Crinja::Value),
         ) : Int32
-          config = ParallelConfig.new(enabled: true)
-          processor = Parallel(Models::Page, Bool).new(config)
+          return 0 if pages.empty?
 
+          config = ParallelConfig.new(enabled: true)
+          worker_count = config.calculate_workers(pages.size)
           safe = site.config.markdown.safe
-          results = processor.process(pages) do |page, _idx|
-            render_page(page, site, templates, output_dir, minify, highlight, safe, verbose, global_vars)
-            source_path = File.join("content", page.path)
-            output_path = get_output_path(page, output_dir)
-            cache.update(source_path, output_path)
-            true
+
+          # Pre-create per-worker Crinja environments and template caches
+          # to avoid shared mutable state between concurrent fibers.
+          worker_envs = Array.new(worker_count) { create_fresh_crinja_env }
+          worker_caches = Array.new(worker_count) { {} of UInt64 => Crinja::Template }
+
+          results = Channel(Bool).new(pages.size)
+          work_queue = Channel({Models::Page, Int32}).new(pages.size)
+
+          # Enqueue all work items
+          pages.each_with_index { |page, idx| work_queue.send({page, idx}) }
+          work_queue.close
+
+          # Spawn workers, each with its own Crinja env and template cache
+          worker_count.times do |worker_id|
+            env = worker_envs[worker_id]
+            tmpl_cache = worker_caches[worker_id]
+            spawn do
+              while work_item = work_queue.receive?
+                page, _idx = work_item
+                begin
+                  render_page(page, site, templates, output_dir, minify, highlight, safe, verbose, global_vars,
+                    crinja_env_override: env, template_cache_override: tmpl_cache)
+                  source_path = File.join("content", page.path)
+                  output_path = get_output_path(page, output_dir)
+                  cache.update(source_path, output_path)
+                  results.send(true)
+                rescue ex
+                  results.send(false)
+                end
+              end
+            end
           end
 
-          results.count(&.success)
+          # Collect results
+          count = 0
+          pages.size.times do
+            count += 1 if results.receive
+          end
+          count
         end
 
         private def process_files_sequential(
@@ -1338,6 +1382,8 @@ module Hwaro
           safe : Bool = false,
           verbose : Bool = false,
           global_vars : Hash(String, Crinja::Value)? = nil,
+          crinja_env_override : Crinja? = nil,
+          template_cache_override : Hash(UInt64, Crinja::Template)? = nil,
         )
           return unless page.render
 
@@ -1358,7 +1404,8 @@ module Hwaro
 
           processed_content = if has_shortcodes
                                 shortcode_context = build_template_variables(page, site, "", "", "", "", nil, nil, global_vars)
-                                process_shortcodes_jinja(raw, templates, shortcode_context, shortcode_results)
+                                process_shortcodes_jinja(raw, templates, shortcode_context, shortcode_results,
+                                  crinja_env_override: crinja_env_override)
                               else
                                 raw
                               end
@@ -1391,12 +1438,14 @@ module Hwaro
 
           # Handle section pages with pagination
           if (template_name == "section" || page.template == "section") && page.is_a?(Models::Section)
-            render_section_with_pagination(page.as(Models::Section), site, templates, template_content, output_dir, minify, html_content, toc_html, verbose, global_vars)
+            render_section_with_pagination(page.as(Models::Section), site, templates, template_content, output_dir, minify, html_content, toc_html, verbose, global_vars,
+              crinja_env_override: crinja_env_override, template_cache_override: template_cache_override)
           else
             section_list_html = ""
 
             final_html = if template_content
-                           apply_template(template_content, html_content, page, site, section_list_html, toc_html, templates, global_vars: global_vars)
+                           apply_template(template_content, html_content, page, site, section_list_html, toc_html, templates, global_vars: global_vars,
+                             crinja_env_override: crinja_env_override, template_cache_override: template_cache_override)
                          else
                            Logger.warn "  [WARN] No template found for #{page.path}. Using raw content."
                            html_content
@@ -1454,6 +1503,8 @@ module Hwaro
           toc_html : String,
           verbose : Bool = false,
           global_vars : Hash(String, Crinja::Value)? = nil,
+          crinja_env_override : Crinja? = nil,
+          template_cache_override : Hash(UInt64, Crinja::Template)? = nil,
         )
           # Get pages in this section using the site utility method
           section_name = Path[section.path].dirname
@@ -1480,7 +1531,8 @@ module Hwaro
                           end
 
             final_html = if template_content
-                           apply_template(template_content, html_content, section, site, section_list_html, toc_html, templates, pagination_nav_html, current_url, paginated_page, global_vars)
+                           apply_template(template_content, html_content, section, site, section_list_html, toc_html, templates, pagination_nav_html, current_url, paginated_page, global_vars,
+                             crinja_env_override: crinja_env_override, template_cache_override: template_cache_override)
                          else
                            Logger.warn "  [WARN] No template found for #{section.path}. Using raw content."
                            html_content
@@ -1615,24 +1667,28 @@ module Hwaro
           page_url_override : String? = nil,
           paginator : Content::Pagination::PaginatedPage? = nil,
           global_vars : Hash(String, Crinja::Value)? = nil,
+          crinja_env_override : Crinja? = nil,
+          template_cache_override : Hash(UInt64, Crinja::Template)? = nil,
         ) : String
-          # Use Crinja for Jinja2-style templates
-          env = crinja_env
+          # Use per-worker env when provided (parallel path), otherwise shared env
+          env = crinja_env_override || crinja_env
+          cache = template_cache_override || @compiled_templates_cache
 
           # Build template variables
           vars = build_template_variables(page, site, content, section_list, toc, pagination, page_url_override, paginator, global_vars)
 
           # Process shortcodes in template first (convert to Jinja2 include syntax)
-          processed_template = process_shortcodes_jinja(template, templates, vars)
+          processed_template = process_shortcodes_jinja(template, templates, vars,
+            crinja_env_override: crinja_env_override)
 
           begin
             # Cache compiled Crinja templates by content hash.
             # Most pages share the same base template string, so this avoids
             # re-parsing the template AST on every page render.
             cache_key = processed_template.hash
-            crinja_template = @compiled_templates_cache[cache_key]? || begin
+            crinja_template = cache[cache_key]? || begin
               compiled = env.from_string(processed_template)
-              @compiled_templates_cache[cache_key] = compiled
+              cache[cache_key] = compiled
               compiled
             end
             crinja_template.render(vars)
@@ -2099,7 +2155,7 @@ module Hwaro
         # Supports two syntax patterns:
         # 1. Explicit: {{ shortcode("name", arg1="value1", arg2="value2") }}
         # 2. Direct:   {{ name(arg1="value1", arg2="value2") }}
-        private def process_shortcodes_jinja(content : String, templates : Hash(String, String), context : Hash(String, Crinja::Value), shortcode_results : Hash(String, String)? = nil) : String
+        private def process_shortcodes_jinja(content : String, templates : Hash(String, String), context : Hash(String, Crinja::Value), shortcode_results : Hash(String, String)? = nil, crinja_env_override : Crinja? = nil) : String
           # Avoid processing shortcodes inside fenced code blocks (``` / ~~~),
           # so documentation can show literal `{{ ... }}` examples safely.
           String.build do |io|
@@ -2118,7 +2174,7 @@ module Hwaro
               end
 
               if match = line.match(/^\s*(`{3,}|~{3,})/)
-                io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results)
+                io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results, crinja_env_override: crinja_env_override)
                 buffer = String::Builder.new
                 in_fence = true
                 fence_marker = match[1]
@@ -2128,11 +2184,11 @@ module Hwaro
               end
             end
 
-            io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results)
+            io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results, crinja_env_override: crinja_env_override)
           end
         end
 
-        private def process_shortcodes_in_text(content : String, templates : Hash(String, String), context : Hash(String, Crinja::Value), shortcode_results : Hash(String, String)? = nil) : String
+        private def process_shortcodes_in_text(content : String, templates : Hash(String, String), context : Hash(String, Crinja::Value), shortcode_results : Hash(String, String)? = nil, crinja_env_override : Crinja? = nil) : String
           # 1. Block shortcodes: {% name(args) %}body{% end %}
           processed = content.gsub(/\{\%\s*([a-zA-Z_][\w\-]*)\s*\((.*?)\)\s*\%\}(.*?)\{\%\s*end\s*\%\}/m) do |match|
             name = $1
@@ -2140,17 +2196,17 @@ module Hwaro
             body = $3.strip
 
             extra_args = {"body" => body}
-            render_shortcode_result(name, args_str, templates, context, shortcode_results, match, warn_missing: true, extra_args: extra_args)
+            render_shortcode_result(name, args_str, templates, context, shortcode_results, match, warn_missing: true, extra_args: extra_args, crinja_env_override: crinja_env_override)
           end
 
           # 2. Explicit call: {{ shortcode("name", args) }}
           processed = processed.gsub(/\{\{\s*shortcode\s*\(\s*"([^"]+)"(?:\s*,\s*(.*?))?\s*\)\s*\}\}/) do |match|
-            render_shortcode_result($1, $2?, templates, context, shortcode_results, match, warn_missing: true)
+            render_shortcode_result($1, $2?, templates, context, shortcode_results, match, warn_missing: true, crinja_env_override: crinja_env_override)
           end
 
           # 3. Direct call: {{ name(args) }}
           processed = processed.gsub(/\{\{\s*([a-zA-Z_][\w\-]*)\s*\((.*?)\)\s*\}\}/) do |match|
-            render_shortcode_result($1, $2, templates, context, shortcode_results, match, warn_missing: false)
+            render_shortcode_result($1, $2, templates, context, shortcode_results, match, warn_missing: false, crinja_env_override: crinja_env_override)
           end
         end
 
@@ -2166,6 +2222,7 @@ module Hwaro
           fallback : String,
           warn_missing : Bool = true,
           extra_args : Hash(String, String)? = nil,
+          crinja_env_override : Crinja? = nil,
         ) : String
           template_key = "shortcodes/#{name}"
           template = templates[template_key]?
@@ -2177,7 +2234,7 @@ module Hwaro
 
           args = parse_shortcode_args_jinja(args_str)
           extra_args.try &.each { |k, v| args[k] = v }
-          html = render_shortcode_jinja(template, args, context)
+          html = render_shortcode_jinja(template, args, context, crinja_env_override: crinja_env_override)
 
           if results = shortcode_results
             placeholder = "HWARO-SHORTCODE-PLACEHOLDER-#{results.size}"
@@ -2203,8 +2260,8 @@ module Hwaro
         end
 
         # Render a shortcode template with Crinja
-        private def render_shortcode_jinja(template : String, args : Hash(String, String), context : Hash(String, Crinja::Value)) : String
-          env = crinja_env
+        private def render_shortcode_jinja(template : String, args : Hash(String, String), context : Hash(String, Crinja::Value), crinja_env_override : Crinja? = nil) : String
+          env = crinja_env_override || crinja_env
           vars = context.dup
           args.each do |key, value|
             vars[key] = Crinja::Value.new(value)
