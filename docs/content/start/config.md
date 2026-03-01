@@ -106,12 +106,18 @@ default_language_only = true   # true: main feed = default language only, false:
 ```toml
 [sitemap]
 enabled = true
+filename = "sitemap.xml"
+changefreq = "weekly"
+priority = 0.5
 exclude = ["/private", "/drafts"]
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | enabled | bool | false | Enable sitemap generation |
+| filename | string | "sitemap.xml" | Output filename |
+| changefreq | string | "weekly" | Default change frequency (`always`, `hourly`, `daily`, `weekly`, `monthly`, `yearly`, `never`) |
+| priority | float | 0.5 | Default priority (0.0 to 1.0) |
 | exclude | array | [] | Exclude paths (prefixes) from sitemap |
 
 ### Robots.txt
@@ -148,7 +154,20 @@ default_image = "/images/og.png"
 type = "website"
 twitter_card = "summary_large_image"
 twitter_site = "@username"
+twitter_creator = "@authorname"
+fb_app_id = "your_fb_app_id"
 ```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| default_image | string | — | Fallback image when page has none |
+| type | string | "article" | OpenGraph type (`website`, `article`) |
+| twitter_card | string | "summary_large_image" | Twitter card type (`summary`, `summary_large_image`) |
+| twitter_site | string | — | Site's Twitter handle |
+| twitter_creator | string | — | Author's Twitter handle |
+| fb_app_id | string | — | Facebook App ID |
+
+See [SEO](/features/seo/) for template usage and output examples.
 
 ## LLMs.txt
 
@@ -192,6 +211,23 @@ exclude = ["/private", "/drafts"]
 | filename | string | "search.json" | Output filename |
 | exclude | array | [] | Exclude paths (prefixes) from search index |
 
+## Pagination
+
+Site-level pagination defaults. These apply when sections enable pagination via front matter.
+
+```toml
+[pagination]
+enabled = false
+per_page = 10
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Enable pagination globally |
+| per_page | int | 10 | Default items per page |
+
+See [Pagination](/features/pagination/) for section-level configuration and template usage.
+
 ## Taxonomies
 
 ```toml
@@ -204,6 +240,13 @@ paginate = 10
 name = "categories"
 feed = true
 ```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| name | string | — | Taxonomy name (used in front matter) |
+| feed | bool | false | Generate RSS feed for each term |
+| sitemap | bool | true | Include taxonomy pages in sitemap |
+| paginate | int | — | Pages per pagination page |
 
 ## Syntax Highlighting
 
@@ -343,6 +386,12 @@ limit = 20
 
 [sitemap]
 enabled = true
+changefreq = "weekly"
+priority = 0.5
+
+[pagination]
+enabled = false
+per_page = 10
 
 [robots]
 enabled = true
@@ -356,6 +405,7 @@ full_enabled = true
 default_image = "/images/og-default.png"
 twitter_card = "summary_large_image"
 twitter_site = "@myblog"
+twitter_creator = "@myblog"
 
 [search]
 enabled = true

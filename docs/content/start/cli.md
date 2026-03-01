@@ -100,7 +100,7 @@ hwaro build -i /path/to/my-site -o ./dist
 | -d, --drafts | Include draft content |
 | --minify | Minify output files (see below) |
 | --no-parallel | Disable parallel processing |
-| --cache | Enable build caching |
+| --cache | Enable build caching (see below) |
 | --skip-highlighting | Disable syntax highlighting |
 | -v, --verbose | Show detailed output |
 | --profile | Print phase-by-phase build timing |
@@ -115,6 +115,10 @@ The minify flag performs conservative optimization on generated files:
 - **XML**: Removes whitespace between tags for smaller file sizes.
 
 Code blocks (`<pre>`, `<code>`) and script/style content are always preserved intact.
+
+**About `--cache`:**
+
+When enabled, Hwaro tracks file modification times in a `.hwaro_cache.json` file at the project root. On subsequent builds, only files that have changed since the last build are re-processed. The cache uses millisecond-precision mtime comparison and also verifies that the output file still exists. Use `hwaro build --cache` to enable, or set `cache = true` in `[build]` config.
 
 **About `-i, --input`:**
 
@@ -153,7 +157,15 @@ hwaro serve -i /path/to/my-site -p 8080
 | --debug | Print debug information after each rebuild |
 | --access-log | Show HTTP access log (e.g. GET requests) |
 
-The server watches for file changes and rebuilds automatically.
+The server watches for file changes and rebuilds automatically. It uses **smart rebuild strategies** based on what changed:
+
+| Change Type | Strategy | Description |
+|-------------|----------|-------------|
+| `config.toml` | Full rebuild | Rebuilds entire site |
+| `content/` only | Incremental | Rebuilds only affected content pages |
+| `templates/` only | Template re-render | Re-renders all pages with existing content |
+| `static/` only | Static copy | Copies only changed static files |
+| Mixed / new / deleted files | Full rebuild | Rebuilds entire site |
 
 When `-i` is specified, the server operates as if you had `cd`-ed into the given directory — watching and serving from that project root.
 

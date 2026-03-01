@@ -24,11 +24,12 @@ feed = true
 name = "authors"
 ```
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `name` | string | Taxonomy name (used in front matter) |
-| `feed` | bool | Generate RSS feed for each term |
-| `paginate` | int | Pages per pagination page |
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | — | Taxonomy name (used in front matter) |
+| `feed` | bool | false | Generate RSS feed for each term |
+| `sitemap` | bool | true | Include taxonomy pages in sitemap |
+| `paginate` | int | — | Pages per pagination page |
 
 ## Using Taxonomies
 

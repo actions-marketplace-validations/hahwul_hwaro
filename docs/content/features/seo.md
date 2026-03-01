@@ -14,11 +14,19 @@ Automatically generates `sitemap.xml` for search engines.
 ```toml
 [sitemap]
 enabled = true
+filename = "sitemap.xml"
+changefreq = "weekly"
+priority = 0.5
 exclude = ["/private", "/drafts"]
 ```
 
-- `enabled`: Generate `sitemap.xml`.
-- `exclude`: List of path prefixes to exclude (e.g., `["/private"]` excludes `/private`, `/private/page.html`).
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Generate `sitemap.xml` |
+| filename | string | "sitemap.xml" | Output filename |
+| changefreq | string | "weekly" | Default change frequency for all pages |
+| priority | float | 0.5 | Default priority for all pages (0.0 to 1.0) |
+| exclude | array | [] | Path prefixes to exclude (e.g., `["/private"]` excludes `/private`, `/private/page.html`) |
 
 ### Output
 

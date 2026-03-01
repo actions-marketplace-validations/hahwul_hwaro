@@ -54,6 +54,7 @@ The `+++` block is TOML front matter. Content below becomes HTML.
 | in_sitemap | bool | Include in sitemap |
 | insert_anchor_links | bool | Add heading anchors |
 | redirect_to | string | Redirect page to this URL |
+| render | bool | Render page to output (default: true) |
 | extra | table | Custom metadata |
 
 ## Examples

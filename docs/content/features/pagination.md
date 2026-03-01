@@ -7,6 +7,21 @@ Split large content lists into multiple pages.
 
 ## Configuration
 
+### Site-Level Defaults
+
+Set default pagination behavior in `config.toml`:
+
+```toml
+[pagination]
+enabled = false
+per_page = 10
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Enable pagination globally |
+| per_page | int | 10 | Default items per page |
+
 ### Section Pagination
 
 Enable in section front matter:
