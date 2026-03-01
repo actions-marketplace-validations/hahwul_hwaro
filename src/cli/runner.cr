@@ -75,7 +75,7 @@ module Hwaro
 
         case command
         when "version", "-v", "--version"
-          Logger.info "hwaro version #{Hwaro::VERSION}"
+          Logger.info "#{Hwaro::VERSION}"
         when "help", "-h", "--help"
           print_help
         else
