@@ -164,9 +164,9 @@ Generate taxonomy term URL:
 ### Display Page Tags
 
 ```jinja
-{% if page.extra.tags %}
+{% if page.tags %}
 <div class="post-tags">
-{% for tag in page.extra.tags %}
+{% for tag in page.tags %}
   <a href="/tags/{{ tag | slugify }}/">{{ tag }}</a>
 {% endfor %}
 </div>

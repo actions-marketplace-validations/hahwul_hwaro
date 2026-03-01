@@ -81,9 +81,23 @@ Rewrite content directory paths to custom URL paths. Useful for site restructuri
 ```toml
 [feeds]
 enabled = true
+type = "rss"
 limit = 20
+truncate = 0
+filename = "feed.xml"
+sections = []
 default_language_only = true   # true: main feed = default language only, false: all languages
 ```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Enable feed generation |
+| type | string | "rss" | Feed format (`"rss"` or `"atom"`) |
+| limit | int | 10 | Maximum number of items in the feed |
+| truncate | int | 0 | Truncate content to N characters (0 = no truncation) |
+| filename | string | "" | Output filename (auto-determined if empty) |
+| sections | array | [] | Limit feed to specific sections |
+| default_language_only | bool | true | Only include default language in main feed |
 
 ### Sitemap
 
@@ -103,7 +117,26 @@ exclude = ["/private", "/drafts"]
 ```toml
 [robots]
 enabled = true
+
+[[robots.rules]]
+user_agent = "*"
+allow = ["/"]
+disallow = ["/private"]
 ```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | true | Enable robots.txt generation |
+| filename | string | "robots.txt" | Output filename |
+| rules | array | [] | List of robot rules |
+
+Each rule in `rules` supports:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| user_agent | string | User-agent to match (e.g. `"*"`, `"Googlebot"`) |
+| allow | array | Paths to allow |
+| disallow | array | Paths to disallow |
 
 ### OpenGraph
 
@@ -144,7 +177,7 @@ See [LLMs.txt](/features/llms-txt/) for details.
 [search]
 enabled = true
 format = "fuse_json"
-fields = ["title", "content", "description"]
+fields = ["title", "content"]
 filename = "search.json"
 exclude = ["/private", "/drafts"]
 ```
@@ -153,7 +186,7 @@ exclude = ["/private", "/drafts"]
 |-----|------|---------|-------------|
 | enabled | bool | false | Generate search index |
 | format | string | "fuse_json" | Search index format |
-| fields | array | ["title", "content", "description"] | Fields to include in index |
+| fields | array | ["title", "content"] | Fields to include in index |
 | filename | string | "search.json" | Output filename |
 | exclude | array | [] | Exclude paths (prefixes) from search index |
 
@@ -324,7 +357,7 @@ twitter_site = "@myblog"
 [search]
 enabled = true
 format = "fuse_json"
-fields = ["title", "content", "description"]
+fields = ["title", "content"]
 
 [highlight]
 enabled = true

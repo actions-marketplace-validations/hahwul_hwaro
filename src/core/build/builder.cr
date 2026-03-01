@@ -1888,6 +1888,9 @@ module Hwaro
           # Convert authors to Crinja array
           authors_array = page.authors.map { |a| Crinja::Value.new(a) }
 
+          # Convert tags to Crinja array
+          tags_array = page.tags.map { |t| Crinja::Value.new(t) }
+
           # Convert assets to Crinja array
           assets_array = page.assets.map { |a| Crinja::Value.new(a) }
 
@@ -1960,6 +1963,7 @@ module Hwaro
             "translations" => Crinja::Value.new(translations),
             # New properties
             "authors"         => Crinja::Value.new(authors_array),
+            "tags"            => Crinja::Value.new(tags_array),
             "assets"          => Crinja::Value.new(assets_array),
             "extra"           => Crinja::Value.new(extra_hash),
             "summary"         => Crinja::Value.new(page.effective_summary || ""),
@@ -1980,6 +1984,7 @@ module Hwaro
           vars["page_reading_time"] = Crinja::Value.new(page.reading_time)
           vars["page_permalink"] = Crinja::Value.new(page.permalink || "")
           vars["page_authors"] = Crinja::Value.new(authors_array)
+          vars["page_tags"] = Crinja::Value.new(tags_array)
           vars["page_weight"] = Crinja::Value.new(page.weight)
 
           # Site variables (flat for convenience)
