@@ -1107,4 +1107,731 @@ describe "Build Integration: Edge cases" do
       File.exists?("public/test/index.html").should be_true
     end
   end
+
+  it "handles content with only front matter and no body" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"empty.md" => "---\ntitle: Empty\n---\n"},
+      template_files: {"page.html" => "TITLE={{ page_title }}|BODY=[{{ content }}]"},
+    ) do
+      File.exists?("public/empty/index.html").should be_true
+      html = File.read("public/empty/index.html")
+      html.should contain("TITLE=Empty")
+    end
+  end
+
+  it "handles special characters in title" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"special.md" => "---\ntitle: \"Hello & World <Test>\"\n---\nBody"},
+      template_files: {"page.html" => "TITLE={{ page_title }}|{{ content }}"},
+    ) do
+      File.exists?("public/special/index.html").should be_true
+      html = File.read("public/special/index.html")
+      html.should contain("Hello & World <Test>")
+    end
+  end
+
+  it "handles unicode content and titles" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"unicode.md" => "---\ntitle: 한국어 제목\n---\n日本語のコンテンツ 中文内容 Ñoño"},
+      template_files: {"page.html" => "TITLE={{ page_title }}|{{ content }}"},
+    ) do
+      html = File.read("public/unicode/index.html")
+      html.should contain("TITLE=한국어 제목")
+      html.should contain("日本語のコンテンツ")
+      html.should contain("中文内容")
+      html.should contain("Ñoño")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 33. Sort by weight
+# ---------------------------------------------------------------------------
+describe "Build Integration: Sort by weight" do
+  it "sorts section pages by weight" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "docs/_index.md"  => "---\ntitle: Docs\nsort_by: weight\n---\n",
+        "docs/intro.md"   => "---\ntitle: Intro\nweight: 1\n---\nIntro",
+        "docs/advanced.md" => "---\ntitle: Advanced\nweight: 3\n---\nAdvanced",
+        "docs/basics.md"  => "---\ntitle: Basics\nweight: 2\n---\nBasics",
+      },
+      template_files: {
+        "page.html"    => "LOWER={% if page.lower %}{{ page.lower.title }}{% else %}NONE{% endif %}|HIGHER={% if page.higher %}{{ page.higher.title }}{% else %}NONE{% endif %}",
+        "section.html" => "{% for p in section.pages %}{{ p.title }},{% endfor %}",
+      },
+    ) do
+      section_html = File.read("public/docs/index.html")
+      section_html.should contain("Intro,")
+      section_html.should contain("Basics,")
+      section_html.should contain("Advanced,")
+
+      # Verify ordering via lower/higher navigation
+      intro_html = File.read("public/docs/intro/index.html")
+      intro_html.should contain("LOWER=NONE")
+      intro_html.should contain("HIGHER=Basics")
+
+      basics_html = File.read("public/docs/basics/index.html")
+      basics_html.should contain("LOWER=Intro")
+      basics_html.should contain("HIGHER=Advanced")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 34. Sort by date
+# ---------------------------------------------------------------------------
+describe "Build Integration: Sort by date" do
+  it "sorts section pages by date" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\nsort_by: date\n---\n",
+        "blog/old.md"    => "---\ntitle: Old Post\ndate: 2024-01-01\n---\nOld",
+        "blog/mid.md"    => "---\ntitle: Mid Post\ndate: 2024-06-15\n---\nMid",
+        "blog/new.md"    => "---\ntitle: New Post\ndate: 2024-12-01\n---\nNew",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "{% for p in section.pages %}{{ p.title }},{% endfor %}",
+      },
+    ) do
+      html = File.read("public/blog/index.html")
+      # All three pages should appear sorted by date
+      html.should contain("Old Post,")
+      html.should contain("Mid Post,")
+      html.should contain("New Post,")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 35. Page date and updated variables
+# ---------------------------------------------------------------------------
+describe "Build Integration: Page date variables" do
+  it "exposes page.date and page.updated" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => "---\ntitle: Post\ndate: \"2024-03-15\"\nupdated: \"2024-06-20\"\n---\nBody",
+      },
+      template_files: {
+        "page.html" => "DATE={{ page.date | date(format=\"%Y-%m-%d\") }}|UPDATED={{ page.updated | date(format=\"%Y-%m-%d\") }}",
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain("DATE=2024-03-15")
+      html.should contain("UPDATED=2024-06-20")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 36. Page weight variable
+# ---------------------------------------------------------------------------
+describe "Build Integration: Page weight" do
+  it "exposes page.weight in template" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => "---\ntitle: Post\nweight: 42\n---\nBody",
+      },
+      template_files: {"page.html" => "WEIGHT={{ page.weight }}"},
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain("WEIGHT=42")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 37. Summary extraction with <!-- more --> marker
+# ---------------------------------------------------------------------------
+describe "Build Integration: Summary via page_summary variable" do
+  it "exposes page_summary in page template" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => "---\ntitle: Post\n---\nThis is the summary.\n\n<!-- more -->\n\nThis is the rest of the content.",
+      },
+      template_files: {
+        "page.html" => "SUMMARY={{ page_summary }}|{{ content }}",
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain("This is the summary.")
+      html.should contain("This is the rest of the content.")
+    end
+  end
+
+  it "uses description as summary fallback" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => "---\ntitle: Post\ndescription: Fallback summary\n---\nBody content",
+      },
+      template_files: {
+        "page.html" => "SUMMARY={{ page_summary }}",
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain("SUMMARY=Fallback summary")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 38. Template include
+# ---------------------------------------------------------------------------
+describe "Build Integration: Template include" do
+  it "supports {% include %} for template partials" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nHome"},
+      template_files: {
+        "page.html"            => "{% include \"partials/header.html\" %}<main>{{ content }}</main>{% include \"partials/footer.html\" %}",
+        "partials/header.html" => "<header>HEADER_CONTENT</header>",
+        "partials/footer.html" => "<footer>FOOTER_CONTENT</footer>",
+      },
+    ) do
+      html = File.read("public/index.html")
+      html.should contain("<header>HEADER_CONTENT</header>")
+      html.should contain("<main>")
+      html.should contain("<footer>FOOTER_CONTENT</footer>")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 39. Block shortcodes
+# ---------------------------------------------------------------------------
+describe "Build Integration: Block shortcodes" do
+  it "renders block shortcodes with body content" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "test.md" => "---\ntitle: Test\n---\n{% note(type=\"info\") %}This is important info{% end %}",
+      },
+      template_files: {
+        "page.html"              => "<div>{{ content }}</div>",
+        "shortcodes/note.html"   => "<div class=\"note note-{{ type }}\">{{ body }}</div>",
+      },
+    ) do
+      html = File.read("public/test/index.html")
+      html.should contain("note-info")
+      html.should contain("This is important info")
+    end
+  end
+
+  it "renders multiple shortcodes in one page" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "test.md" => "---\ntitle: Test\n---\n{{ alert(type=\"warning\", message=\"Warn!\") }}\n\nSome text\n\n{{ alert(type=\"error\", message=\"Error!\") }}",
+      },
+      template_files: {
+        "page.html"              => "{{ content }}",
+        "shortcodes/alert.html"  => "<div class=\"alert-{{ type }}\">{{ message }}</div>",
+      },
+    ) do
+      html = File.read("public/test/index.html")
+      html.should contain("alert-warning")
+      html.should contain("Warn!")
+      html.should contain("alert-error")
+      html.should contain("Error!")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 40. Markdown features
+# ---------------------------------------------------------------------------
+describe "Build Integration: Markdown features" do
+  it "renders code blocks with language class" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "code.md" => "---\ntitle: Code\n---\n```crystal\nputs \"hello\"\n```",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/code/index.html")
+      html.should contain("<code")
+      html.should contain("crystal")
+      html.should contain("puts")
+    end
+  end
+
+  it "renders blockquotes" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "quote.md" => "---\ntitle: Quote\n---\n> This is a blockquote\n> with multiple lines",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/quote/index.html")
+      html.should contain("<blockquote>")
+      html.should contain("This is a blockquote")
+    end
+  end
+
+  it "renders images in markdown" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "img.md" => "---\ntitle: Images\n---\n![Alt text](/images/photo.jpg)",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/img/index.html")
+      html.should contain("<img")
+      html.should contain("Alt text")
+      html.should contain("/images/photo.jpg")
+    end
+  end
+
+  it "renders inline links" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "links.md" => "---\ntitle: Links\n---\nVisit [Example](https://example.com) for more.",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/links/index.html")
+      html.should contain("<a href=\"https://example.com\">Example</a>")
+    end
+  end
+
+  it "renders ordered and unordered lists" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "lists.md" => "---\ntitle: Lists\n---\n- Item A\n- Item B\n\n1. First\n2. Second",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/lists/index.html")
+      html.should contain("<ul>")
+      html.should contain("<li>Item A</li>")
+      html.should contain("<ol>")
+      html.should contain("<li>First</li>")
+    end
+  end
+
+  it "renders inline formatting (bold, italic, code)" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "fmt.md" => "---\ntitle: Format\n---\n**bold** and *italic* and `code`",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/fmt/index.html")
+      html.should contain("<strong>bold</strong>")
+      html.should contain("<em>italic</em>")
+      html.should contain("<code>code</code>")
+    end
+  end
+
+  it "renders horizontal rules" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "hr.md" => "---\ntitle: HR\n---\nAbove\n\n---\n\nBelow",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/hr/index.html")
+      html.should contain("<hr")
+      html.should contain("Above")
+      html.should contain("Below")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 41. Emoji support
+# ---------------------------------------------------------------------------
+describe "Build Integration: Emoji" do
+  it "converts emoji shortcodes when enabled" do
+    config = <<-TOML
+    title = "Test"
+    base_url = "http://localhost"
+
+    [markdown]
+    emoji = true
+    TOML
+
+    build_site(
+      config,
+      content_files: {"post.md" => "---\ntitle: Post\n---\nHello :smile: World"},
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/post/index.html")
+      html.should_not contain(":smile:")
+      # Should contain the actual emoji character
+      html.should contain("😄")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 42. Lazy loading images
+# ---------------------------------------------------------------------------
+describe "Build Integration: Lazy loading" do
+  it "adds loading=lazy to images when enabled" do
+    config = <<-TOML
+    title = "Test"
+    base_url = "http://localhost"
+
+    [markdown]
+    lazy_loading = true
+    TOML
+
+    build_site(
+      config,
+      content_files: {"post.md" => "---\ntitle: Post\n---\n![Photo](/img/photo.jpg)"},
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain("loading=\"lazy\"")
+      html.should contain("/img/photo.jpg")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 43. Safe mode (no raw HTML)
+# ---------------------------------------------------------------------------
+describe "Build Integration: Safe mode" do
+  it "strips raw HTML when safe mode is enabled" do
+    config = <<-TOML
+    title = "Test"
+    base_url = "http://localhost"
+
+    [markdown]
+    safe = true
+    TOML
+
+    build_site(
+      config,
+      content_files: {"post.md" => "---\ntitle: Post\n---\n<script>alert('xss')</script>\n\nSafe text"},
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      html = File.read("public/post/index.html")
+      html.should_not contain("<script>")
+      html.should contain("Safe text")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 44. Multiple data file types
+# ---------------------------------------------------------------------------
+describe "Build Integration: Multiple data files" do
+  it "loads multiple JSON data files" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nHome"},
+      template_files: {
+        "page.html" => "MENU={% for item in site.data.menu %}{{ item.name }},{% endfor %}|SETTINGS={{ site.data.settings.theme }}",
+      },
+      data_files: {
+        "menu.json"     => "[{\"name\": \"Home\"}, {\"name\": \"About\"}, {\"name\": \"Contact\"}]",
+        "settings.json" => "{\"theme\": \"dark\", \"version\": 2}",
+      },
+    ) do
+      html = File.read("public/index.html")
+      html.should contain("Home,")
+      html.should contain("About,")
+      html.should contain("Contact,")
+      html.should contain("SETTINGS=dark")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 45. Template loop variables
+# ---------------------------------------------------------------------------
+describe "Build Integration: Template loop variables" do
+  it "provides loop.index and loop.length in for loops" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/a.md"      => "---\ntitle: A\n---\nA",
+        "blog/b.md"      => "---\ntitle: B\n---\nB",
+        "blog/c.md"      => "---\ntitle: C\n---\nC",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "{% for p in section.pages %}{{ loop.index }}:{{ p.title }},{% endfor %}",
+      },
+    ) do
+      html = File.read("public/blog/index.html")
+      html.should contain("1:")
+      html.should contain("2:")
+      html.should contain("3:")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 46. Template conditionals
+# ---------------------------------------------------------------------------
+describe "Build Integration: Template conditionals" do
+  it "supports if/elif/else conditional rendering" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "draft.md" => "---\ntitle: Draft\ndraft: true\n---\nDraft body",
+        "live.md"  => "---\ntitle: Live\ndraft: false\n---\nLive body",
+      },
+      template_files: {
+        "page.html" => "{% if page.draft %}STATUS=DRAFT{% else %}STATUS=LIVE{% endif %}|{{ content }}",
+      },
+      drafts: true,
+    ) do
+      draft_html = File.read("public/draft/index.html")
+      draft_html.should contain("STATUS=DRAFT")
+
+      live_html = File.read("public/live/index.html")
+      live_html.should contain("STATUS=LIVE")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 47. Multiple taxonomies
+# ---------------------------------------------------------------------------
+describe "Build Integration: Multiple taxonomies" do
+  it "generates pages for multiple taxonomy types" do
+    config = <<-TOML
+    title = "Test"
+    base_url = "http://localhost"
+
+    [[taxonomies]]
+    name = "tags"
+
+    [[taxonomies]]
+    name = "categories"
+    TOML
+
+    build_site(
+      config,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/post.md"   => "---\ntitle: Post\ntags:\n  - crystal\ncategories:\n  - tutorial\n---\nBody",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "<h1>{{ taxonomy_name }}</h1>",
+        "taxonomy_term.html" => "<h1>{{ taxonomy_term }}</h1>",
+      },
+    ) do
+      File.exists?("public/tags/index.html").should be_true
+      File.exists?("public/tags/crystal/index.html").should be_true
+      File.exists?("public/categories/index.html").should be_true
+      File.exists?("public/categories/tutorial/index.html").should be_true
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 48. Deeply nested sections (3+ levels)
+# ---------------------------------------------------------------------------
+describe "Build Integration: Deeply nested sections" do
+  it "builds pages 3+ levels deep" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "docs/_index.md"                    => "---\ntitle: Docs\n---\n",
+        "docs/guide/_index.md"              => "---\ntitle: Guide\n---\n",
+        "docs/guide/advanced/_index.md"     => "---\ntitle: Advanced\n---\n",
+        "docs/guide/advanced/deep-page.md"  => "---\ntitle: Deep Page\n---\nDeep content",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "TITLE={{ section.title }}|{{ section_list }}",
+      },
+    ) do
+      File.exists?("public/docs/guide/advanced/deep-page/index.html").should be_true
+      html = File.read("public/docs/guide/advanced/deep-page/index.html")
+      html.should contain("Deep content")
+
+      # Verify parent sections exist
+      File.exists?("public/docs/index.html").should be_true
+      File.exists?("public/docs/guide/index.html").should be_true
+      File.exists?("public/docs/guide/advanced/index.html").should be_true
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 49. Custom output directory
+# ---------------------------------------------------------------------------
+describe "Build Integration: Custom output directory" do
+  it "writes output to a custom directory" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nHome content"},
+      template_files: {"page.html" => "{{ content }}"},
+      output_dir: "dist",
+    ) do
+      File.exists?("dist/index.html").should be_true
+      html = File.read("dist/index.html")
+      html.should contain("Home content")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 50. Page template override
+# ---------------------------------------------------------------------------
+describe "Build Integration: Page template override" do
+  it "uses custom template specified in front matter" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "special.md" => "---\ntitle: Special\ntemplate: custom\n---\nSpecial content",
+        "normal.md"  => "---\ntitle: Normal\n---\nNormal content",
+      },
+      template_files: {
+        "page.html"   => "DEFAULT|{{ content }}",
+        "custom.html"  => "CUSTOM|{{ content }}",
+      },
+    ) do
+      special_html = File.read("public/special/index.html")
+      special_html.should contain("CUSTOM|")
+      special_html.should_not contain("DEFAULT|")
+
+      normal_html = File.read("public/normal/index.html")
+      normal_html.should contain("DEFAULT|")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 51. TOC with nested headings
+# ---------------------------------------------------------------------------
+describe "Build Integration: TOC with nested headings" do
+  it "generates nested TOC for multiple heading levels" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "doc.md" => "---\ntitle: Doc\ntoc: true\n---\n## Chapter 1\n\nContent\n\n### Section 1.1\n\nMore\n\n## Chapter 2\n\nEnd",
+      },
+      template_files: {"page.html" => "<nav>{{ toc }}</nav><main>{{ content }}</main>"},
+    ) do
+      html = File.read("public/doc/index.html")
+      html.should contain("Chapter 1")
+      html.should contain("Section 1.1")
+      html.should contain("Chapter 2")
+      # Should have nested list structure
+      html.should contain("<ul")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 52. Section content rendering
+# ---------------------------------------------------------------------------
+describe "Build Integration: Section content" do
+  it "renders _index.md content in section template" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n# Welcome to the Blog\n\nThis is the blog intro.",
+        "blog/post.md"   => "---\ntitle: Post\n---\nPost body",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "<div class=\"intro\">{{ content }}</div><div class=\"list\">{{ section_list }}</div>",
+      },
+    ) do
+      html = File.read("public/blog/index.html")
+      html.should contain("Welcome to the Blog")
+      html.should contain("This is the blog intro.")
+      html.should contain("Post")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 53. Render: false pages still accessible in section.pages
+# ---------------------------------------------------------------------------
+describe "Build Integration: render=false in section list" do
+  it "pages with render: false are excluded from section.pages" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/visible.md" => "---\ntitle: Visible\n---\nV",
+        "blog/hidden.md"  => "---\ntitle: Hidden\nrender: false\n---\nH",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "COUNT={{ section.pages_count }}|{{ section_list }}",
+      },
+    ) do
+      html = File.read("public/blog/index.html")
+      html.should contain("Visible")
+      File.exists?("public/blog/hidden/index.html").should be_false
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 54. Multiple aliases on one page
+# ---------------------------------------------------------------------------
+describe "Build Integration: Multiple aliases" do
+  it "creates redirect pages for all aliases" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "new.md" => "---\ntitle: New Page\naliases:\n  - /old-1/\n  - /old-2/\n  - /archive/old-3/\n---\nNew content",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.exists?("public/new/index.html").should be_true
+      File.exists?("public/old-1/index.html").should be_true
+      File.exists?("public/old-2/index.html").should be_true
+      File.exists?("public/archive/old-3/index.html").should be_true
+
+      alias_html = File.read("public/old-1/index.html")
+      alias_html.should contain("url=/new/")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 55. Static files with nested directories
+# ---------------------------------------------------------------------------
+describe "Build Integration: Static file nested directories" do
+  it "copies deeply nested static files preserving structure" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nHome"},
+      template_files: {"page.html" => "{{ content }}"},
+      static_files: {
+        "assets/css/main.css"       => "body{}",
+        "assets/js/app.js"          => "console.log('x');",
+        "assets/images/logo.png"    => "fake_png",
+        "assets/fonts/custom.woff2" => "fake_font",
+      },
+    ) do
+      File.exists?("public/assets/css/main.css").should be_true
+      File.exists?("public/assets/js/app.js").should be_true
+      File.exists?("public/assets/images/logo.png").should be_true
+      File.exists?("public/assets/fonts/custom.woff2").should be_true
+      File.read("public/assets/css/main.css").should eq("body{}")
+    end
+  end
 end

@@ -99,3 +99,86 @@ describe "Cache: Rebuild after file change" do
     end
   end
 end
+
+describe "Cache: Rebuild with new file added" do
+  it "detects and builds newly added files" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page1.md", "---\ntitle: Page 1\n---\nContent 1")
+        File.write("templates/page.html", "{{ content }}")
+
+        # First build
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        File.exists?("public/page1/index.html").should be_true
+        File.exists?("public/page2/index.html").should be_false
+
+        # Add new file
+        sleep 100.milliseconds
+        File.write("content/page2.md", "---\ntitle: Page 2\n---\nContent 2")
+
+        # Rebuild
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        File.exists?("public/page1/index.html").should be_true
+        File.exists?("public/page2/index.html").should be_true
+        File.read("public/page2/index.html").should contain("Content 2")
+      end
+    end
+  end
+end
+
+describe "Cache: Cache with multiple files" do
+  it "caches multiple content files correctly" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "page1.md" => "---\ntitle: Page 1\n---\nContent 1",
+        "page2.md" => "---\ntitle: Page 2\n---\nContent 2",
+        "page3.md" => "---\ntitle: Page 3\n---\nContent 3",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+      cache: true,
+    ) do
+      File.exists?(".hwaro_cache.json").should be_true
+      cache_json = File.read(".hwaro_cache.json")
+      cache_json.should contain("page1.md")
+      cache_json.should contain("page2.md")
+      cache_json.should contain("page3.md")
+
+      File.exists?("public/page1/index.html").should be_true
+      File.exists?("public/page2/index.html").should be_true
+      File.exists?("public/page3/index.html").should be_true
+    end
+  end
+end
+
+describe "Cache: Cache with section content" do
+  it "caches section pages correctly" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/post1.md"  => "---\ntitle: Post 1\n---\nP1",
+        "blog/post2.md"  => "---\ntitle: Post 2\n---\nP2",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "{{ section_list }}",
+      },
+      cache: true,
+    ) do
+      File.exists?(".hwaro_cache.json").should be_true
+      File.exists?("public/blog/index.html").should be_true
+      File.exists?("public/blog/post1/index.html").should be_true
+      File.exists?("public/blog/post2/index.html").should be_true
+    end
+  end
+end

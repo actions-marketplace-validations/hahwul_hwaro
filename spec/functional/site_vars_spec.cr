@@ -45,4 +45,52 @@ describe "Site Variables Integration" do
       output.should contain("Tags: 1")
     end
   end
+
+  it "exposes site.title and site.base_url" do
+    Dir.mktmpdir do |tmp_dir|
+      FileUtils.mkdir_p(File.join(tmp_dir, "content"))
+      FileUtils.mkdir_p(File.join(tmp_dir, "templates"))
+
+      File.write(File.join(tmp_dir, "config.toml"), "title = \"My Awesome Site\"\nbase_url = \"https://example.com\"")
+      File.write(File.join(tmp_dir, "content/index.md"), "---\ntitle: Home\n---\nHello")
+
+      template = <<-HTML
+      SITE_TITLE={{ site_title }}
+      BASE_URL={{ base_url }}
+      HTML
+      File.write(File.join(tmp_dir, "templates/page.html"), template)
+
+      Dir.cd(tmp_dir) do
+        builder = Hwaro::Core::Build::Builder.new
+        builder.run(output_dir: "public")
+      end
+
+      output = File.read(File.join(tmp_dir, "public/index.html"))
+      output.should contain("SITE_TITLE=My Awesome Site")
+      output.should contain("BASE_URL=https://example.com")
+    end
+  end
+
+  it "exposes site.pages with page attributes" do
+    Dir.mktmpdir do |tmp_dir|
+      FileUtils.mkdir_p(File.join(tmp_dir, "content"))
+      FileUtils.mkdir_p(File.join(tmp_dir, "templates"))
+
+      File.write(File.join(tmp_dir, "config.toml"), "title = \"Test\"\nbase_url = \"http://localhost\"")
+      File.write(File.join(tmp_dir, "content/index.md"), "---\ntitle: Home\n---\nHello")
+      File.write(File.join(tmp_dir, "content/about.md"), "---\ntitle: About\n---\nAbout")
+
+      template = "{% for p in site.pages %}{{ p.title }},{% endfor %}"
+      File.write(File.join(tmp_dir, "templates/page.html"), template)
+
+      Dir.cd(tmp_dir) do
+        builder = Hwaro::Core::Build::Builder.new
+        builder.run(output_dir: "public")
+      end
+
+      output = File.read(File.join(tmp_dir, "public/index.html"))
+      output.should contain("Home,")
+      output.should contain("About,")
+    end
+  end
 end
