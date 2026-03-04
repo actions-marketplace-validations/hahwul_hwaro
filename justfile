@@ -11,6 +11,10 @@ dev:
 build:
     shards build
 
+# Run all tests
+test:
+    crystal spec
+
 # Fix lint
 fix:
     crystal tool format
