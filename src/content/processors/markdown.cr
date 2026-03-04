@@ -132,78 +132,46 @@ module Hwaro
           redirect_to = nil.as(String?)
           weight = 0
 
-          # Try TOML Front Matter (+++)
+          # Try TOML Front Matter (+++) then YAML Front Matter (---)
           if match = raw_content.match(TOML_FRONT_MATTER_REGEX)
             result = extract_from_toml(match[1], file_path)
-            if result
-              title = result[:title]
-              description = result[:description]
-              image = result[:image]
-              is_draft = result[:draft]
-              template = result[:template]
-              in_sitemap = result[:in_sitemap]
-              toc = result[:toc]
-              date = result[:date]
-              updated = result[:updated]
-              render = result[:render]
-              slug = result[:slug]
-              custom_path = result[:custom_path]
-              aliases = result[:aliases]
-              transparent = result[:transparent]
-              generate_feeds = result[:generate_feeds]
-              paginate = result[:paginate]
-              pagination_enabled = result[:pagination_enabled]
-              sort_by = result[:sort_by]
-              reverse = result[:reverse]
-              authors = result[:authors]
-              extra = result[:extra]
-              in_search_index = result[:in_search_index]
-              insert_anchor_links = result[:insert_anchor_links]
-              page_template = result[:page_template]
-              paginate_path = result[:paginate_path]
-              redirect_to = result[:redirect_to]
-              weight = result[:weight]
-              front_matter_keys = result[:front_matter_keys]
-              taxonomies = result[:taxonomies]
-              tags = result[:tags]
-            end
             markdown_content = match[2]
-            # Try YAML Front Matter (---)
           elsif match = raw_content.match(YAML_FRONT_MATTER_REGEX)
             result = extract_from_yaml(match[1], file_path)
-            if result
-              title = result[:title]
-              description = result[:description]
-              image = result[:image]
-              is_draft = result[:draft]
-              template = result[:template]
-              in_sitemap = result[:in_sitemap]
-              toc = result[:toc]
-              date = result[:date]
-              updated = result[:updated]
-              render = result[:render]
-              slug = result[:slug]
-              custom_path = result[:custom_path]
-              aliases = result[:aliases]
-              transparent = result[:transparent]
-              generate_feeds = result[:generate_feeds]
-              paginate = result[:paginate]
-              pagination_enabled = result[:pagination_enabled]
-              sort_by = result[:sort_by]
-              reverse = result[:reverse]
-              authors = result[:authors]
-              extra = result[:extra]
-              in_search_index = result[:in_search_index]
-              insert_anchor_links = result[:insert_anchor_links]
-              page_template = result[:page_template]
-              paginate_path = result[:paginate_path]
-              redirect_to = result[:redirect_to]
-              weight = result[:weight]
-              front_matter_keys = result[:front_matter_keys]
-              taxonomies = result[:taxonomies]
-              tags = result[:tags]
-            end
             markdown_content = match[2]
+          end
+
+          if result
+            title = result[:title]
+            description = result[:description]
+            image = result[:image]
+            is_draft = result[:draft]
+            template = result[:template]
+            in_sitemap = result[:in_sitemap]
+            toc = result[:toc]
+            date = result[:date]
+            updated = result[:updated]
+            render = result[:render]
+            slug = result[:slug]
+            custom_path = result[:custom_path]
+            aliases = result[:aliases]
+            transparent = result[:transparent]
+            generate_feeds = result[:generate_feeds]
+            paginate = result[:paginate]
+            pagination_enabled = result[:pagination_enabled]
+            sort_by = result[:sort_by]
+            reverse = result[:reverse]
+            authors = result[:authors]
+            extra = result[:extra]
+            in_search_index = result[:in_search_index]
+            insert_anchor_links = result[:insert_anchor_links]
+            page_template = result[:page_template]
+            paginate_path = result[:paginate_path]
+            redirect_to = result[:redirect_to]
+            weight = result[:weight]
+            front_matter_keys = result[:front_matter_keys]
+            taxonomies = result[:taxonomies]
+            tags = result[:tags]
           end
 
           {
@@ -703,13 +671,16 @@ module Hwaro
           end
         end
 
+        # Array-typed front matter keys that are NOT taxonomies.
+        # These are excluded from automatic taxonomy extraction.
+        NON_TAXONOMY_ARRAY_KEYS = Set{"tags", "aliases", "authors"}
+
         private def extract_taxonomies(front_matter : TOML::Table | YAML::Any, keys : Array(String)) : Hash(String, Array(String))
           taxonomies = {} of String => Array(String)
 
           if front_matter.is_a?(TOML::Table)
             front_matter.each do |key, value|
-              next if key == "tags"
-              # TOML values are wrapped in TOML::Any, need to check as_a?
+              next if NON_TAXONOMY_ARRAY_KEYS.includes?(key)
               if arr = value.as_a?
                 values = arr.compact_map { |v| v.as_s? }
                 taxonomies[key] = values
@@ -720,17 +691,13 @@ module Hwaro
               fm_hash.each do |key_any, value|
                 key = key_any.as_s?
                 next unless key
-                next if key == "tags"
-                values = value.as_a?.try { |arr| arr.compact_map(&.as_s?) } || [] of String
-                taxonomies[key] = values
+                next if NON_TAXONOMY_ARRAY_KEYS.includes?(key)
+                if arr = value.as_a?
+                  values = arr.compact_map(&.as_s?)
+                  taxonomies[key] = values
+                end
               end
             end
-          end
-
-          keys.each do |key|
-            next if key == "tags"
-            next if taxonomies.has_key?(key)
-            taxonomies[key] = [] of String
           end
 
           taxonomies

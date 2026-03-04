@@ -1,5 +1,6 @@
 require "toml"
 require "./deployment"
+require "../utils/text_utils"
 
 module Hwaro
   module Models
@@ -175,26 +176,19 @@ module Hwaro
 
       # Generate CSS link tags for files in configured directories
       def css_tags(base_url : String = "", cache_bust : String = "") : String
-        return "" unless @enabled
-        return "" if @dirs.empty?
-
-        suffix = cache_bust.empty? ? "" : "?v=#{cache_bust}"
-        tags = [] of String
-        @dirs.each do |dir|
-          static_dir = File.join("static", dir)
-          next unless Dir.exists?(static_dir)
-
-          Dir.glob(File.join(static_dir, "**", "*.css")).sort.each do |file|
-            # Convert static/assets/css/style.css to /assets/css/style.css
-            relative_path = file.sub(/^static\/?/, "/")
-            tags << %(<link rel="stylesheet" href="#{base_url}#{relative_path}#{suffix}">)
-          end
+        collect_tags("css", base_url, cache_bust) do |url|
+          %(<link rel="stylesheet" href="#{url}">)
         end
-        tags.join("\n")
       end
 
       # Generate JS script tags for files in configured directories
       def js_tags(base_url : String = "", cache_bust : String = "") : String
+        collect_tags("js", base_url, cache_bust) do |url|
+          %(<script src="#{url}"></script>)
+        end
+      end
+
+      private def collect_tags(extension : String, base_url : String, cache_bust : String, &block : String -> String) : String
         return "" unless @enabled
         return "" if @dirs.empty?
 
@@ -204,10 +198,9 @@ module Hwaro
           static_dir = File.join("static", dir)
           next unless Dir.exists?(static_dir)
 
-          Dir.glob(File.join(static_dir, "**", "*.js")).sort.each do |file|
-            # Convert static/assets/js/main.js to /assets/js/main.js
+          Dir.glob(File.join(static_dir, "**", "*.#{extension}")).sort.each do |file|
             relative_path = file.sub(/^static\/?/, "/")
-            tags << %(<script src="#{base_url}#{relative_path}#{suffix}"></script>)
+            tags << yield("#{base_url}#{relative_path}#{suffix}")
           end
         end
         tags.join("\n")
@@ -260,12 +253,12 @@ module Hwaro
       ) : String
         tags = [] of String
 
-        tags << %(<meta property="og:title" content="#{escape_html(title)}">)
+        tags << %(<meta property="og:title" content="#{Utils::TextUtils.escape_xml(title)}">)
         tags << %(<meta property="og:type" content="#{@og_type}">)
         tags << %(<meta property="og:url" content="#{base_url}#{url}">)
 
         if desc = description
-          tags << %(<meta property="og:description" content="#{escape_html(desc)}">)
+          tags << %(<meta property="og:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
         end
 
         # Use page image or fall back to default
@@ -292,10 +285,10 @@ module Hwaro
         tags = [] of String
 
         tags << %(<meta name="twitter:card" content="#{@twitter_card}">)
-        tags << %(<meta name="twitter:title" content="#{escape_html(title)}">)
+        tags << %(<meta name="twitter:title" content="#{Utils::TextUtils.escape_xml(title)}">)
 
         if desc = description
-          tags << %(<meta name="twitter:description" content="#{escape_html(desc)}">)
+          tags << %(<meta name="twitter:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
         end
 
         # Use page image or fall back to default
@@ -328,12 +321,6 @@ module Hwaro
         [og, twitter].reject(&.empty?).join("\n")
       end
 
-      private def escape_html(text : String) : String
-        text.gsub("&", "&amp;")
-          .gsub("<", "&lt;")
-          .gsub(">", "&gt;")
-          .gsub("\"", "&quot;")
-      end
     end
 
     # Syntax highlighting configuration
