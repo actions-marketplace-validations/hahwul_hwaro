@@ -66,10 +66,10 @@ module Hwaro
         @pages_by_path : Hash(String, Models::Page)?
 
         # Regex constants for HTML minification
-        private REGEX_PRE_OPEN       = /<pre([^>]*)>\s*<code/
-        private REGEX_PRE_CLOSE      = /<\/code>\s*<\/pre>/
-        private REGEX_COMMENTS       = /<!--(?!\[if|\s*more\s*-->).*?-->/m
-        private REGEX_BLANK_LINES    = /\n{3,}/
+        private REGEX_PRE_OPEN    = /<pre([^>]*)>\s*<code/
+        private REGEX_PRE_CLOSE   = /<\/code>\s*<\/pre>/
+        private REGEX_COMMENTS    = /<!--(?!\[if|\s*more\s*-->).*?-->/m
+        private REGEX_BLANK_LINES = /\n{3,}/
 
         def initialize
           @lifecycle = Lifecycle::Manager.new

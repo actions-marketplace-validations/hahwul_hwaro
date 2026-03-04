@@ -27,10 +27,10 @@ describe "Internal Links: Basic resolution" do
     build_site(
       BASIC_CONFIG,
       content_files: {
-        "blog/_index.md"  => "---\ntitle: Blog\n---\n",
-        "blog/post.md"    => "---\ntitle: Post\n---\nPost content",
-        "docs/_index.md"  => "---\ntitle: Docs\n---\n",
-        "docs/guide.md"   => "---\ntitle: Guide\n---\nCheck the [blog post](@/blog/post.md)",
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/post.md"   => "---\ntitle: Post\n---\nPost content",
+        "docs/_index.md" => "---\ntitle: Docs\n---\n",
+        "docs/guide.md"  => "---\ntitle: Guide\n---\nCheck the [blog post](@/blog/post.md)",
       },
       template_files: {
         "page.html"    => "{{ content }}",

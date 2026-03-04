@@ -1155,10 +1155,10 @@ describe "Build Integration: Sort by weight" do
     build_site(
       BASIC_CONFIG,
       content_files: {
-        "docs/_index.md"  => "---\ntitle: Docs\nsort_by: weight\n---\n",
-        "docs/intro.md"   => "---\ntitle: Intro\nweight: 1\n---\nIntro",
+        "docs/_index.md"   => "---\ntitle: Docs\nsort_by: weight\n---\n",
+        "docs/intro.md"    => "---\ntitle: Intro\nweight: 1\n---\nIntro",
         "docs/advanced.md" => "---\ntitle: Advanced\nweight: 3\n---\nAdvanced",
-        "docs/basics.md"  => "---\ntitle: Basics\nweight: 2\n---\nBasics",
+        "docs/basics.md"   => "---\ntitle: Basics\nweight: 2\n---\nBasics",
       },
       template_files: {
         "page.html"    => "LOWER={% if page.lower %}{{ page.lower.title }}{% else %}NONE{% endif %}|HIGHER={% if page.higher %}{{ page.higher.title }}{% else %}NONE{% endif %}",
@@ -1317,8 +1317,8 @@ describe "Build Integration: Block shortcodes" do
         "test.md" => "---\ntitle: Test\n---\n{% note(type=\"info\") %}This is important info{% end %}",
       },
       template_files: {
-        "page.html"              => "<div>{{ content }}</div>",
-        "shortcodes/note.html"   => "<div class=\"note note-{{ type }}\">{{ body }}</div>",
+        "page.html"            => "<div>{{ content }}</div>",
+        "shortcodes/note.html" => "<div class=\"note note-{{ type }}\">{{ body }}</div>",
       },
     ) do
       html = File.read("public/test/index.html")
@@ -1334,8 +1334,8 @@ describe "Build Integration: Block shortcodes" do
         "test.md" => "---\ntitle: Test\n---\n{{ alert(type=\"warning\", message=\"Warn!\") }}\n\nSome text\n\n{{ alert(type=\"error\", message=\"Error!\") }}",
       },
       template_files: {
-        "page.html"              => "{{ content }}",
-        "shortcodes/alert.html"  => "<div class=\"alert-{{ type }}\">{{ message }}</div>",
+        "page.html"             => "{{ content }}",
+        "shortcodes/alert.html" => "<div class=\"alert-{{ type }}\">{{ message }}</div>",
       },
     ) do
       html = File.read("public/test/index.html")
@@ -1652,10 +1652,10 @@ describe "Build Integration: Deeply nested sections" do
     build_site(
       BASIC_CONFIG,
       content_files: {
-        "docs/_index.md"                    => "---\ntitle: Docs\n---\n",
-        "docs/guide/_index.md"              => "---\ntitle: Guide\n---\n",
-        "docs/guide/advanced/_index.md"     => "---\ntitle: Advanced\n---\n",
-        "docs/guide/advanced/deep-page.md"  => "---\ntitle: Deep Page\n---\nDeep content",
+        "docs/_index.md"                   => "---\ntitle: Docs\n---\n",
+        "docs/guide/_index.md"             => "---\ntitle: Guide\n---\n",
+        "docs/guide/advanced/_index.md"    => "---\ntitle: Advanced\n---\n",
+        "docs/guide/advanced/deep-page.md" => "---\ntitle: Deep Page\n---\nDeep content",
       },
       template_files: {
         "page.html"    => "{{ content }}",
@@ -1705,7 +1705,7 @@ describe "Build Integration: Page template override" do
       },
       template_files: {
         "page.html"   => "DEFAULT|{{ content }}",
-        "custom.html"  => "CUSTOM|{{ content }}",
+        "custom.html" => "CUSTOM|{{ content }}",
       },
     ) do
       special_html = File.read("public/special/index.html")
@@ -1772,7 +1772,7 @@ describe "Build Integration: render=false in section list" do
     build_site(
       BASIC_CONFIG,
       content_files: {
-        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/_index.md"  => "---\ntitle: Blog\n---\n",
         "blog/visible.md" => "---\ntitle: Visible\n---\nV",
         "blog/hidden.md"  => "---\ntitle: Hidden\nrender: false\n---\nH",
       },

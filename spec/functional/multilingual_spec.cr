@@ -47,10 +47,10 @@ describe "Multilingual: URL generation" do
     build_site(
       MULTILINGUAL_CONFIG,
       content_files: {
-        "blog/_index.md"     => "---\ntitle: Blog\n---\n",
-        "blog/_index.ko.md"  => "---\ntitle: 블로그\n---\n",
-        "blog/post.md"       => "---\ntitle: Post\n---\nEnglish post",
-        "blog/post.ko.md"    => "---\ntitle: 포스트\n---\n한국어 포스트",
+        "blog/_index.md"    => "---\ntitle: Blog\n---\n",
+        "blog/_index.ko.md" => "---\ntitle: 블로그\n---\n",
+        "blog/post.md"      => "---\ntitle: Post\n---\nEnglish post",
+        "blog/post.ko.md"   => "---\ntitle: 포스트\n---\n한국어 포스트",
       },
       template_files: {
         "page.html"    => "{{ content }}",

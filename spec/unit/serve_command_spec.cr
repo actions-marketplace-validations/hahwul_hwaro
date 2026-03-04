@@ -81,7 +81,6 @@ describe Hwaro::CLI::Commands::ServeCommand do
     end
   end
 
-
   describe "metadata" do
     it "has correct name" do
       meta = Hwaro::CLI::Commands::ServeCommand.metadata

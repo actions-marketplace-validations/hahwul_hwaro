@@ -320,7 +320,6 @@ module Hwaro
         twitter = twitter_tags(title, description, image, base_url)
         [og, twitter].reject(&.empty?).join("\n")
       end
-
     end
 
     # Syntax highlighting configuration

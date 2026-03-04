@@ -181,12 +181,12 @@ describe "SEO: Sitemap with custom configuration" do
     build_site(
       config,
       content_files: {
-        "about.md" => "---\ntitle: About\n---\nAbout",
+        "about.md"       => "---\ntitle: About\n---\nAbout",
         "blog/_index.md" => "---\ntitle: Blog\n---\n",
-        "blog/post.md" => "---\ntitle: Post\n---\nPost",
+        "blog/post.md"   => "---\ntitle: Post\n---\nPost",
       },
       template_files: {
-        "page.html" => "{{ content }}",
+        "page.html"    => "{{ content }}",
         "section.html" => "{{ content }}",
       },
     ) do
@@ -390,12 +390,12 @@ describe "SEO: llms.txt content structure" do
     build_site(
       config,
       content_files: {
-        "about.md" => "---\ntitle: About Us\n---\nAbout content",
+        "about.md"       => "---\ntitle: About Us\n---\nAbout content",
         "blog/_index.md" => "---\ntitle: Blog\n---\n",
-        "blog/post.md" => "---\ntitle: Hello World\n---\nPost content",
+        "blog/post.md"   => "---\ntitle: Hello World\n---\nPost content",
       },
       template_files: {
-        "page.html" => "{{ content }}",
+        "page.html"    => "{{ content }}",
         "section.html" => "{{ content }}",
       },
     ) do
