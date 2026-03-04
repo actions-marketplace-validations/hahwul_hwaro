@@ -176,11 +176,11 @@ module Hwaro
         CommandRegistry.all.sort_by { |cmd|
           priority.index(cmd[:name]) || priority.size
         }.each do |cmd|
-          Logger.info "  #{cmd[:name].ljust(8)} #{cmd[:description]}"
+          Logger.info "  #{cmd[:name].ljust(12)} #{cmd[:description]}"
         end
 
-        Logger.info "  version  Show version"
-        Logger.info "  help     Show this help"
+        Logger.info "  #{"version".ljust(12)} Show version"
+        Logger.info "  #{"help".ljust(12)} Show this help"
         Logger.info ""
         Logger.info "Run 'hwaro <command> --help' for more information on a command."
       end
