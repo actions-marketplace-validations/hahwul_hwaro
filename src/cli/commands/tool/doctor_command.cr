@@ -54,6 +54,19 @@ module Hwaro
 
             Logger.info "Running diagnostics..."
             Logger.info ""
+            Logger.info "  #{config_path}"
+            Logger.info "    ☐ base_url, title"
+            Logger.info "    ☐ feeds (enabled + filename)"
+            Logger.info "    ☐ sitemap (changefreq, priority)"
+            Logger.info "    ☐ taxonomies (duplicates)"
+            Logger.info "    ☐ search (format)"
+            Logger.info ""
+            Logger.info "  #{content_dir}/"
+            Logger.info "    ☐ frontmatter (title, description, date)"
+            Logger.info "    ☐ frontmatter parse errors"
+            Logger.info "    ☐ image alt text"
+            Logger.info "    ☐ draft status"
+            Logger.info ""
 
             doctor = Services::Doctor.new(content_dir: content_dir, config_path: config_path)
             issues = doctor.run
@@ -69,17 +82,13 @@ module Hwaro
 
             unless config_issues.empty?
               Logger.info "Config:"
-              config_issues.each do |issue|
-                print_issue(issue)
-              end
+              config_issues.each { |issue| print_issue(issue) }
               Logger.info ""
             end
 
             unless content_issues.empty?
               Logger.info "Content:"
-              content_issues.each do |issue|
-                print_issue(issue)
-              end
+              content_issues.each { |issue| print_issue(issue) }
               Logger.info ""
             end
 
