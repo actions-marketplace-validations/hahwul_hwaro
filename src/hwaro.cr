@@ -94,5 +94,5 @@ require "./content/hooks"
 require "./cli/runner"
 
 module Hwaro
-  VERSION = "0.2.0"
+  VERSION = "0.3.0"
 end
