@@ -209,7 +209,7 @@ hwaro tool list all             # List all content files
 hwaro tool list drafts          # List draft files
 hwaro tool list published       # List published files
 hwaro tool deadlink             # Check for dead external links
-hwaro tool doctor              # Diagnose config and content issues
+hwaro tool doctor               # Diagnose config and content issues
 ```
 
 **Subcommands:**

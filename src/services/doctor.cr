@@ -18,6 +18,9 @@ module Hwaro
       YAML_DELIMITER = "---"
       TOML_DELIMITER = "+++"
 
+      TOML_FRONTMATTER_RE = /\A\+\+\+\s*\n(.*?\n?)^\+\+\+\s*$\n?/m
+      YAML_FRONTMATTER_RE = /\A---\s*\n(.*?\n?)^---\s*$\n?/m
+
       VALID_CHANGEFREQS    = %w[always hourly daily weekly monthly yearly never]
       VALID_SEARCH_FORMATS = %w[fuse_json fuse_javascript elasticlunr_json elasticlunr_javascript]
 
@@ -150,7 +153,7 @@ module Hwaro
       # Parse frontmatter and return a hash of key-value pairs.
       # Returns nil if no frontmatter found. Reports parse errors as issues.
       private def parse_frontmatter(file_path : String, content : String, issues : Array(Issue)) : Hash(String, FrontmatterValue)?
-        if match = content.match(/\A\+\+\+\s*\n(.*?\n?)^\+\+\+\s*$\n?/m)
+        if match = content.match(TOML_FRONTMATTER_RE)
           begin
             toml_data = TOML.parse(match[1])
             result = {} of String => FrontmatterValue
@@ -169,7 +172,7 @@ module Hwaro
               message: "TOML frontmatter parse error: #{ex.message}")
             return nil
           end
-        elsif match = content.match(/\A---\s*\n(.*?\n?)^---\s*$\n?/m)
+        elsif match = content.match(YAML_FRONTMATTER_RE)
           begin
             yaml_data = YAML.parse(match[1])
             if h = yaml_data.as_h?
@@ -213,13 +216,7 @@ module Hwaro
 
       # Strip frontmatter from content to get body only
       private def extract_body(content : String) : String
-        if content.match(/\A\+\+\+\s*\n.*?^\+\+\+\s*$\n?/m)
-          content.sub(/\A\+\+\+\s*\n.*?^\+\+\+\s*$\n?/m, "")
-        elsif content.match(/\A---\s*\n.*?^---\s*$\n?/m)
-          content.sub(/\A---\s*\n.*?^---\s*$\n?/m, "")
-        else
-          content
-        end
+        content.sub(TOML_FRONTMATTER_RE, "").sub(YAML_FRONTMATTER_RE, "")
       end
 
       alias FrontmatterValue = String | Bool | Int64 | Float64 | Nil
