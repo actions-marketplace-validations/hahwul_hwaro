@@ -43,8 +43,9 @@ module Hwaro
           if limit = @memory_limit
             bytes = parse_memory_limit(limit)
             # Heuristic: ~50KB per page
-            size = (bytes / (50 * 1024)).to_i32
-            size < 1 ? 1 : size
+            size = bytes // (50 * 1024)
+            size = size.clamp(1, Int32::MAX.to_i64).to_i32
+            size
           else
             50
           end

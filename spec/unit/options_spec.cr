@@ -98,6 +98,12 @@ describe Hwaro::Config::Options::BuildOptions do
       options = Hwaro::Config::Options::BuildOptions.new(memory_limit: "1g")
       options.batch_size.should eq(20971)
     end
+
+    it "clamps to Int32::MAX for very large limits" do
+      # Need bytes / (50*1024) > Int32::MAX (~2.1B), so > ~102TB
+      options = Hwaro::Config::Options::BuildOptions.new(memory_limit: "999999G")
+      options.batch_size.should eq(Int32::MAX)
+    end
   end
 end
 

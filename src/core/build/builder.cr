@@ -321,10 +321,6 @@ module Hwaro
           end
 
           Logger.info "Building site..."
-          if stream || !memory_limit.nil?
-            batch = Config::Options::BuildOptions.new(stream: stream, memory_limit: memory_limit).batch_size
-            Logger.info "  Streaming mode enabled (batch size: #{batch})"
-          end
           start_time = Time.instant
 
           # Initialize profiler
@@ -348,6 +344,10 @@ module Hwaro
             stream: stream,
             memory_limit: memory_limit,
           )
+          if options.streaming?
+            Logger.info "  Streaming mode enabled (batch size: #{options.batch_size})"
+          end
+
           ctx = Lifecycle::BuildContext.new(options)
           ctx.stats.start_time = Time.instant
           @context = ctx
