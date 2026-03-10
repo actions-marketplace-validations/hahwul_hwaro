@@ -189,6 +189,28 @@ module Hwaro
           end
 
           Logger.info "Fetched #{targets.size} files from remote scaffold."
+
+          warn_dangerous_config(@config_data, label) unless @config_data.empty?
+        end
+
+        # Warn the user if a remote scaffold's config.toml contains settings
+        # that can execute arbitrary commands (build hooks, deploy commands).
+        private def warn_dangerous_config(config_data : String, label : String)
+          dangerous = [] of String
+
+          if config_data.matches?(/hooks\s*\.\s*pre\s*=/m) || config_data.matches?(/hooks\s*\.\s*post\s*=/m)
+            dangerous << "build hooks (hooks.pre / hooks.post)"
+          end
+
+          if config_data.matches?(/command\s*=/m)
+            dangerous << "deploy commands (command)"
+          end
+
+          return if dangerous.empty?
+
+          Logger.warn "Security warning: remote scaffold '#{label}' contains config that can execute shell commands:"
+          dangerous.each { |d| Logger.warn "  - #{d}" }
+          Logger.warn "Review config.toml carefully before running 'hwaro build' or 'hwaro deploy'."
         end
 
         # Extract front matter from markdown content, discarding the body.

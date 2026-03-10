@@ -17,7 +17,7 @@ module Hwaro
         property cache_busting : Bool
 
         def initialize(
-          @host : String = "0.0.0.0",
+          @host : String = "127.0.0.1",
           @port : Int32 = 3000,
           @base_url : String? = nil,
           @drafts : Bool = false,

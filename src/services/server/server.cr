@@ -159,7 +159,7 @@ module Hwaro
         run_with_options(options.host, options.port, options.open_browser, options.access_log, options.live_reload, build_options)
       end
 
-      def run(host : String = "0.0.0.0", port : Int32 = 3000, drafts : Bool = false)
+      def run(host : String = "127.0.0.1", port : Int32 = 3000, drafts : Bool = false)
         build_options = Config::Options::BuildOptions.new(drafts: drafts)
         run_with_options(host, port, false, false, false, build_options)
       end

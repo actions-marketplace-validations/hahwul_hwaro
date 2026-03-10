@@ -1,5 +1,5 @@
 require "file_utils"
-require "digest/md5"
+require "digest/sha256"
 require "set"
 require "uri"
 
@@ -378,7 +378,7 @@ module Hwaro
         a_info = File.info(a)
         b_info = File.info(b)
         return false unless a_info.size == b_info.size
-        Digest::MD5.hexdigest(File.read(a)) == Digest::MD5.hexdigest(File.read(b))
+        Digest::SHA256.hexdigest(File.read(a)) == Digest::SHA256.hexdigest(File.read(b))
       rescue
         false
       end
@@ -455,9 +455,15 @@ module Hwaro
 
       private def expand_placeholders(command : String, source_dir : String, target : Models::DeploymentTarget) : String
         command
-          .gsub("{source}", source_dir)
-          .gsub("{url}", target.url)
-          .gsub("{target}", target.name)
+          .gsub("{source}", shell_escape(source_dir))
+          .gsub("{url}", shell_escape(target.url))
+          .gsub("{target}", shell_escape(target.name))
+      end
+
+      # Escape a string for safe interpolation into a shell command.
+      # Wraps the value in single quotes and escapes any embedded single quotes.
+      private def shell_escape(value : String) : String
+        "'" + value.gsub("'", "'\\''") + "'"
       end
 
       private def local_directory_destination(url : String) : String?

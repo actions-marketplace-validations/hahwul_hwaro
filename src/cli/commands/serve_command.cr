@@ -17,7 +17,7 @@ module Hwaro
         # Flags defined here are used both for OptionParser and completion generation
         FLAGS = [
           FlagInfo.new(short: "-i", long: "--input", description: "Input directory (default: current directory)", takes_value: true, value_hint: "DIR"),
-          FlagInfo.new(short: "-b", long: "--bind", description: "Bind address (default: 0.0.0.0)", takes_value: true, value_hint: "HOST"),
+          FlagInfo.new(short: "-b", long: "--bind", description: "Bind address (default: 127.0.0.1)", takes_value: true, value_hint: "HOST"),
           FlagInfo.new(short: "-p", long: "--port", description: "Port to listen on (default: 3000)", takes_value: true, value_hint: "PORT"),
           FlagInfo.new(short: nil, long: "--base-url", description: "Override base_url from config.toml", takes_value: true, value_hint: "URL"),
           FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content"),
@@ -60,7 +60,7 @@ module Hwaro
 
         private def parse_options(args : Array(String)) : {String?, Config::Options::ServeOptions}
           input_dir = nil.as(String?)
-          host = "0.0.0.0"
+          host = "127.0.0.1"
           port = 3000
           base_url = nil.as(String?)
           drafts = false
@@ -77,7 +77,7 @@ module Hwaro
           OptionParser.parse(args) do |parser|
             parser.banner = "Usage: hwaro serve [options]"
             parser.on("-i DIR", "--input DIR", "Input directory (default: current directory)") { |dir| input_dir = dir }
-            parser.on("-b HOST", "--bind HOST", "Bind address (default: 0.0.0.0)") { |h| host = h }
+            parser.on("-b HOST", "--bind HOST", "Bind address (default: 127.0.0.1)") { |h| host = h }
             parser.on("-p PORT", "--port PORT", "Port to listen on (default: 3000)") { |p| port = p.to_i }
             parser.on("--base-url URL", "Override base_url from config.toml") { |url| base_url = url }
             parser.on("-d", "--drafts", "Include draft content") { drafts = true }

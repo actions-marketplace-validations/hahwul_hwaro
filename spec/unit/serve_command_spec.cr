@@ -29,10 +29,10 @@ describe Hwaro::CLI::Commands::ServeCommand do
       options.error_overlay.should be_false
     end
 
-    it "defaults host to 0.0.0.0" do
+    it "defaults host to 127.0.0.1" do
       cmd = Hwaro::CLI::Commands::ServeCommand.new
       _, options = cmd.test_parse_options([] of String)
-      options.host.should eq("0.0.0.0")
+      options.host.should eq("127.0.0.1")
     end
 
     it "defaults port to 3000" do
