@@ -11,6 +11,7 @@ require "http/client"
 require "json"
 require "uri"
 require "./base"
+require "../../utils/path_utils"
 
 module Hwaro
   module Services
@@ -131,13 +132,21 @@ module Hwaro
             if path == "config.toml"
               targets << {category: :config, key: "", full_path: full_path, display: path}
             elsif path.starts_with?("content/") && path.ends_with?(".md")
-              targets << {category: :content, key: path.sub("content/", ""), full_path: full_path, display: path}
+              key = Utils::PathUtils.sanitize_path(path.sub("content/", ""))
+              next if key.empty?
+              targets << {category: :content, key: key, full_path: full_path, display: path}
             elsif path.starts_with?("templates/shortcodes/")
-              targets << {category: :shortcode, key: path.sub("templates/", ""), full_path: full_path, display: path}
+              key = Utils::PathUtils.sanitize_path(path.sub("templates/", ""))
+              next if key.empty?
+              targets << {category: :shortcode, key: key, full_path: full_path, display: path}
             elsif path.starts_with?("templates/")
-              targets << {category: :template, key: path.sub("templates/", ""), full_path: full_path, display: path}
+              key = Utils::PathUtils.sanitize_path(path.sub("templates/", ""))
+              next if key.empty?
+              targets << {category: :template, key: key, full_path: full_path, display: path}
             elsif path.starts_with?("static/")
-              targets << {category: :static, key: path.sub("static/", ""), full_path: full_path, display: path}
+              key = Utils::PathUtils.sanitize_path(path.sub("static/", ""))
+              next if key.empty?
+              targets << {category: :static, key: key, full_path: full_path, display: path}
             end
           end
 
