@@ -21,8 +21,10 @@ Hwaro(화로) is a fast, lightweight static site generator built with Crystal.
 git clone https://github.com/hahwul/hwaro
 cd hwaro && shards build --release
 
-# Create site
+# Create site (built-in scaffold)
 ./bin/hwaro init my-site --scaffold blog
+# Or use a remote scaffold
+./bin/hwaro init my-site --scaffold github:hahwul/hwaro/docs
 cd my-site
 
 # Start server

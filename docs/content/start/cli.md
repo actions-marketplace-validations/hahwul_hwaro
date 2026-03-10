@@ -18,11 +18,25 @@ hwaro init my-site --scaffold blog
 hwaro init my-site --scaffold docs
 ```
 
+You can also use a remote scaffold from a GitHub repository:
+
+```bash
+# GitHub shorthand
+hwaro init my-site --scaffold github:user/repo
+hwaro init my-site --scaffold github:user/repo/docs
+
+# Full URL
+hwaro init my-site --scaffold https://github.com/user/repo
+hwaro init my-site --scaffold https://github.com/user/repo/tree/main/docs
+```
+
+Remote scaffolds fetch `config.toml`, `templates/`, `static/`, and content structure from the repository. Content files keep only front matter (metadata) so you can see the expected page structure without the original body text. Set `GITHUB_TOKEN` environment variable to avoid API rate limits.
+
 **Options:**
 
 | Flag | Description |
 |------|-------------|
-| --scaffold NAME | Use a scaffold template: simple, blog, docs |
+| --scaffold TYPE | Built-in (`simple`, `blog`, `docs`) or remote source (`github:user/repo[/path]`, URL) |
 | -f, --force | Force creation even if directory is not empty |
 | --skip-agents-md | Skip creating AGENTS.md file |
 | --skip-sample-content | Skip creating sample content files |
