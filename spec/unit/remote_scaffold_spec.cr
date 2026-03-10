@@ -115,4 +115,65 @@ describe Hwaro::Services::Scaffolds::Remote do
       end
     end
   end
+
+  describe "#extract_front_matter (via content_files)" do
+    # Test the extract_front_matter logic directly via a helper instance
+    it "extracts TOML front matter (+++ delimiters)" do
+      input = "+++\ntitle = \"Hello\"\nweight = 1\n+++\n\nThis is body content.\n\n## Heading\n\nMore text."
+      expected = "+++\ntitle = \"Hello\"\nweight = 1\n+++\n"
+
+      # Use a test subclass to expose the private method
+      result = TestRemoteHelper.extract(input)
+      result.should eq(expected)
+    end
+
+    it "extracts YAML front matter (--- delimiters)" do
+      input = "---\ntitle: Hello\nweight: 1\n---\n\nBody content here."
+      expected = "---\ntitle: Hello\nweight: 1\n---\n"
+
+      result = TestRemoteHelper.extract(input)
+      result.should eq(expected)
+    end
+
+    it "returns original content if no front matter" do
+      input = "# Just a heading\n\nSome text."
+      result = TestRemoteHelper.extract(input)
+      result.should eq(input)
+    end
+
+    it "returns original content if front matter is not closed" do
+      input = "+++\ntitle = \"Unclosed\"\nno closing delimiter"
+      result = TestRemoteHelper.extract(input)
+      result.should eq(input)
+    end
+
+    it "handles empty front matter" do
+      input = "+++\n+++\n\nBody."
+      expected = "+++\n+++\n"
+
+      result = TestRemoteHelper.extract(input)
+      result.should eq(expected)
+    end
+  end
+end
+
+# Helper to test the private extract_front_matter method
+class TestRemoteHelper < Hwaro::Services::Scaffolds::Remote
+  def initialize
+    @config_data = ""
+    @content_data = {} of String => String
+    @template_data = {} of String => String
+    @static_data = {} of String => String
+    @shortcode_data = {} of String => String
+    @description_text = "test"
+  end
+
+  def self.extract(content : String) : String
+    instance = new
+    instance.do_extract(content)
+  end
+
+  def do_extract(content : String) : String
+    extract_front_matter(content)
+  end
 end

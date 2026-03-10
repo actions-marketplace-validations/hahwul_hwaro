@@ -4,8 +4,8 @@
 #   - github:owner/repo[/path]     (GitHub shorthand, optional subpath)
 #   - https://github.com/owner/repo[/tree/branch/path]  (Full GitHub URL)
 #
-# Fetches config.toml, templates/, and static/ from the repository (or subpath).
-# Content files are excluded to let users create their own content.
+# Fetches config.toml, templates/, static/, and content/ from the repository (or subpath).
+# Content files keep only front matter (metadata) so users can see the structure.
 
 require "http/client"
 require "json"
@@ -17,6 +17,7 @@ module Hwaro
     module Scaffolds
       class Remote < Base
         @config_data : String
+        @content_data : Hash(String, String)
         @template_data : Hash(String, String)
         @static_data : Hash(String, String)
         @shortcode_data : Hash(String, String)
@@ -27,6 +28,7 @@ module Hwaro
           label = subpath.empty? ? "#{owner}/#{repo}" : "#{owner}/#{repo}/#{subpath}"
           @description_text = "Remote scaffold from #{label}"
           @config_data = ""
+          @content_data = {} of String => String
           @template_data = {} of String => String
           @static_data = {} of String => String
           @shortcode_data = {} of String => String
@@ -42,7 +44,7 @@ module Hwaro
         end
 
         def content_files(skip_taxonomies : Bool = false) : Hash(String, String)
-          {} of String => String
+          @content_data
         end
 
         def template_files(skip_taxonomies : Bool = false) : Hash(String, String)
@@ -125,10 +127,11 @@ module Hwaro
             end
 
             path = prefix.empty? ? full_path : full_path.sub(prefix, "")
-            next if path.starts_with?("content/")
 
             if path == "config.toml"
               targets << {category: :config, key: "", full_path: full_path, display: path}
+            elsif path.starts_with?("content/") && path.ends_with?(".md")
+              targets << {category: :content, key: path.sub("content/", ""), full_path: full_path, display: path}
             elsif path.starts_with?("templates/shortcodes/")
               targets << {category: :shortcode, key: path.sub("templates/", ""), full_path: full_path, display: path}
             elsif path.starts_with?("templates/")
@@ -159,6 +162,8 @@ module Hwaro
             case result[:category]
             when :config
               @config_data = result[:body]
+            when :content
+              @content_data[result[:key]] = extract_front_matter(result[:body])
             when :shortcode
               @shortcode_data[result[:key]] = result[:body]
             when :template
@@ -170,6 +175,32 @@ module Hwaro
           end
 
           Logger.info "Fetched #{targets.size} files from remote scaffold."
+        end
+
+        # Extract front matter from markdown content, discarding the body.
+        # Keeps the +++ delimited TOML front matter block and adds a placeholder.
+        private def extract_front_matter(content : String) : String
+          lines = content.lines
+          return content if lines.empty?
+
+          # Detect front matter delimiter (+++ for TOML, --- for YAML)
+          delimiter = lines[0].strip
+          return content unless delimiter == "+++" || delimiter == "---"
+
+          # Find the closing delimiter
+          close_index = nil
+          lines.each_with_index do |line, i|
+            next if i == 0
+            if line.strip == delimiter
+              close_index = i
+              break
+            end
+          end
+
+          return content unless close_index
+
+          front_matter = lines[0..close_index].join("\n")
+          "#{front_matter}\n"
         end
 
         private def fetch_default_branch(owner : String, repo : String) : String
@@ -226,10 +257,15 @@ module Hwaro
           client.connect_timeout = 10.seconds
           client.read_timeout = 30.seconds
 
-          client.get(path, headers: HTTP::Headers{
+          headers = HTTP::Headers{
             "User-Agent" => "Hwaro",
             "Accept"     => "application/vnd.github.v3+json",
-          })
+          }
+          if token = ENV["GITHUB_TOKEN"]?
+            headers["Authorization"] = "Bearer #{token}"
+          end
+
+          client.get(path, headers: headers)
         end
       end
     end
