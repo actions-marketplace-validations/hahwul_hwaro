@@ -13,10 +13,19 @@ hwaro init my-site --scaffold blog
 cd my-site
 ```
 
-Scaffolds available:
+Built-in scaffolds:
 - `simple` — Landing pages, small sites
 - `blog` — Posts with tags and categories
 - `docs` — Documentation with sidebar
+
+You can also use a remote scaffold from a GitHub repository:
+
+```bash
+hwaro init my-site --scaffold github:hahwul/hwaro/docs
+hwaro init my-site --scaffold https://github.com/user/my-scaffold
+```
+
+Remote scaffolds fetch `config.toml`, `templates/`, `static/`, and content structure (front matter only) from the repository. Use `--skip-sample-content` to skip content files.
 
 ## 2. Start Development Server
 
