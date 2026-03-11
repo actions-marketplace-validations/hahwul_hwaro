@@ -198,6 +198,7 @@ module Hwaro
           Filters::UrlFilters.register(@env)
           Filters::HtmlFilters.register(@env)
           Filters::CollectionFilters.register(@env)
+          Filters::MathFilters.register(@env)
           Filters::MiscFilters.register(@env)
         end
 

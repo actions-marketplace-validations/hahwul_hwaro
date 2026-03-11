@@ -25,6 +25,7 @@ require "../../content/seo/sitemap"
 require "../../content/seo/robots"
 require "../../content/seo/llms"
 require "../../content/seo/tags"
+require "../../content/seo/jsonld"
 require "../../content/search"
 require "../../content/pagination/paginator"
 require "../../content/pagination/renderer"
@@ -2337,6 +2338,14 @@ module Hwaro
           hreflang_tags = Content::Seo::Tags.hreflang_tags(page, config)
           vars["canonical_tag"] = Crinja::Value.new(canonical_tag)
           vars["hreflang_tags"] = Crinja::Value.new(hreflang_tags)
+
+          # JSON-LD structured data
+          jsonld_article = Content::Seo::JsonLd.article(page, config)
+          jsonld_breadcrumb = Content::Seo::JsonLd.breadcrumb(page, config)
+          jsonld_all = Content::Seo::JsonLd.all_tags(page, config)
+          vars["jsonld_article"] = Crinja::Value.new(jsonld_article)
+          vars["jsonld_breadcrumb"] = Crinja::Value.new(jsonld_breadcrumb)
+          vars["jsonld"] = Crinja::Value.new(jsonld_all)
 
           # NOTE: current_year/current_date/current_datetime are now in
           # global_vars (computed once in build_global_vars).
