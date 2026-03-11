@@ -9,7 +9,6 @@
 # so documentation can show literal `{{ ... }}` examples safely.
 
 require "crinja"
-require "markd"
 require "../../utils/logger"
 
 module Hwaro
@@ -17,7 +16,8 @@ module Hwaro
     module Build
       module ShortcodeProcessor
         SHORTCODE_ARGS_REGEX  = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^,\s]+))/
-        POSITIONAL_ARG_REGEX  = /(?:^|,)\s*(?:"([^"]*)"|'([^']*)'|([^,\s=]+))/
+        # NOTE: POSITIONAL_ARG_REGEX is reserved for future use
+        # POSITIONAL_ARG_REGEX  = /(?:^|,)\s*(?:"([^"]*)"|'([^']*)'|([^,\s=]+))/
         MAX_SHORTCODE_NESTING = 5
 
         # Process shortcodes in content (Jinja2/Crinja style)
@@ -69,8 +69,10 @@ module Hwaro
               body = process_shortcodes_in_text(body, templates, context, shortcode_results, crinja_env_override: crinja_env_override, depth: depth + 1)
             end
 
-            # Process markdown in body
-            body = Markd.to_html(body).strip if body.includes?("\n") || body.match(/[*_#\[`~]/)
+            # NOTE: Markdown conversion of shortcode body is left to the shortcode
+            # template itself (e.g. via {{ body | safe }} or a markdown filter).
+            # Automatic conversion was removed to avoid unintended transformations
+            # when body contains characters like *, _, or ` in non-markdown context.
 
             extra_args = {"body" => body}
             render_shortcode_result(name, args_str, templates, context, shortcode_results, match, warn_missing: true, extra_args: extra_args, crinja_env_override: crinja_env_override)

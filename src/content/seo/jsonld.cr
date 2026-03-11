@@ -13,36 +13,42 @@ module Hwaro
           base = config.base_url.rstrip("/")
           url = page.permalink || "#{base}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
 
-          data = {
-            "@context"      => "https://schema.org",
-            "@type"         => "Article",
-            "headline"      => page.title,
-            "url"           => url,
-            "datePublished" => page.date.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z")) || "",
-          }
+          date_published = page.date.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z")) || ""
+          updated_str = page.updated.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z"))
+          desc = page.description
+          image_url = if image = page.image
+                        image.starts_with?("http") ? image : "#{base}#{image.starts_with?("/") ? image : "/#{image}"}"
+                      end
+          author_name = page.authors.first?
 
-          if updated = page.updated
-            data["dateModified"] = updated.to_s("%Y-%m-%dT%H:%M:%S%:z")
+          json = JSON.build do |j|
+            j.object do
+              j.field "@context", "https://schema.org"
+              j.field "@type", "Article"
+              j.field "headline", page.title
+              j.field "url", url
+              j.field "datePublished", date_published
+              if us = updated_str
+                j.field "dateModified", us
+              end
+              if d = desc
+                j.field "description", d
+              end
+              if img = image_url
+                j.field "image", img
+              end
+              if name = author_name
+                j.field "author" do
+                  j.object do
+                    j.field "@type", "Person"
+                    j.field "name", name
+                  end
+                end
+              end
+            end
           end
 
-          if desc = page.description
-            data["description"] = desc
-          end
-
-          if image = page.image
-            img_url = image.starts_with?("http") ? image : "#{base}#{image.starts_with?("/") ? image : "/#{image}"}"
-            data["image"] = img_url
-          end
-
-          unless page.authors.empty?
-            # Use first author for simplicity
-            data["author"] = {
-              "@type" => "Person",
-              "name"  => page.authors.first,
-            }.to_json
-          end
-
-          wrap_script(data)
+          %(<script type="application/ld+json">#{json}</script>)
         end
 
         # Generate BreadcrumbList JSON-LD from page ancestors
@@ -106,23 +112,6 @@ module Hwaro
           parts.join("\n")
         end
 
-        private def wrap_script(data : Hash) : String
-          # Build JSON manually to avoid nested JSON encoding of author
-          json = JSON.build do |json|
-            json.object do
-              data.each do |k, v|
-                if k == "author" && v.is_a?(String) && v.starts_with?("{")
-                  json.field k do
-                    json.raw v
-                  end
-                else
-                  json.field k, v
-                end
-              end
-            end
-          end
-          %(<script type="application/ld+json">#{json}</script>)
-        end
       end
     end
   end

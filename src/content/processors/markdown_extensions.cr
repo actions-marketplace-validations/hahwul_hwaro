@@ -1,3 +1,4 @@
+require "html"
 require "../../models/config"
 
 module Hwaro
@@ -58,13 +59,13 @@ module Hwaro
                 term = lines[i].strip
                 break if term.empty?
 
-                result << "<dt>#{term}</dt>"
+                result << "<dt>#{HTML.escape(term)}</dt>"
                 i += 1
 
                 # Collect definitions for this term
                 while i < lines.size && lines[i].lstrip.starts_with?(": ")
                   definition = lines[i].lstrip.lchop(": ").strip
-                  result << "<dd>#{definition}</dd>"
+                  result << "<dd>#{HTML.escape(definition)}</dd>"
                   i += 1
                 end
 
@@ -93,8 +94,8 @@ module Hwaro
         def preprocess_footnotes(content : String) : String
           # Extract and remove footnote definitions
           footnotes = {} of String => String
-          cleaned = content.gsub(FOOTNOTE_DEF_RE) do |_, match|
-            footnotes[match[1]] = match[2]
+          cleaned = content.gsub(FOOTNOTE_DEF_RE) do |_|
+            footnotes[$~[1]] = $~[2]
             "" # Remove definition from content
           end
 
@@ -103,9 +104,9 @@ module Hwaro
           # Replace references with superscript HTML placeholders
           counter = 0
           ref_order = {} of String => Int32
-          result = cleaned.gsub(FOOTNOTE_REF_RE) do |_, match|
-            key = match[1]
-            next match[0] unless footnotes.has_key?(key)
+          result = cleaned.gsub(FOOTNOTE_REF_RE) do |full_match|
+            key = $~[1]
+            next full_match unless footnotes.has_key?(key)
 
             unless ref_order.has_key?(key)
               counter += 1
@@ -159,14 +160,14 @@ module Hwaro
         # Wraps math expressions in special HTML to prevent Markd from processing them
         def preprocess_math(content : String) : String
           # Display math: $$...$$ (multi-line)
-          result = content.gsub(/\$\$(.*?)\$\$/m) do |_, match|
-            escaped = match[1].gsub("<", "&lt;").gsub(">", "&gt;")
+          result = content.gsub(/\$\$(.*?)\$\$/m) do |_|
+            escaped = $~[1].gsub("<", "&lt;").gsub(">", "&gt;")
             "<div class=\"math math-display\">\\[#{escaped}\\]</div>"
           end
 
           # Inline math: $...$ (single line, no space after opening or before closing $)
-          result = result.gsub(/(?<![\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$(?!\d)/) do |_, match|
-            escaped = match[1].gsub("<", "&lt;").gsub(">", "&gt;")
+          result = result.gsub(/(?<![\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$(?!\d)/) do |_|
+            escaped = $~[1].gsub("<", "&lt;").gsub(">", "&gt;")
             "<span class=\"math math-inline\">\\(#{escaped}\\)</span>"
           end
 
@@ -176,8 +177,8 @@ module Hwaro
         # --- Mermaid ---
         # Post-processing: convert mermaid code blocks to div elements
         def postprocess_mermaid(html : String) : String
-          html.gsub(/<pre><code class="language-mermaid[^"]*">(.*?)<\/code><\/pre>/m) do |_, match|
-            code = match[1]
+          html.gsub(/<pre><code class="language-mermaid[^"]*">(.*?)<\/code><\/pre>/m) do |_|
+            code = $~[1]
               .gsub("&amp;", "&")
               .gsub("&lt;", "<")
               .gsub("&gt;", ">")

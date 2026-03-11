@@ -316,7 +316,7 @@ describe Hwaro::Core::Build::Builder do
   end
 
   describe "markdown in shortcode body" do
-    it "processes markdown in block shortcode body" do
+    it "passes raw body to shortcode template without automatic markdown conversion" do
       builder = Hwaro::Core::Build::Builder.new
       env = Crinja.new
 
@@ -327,7 +327,8 @@ describe Hwaro::Core::Build::Builder do
       content = "{% note() %}\n**bold** text\n{% end %}"
 
       result = builder.test_process_shortcodes_jinja(content, templates, context, crinja_env_override: env)
-      result.should contain("<strong>bold</strong>")
+      # Body is passed as-is; markdown conversion is the template's responsibility
+      result.should contain("**bold** text")
       result.should contain("note")
     end
   end
