@@ -224,8 +224,8 @@ module Hwaro
           end
           toc = toml_fm["toc"]?.try(&.as_bool) || false
 
-          date = parse_time(toml_fm["date"]?.try(&.as_s))
-          updated = parse_time(toml_fm["updated"]?.try(&.as_s))
+          date = parse_toml_time(toml_fm["date"]?)
+          updated = parse_toml_time(toml_fm["updated"]?)
 
           render = true
           if toml_fm.has_key?("render")
@@ -644,6 +644,17 @@ module Hwaro
           end
 
           result.to_s
+        end
+
+        # Parse a TOML value that may be a native Time or a String
+        private def parse_toml_time(val : TOML::Any?) : Time?
+          return nil unless val
+          raw = val.raw
+          if raw.is_a?(Time)
+            raw
+          else
+            parse_time(val.as_s?)
+          end
         end
 
         private def parse_time(time_str : String?) : Time?
