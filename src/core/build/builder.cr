@@ -15,7 +15,6 @@ require "html"
 require "set"
 require "toml"
 require "json"
-require "uri"
 require "crinja"
 require "./cache"
 require "./parallel"
@@ -758,19 +757,19 @@ module Hwaro
               value = case ext
                       when ".yml", ".yaml"
                         if parsed = YAML.parse(content)
-                          to_crinja(parsed)
+                          Utils::CrinjaUtils.from_yaml(parsed)
                         else
                           Crinja::Value.new(nil)
                         end
                       when ".json"
                         if parsed = JSON.parse(content)
-                          to_crinja(parsed)
+                          Utils::CrinjaUtils.from_json(parsed)
                         else
                           Crinja::Value.new(nil)
                         end
                       when ".toml"
                         if parsed = TOML.parse(content)
-                          to_crinja(parsed)
+                          Utils::CrinjaUtils.from_toml(parsed)
                         else
                           Crinja::Value.new(nil)
                         end
@@ -884,22 +883,6 @@ module Hwaro
           end
         end
 
-        # Delegate to shared CrinjaUtils for YAML/TOML/JSON → Crinja::Value conversion
-        private def to_crinja(value : YAML::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_yaml(value)
-        end
-
-        private def to_crinja(value : Hash(String, TOML::Any)) : Crinja::Value
-          Utils::CrinjaUtils.from_toml(value)
-        end
-
-        private def to_crinja(value : TOML::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_toml(value)
-        end
-
-        private def to_crinja(value : JSON::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_json(value)
-        end
 
         LANGUAGE_FILENAME_PATTERN = /^(.+)\.([a-z]{2,3})\.md$/
 
@@ -2119,12 +2102,17 @@ module Hwaro
 
           effective_url = page_url_override || page.url
 
+          # Precompute date strings once to avoid repeated .to_s formatting
+          date_str = page.date.try(&.to_s("%Y-%m-%d")) || ""
+          updated_str = page.updated.try(&.to_s("%Y-%m-%d")) || ""
+          date_crinja = Crinja::Value.new(date_str)
+
           # Page variables (flat for convenience)
           vars["page_title"] = Crinja::Value.new(page.title)
           vars["page_description"] = Crinja::Value.new(page.description || config.description || "")
           vars["page_url"] = Crinja::Value.new(effective_url)
           vars["page_section"] = Crinja::Value.new(page.section)
-          vars["page_date"] = Crinja::Value.new(page.date.try(&.to_s("%Y-%m-%d")) || "")
+          vars["page_date"] = date_crinja
           vars["page_image"] = Crinja::Value.new(page.image || config.og.default_image || "")
           vars["taxonomy_name"] = Crinja::Value.new(page.taxonomy_name || "")
           vars["taxonomy_term"] = Crinja::Value.new(page.taxonomy_term || "")
@@ -2144,8 +2132,8 @@ module Hwaro
           end
           vars["page_translations"] = Crinja::Value.new(translations)
 
-          # Generate permalink
-          page.generate_permalink(config.base_url)
+          # Generate permalink only if not already set
+          page.generate_permalink(config.base_url) unless page.permalink
 
           # Convert authors to Crinja array
           authors_array = page.authors.map { |a| Crinja::Value.new(a) }
@@ -2212,8 +2200,8 @@ module Hwaro
             "description"  => Crinja::Value.new(page.description || ""),
             "url"          => Crinja::Value.new(effective_url),
             "section"      => Crinja::Value.new(page.section),
-            "date"         => Crinja::Value.new(page.date.try(&.to_s("%Y-%m-%d")) || ""),
-            "updated"      => Crinja::Value.new(page.updated.try(&.to_s("%Y-%m-%d")) || ""),
+            "date"         => date_crinja,
+            "updated"      => Crinja::Value.new(updated_str),
             "image"        => Crinja::Value.new(page.image || ""),
             "draft"        => Crinja::Value.new(page.draft),
             "toc"          => Crinja::Value.new(page.toc),
@@ -2393,12 +2381,11 @@ module Hwaro
           vars["canonical_tag"] = Crinja::Value.new(canonical_tag)
           vars["hreflang_tags"] = Crinja::Value.new(hreflang_tags)
 
-          # JSON-LD structured data — reuse individual results instead of calling all_tags again
+          # JSON-LD structured data — generate breadcrumb only when needed
           jsonld_article = Content::Seo::JsonLd.article(page, config)
-          jsonld_breadcrumb = Content::Seo::JsonLd.breadcrumb(page, config)
-          jsonld_parts = [jsonld_article]
-          jsonld_parts << jsonld_breadcrumb unless page.ancestors.empty? && page.is_index
-          jsonld_all = jsonld_parts.join("\n")
+          needs_breadcrumb = !page.ancestors.empty? || !page.is_index
+          jsonld_breadcrumb = needs_breadcrumb ? Content::Seo::JsonLd.breadcrumb(page, config) : ""
+          jsonld_all = needs_breadcrumb ? "#{jsonld_article}\n#{jsonld_breadcrumb}" : jsonld_article
           vars["jsonld_article"] = Crinja::Value.new(jsonld_article)
           vars["jsonld_breadcrumb"] = Crinja::Value.new(jsonld_breadcrumb)
           vars["jsonld"] = Crinja::Value.new(jsonld_all)

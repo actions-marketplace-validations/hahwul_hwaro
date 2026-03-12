@@ -30,6 +30,11 @@ module Hwaro
             content_path = $1
             anchor = $2?
 
+            if content_path.empty?
+              Logger.warn "  [WARN] Empty internal link '@/' in '#{source_path}'"
+              next match
+            end
+
             if page = pages_by_path[content_path]?
               url = page.url
               if anchor && !anchor.empty?
