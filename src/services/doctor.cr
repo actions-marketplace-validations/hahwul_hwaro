@@ -167,12 +167,6 @@ module Hwaro
             message: "Missing description in frontmatter")
         end
 
-        # date check
-        if date.nil?
-          issues << Issue.new(level: :warning, category: "content", file: file_path,
-            message: "Missing date in frontmatter")
-        end
-
         # draft info
         if draft == true
           issues << Issue.new(level: :info, category: "content", file: file_path,
@@ -258,23 +252,19 @@ module Hwaro
         content.sub(TOML_FRONTMATTER_RE, "").sub(YAML_FRONTMATTER_RE, "")
       end
 
-      # Check for internal broken links in markdown body
+      # Check for broken internal links (@/ prefixed) in markdown body
       private def check_internal_links(file_path : String, content : String, issues : Array(Issue))
         body = extract_body(content)
-        # Match markdown links [text](url) — skip images (![...]), external, anchors-only, and mailto
+        # Match markdown links [text](url) — only check @/ prefixed internal links
         body.scan(/(?<!!)\[([^\]]*)\]\(([^\)]+)\)/) do |match|
-          url = match[2].split("#").first.split("?").first.strip
-          next if url.empty?
-          next if url.starts_with?("http://") || url.starts_with?("https://")
-          next if url.starts_with?("mailto:") || url.starts_with?("#")
+          raw_url = match[2].strip
+          next unless raw_url.starts_with?("@/")
 
-          # Resolve relative path from the content file's directory
-          base_dir = File.dirname(file_path)
-          target = if url.starts_with?("/")
-                     File.join(@content_dir, url.lstrip("/"))
-                   else
-                     File.join(base_dir, url)
-                   end
+          # Strip @/ prefix and anchors/query params
+          path = raw_url.lchop("@/").split("#").first.split("?").first.strip
+          next if path.empty?
+
+          target = File.join(@content_dir, path)
 
           # Check if target exists as file or directory (with _index.md or index.md)
           exists = File.exists?(target) ||
@@ -284,7 +274,7 @@ module Hwaro
 
           unless exists
             issues << Issue.new(level: :warning, category: "content", file: file_path,
-              message: "Possible broken internal link: #{match[2]}")
+              message: "Possible broken internal link: #{raw_url}")
           end
         end
       end

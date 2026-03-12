@@ -122,10 +122,10 @@ describe Hwaro::Services::Doctor do
         content_issues.any? { |i| i.message.includes?("Missing description") }.should be_true
       end
 
-      it "warns on missing date" do
+      it "does not warn on missing date" do
         issues = run_doctor(base_config, {"test.md" => "+++\ntitle = \"My Post\"\ndescription = \"A post\"\n+++\n\nHello"})
         content_issues = issues.select { |i| i.category == "content" }
-        content_issues.any? { |i| i.message.includes?("Missing date") }.should be_true
+        content_issues.any? { |i| i.message.includes?("Missing date") }.should be_false
       end
 
       it "reports draft files as info" do
@@ -167,27 +167,35 @@ describe Hwaro::Services::Doctor do
         content_issues.should be_empty
       end
 
-      it "warns on broken internal link" do
+      it "warns on broken @/ internal link" do
         files = {
-          "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[Link](/nonexistent/)\n",
+          "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[Link](@/nonexistent/page.md)\n",
         }
         issues = run_doctor(base_config, files)
         issues.any? { |i| i.message.includes?("broken internal link") }.should be_true
       end
 
-      it "does not warn on valid internal link" do
+      it "does not warn on valid @/ internal link" do
         Dir.mktmpdir do |dir|
           config_path = File.join(dir, "config.toml")
           File.write(config_path, base_config)
           content_dir = File.join(dir, "content")
           FileUtils.mkdir_p(File.join(content_dir, "about"))
           File.write(File.join(content_dir, "about", "_index.md"), "+++\ntitle = \"About\"\ndate = \"2024-01-01\"\ndescription = \"About\"\n+++\n")
-          File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[About](/about/)\n")
+          File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[About](@/about/_index.md)\n")
 
           doctor = Hwaro::Services::Doctor.new(content_dir: content_dir, config_path: config_path)
           issues = doctor.run
           issues.any? { |i| i.message.includes?("broken internal link") }.should be_false
         end
+      end
+
+      it "does not flag web path links as broken" do
+        files = {
+          "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[CLI](/start/cli/#deploy)\n",
+        }
+        issues = run_doctor(base_config, files)
+        issues.any? { |i| i.message.includes?("broken internal link") }.should be_false
       end
 
       it "does not flag external links as broken" do

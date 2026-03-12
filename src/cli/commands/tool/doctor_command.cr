@@ -83,7 +83,7 @@ module Hwaro
             Logger.info "    ☐ search (format)"
             Logger.info ""
             Logger.info "  #{content_dir}/"
-            Logger.info "    ☐ frontmatter (title, description, date)"
+            Logger.info "    ☐ frontmatter (title, description)"
             Logger.info "    ☐ frontmatter parse errors"
             Logger.info "    ☐ image alt text"
             Logger.info "    ☐ draft status"
