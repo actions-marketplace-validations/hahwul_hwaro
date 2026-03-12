@@ -67,6 +67,8 @@ module Hwaro
         @compiled_templates_cache : Hash(UInt64, Crinja::Template) = {} of UInt64 => Crinja::Template
         @pages_by_path : Hash(String, Models::Page)?
         @i18n_translations : Content::I18n::TranslationData = Content::I18n::TranslationData.new
+        # Per-section cache of Crinja::Value arrays, keyed by "section_name:language"
+        @section_pages_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
 
         # Regex constants for HTML minification
         private REGEX_PRE_OPEN    = /<pre([^>]*)>\s*<code/
@@ -135,6 +137,9 @@ module Hwaro
           changed_pages = [] of Models::Page
           affected_sections = Set(String).new
 
+          # Build O(1) lookup map for changed file matching
+          pages_map = @pages_by_path || build_pages_by_path(site)
+
           changed_content_files.each do |file|
             relative_path = begin
               Path[file].relative_to("content").to_s
@@ -142,8 +147,7 @@ module Hwaro
               file.sub(/^content\//, "")
             end
 
-            page = site.pages.find { |p| p.path == relative_path } ||
-                   site.sections.find { |s| s.path == relative_path }
+            page = pages_map[relative_path]?
 
             next unless page
 
@@ -238,6 +242,7 @@ module Hwaro
           # Reload templates from disk & reset compiled template cache
           @templates = nil
           @compiled_templates_cache.clear
+          @section_pages_crinja_cache.clear
           templates = load_templates
           @templates = templates
 
@@ -359,6 +364,7 @@ module Hwaro
           @site = nil
           @templates = nil
           @compiled_templates_cache.clear
+          @section_pages_crinja_cache.clear
 
           # Execute build phases through lifecycle
           result = execute_phases(ctx, profiler)
@@ -605,8 +611,9 @@ module Hwaro
                     end
             total_count += count
 
-            # Release rendered HTML to free memory
+            # Release rendered HTML and per-section caches to free memory
             batch.each { |page| page.content = "" }
+            @section_pages_crinja_cache.clear
             GC.collect
           end
 
@@ -669,76 +676,60 @@ module Hwaro
           result
         end
 
-        # Collect content file paths without parsing
+        # Collect content file paths without parsing (single directory traversal)
         private def collect_content_paths(ctx : Lifecycle::BuildContext, include_drafts : Bool)
           config = ctx.config
-
-          # Collect markdown files
-          Dir.glob("content/**/*.md") do |file_path|
-            relative_path = Path[file_path].relative_to("content").to_s
-            basename = Path[relative_path].basename
-
-            # Extract language from filename (e.g., "about.ko.md" -> "ko", "_index.ko.md" -> "ko")
-            language = extract_language_from_filename(basename, config)
-
-            # Remove language suffix from basename for is_index check
-            clean_basename = if language
-                               basename.sub(/\.#{language}\.md$/, ".md")
-                             else
-                               basename
-                             end
-
-            is_section_index = clean_basename == "_index.md"
-            is_index = clean_basename == "index.md" || is_section_index
-
-            if is_section_index
-              page = Models::Section.new(relative_path)
-              ctx.sections << page
-            else
-              page = Models::Page.new(relative_path)
-              ctx.pages << page
-            end
-
-            # Set basic path info
-            path_parts = Path[relative_path].parts
-            # For nested sections, section is the full path to the directory
-            if is_section_index
-              # For _index.md, section is the directory path
-              page.section = path_parts.size > 1 ? path_parts[0..-2].join("/") : ""
-            elsif is_index
-              # For index.md, section is the parent directory
-              page.section = path_parts.size > 2 ? path_parts[0..-3].join("/") : ""
-            else
-              # For regular pages, section is the directory path
-              page.section = path_parts.size > 1 ? path_parts[0..-2].join("/") : ""
-            end
-            page.is_index = is_index
-            page.language = language
-          end
-
-          # Collect raw files (JSON, XML) for processing
-          collect_raw_files(ctx)
-        end
-
-        # Collect JSON, XML, and configured content files from content directory
-        private def collect_raw_files(ctx : Lifecycle::BuildContext)
-          seen = Set(String).new
-          config = ctx.config
           content_files_enabled = config.try(&.content_files.enabled?) || false
+          seen_raw = Set(String).new
 
-          # Single pass: collect JSON/XML directly, and content files if enabled
+          # Single pass over content directory for both markdown and raw files
           Dir.glob("content/**/*") do |file_path|
             next if File.directory?(file_path)
             relative_path = Path[file_path].relative_to("content").to_s
-            next if seen.includes?(relative_path)
-
             ext = Path[file_path].extension.downcase
-            is_raw = ext == ".json" || ext == ".xml"
-            is_content_file = content_files_enabled && config && Content::Processors::ContentFiles.publish?(relative_path, config)
 
-            if is_raw || is_content_file
-              ctx.raw_files << Lifecycle::RawFile.new(file_path, relative_path)
-              seen << relative_path
+            if ext == ".md"
+              # Process markdown file
+              basename = Path[relative_path].basename
+              language = extract_language_from_filename(basename, config)
+
+              clean_basename = if language
+                                 basename.sub(/\.#{language}\.md$/, ".md")
+                               else
+                                 basename
+                               end
+
+              is_section_index = clean_basename == "_index.md"
+              is_index = clean_basename == "index.md" || is_section_index
+
+              if is_section_index
+                page = Models::Section.new(relative_path)
+                ctx.sections << page
+              else
+                page = Models::Page.new(relative_path)
+                ctx.pages << page
+              end
+
+              path_parts = Path[relative_path].parts
+              if is_section_index
+                page.section = path_parts.size > 1 ? path_parts[0..-2].join("/") : ""
+              elsif is_index
+                page.section = path_parts.size > 2 ? path_parts[0..-3].join("/") : ""
+              else
+                page.section = path_parts.size > 1 ? path_parts[0..-2].join("/") : ""
+              end
+              page.is_index = is_index
+              page.language = language
+            else
+              # Collect raw files (JSON, XML) and content files
+              next if seen_raw.includes?(relative_path)
+              is_raw = ext == ".json" || ext == ".xml"
+              is_content_file = content_files_enabled && config && Content::Processors::ContentFiles.publish?(relative_path, config)
+
+              if is_raw || is_content_file
+                ctx.raw_files << Lifecycle::RawFile.new(file_path, relative_path)
+                seen_raw << relative_path
+              end
             end
           end
         end
@@ -1577,20 +1568,27 @@ module Hwaro
           redirect_url = page.redirect_to
           return unless redirect_url
 
-          escaped_url = Utils::TextUtils.escape_xml(redirect_url)
+          html_escaped_url = Utils::TextUtils.escape_xml(redirect_url)
+          # For JavaScript context: escape backslashes, quotes, newlines, and </script>
+          js_escaped_url = redirect_url
+            .gsub("\\", "\\\\")
+            .gsub("\"", "\\\"")
+            .gsub("\n", "\\n")
+            .gsub("\r", "\\r")
+            .gsub("</", "<\\/")
 
           redirect_html = <<-HTML
           <!DOCTYPE html>
           <html>
           <head>
             <meta charset="utf-8">
-            <meta http-equiv="refresh" content="0; url=#{escaped_url}">
-            <link rel="canonical" href="#{escaped_url}">
+            <meta http-equiv="refresh" content="0; url=#{html_escaped_url}">
+            <link rel="canonical" href="#{html_escaped_url}">
             <title>Redirecting...</title>
           </head>
           <body>
-            <p>Redirecting to <a href="#{escaped_url}">#{escaped_url}</a>...</p>
-            <script>window.location.href = "#{escaped_url}";</script>
+            <p>Redirecting to <a href="#{html_escaped_url}">#{html_escaped_url}</a>...</p>
+            <script>window.location.href = "#{js_escaped_url}";</script>
           </body>
           </html>
           HTML
@@ -1617,11 +1615,10 @@ module Hwaro
           error_overlay : Bool = false,
         )
           # Get pages in this section using the site utility method
+          # Note: sorting is handled by Paginator.paginate (uses section.sort_by setting)
           section_name = Path[section.path].dirname
           section_name = "" if section_name == "."
-          section_pages = site.pages_for_section(section_name, section.language).dup
-
-          section_pages.sort_by! { |p| p.title }
+          section_pages = site.pages_for_section(section_name, section.language)
 
           # Create paginator and render
           paginator = Content::Pagination::Paginator.new(site.config)
@@ -1707,11 +1704,8 @@ module Hwaro
           # Use the site utility method to get pages for the current section
           section_name = current_page.section
           section_pages = site.pages_for_section(section_name, current_page.language)
-
-          # Exclude the current page if it was included
-          section_pages.reject! { |p| p == current_page }
-
-          section_pages.sort_by! { |p| p.title }
+            .reject { |p| p == current_page }
+            .sort_by { |p| p.title }
 
           String.build do |str|
             section_pages.each do |p|
@@ -1858,6 +1852,49 @@ module Hwaro
           end
         end
 
+        # Convert a Page to a Crinja::Value hash for use in section page lists and paginator.
+        # This is a shared helper to avoid duplicating the same conversion in multiple places.
+        private def page_to_crinja_list_value(p : Models::Page, default_language : String) : Crinja::Value
+          Crinja::Value.new({
+            "title"       => Crinja::Value.new(p.title),
+            "description" => Crinja::Value.new(p.description || ""),
+            "url"         => Crinja::Value.new(p.url),
+            "date"        => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
+            "image"       => Crinja::Value.new(p.image || ""),
+            "draft"       => Crinja::Value.new(p.draft),
+            "toc"         => Crinja::Value.new(p.toc),
+            "render"      => Crinja::Value.new(p.render),
+            "is_index"    => Crinja::Value.new(p.is_index),
+            "generated"   => Crinja::Value.new(p.generated),
+            "in_sitemap"  => Crinja::Value.new(p.in_sitemap),
+            "language"    => Crinja::Value.new(p.language || default_language),
+          })
+        end
+
+        # Get (or build and cache) the sorted Crinja::Value array for a section's pages.
+        # The cache stores the full sorted list; callers should filter current_page themselves if needed.
+        private def cached_section_pages_crinja(
+          section_name : String,
+          language : String?,
+          site : Models::Site,
+        ) : Array(Crinja::Value)
+          cache_key = "#{section_name}:#{language}"
+          @section_pages_crinja_cache[cache_key]? || begin
+            pages = site.pages_for_section(section_name, language)
+
+            # Use section's sort_by setting if available, otherwise sort by title
+            section = site.sections.find { |s| s.section == section_name }
+            sort_by = section.try(&.sort_by) || "title"
+            reverse = section.try(&.reverse) || false
+            pages = Utils::SortUtils.sort_pages(pages, sort_by, reverse)
+
+            default_lang = site.config.default_language
+            arr = pages.map { |p| page_to_crinja_list_value(p, default_lang) }
+            @section_pages_crinja_cache[cache_key] = arr
+            arr
+          end
+        end
+
         # Build global template variables once
         # Build a lookup map from content path → Page for internal link resolution.
         private def build_pages_by_path(site : Models::Site) : Hash(String, Models::Page)
@@ -1906,7 +1943,10 @@ module Hwaro
           vars["__all_pages__"] = Crinja::Value.new(all_pages_array)
           vars["__pages_by_path__"] = Crinja::Value.new(pages_by_path)
 
-          all_sections_array = site.sections.map do |s|
+          all_sections_array = [] of Crinja::Value
+          sections_by_key = {} of String => Crinja::Value
+
+          site.sections.each do |s|
             section_pages = s.pages.map do |sp|
               Crinja::Value.new({
                 "title" => Crinja::Value.new(sp.title),
@@ -1914,7 +1954,7 @@ module Hwaro
                 "date"  => Crinja::Value.new(sp.date.try(&.to_s("%Y-%m-%d")) || ""),
               })
             end
-            Crinja::Value.new({
+            section_val = Crinja::Value.new({
               "path"        => Crinja::Value.new(s.path),
               "name"        => Crinja::Value.new(s.section),
               "title"       => Crinja::Value.new(s.title),
@@ -1924,8 +1964,15 @@ module Hwaro
               "pages_count" => Crinja::Value.new(s.pages.size),
               "assets"      => Crinja::Value.new(s.assets.map { |a| Crinja::Value.new(a) }),
             })
+            all_sections_array << section_val
+
+            # Build O(1) lookup map for get_section() — match by path, name, and URL
+            sections_by_key[s.path] ||= section_val
+            sections_by_key[s.section] ||= section_val unless s.section.empty?
+            sections_by_key[s.url] ||= section_val
           end
           vars["__all_sections__"] = Crinja::Value.new(all_sections_array)
+          vars["__sections_by_key__"] = Crinja::Value.new(sections_by_key)
 
           # Build taxonomies hash for get_taxonomy function
           taxonomies_hash = {} of String => Crinja::Value
@@ -2240,33 +2287,18 @@ module Hwaro
           end
 
           if !current_section.empty?
-            # Use paginated pages if provided (for section pages with pagination)
-            # Otherwise, fall back to full section pages list
-            section_pages = if paginator
-                              paginator.pages
-                            else
-                              pages = site.pages_for_section(current_section, page.language).dup
-                              # Exclude the current page if it was included
-                              pages.reject! { |p| p == page }
-                              pages.sort_by! { |p| p.title }
-                              pages
-                            end
-
-            section_pages_array = section_pages.map do |p|
-              Crinja::Value.new({
-                "title"       => Crinja::Value.new(p.title),
-                "description" => Crinja::Value.new(p.description || ""),
-                "url"         => Crinja::Value.new(p.url),
-                "date"        => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
-                "image"       => Crinja::Value.new(p.image || ""),
-                "draft"       => Crinja::Value.new(p.draft),
-                "toc"         => Crinja::Value.new(p.toc),
-                "render"      => Crinja::Value.new(p.render),
-                "is_index"    => Crinja::Value.new(p.is_index),
-                "generated"   => Crinja::Value.new(p.generated),
-                "in_sitemap"  => Crinja::Value.new(p.in_sitemap),
-                "language"    => Crinja::Value.new(p.language || config.default_language),
-              })
+            if paginator
+              # Paginated: convert paginator's page subset
+              default_lang = config.default_language
+              section_pages_array = paginator.pages.map { |p| page_to_crinja_list_value(p, default_lang) }
+            else
+              # Non-paginated: use per-section cache, then exclude current page
+              all_section = cached_section_pages_crinja(current_section, page.language, site)
+              page_url_str = page.url
+              section_pages_array = all_section.reject do |v|
+                raw = v.raw
+                raw.is_a?(Hash) && raw["url"]?.try(&.to_s) == page_url_str
+              end
             end
           end
           vars["section_title"] = Crinja::Value.new(section_title)
@@ -2307,6 +2339,7 @@ module Hwaro
           vars["pagination_seo_links"] = Crinja::Value.new(pagination_seo_links)
 
           if paginator
+            # Reuse section_pages_array already built above for paginator.pages
             paginator_obj = {
               "paginate_by"   => Crinja::Value.new(paginator.per_page),
               "base_url"      => Crinja::Value.new(paginator.base_url),
@@ -2315,28 +2348,7 @@ module Hwaro
               "last"          => Crinja::Value.new(paginator.last_url),
               "previous"      => Crinja::Value.new(paginator.prev_url),
               "next"          => Crinja::Value.new(paginator.next_url),
-              "pages"         => Crinja::Value.new(paginator.pages.map do |p|
-                Crinja::Value.new({
-                  "title"        => Crinja::Value.new(p.title),
-                  "description"  => Crinja::Value.new(p.description || ""),
-                  "url"          => Crinja::Value.new(p.url),
-                  "date"         => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
-                  "image"        => Crinja::Value.new(p.image || ""),
-                  "draft"        => Crinja::Value.new(p.draft),
-                  "toc"          => Crinja::Value.new(p.toc),
-                  "render"       => Crinja::Value.new(p.render),
-                  "is_index"     => Crinja::Value.new(p.is_index),
-                  "generated"    => Crinja::Value.new(p.generated),
-                  "in_sitemap"   => Crinja::Value.new(p.in_sitemap),
-                  "language"     => Crinja::Value.new(p.language || config.default_language),
-                  "summary"      => Crinja::Value.new(p.effective_summary || ""),
-                  "word_count"   => Crinja::Value.new(p.word_count),
-                  "reading_time" => Crinja::Value.new(p.reading_time),
-                  "permalink"    => Crinja::Value.new(p.permalink || ""),
-                  "weight"       => Crinja::Value.new(p.weight),
-                  "authors"      => Crinja::Value.new(p.authors.map { |a| Crinja::Value.new(a) }),
-                })
-              end),
+              "pages"         => Crinja::Value.new(section_pages_array),
               "current_index" => Crinja::Value.new(paginator.page_number),
               "total_pages"   => Crinja::Value.new(paginator.total_items),
             }

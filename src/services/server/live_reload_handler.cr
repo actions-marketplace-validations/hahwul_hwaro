@@ -26,13 +26,15 @@ module Hwaro
       end
 
       def notify_reload
+        dead = [] of HTTP::WebSocket
         @sockets.each do |socket|
           begin
             socket.send("reload")
           rescue
-            @sockets.delete(socket)
+            dead << socket
           end
         end
+        dead.each { |s| @sockets.delete(s) }
       end
     end
 
