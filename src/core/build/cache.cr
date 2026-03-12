@@ -143,8 +143,6 @@ module Hwaro
         def enabled? : Bool
           @enabled
         end
-
-
       end
     end
   end

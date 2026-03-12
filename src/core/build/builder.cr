@@ -617,7 +617,7 @@ module Hwaro
             # Release rendered HTML and per-section caches to free memory
             batch.each { |page| page.content = "" }
             @section_pages_crinja_cache.clear
-          @section_assets_crinja_cache.clear
+            @section_assets_crinja_cache.clear
             GC.collect
           end
 
@@ -882,7 +882,6 @@ module Hwaro
             site.authors[id] = Crinja::Value.new(author_hash)
           end
         end
-
 
         LANGUAGE_FILENAME_PATTERN = /^(.+)\.([a-z]{2,3})\.md$/
 
@@ -1689,7 +1688,6 @@ module Hwaro
 
           "page"
         end
-
 
         private def generate_aliases(page : Models::Page, output_dir : String, verbose : Bool)
           page.aliases.each do |alias_path|
