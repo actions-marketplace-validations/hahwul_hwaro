@@ -69,6 +69,8 @@ module Hwaro
         @i18n_translations : Content::I18n::TranslationData = Content::I18n::TranslationData.new
         # Per-section cache of Crinja::Value arrays, keyed by "section_name:language"
         @section_pages_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
+        # Per-section cache of Crinja::Value arrays for section assets, keyed by section name
+        @section_assets_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
 
         # Regex constants for HTML minification
         private REGEX_PRE_OPEN    = /<pre([^>]*)>\s*<code/
@@ -243,6 +245,7 @@ module Hwaro
           @templates = nil
           @compiled_templates_cache.clear
           @section_pages_crinja_cache.clear
+          @section_assets_crinja_cache.clear
           templates = load_templates
           @templates = templates
 
@@ -365,6 +368,7 @@ module Hwaro
           @templates = nil
           @compiled_templates_cache.clear
           @section_pages_crinja_cache.clear
+          @section_assets_crinja_cache.clear
 
           # Execute build phases through lifecycle
           result = execute_phases(ctx, profiler)
@@ -614,6 +618,7 @@ module Hwaro
             # Release rendered HTML and per-section caches to free memory
             batch.each { |page| page.content = "" }
             @section_pages_crinja_cache.clear
+          @section_assets_crinja_cache.clear
             GC.collect
           end
 
@@ -1488,6 +1493,7 @@ module Hwaro
           shortcode_results = {} of String => String
           raw = page.raw_content
           has_shortcodes = raw.includes?("{{") || raw.includes?("{%")
+          shortcode_context : Hash(String, Crinja::Value)? = nil
 
           processed_content = if has_shortcodes
                                 shortcode_context = build_template_variables(page, site, "", "", "", "", nil, nil, global_vars)
@@ -1539,7 +1545,8 @@ module Hwaro
 
             final_html = if template_content
                            apply_template(template_content, html_content, page, site, section_list_html, toc_html, templates, global_vars: global_vars,
-                             crinja_env_override: crinja_env_override, template_cache_override: template_cache_override)
+                             crinja_env_override: crinja_env_override, template_cache_override: template_cache_override,
+                             prebuilt_vars: shortcode_context)
                          else
                            msg = "No template found for #{page.path}. Using raw content."
                            Logger.warn "  [WARN] #{msg}"
@@ -1700,21 +1707,6 @@ module Hwaro
           "page"
         end
 
-        private def generate_section_list(current_page : Models::Page, site : Models::Site) : String
-          # Use the site utility method to get pages for the current section
-          section_name = current_page.section
-          section_pages = site.pages_for_section(section_name, current_page.language)
-            .reject { |p| p == current_page }
-            .sort_by { |p| p.title }
-
-          String.build do |str|
-            section_pages.each do |p|
-              full_url = HTML.escape("#{site.config.base_url}#{p.url}")
-              escaped_title = HTML.escape(p.title)
-              str << "<li><a href=\"#{full_url}\">#{escaped_title}</a></li>\n"
-            end
-          end
-        end
 
         private def generate_aliases(page : Models::Page, output_dir : String, verbose : Bool)
           page.aliases.each do |alias_path|
@@ -1816,13 +1808,19 @@ module Hwaro
           crinja_env_override : Crinja? = nil,
           template_cache_override : Hash(UInt64, Crinja::Template)? = nil,
           pagination_seo_links : String = "",
+          prebuilt_vars : Hash(String, Crinja::Value)? = nil,
         ) : String
           # Use per-worker env when provided (parallel path), otherwise shared env
           env = crinja_env_override || crinja_env
           cache = template_cache_override || @compiled_templates_cache
 
-          # Build template variables
-          vars = build_template_variables(page, site, content, section_list, toc, pagination, page_url_override, paginator, global_vars, pagination_seo_links: pagination_seo_links)
+          # Build template variables — reuse prebuilt_vars if available (shortcode path)
+          vars = if pv = prebuilt_vars
+                   update_content_vars(pv, content, section_list, toc, pagination, pagination_seo_links)
+                   pv
+                 else
+                   build_template_variables(page, site, content, section_list, toc, pagination, page_url_override, paginator, global_vars, pagination_seo_links: pagination_seo_links)
+                 end
 
           begin
             # Process shortcodes in template first (convert to Jinja2 include syntax)
@@ -1850,6 +1848,25 @@ module Hwaro
             page.build_warnings << msg unless page.build_warnings.includes?(msg)
             content
           end
+        end
+
+        # Update only content-dependent vars in a pre-built template variables hash.
+        # Used to avoid rebuilding the entire variables hash when only content/toc/pagination change
+        # (e.g., reusing shortcode context for final template rendering).
+        private def update_content_vars(
+          vars : Hash(String, Crinja::Value),
+          content : String,
+          section_list : String,
+          toc : String,
+          pagination : String,
+          pagination_seo_links : String,
+        )
+          vars["content"] = Crinja::Value.new(content)
+          vars["section_list"] = Crinja::Value.new(section_list)
+          vars["toc"] = Crinja::Value.new(toc)
+          vars["toc_obj"] = Crinja::Value.new({"html" => Crinja::Value.new(toc)})
+          vars["pagination"] = Crinja::Value.new(pagination)
+          vars["pagination_seo_links"] = Crinja::Value.new(pagination_seo_links)
         end
 
         # Convert a Page to a Crinja::Value hash for use in section page lists and paginator.
@@ -2281,8 +2298,12 @@ module Hwaro
               section_title = section_page.title
               section_description = section_page.description || ""
               current_section = page.section
-              # Use the section page's assets
-              section_assets_array = section_page.assets.map { |a| Crinja::Value.new(a) }
+              # Use cached section assets to avoid re-allocating per page
+              section_assets_array = @section_assets_crinja_cache[page.section]? || begin
+                arr = section_page.assets.map { |a| Crinja::Value.new(a) }
+                @section_assets_crinja_cache[page.section] = arr
+                arr
+              end
             end
           end
 
