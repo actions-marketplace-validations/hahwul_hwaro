@@ -12,6 +12,7 @@
 # https://jinja.palletsprojects.com/en/3.1.x/templates/
 # https://github.com/straight-shoota/crinja
 
+require "csv"
 require "crinja"
 require "./filters/*"
 require "../../utils/crinja_utils"
@@ -478,10 +479,9 @@ module Hwaro
                   yaml_data = YAML.parse(content)
                   result = yaml_to_crinja(yaml_data)
                 elsif path.ends_with?(".csv")
-                  # Parse CSV as array of arrays
-                  lines = content.split("\n").reject(&.empty?)
-                  csv_data = lines.map do |line|
-                    Crinja::Value.new(line.split(",").map { |cell| Crinja::Value.new(cell.strip) })
+                  # Parse CSV using stdlib parser (handles quoted fields correctly)
+                  csv_data = CSV.parse(content).map do |row|
+                    Crinja::Value.new(row.map { |cell| Crinja::Value.new(cell.strip) })
                   end
                   result = Crinja::Value.new(csv_data)
                 end

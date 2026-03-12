@@ -90,7 +90,7 @@ module Hwaro
 
       def pages_for_section(section_name : String, language : String?, items : Array(Page)? = nil) : Array(Page)
         # Normalize section name: remove leading/trailing slashes and handle root
-        normalized_name = section_name.strip.gsub(/^\/|\/$/, "")
+        normalized_name = section_name.strip.strip('/')
 
         if @lookup_index_built && items.nil?
           cache_key = {normalized_name, language}

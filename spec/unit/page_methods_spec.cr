@@ -123,18 +123,19 @@ describe Hwaro::Models::Page do
   end
 
   describe "#extract_summary" do
-    it "extracts summary from content before <!-- more --> marker with TOML front matter" do
+    it "extracts summary from content before <!-- more --> marker (front matter already stripped)" do
       page = Hwaro::Models::Page.new("test.md")
-      page.raw_content = "+++\ntitle = \"Test\"\n+++\n\nThis is the summary.\n\n<!-- more -->\n\nThis is the rest."
+      # In production, raw_content has front matter already stripped by the parser
+      page.raw_content = "This is the summary.\n\n<!-- more -->\n\nThis is the rest."
       summary = page.extract_summary
       summary.should_not be_nil
       summary.not_nil!.should eq("This is the summary.")
       page.summary.should eq("This is the summary.")
     end
 
-    it "extracts summary from content before <!-- more --> marker with YAML front matter" do
+    it "extracts summary from multiline content before <!-- more --> marker" do
       page = Hwaro::Models::Page.new("test.md")
-      page.raw_content = "---\ntitle: Test\n---\n\nSummary paragraph.\n\n<!-- more -->\n\nFull content."
+      page.raw_content = "Summary paragraph.\n\n<!-- more -->\n\nFull content."
       summary = page.extract_summary
       summary.should_not be_nil
       summary.not_nil!.should eq("Summary paragraph.")
@@ -150,7 +151,7 @@ describe Hwaro::Models::Page do
 
     it "returns nil when no <!-- more --> marker exists" do
       page = Hwaro::Models::Page.new("test.md")
-      page.raw_content = "+++\ntitle = \"Test\"\n+++\n\nNo marker in this content."
+      page.raw_content = "No marker in this content."
       summary = page.extract_summary
       summary.should be_nil
     end
@@ -172,9 +173,9 @@ describe Hwaro::Models::Page do
 
     it "returns nil when summary portion is empty" do
       page = Hwaro::Models::Page.new("test.md")
-      page.raw_content = "+++\ntitle = \"Test\"\n+++\n\n<!-- more -->\n\nOnly after marker."
+      page.raw_content = "<!-- more -->\n\nOnly after marker."
       summary = page.extract_summary
-      # The content between front matter and marker is empty after strip
+      # The content before the marker is empty after strip
       summary.should be_nil
     end
 

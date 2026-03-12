@@ -88,13 +88,6 @@ module Hwaro
       # New: Redirect to - URL to redirect this page to
       property redirect_to : String?
 
-      # Regex constants for word count calculation
-      # Compile regexes once at startup instead of every time the method is called
-      REGEX_FRONT_MATTER    = /\A(\+\+\+|---)\s*\n.*?\n\1\s*\n/m
-      REGEX_HTML_TAGS       = /<[^>]+>/
-      REGEX_MARKDOWN_SYNTAX = /[#*_`\[\]()~>|]/
-      REGEX_WHITESPACE      = /\s+/
-
       def initialize(@path : String)
         @title = "Untitled"
         @draft = false
@@ -202,13 +195,11 @@ module Hwaro
 
       # Extract summary from content using <!-- more --> marker
       # Returns content before the marker, or nil if no marker found
+      # Note: @raw_content has front matter already stripped during parsing
+      MORE_MARKER_REGEX = /\A(.*?)<!--\s*more\s*-->/mi
+
       def extract_summary : String?
-        # Check for <!-- more --> marker in raw content
-        if match = @raw_content.match(/\A(\+\+\+|---)\s*\n.*?\n\1\s*\n(.*?)<!--\s*more\s*-->/mi)
-          summary_md = match[2].strip
-          @summary = summary_md unless summary_md.empty?
-        elsif match = @raw_content.match(/\A(.*?)<!--\s*more\s*-->/mi)
-          # No front matter case
+        if match = @raw_content.match(MORE_MARKER_REGEX)
           summary_md = match[1].strip
           @summary = summary_md unless summary_md.empty?
         end

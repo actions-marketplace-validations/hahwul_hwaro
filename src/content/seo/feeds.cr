@@ -193,9 +193,9 @@ module Hwaro
               content = get_content_for_feed(page, config.feeds.truncate)
               str << "      <description>#{Utils::TextUtils.escape_xml(content)}</description>\n"
 
-              # Add date if available (prefer updated, then date)
-              if date = (page.updated || page.date)
-                str << "      <pubDate>#{date.to_rfc2822}</pubDate>\n"
+              # Add pubDate (publication date) and separate lastBuildDate if updated
+              if pub_date = page.date
+                str << "      <pubDate>#{pub_date.to_rfc2822}</pubDate>\n"
               end
 
               str << "    </item>\n"

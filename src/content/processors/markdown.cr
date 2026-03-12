@@ -485,8 +485,8 @@ module Hwaro
         private def extract_extra_value(value : TOML::Any | YAML::Any) : String | Bool | Int64 | Float64 | Array(String)
           if str = value.as_s?
             str
-          elsif bool = value.as_bool?
-            bool
+          elsif !value.as_bool?.nil?
+            value.as_bool?.not_nil!
           elsif int = value.as_i?
             int.to_i64
           elsif float = value.as_f?

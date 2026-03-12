@@ -53,6 +53,8 @@ module Hwaro
         # Track build statistics
         property stats : BuildStats
 
+        @all_pages_cache : Array(Models::Page)?
+
         def initialize(@options : Config::Options::BuildOptions)
           @pages = [] of Models::Page
           @sections = [] of Models::Section
@@ -63,9 +65,14 @@ module Hwaro
           @stats = BuildStats.new
         end
 
-        # Convenience: all pages including sections
+        # Convenience: all pages including sections (cached after first call)
         def all_pages : Array(Models::Page)
-          (@pages + @sections).as(Array(Models::Page))
+          @all_pages_cache ||= (@pages + @sections).as(Array(Models::Page))
+        end
+
+        # Invalidate the cached all_pages array (call after modifying pages/sections)
+        def invalidate_all_pages_cache
+          @all_pages_cache = nil
         end
 
         # Set metadata with type safety

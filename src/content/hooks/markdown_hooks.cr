@@ -95,6 +95,7 @@ module Hwaro
           unless ctx.options.drafts
             ctx.pages.reject! { |p| p.draft }
             ctx.sections.reject! { |s| s.draft }
+            ctx.invalidate_all_pages_cache
           end
         end
 
