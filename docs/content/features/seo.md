@@ -1,5 +1,6 @@
 +++
 title = "SEO"
+description = "Built-in sitemaps, RSS feeds, robots.txt, and social sharing meta tags"
 weight = 1
 +++
 

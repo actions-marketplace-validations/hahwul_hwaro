@@ -1,5 +1,6 @@
 +++
 title = "Pages"
+description = "Create pages from Markdown with front matter metadata"
 weight = 2
 toc = true
 +++

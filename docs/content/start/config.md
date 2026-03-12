@@ -1,5 +1,6 @@
 +++
 title = "Configuration"
+description = "Site configuration reference for config.toml"
 weight = 4
 toc = true
 +++

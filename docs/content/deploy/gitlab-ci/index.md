@@ -1,5 +1,6 @@
 +++
 title = "GitLab CI"
+description = "Deploy your Hwaro site using GitLab CI/CD"
 weight = 3
 +++
 

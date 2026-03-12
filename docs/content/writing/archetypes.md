@@ -1,5 +1,6 @@
 +++
 title = "Archetypes"
+description = "Content templates for consistent front matter and structure"
 weight = 5
 toc = true
 +++

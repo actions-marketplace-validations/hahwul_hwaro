@@ -1,5 +1,6 @@
 +++
 title = "Auto Includes"
+description = "Automatically load CSS and JS files into all pages"
 weight = 6
 toc = true
 +++

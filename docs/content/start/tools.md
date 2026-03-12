@@ -1,5 +1,6 @@
 +++
 title = "Tools & Completion"
+description = "Utility tools for content management and shell completion"
 weight = 5
 toc = true
 +++
@@ -255,9 +256,8 @@ This command checks:
 
 - Missing `title` in frontmatter
 - Missing `description` in frontmatter
-- Missing `date` in frontmatter
 - Images without alt text (`![](url)`)
-- Broken internal links (relative/absolute paths that don't resolve)
+- Broken internal links (`@/` prefixed paths that don't resolve)
 - Frontmatter parse errors (TOML/YAML)
 - Draft files (reported as info)
 

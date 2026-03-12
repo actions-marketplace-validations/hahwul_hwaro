@@ -1,5 +1,6 @@
 +++
 title = "LLMs.txt"
+description = "Generate llms.txt files for AI and LLM crawlers"
 weight = 9
 toc = true
 +++

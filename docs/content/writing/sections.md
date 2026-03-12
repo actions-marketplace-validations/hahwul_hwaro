@@ -1,5 +1,6 @@
 +++
 title = "Sections"
+description = "Group related content with directory sections"
 weight = 2
 toc = true
 +++

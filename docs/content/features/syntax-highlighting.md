@@ -1,5 +1,6 @@
 +++
 title = "Syntax Highlighting"
+description = "Automatic syntax highlighting for code blocks"
 weight = 3
 +++
 

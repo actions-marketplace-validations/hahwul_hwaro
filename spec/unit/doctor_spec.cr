@@ -198,6 +198,22 @@ describe Hwaro::Services::Doctor do
         issues.any? { |i| i.message.includes?("broken internal link") }.should be_false
       end
 
+      it "does not flag @/ links inside code blocks" do
+        files = {
+          "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n```markdown\n[Link](@/nonexistent/page.md)\n```\n",
+        }
+        issues = run_doctor(base_config, files)
+        issues.any? { |i| i.message.includes?("broken internal link") }.should be_false
+      end
+
+      it "does not flag images inside code blocks" do
+        files = {
+          "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n```markdown\n![](example.png)\n```\n",
+        }
+        issues = run_doctor(base_config, files)
+        issues.any? { |i| i.message.includes?("alt text") }.should be_false
+      end
+
       it "does not flag external links as broken" do
         files = {
           "post.md" => "+++\ntitle = \"Post\"\ndate = \"2024-01-01\"\ndescription = \"A post\"\n+++\n\n[Google](https://google.com)\n",

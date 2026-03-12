@@ -239,8 +239,8 @@ module Hwaro
 
       # Check for images with empty alt text: ![](url)
       private def check_image_alt(file_path : String, content : String, issues : Array(Issue))
-        # Extract body after frontmatter
-        body = extract_body(content)
+        # Extract body after frontmatter, stripping code blocks
+        body = strip_code_blocks(extract_body(content))
         body.scan(/!\[\s*\]\([^\)]+\)/) do |match|
           issues << Issue.new(level: :warning, category: "content", file: file_path,
             message: "Image missing alt text: #{match[0]}")
@@ -252,9 +252,15 @@ module Hwaro
         content.sub(TOML_FRONTMATTER_RE, "").sub(YAML_FRONTMATTER_RE, "")
       end
 
+      # Strip fenced code blocks and inline code from text to avoid false positives
+      private def strip_code_blocks(text : String) : String
+        text.gsub(/(?ms)^(`{3,}|~{3,})[^\n]*\n.*?^\1\s*$/, "")
+            .gsub(/`[^`]+`/, "")
+      end
+
       # Check for broken internal links (@/ prefixed) in markdown body
       private def check_internal_links(file_path : String, content : String, issues : Array(Issue))
-        body = extract_body(content)
+        body = strip_code_blocks(extract_body(content))
         # Match markdown links [text](url) — only check @/ prefixed internal links
         body.scan(/(?<!!)\[([^\]]*)\]\(([^\)]+)\)/) do |match|
           raw_url = match[2].strip

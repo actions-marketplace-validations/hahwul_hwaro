@@ -1,5 +1,6 @@
 +++
 title = "Installation"
+description = "Install Hwaro from source or pre-built binary"
 weight = 1
 toc = true
 +++

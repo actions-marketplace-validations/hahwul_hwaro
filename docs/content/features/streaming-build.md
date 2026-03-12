@@ -1,5 +1,6 @@
 +++
 title = "Streaming Build"
+description = "Reduce memory usage by processing pages in batches"
 weight = 9
 toc = true
 +++

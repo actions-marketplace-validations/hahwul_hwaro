@@ -1,5 +1,6 @@
 +++
 title = "Syntax"
+description = "Jinja2-compatible template syntax reference"
 weight = 2
 toc = true
 +++

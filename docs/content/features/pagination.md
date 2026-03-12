@@ -1,5 +1,6 @@
 +++
 title = "Pagination"
+description = "Split large content lists into multiple pages"
 weight = 4
 +++
 

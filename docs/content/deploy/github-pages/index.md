@@ -1,5 +1,6 @@
 +++
 title = "GitHub Pages"
+description = "Deploy your Hwaro site to GitHub Pages"
 weight = 2
 +++
 

@@ -1,5 +1,6 @@
 +++
 title = "Shortcodes"
+description = "Reusable template snippets for Markdown content"
 weight = 4
 toc = true
 +++

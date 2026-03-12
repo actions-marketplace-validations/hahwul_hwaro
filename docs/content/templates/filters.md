@@ -1,5 +1,6 @@
 +++
 title = "Filters"
+description = "Transform values in templates with the pipe operator"
 weight = 4
 toc = true
 +++

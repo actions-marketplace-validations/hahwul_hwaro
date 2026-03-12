@@ -1,5 +1,6 @@
 +++
 title = "Taxonomies"
+description = "Organize content with tags, categories, and custom groups"
 weight = 4
 toc = true
 +++

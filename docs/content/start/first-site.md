@@ -1,5 +1,6 @@
 +++
 title = "First Site"
+description = "Create your first Hwaro site in 5 minutes"
 weight = 2
 toc = true
 +++

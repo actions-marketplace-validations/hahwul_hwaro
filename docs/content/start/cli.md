@@ -1,5 +1,6 @@
 +++
 title = "CLI"
+description = "Commands for creating, building, and serving your site"
 weight = 3
 toc = true
 +++

@@ -1,5 +1,6 @@
 +++
 title = "Content Files"
+description = "Publish non-Markdown files from the content directory"
 weight = 7
 toc = true
 +++

@@ -1,5 +1,6 @@
 +++
 title = "Functions"
+description = "Built-in functions for data retrieval and URL generation"
 weight = 3
 toc = true
 +++

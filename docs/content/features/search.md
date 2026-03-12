@@ -1,5 +1,6 @@
 +++
 title = "Search"
+description = "Generate a client-side search index with Fuse.js"
 weight = 2
 +++
 

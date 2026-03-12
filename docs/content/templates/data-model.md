@@ -1,5 +1,6 @@
 +++
 title = "Data Model"
+description = "Site, Section, and Page data types available in templates"
 weight = 1
 toc = true
 +++

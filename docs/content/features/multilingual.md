@@ -1,5 +1,6 @@
 +++
 title = "Multilingual"
+description = "Build multilingual sites with translation linking and hreflang tags"
 weight = 5
 toc = true
 +++
