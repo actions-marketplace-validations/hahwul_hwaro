@@ -42,26 +42,18 @@ module Hwaro
       end
 
       # Sort pages by date (newest first)
-      #
-      # Pages without dates are placed at the end
-      #
       def sort_by_date(pages : Array(Models::Page), reverse : Bool = false) : Array(Models::Page)
-        sorted = pages.sort { |a, b| compare_by_date(a, b) }
-        reverse ? sorted.reverse : sorted
+        sort_pages(pages, "date", reverse)
       end
 
       # Sort pages by title alphabetically
-      #
       def sort_by_title(pages : Array(Models::Page), reverse : Bool = false) : Array(Models::Page)
-        sorted = pages.sort { |a, b| compare_by_title(a, b) }
-        reverse ? sorted.reverse : sorted
+        sort_pages(pages, "title", reverse)
       end
 
       # Sort pages by weight
-      #
       def sort_by_weight(pages : Array(Models::Page), reverse : Bool = false) : Array(Models::Page)
-        sorted = pages.sort { |a, b| compare_by_weight(a, b) }
-        reverse ? sorted.reverse : sorted
+        sort_pages(pages, "weight", reverse)
       end
 
       # Generic page sorting with specified criteria
@@ -73,17 +65,17 @@ module Hwaro
         sort_by : String = "date",
         reverse : Bool = false,
       ) : Array(Models::Page)
-        case sort_by.downcase
-        when "title"
-          sort_by_title(pages, reverse)
-        when "weight"
-          sort_by_weight(pages, reverse)
-        when "date"
-          sort_by_date(pages, reverse)
-        else
-          Logger.warn "  [WARN] Unknown sort_by '#{sort_by}', defaulting to 'date'"
-          sort_by_date(pages, reverse)
-        end
+        comparator = case sort_by.downcase
+                     when "title"  then ->compare_by_title(Models::Page, Models::Page)
+                     when "weight" then ->compare_by_weight(Models::Page, Models::Page)
+                     when "date"   then ->compare_by_date(Models::Page, Models::Page)
+                     else
+                       Logger.warn "  [WARN] Unknown sort_by '#{sort_by}', defaulting to 'date'"
+                       ->compare_by_date(Models::Page, Models::Page)
+                     end
+
+        sorted = pages.sort { |a, b| comparator.call(a, b) }
+        reverse ? sorted.reverse : sorted
       end
     end
   end

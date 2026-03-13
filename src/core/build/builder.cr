@@ -46,6 +46,9 @@ require "../lifecycle"
 require "../../utils/debug_printer"
 require "../../utils/path_utils"
 require "../../utils/crinja_utils"
+require "../../utils/html_minifier"
+require "../../utils/output_guard"
+require "../../utils/redirect_html"
 
 module Hwaro
   module Core
@@ -70,12 +73,6 @@ module Hwaro
         @section_pages_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
         # Per-section cache of Crinja::Value arrays for section assets, keyed by section name
         @section_assets_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
-
-        # Regex constants for HTML minification
-        private REGEX_PRE_OPEN    = /<pre([^>]*)>\s*<code/
-        private REGEX_PRE_CLOSE   = /<\/code>\s*<\/pre>/
-        private REGEX_COMMENTS    = /<!--(?!\[if|\s*more\s*-->).*?-->/m
-        private REGEX_BLANK_LINES = /\n{3,}/
 
         def initialize
           @lifecycle = Lifecycle::Manager.new
@@ -817,38 +814,23 @@ module Hwaro
           # where keys match author IDs
           if authors_data = site.data["authors"]?
             temp_authors.each_key do |id|
-              # Crinja::Value#[] returns generic Value
               author_info = authors_data[id]
-
-              # Check if it has data
               next if author_info.raw.nil?
 
+              # Normalize Crinja hash entries to {String, Crinja::Value} pairs
+              pairs = [] of {String, Crinja::Value}
               if info_hash = author_info.raw.as?(Hash(Crinja::Value, Crinja::Value))
-                info_hash.each do |k_val, v|
-                  k = k_val.to_s
-                  if k == "name"
-                    current = temp_authors[id]
-                    temp_authors[id] = {
-                      name:  v.to_s,
-                      pages: current[:pages],
-                      extra: current[:extra],
-                    }
-                  else
-                    temp_authors[id][:extra][k] = v
-                  end
-                end
+                info_hash.each { |k_val, v| pairs << {k_val.to_s, v} }
               elsif info_hash = author_info.raw.as?(Hash(String, Crinja::Value))
-                info_hash.each do |k, v|
-                  if k == "name"
-                    current = temp_authors[id]
-                    temp_authors[id] = {
-                      name:  v.to_s,
-                      pages: current[:pages],
-                      extra: current[:extra],
-                    }
-                  else
-                    temp_authors[id][:extra][k] = v
-                  end
+                info_hash.each { |k, v| pairs << {k, v} }
+              end
+
+              pairs.each do |k, v|
+                if k == "name"
+                  current = temp_authors[id]
+                  temp_authors[id] = {name: v.to_s, pages: current[:pages], extra: current[:extra]}
+                else
+                  temp_authors[id][:extra][k] = v
                 end
               end
             end
@@ -1130,13 +1112,14 @@ module Hwaro
 
         private def calculate_page_url(page : Models::Page)
           relative_path = page.path
+          config = @config
 
           # Apply permalinks mapping
           directory_path = Path[relative_path].dirname.to_s
           effective_dir = directory_path
 
-          if @config
-            @config.not_nil!.permalinks.each do |source, target|
+          if config
+            config.permalinks.each do |source, target|
               if directory_path == source
                 effective_dir = target
                 break
@@ -1148,7 +1131,7 @@ module Hwaro
           end
 
           # For multilingual sites, include language prefix for non-default languages
-          lang_prefix = if page.language && @config && page.language != @config.not_nil!.default_language
+          lang_prefix = if page.language && config && page.language != config.default_language
                           "/#{page.language}"
                         else
                           ""
@@ -1195,16 +1178,7 @@ module Hwaro
         private def get_output_path(page : Models::Page, output_dir : String) : String
           url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
           output_path = File.join(output_dir, url_path, "index.html")
-
-          # Ensure output path is within output directory
-          canonical_output = File.expand_path(output_path)
-          canonical_output_dir = File.expand_path(output_dir)
-          unless canonical_output.starts_with?(canonical_output_dir)
-            Logger.warn "  [WARN] Skipping output outside output directory: #{output_path}"
-            return File.join(output_dir, "index.html")
-          end
-
-          output_path
+          Utils::OutputGuard.safe_output_path(output_path, output_dir) || File.join(output_dir, "index.html")
         end
 
         private def setup_output_dir(output_dir : String, incremental : Bool = false)
@@ -1272,7 +1246,7 @@ module Hwaro
                   begin
                     FileUtils.cp(src, dest)
                   rescue ex
-                    Logger.error "Copy failed: #{ex}"
+                    Logger.error "Copy failed #{src} -> #{dest}: #{ex.message}"
                   end
                 end
               ensure
@@ -1397,7 +1371,9 @@ module Hwaro
                   cache.update(source_path, output_path)
                   results.send(true)
                 rescue ex
-                  Logger.debug "Parallel render failed for #{page.path}: #{ex.message}"
+                  Logger.error "Parallel render failed for #{page.path}: #{ex.message}"
+                  Logger.debug "  Template: #{determine_template(page, templates)}, Section: #{page.section}"
+                  Logger.debug "  Backtrace: #{ex.backtrace?.try(&.first(3).join("\n    ")) || "unavailable"}"
                   results.send(false)
                 end
               end
@@ -1549,7 +1525,6 @@ module Hwaro
           generate_aliases(page, output_dir, verbose)
         end
 
-        # Generate redirect page for sections with redirect_to
         private def generate_redirect_page(
           page : Models::Page,
           output_dir : String,
@@ -1558,34 +1533,9 @@ module Hwaro
           redirect_url = page.redirect_to
           return unless redirect_url
 
-          html_escaped_url = Utils::TextUtils.escape_xml(redirect_url)
-          # For JavaScript context: escape backslashes, quotes, newlines, and </script>
-          js_escaped_url = redirect_url
-            .gsub("\\", "\\\\")
-            .gsub("\"", "\\\"")
-            .gsub("\n", "\\n")
-            .gsub("\r", "\\r")
-            .gsub("</", "<\\/")
-
-          redirect_html = <<-HTML
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <meta http-equiv="refresh" content="0; url=#{html_escaped_url}">
-            <link rel="canonical" href="#{html_escaped_url}">
-            <title>Redirecting...</title>
-          </head>
-          <body>
-            <p>Redirecting to <a href="#{html_escaped_url}">#{html_escaped_url}</a>...</p>
-            <script>window.location.href = "#{js_escaped_url}";</script>
-          </body>
-          </html>
-          HTML
-
           output_path = File.join(output_dir, page.url.sub(/^\//, ""), "index.html")
           FileUtils.mkdir_p(Path[output_path].dirname)
-          File.write(output_path, redirect_html)
+          File.write(output_path, Utils::RedirectHtml.full_redirect(redirect_url))
           Logger.action :create, output_path if verbose
         end
 
@@ -1654,17 +1604,9 @@ module Hwaro
         end
 
         private def write_paginated_output(page : Models::Page, page_number : Int32, output_dir : String, content : String, verbose : Bool, paginate_path : String = "page")
-          # Sanitize URL to prevent path traversal
           url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, "").rstrip("/"))
           output_path = File.join(output_dir, url_path, paginate_path, page_number.to_s, "index.html")
-
-          # Ensure output path is within output directory
-          canonical_output = File.expand_path(output_path)
-          canonical_output_dir = File.expand_path(output_dir)
-          unless canonical_output.starts_with?(canonical_output_dir)
-            Logger.warn "  [WARN] Skipping output outside output directory: #{output_path}"
-            return
-          end
+          return unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
 
           FileUtils.mkdir_p(Path[output_path].dirname)
           File.write(output_path, content)
@@ -1694,34 +1636,12 @@ module Hwaro
           page.aliases.each do |alias_path|
             alias_clean = Utils::PathUtils.sanitize_path(alias_path.sub(/^\//, ""))
             dest_path = File.join(output_dir, alias_clean, "index.html")
-
-            # Ensure output path is within output directory
-            canonical_dest = File.expand_path(dest_path)
-            canonical_output_dir = File.expand_path(output_dir)
-            unless canonical_dest.starts_with?(canonical_output_dir)
-              Logger.warn "  [WARN] Skipping alias outside output directory: #{dest_path}"
-              next
-            end
+            next unless Utils::OutputGuard.within_output_dir?(dest_path, output_dir)
 
             FileUtils.mkdir_p(File.dirname(dest_path))
 
             redirect_url = page.redirect_to || page.url
-            escaped_url = HTML.escape(redirect_url)
-
-            content = <<-HTML
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <meta http-equiv="refresh" content="0; url=#{escaped_url}" />
-              <title>Redirecting to #{escaped_url}</title>
-            </head>
-            <body>
-              <p>Redirecting to <a href="#{escaped_url}">#{escaped_url}</a>.</p>
-            </body>
-            </html>
-            HTML
-
-            File.write(dest_path, content)
+            File.write(dest_path, Utils::RedirectHtml.simple_redirect(redirect_url))
             Logger.action :create, dest_path, :yellow if verbose
           end
         end
@@ -2388,25 +2308,8 @@ module Hwaro
           vars
         end
 
-        # Very conservative HTML minification
-        # Only removes: HTML comments, trailing whitespace on lines, excessive blank lines
-        # Preserves: all meaningful whitespace, newlines, indentation structure
         private def minify_html(html : String) : String
-          # Clean up template-induced whitespace inside pre blocks
-          # This handles cases like: <pre>\n  <code>content</code>\n</pre>
-          # Converting to: <pre><code>content</code></pre>
-          cleaned = html
-            .gsub(REGEX_PRE_OPEN, "<pre\\1><code")  # <pre>\n  <code> -> <pre><code>
-            .gsub(REGEX_PRE_CLOSE, "</code></pre>") # </code>\n</pre> -> </code></pre>
-
-          # Remove HTML comments (but not conditional comments like <!--[if IE]>)
-          # Also preserve <!-- more --> markers used for content summaries
-          minified = cleaned.gsub(REGEX_COMMENTS, "")
-
-          # Collapse 3+ consecutive blank lines to 2
-          minified = minified.gsub(REGEX_BLANK_LINES, "\n\n")
-
-          minified.strip
+          Utils::HtmlMinifier.minify(html)
         end
 
         private def write_output(page : Models::Page, output_dir : String, content : String, verbose : Bool)

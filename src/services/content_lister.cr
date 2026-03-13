@@ -233,7 +233,7 @@ module Hwaro
           date: date
         )
       rescue ex
-        Logger.debug "Failed to read content file #{file_path}: #{ex.message}"
+        Logger.warn "Failed to read content file #{file_path}: #{ex.message}"
         nil
       end
 

@@ -83,7 +83,8 @@ module Hwaro
                 return result
               end
             rescue ex
-              Logger.error "  ✖ Hook '#{hook.name}' failed: #{ex.message}"
+              Logger.error "  Hook '#{hook.name}' failed at #{point}: #{ex.message}"
+              Logger.debug "  Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
               return HookResult::Abort
             end
           end
@@ -106,6 +107,7 @@ module Hwaro
             yield
           rescue ex
             Logger.error "Phase #{phase} failed: #{ex.message}"
+            Logger.debug "  Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
             return HookResult::Abort
           end
 

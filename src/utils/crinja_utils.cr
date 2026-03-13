@@ -14,6 +14,9 @@ module Hwaro
     module CrinjaUtils
       extend self
 
+      # Pre-allocated nil value to avoid repeated allocations in hot paths
+      NIL_VALUE = Crinja::Value.new(nil)
+
       # Convert a YAML::Any value to Crinja::Value
       def from_yaml(value : YAML::Any) : Crinja::Value
         if arr = value.as_a?
@@ -33,7 +36,7 @@ module Hwaro
         elsif b = value.as_bool?
           Crinja::Value.new(b)
         else
-          Crinja::Value.new(nil)
+          NIL_VALUE
         end
       end
 
@@ -67,7 +70,7 @@ module Hwaro
         elsif (t = value.raw).is_a?(Time)
           Crinja::Value.new(t.to_s)
         else
-          Crinja::Value.new(nil)
+          NIL_VALUE
         end
       end
 
@@ -100,7 +103,7 @@ module Hwaro
         when Bool
           Crinja::Value.new(value.as_bool)
         when Nil
-          Crinja::Value.new(nil)
+          NIL_VALUE
         else
           Crinja::Value.new(value.to_s)
         end

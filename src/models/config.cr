@@ -263,10 +263,7 @@ module Hwaro
           tags << %(<meta property="og:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
         end
 
-        # Use page image or fall back to default
-        if img = (image || @default_image)
-          # Make image URL absolute
-          img_url = img.starts_with?("http") ? img : "#{base_url}#{img.starts_with?("/") ? img : "/#{img}"}"
+        if img_url = resolve_image_url(image, base_url)
           tags << %(<meta property="og:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
         end
 
@@ -293,9 +290,7 @@ module Hwaro
           tags << %(<meta name="twitter:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
         end
 
-        # Use page image or fall back to default
-        if img = (image || @default_image)
-          img_url = img.starts_with?("http") ? img : "#{base_url}#{img.starts_with?("/") ? img : "/#{img}"}"
+        if img_url = resolve_image_url(image, base_url)
           tags << %(<meta name="twitter:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
         end
 
@@ -308,6 +303,13 @@ module Hwaro
         end
 
         tags.join("\n")
+      end
+
+      # Resolve an image path to an absolute URL, falling back to default_image
+      private def resolve_image_url(image : String?, base_url : String) : String?
+        img = image || @default_image
+        return nil unless img
+        img.starts_with?("http") ? img : "#{base_url}#{img.starts_with?("/") ? img : "/#{img}"}"
       end
 
       # Generate both OG and Twitter tags
@@ -596,22 +598,8 @@ module Hwaro
             if rule_h = rule_any.as_h?
               user_agent = rule_h["user_agent"]?.try(&.as_s?) || "*"
               rule = RobotsRule.new(user_agent)
-
-              if allow = rule_h["allow"]?
-                if allow_arr = allow.as_a?
-                  rule.allow = allow_arr.compact_map(&.as_s?)
-                elsif allow_str = allow.as_s?
-                  rule.allow = [allow_str]
-                end
-              end
-
-              if disallow = rule_h["disallow"]?
-                if disallow_arr = disallow.as_a?
-                  rule.disallow = disallow_arr.compact_map(&.as_s?)
-                elsif disallow_str = disallow.as_s?
-                  rule.disallow = [disallow_str]
-                end
-              end
+              rule.allow = string_or_array(rule_h["allow"]?)
+              rule.disallow = string_or_array(rule_h["disallow"]?)
               rule
             else
               nil

@@ -121,21 +121,13 @@ module Hwaro
     def record_template(template : String, bytes : Int64, time_ms : Float64)
       return unless @enabled
       @template_mutex.synchronize do
-        if existing = @template_profiles[template]?
-          @template_profiles[template] = TemplateProfile.new(
-            template: template,
-            count: existing.count + 1,
-            total_bytes: existing.total_bytes + bytes,
-            total_time_ms: existing.total_time_ms + time_ms,
-          )
-        else
-          @template_profiles[template] = TemplateProfile.new(
-            template: template,
-            count: 1,
-            total_bytes: bytes,
-            total_time_ms: time_ms,
-          )
-        end
+        profile = @template_profiles[template]? || TemplateProfile.new(template)
+        @template_profiles[template] = TemplateProfile.new(
+          template: template,
+          count: profile.count + 1,
+          total_bytes: profile.total_bytes + bytes,
+          total_time_ms: profile.total_time_ms + time_ms,
+        )
       end
     end
 

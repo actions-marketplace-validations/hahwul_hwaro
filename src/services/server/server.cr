@@ -236,6 +236,7 @@ module Hwaro
                 apply_changeset(changeset, build_options)
               rescue ex
                 Logger.error "[Watch] Build failed: #{ex.message}"
+                Logger.debug "[Watch] Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
               end
             end
 

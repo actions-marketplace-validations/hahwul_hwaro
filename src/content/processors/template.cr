@@ -30,31 +30,22 @@ module Hwaro
           @variables = build_variables
         end
 
-        # Add extra variables to the context
+        # Add a pre-built Crinja::Value to the context
         def add(name : String, value : Crinja::Value)
           @variables[name] = value
         end
 
-        def add(name : String, value : String)
+        # Add a scalar value (String, Bool, Int, Nil) to the context
+        def add(name : String, value : String | Bool | Int32 | Int64 | Nil)
           @variables[name] = Crinja::Value.new(value)
         end
 
-        def add(name : String, value : Bool)
-          @variables[name] = Crinja::Value.new(value)
-        end
-
-        def add(name : String, value : Int32 | Int64)
-          @variables[name] = Crinja::Value.new(value)
-        end
-
-        def add(name : String, value : Nil)
-          @variables[name] = Crinja::Value.new(nil)
-        end
-
+        # Add an array of strings to the context
         def add(name : String, value : Array(String))
           @variables[name] = Crinja::Value.new(value.map { |v| Crinja::Value.new(v) })
         end
 
+        # Add a string-keyed hash to the context
         def add(name : String, value : Hash(String, String))
           hash = {} of Crinja::Value => Crinja::Value
           value.each do |k, v|
@@ -98,21 +89,15 @@ module Hwaro
           vars["site_description"] = Crinja::Value.new(@config.description || "")
           vars["base_url"] = Crinja::Value.new(@config.base_url)
 
-          # Site object
+          # Site object (also available as "config" for advanced use)
           site_obj = {
             "title"       => Crinja::Value.new(@config.title),
             "description" => Crinja::Value.new(@config.description || ""),
             "base_url"    => Crinja::Value.new(@config.base_url),
           }
-          vars["site"] = Crinja::Value.new(site_obj)
-
-          # Config object (for advanced use)
-          config_obj = {
-            "title"       => Crinja::Value.new(@config.title),
-            "description" => Crinja::Value.new(@config.description || ""),
-            "base_url"    => Crinja::Value.new(@config.base_url),
-          }
-          vars["config"] = Crinja::Value.new(config_obj)
+          site_value = Crinja::Value.new(site_obj)
+          vars["site"] = site_value
+          vars["config"] = site_value
 
           # Section variables (basic, will be enriched by builder with actual section data)
           vars["section_title"] = Crinja::Value.new("")
@@ -487,7 +472,7 @@ module Hwaro
                 end
               end
             rescue ex
-              # Return nil on error
+              Logger.debug "load_data('#{path}'): #{ex.message}"
               result = Crinja::Value.new(nil)
             end
 
@@ -495,17 +480,12 @@ module Hwaro
           end
         end
 
-        # Delegate to shared CrinjaUtils for JSON/TOML/YAML → Crinja::Value conversion
         private def json_to_crinja(json : JSON::Any) : Crinja::Value
           Utils::CrinjaUtils.from_json(json)
         end
 
         private def toml_to_crinja(toml : TOML::Table) : Crinja::Value
           Utils::CrinjaUtils.from_toml(toml)
-        end
-
-        private def toml_any_to_crinja(value : TOML::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_toml(value)
         end
 
         private def yaml_to_crinja(yaml : YAML::Any) : Crinja::Value
