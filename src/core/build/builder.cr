@@ -2033,15 +2033,12 @@ module Hwaro
         ) : Hash(String, Crinja::Value)
           config = site.config
 
-          # Start from a dup of global_vars instead of building an empty hash
-          # and merge!'ing at the end.  This avoids incremental hash growth
-          # (0→8→16→32→64→128 rehashes) since the hash starts pre-sized.
-          # Page-specific vars are written on top, which is the desired behavior.
-          vars = if global_vars
-                   global_vars.dup
-                 else
-                   build_global_vars(site)
-                 end
+          # Build page-specific vars into a fresh hash, then merge global_vars
+          # at the end.  This is cheaper than global_vars.dup (which copies ~25
+          # entries including heavy __all_pages__) because page vars are the
+          # smaller set (~50 entries) and we only iterate global_vars once via
+          # merge! rather than duplicating it per page.
+          vars = {} of String => Crinja::Value
 
           effective_url = page_url_override || page.url
 
@@ -2231,13 +2228,25 @@ module Hwaro
               default_lang = config.default_language
               section_pages_array = paginator.pages.map { |p| page_to_crinja_list_value(p, default_lang) }
             else
-              # Non-paginated: use per-section cache, then exclude current page
+              # Non-paginated: use per-section cache, then exclude current page.
+              # Find the index of the current page by URL for O(1) removal
+              # instead of O(n) reject with per-element Hash access.
               all_section = cached_section_pages_crinja(current_section, page.language, site)
               page_url_str = page.url
-              section_pages_array = all_section.reject do |v|
+              exclude_idx = -1
+              all_section.each_with_index do |v, i|
                 raw = v.raw
-                raw.is_a?(Hash) && raw["url"]?.try(&.to_s) == page_url_str
+                if raw.is_a?(Hash) && raw["url"]?.try(&.to_s) == page_url_str
+                  exclude_idx = i
+                  break
+                end
               end
+              section_pages_array = if exclude_idx >= 0
+                                      # Build array without the excluded element (avoids full reject scan)
+                                      all_section[0...exclude_idx] + all_section[(exclude_idx + 1)..]
+                                    else
+                                      all_section
+                                    end
             end
           end
           vars["section_title"] = Crinja::Value.new(section_title)
@@ -2320,8 +2329,11 @@ module Hwaro
           vars["jsonld_breadcrumb"] = Crinja::Value.new(jsonld_breadcrumb)
           vars["jsonld"] = Crinja::Value.new(jsonld_all)
 
-          # NOTE: global_vars are already included — vars was initialized from
-          # global_vars.dup at the top, so no merge! needed here.
+          # Merge global vars at the end.  Page-specific keys (written above)
+          # take precedence because they were set first; merge! only adds keys
+          # that don't already exist when we reverse the direction below.
+          gv = global_vars || build_global_vars(site)
+          gv.each { |k, v| vars[k] = v unless vars.has_key?(k) }
 
           vars
         end

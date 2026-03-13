@@ -34,11 +34,18 @@ module Hwaro
             Logger.warn "  [WARN] base_url is empty. Sitemap will contain relative URLs instead of absolute URLs."
           end
 
-          xml_content = String.build do |str|
+          # Pre-compute config values once outside the loop
+          base = site.config.base_url.rstrip('/')
+          changefreq = site.config.sitemap.changefreq
+          has_changefreq = !changefreq.empty?
+          escaped_changefreq = has_changefreq ? Utils::TextUtils.escape_xml(changefreq) : ""
+          priority = site.config.sitemap.priority
+          priority_str = "    <priority>#{priority}</priority>\n"
+
+          xml_content = String.build(sitemap_pages.size * 256) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             str << "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
 
-            base = site.config.base_url.rstrip('/')
             sitemap_pages.each do |page|
               path = page.url.starts_with?('/') ? page.url : "/#{page.url}"
               full_url = base.empty? ? path : base + path
@@ -53,14 +60,11 @@ module Hwaro
                 str << "    <lastmod>#{date.to_s("%Y-%m-%d")}</lastmod>\n"
               end
 
-              # Add changefreq and priority from config
-              changefreq = site.config.sitemap.changefreq
-              unless changefreq.empty?
-                str << "    <changefreq>#{Utils::TextUtils.escape_xml(changefreq)}</changefreq>\n"
+              if has_changefreq
+                str << "    <changefreq>#{escaped_changefreq}</changefreq>\n"
               end
 
-              priority = site.config.sitemap.priority
-              str << "    <priority>#{priority}</priority>\n"
+              str << priority_str
 
               str << "  </url>\n"
             end

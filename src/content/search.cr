@@ -59,14 +59,15 @@ module Hwaro
       end
 
       private def self.build_search_data(pages : Array(Models::Page), config : Models::Config) : Array(Hash(String, String | Array(String)))
-        fields = config.search.fields
+        # Pre-lowercase field names once instead of per-page per-field
+        fields = config.search.fields.map(&.downcase)
         cjk = config.search.tokenize_cjk
 
         pages.map do |page|
           data = {} of String => String | Array(String)
 
           fields.each do |field|
-            case field.downcase
+            case field
             when "title"
               title = page.title
               data["title"] = cjk ? Utils::TextUtils.tokenize_cjk(title) : title
