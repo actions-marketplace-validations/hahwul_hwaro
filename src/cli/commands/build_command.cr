@@ -25,6 +25,7 @@ module Hwaro
           FlagInfo.new(short: nil, long: "--minify", description: "Minify HTML output (and minified json, xml)"),
           FlagInfo.new(short: nil, long: "--no-parallel", description: "Disable parallel file processing"),
           FlagInfo.new(short: nil, long: "--cache", description: "Enable build caching (skip unchanged files)"),
+          FlagInfo.new(short: nil, long: "--full", description: "Force a complete rebuild (ignore cache)"),
           FlagInfo.new(short: nil, long: "--skip-highlighting", description: "Disable syntax highlighting"),
           FlagInfo.new(short: "-v", long: "--verbose", description: "Show detailed output including generated files"),
           FlagInfo.new(short: nil, long: "--profile", description: "Show build timing profile for each phase"),
@@ -90,6 +91,7 @@ module Hwaro
           minify = false
           parallel = true
           cache = false
+          full = false
           highlight = true
           verbose = false
           profile = false
@@ -108,6 +110,7 @@ module Hwaro
             parser.on("--minify", "Minify HTML output (and minified json, xml)") { minify = true }
             parser.on("--no-parallel", "Disable parallel file processing") { parallel = false }
             parser.on("--cache", "Enable build caching (skip unchanged files)") { cache = true }
+            parser.on("--full", "Force a complete rebuild (ignore cache)") { full = true }
             parser.on("--skip-highlighting", "Disable syntax highlighting") { highlight = false }
             parser.on("-v", "--verbose", "Show detailed output including generated files") { verbose = true }
             parser.on("--profile", "Show build timing profile for each phase") { profile = true }
@@ -126,6 +129,7 @@ module Hwaro
             minify: minify,
             parallel: parallel,
             cache: cache,
+            full: full,
             highlight: highlight,
             verbose: verbose,
             profile: profile,

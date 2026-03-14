@@ -160,6 +160,148 @@ describe "Cache: Cache with multiple files" do
   end
 end
 
+describe "Cache: Template change invalidation" do
+  it "rebuilds all pages when templates change" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page.md", "---\ntitle: Page\n---\nContent")
+        File.write("templates/page.html", "<div>{{ content }}</div>")
+
+        # First build
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        html1 = File.read("public/page/index.html")
+        html1.should contain("<div>")
+
+        # Change template
+        sleep 100.milliseconds
+        File.write("templates/page.html", "<section>{{ content }}</section>")
+
+        # Rebuild — template hash change should force rebuild
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        html2 = File.read("public/page/index.html")
+        html2.should contain("<section>")
+        html2.should_not contain("<div>")
+      end
+    end
+  end
+end
+
+describe "Cache: Config change invalidation" do
+  it "rebuilds all pages when config changes" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page.md", "---\ntitle: Page\n---\nContent")
+        File.write("templates/page.html", "{{ content }}")
+
+        # First build
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        File.exists?("public/page/index.html").should be_true
+
+        # Change config
+        sleep 100.milliseconds
+        new_config = BASIC_CONFIG.gsub("Test Site", "Updated Site")
+        File.write("config.toml", new_config)
+
+        # Rebuild — config hash change should force rebuild
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        File.exists?("public/page/index.html").should be_true
+      end
+    end
+  end
+end
+
+describe "Cache: Full rebuild flag" do
+  it "rebuilds everything with --full even if cache exists" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page.md", "---\ntitle: Page\n---\nOriginal")
+        File.write("templates/page.html", "{{ content }}")
+
+        # First build with cache
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        File.exists?(".hwaro_cache.json").should be_true
+
+        # Full rebuild (no file changes, but --full should still rebuild)
+        options = Hwaro::Config::Options::BuildOptions.new(
+          output_dir: "public",
+          parallel: false,
+          cache: true,
+          full: true,
+          highlight: false,
+          verbose: false,
+          profile: false,
+        )
+
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(options)
+
+        # Cache file should be saved (for next incremental build)
+        File.exists?(".hwaro_cache.json").should be_true
+        File.exists?("public/page/index.html").should be_true
+      end
+    end
+  end
+end
+
+describe "Cache: Content checksum verification" do
+  it "detects change via checksum even if mtime is ambiguous" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page.md", "---\ntitle: Page\n---\nOriginal content")
+        File.write("templates/page.html", "{{ content }}")
+
+        # First build
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        html1 = File.read("public/page/index.html")
+        html1.should contain("Original content")
+
+        # Modify file
+        sleep 100.milliseconds
+        File.write("content/page.md", "---\ntitle: Page\n---\nModified content")
+
+        # Rebuild
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        html2 = File.read("public/page/index.html")
+        html2.should contain("Modified content")
+      end
+    end
+  end
+end
+
 describe "Cache: Cache with section content" do
   it "caches section pages correctly" do
     build_site(

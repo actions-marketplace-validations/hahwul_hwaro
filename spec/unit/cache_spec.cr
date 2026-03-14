@@ -182,6 +182,43 @@ describe Hwaro::Core::Build::Cache do
       end
     end
 
+    it "loads legacy cache format (plain array without metadata)" do
+      Dir.mktmpdir do |dir|
+        cache_path = File.join(dir, ".hwaro_cache.json")
+        test_file = File.join(dir, "test.md")
+        File.write(test_file, "content")
+        mtime = File.info(test_file).modification_time.to_unix_ms
+
+        # Write legacy format: plain array of entries without template_hash/config_hash
+        legacy_json = %([{"path":"#{test_file}","mtime":#{mtime},"hash":"","output_path":""}])
+        File.write(cache_path, legacy_json)
+
+        cache = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+        cache.stats[:total].should eq(1)
+        cache.changed?(test_file).should be_false
+      end
+    end
+
+    it "loads new format entries that are missing optional fields" do
+      Dir.mktmpdir do |dir|
+        cache_path = File.join(dir, ".hwaro_cache.json")
+        test_file = File.join(dir, "test.md")
+        File.write(test_file, "content")
+        mtime = File.info(test_file).modification_time.to_unix_ms
+
+        # New format with metadata, but entries lack template_hash/config_hash
+        new_json = %({
+          "metadata":{"template_hash":"abc","config_hash":"def"},
+          "entries":[{"path":"#{test_file}","mtime":#{mtime},"hash":"","output_path":""}]
+        })
+        File.write(cache_path, new_json)
+
+        cache = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+        cache.stats[:total].should eq(1)
+        cache.changed?(test_file).should be_false
+      end
+    end
+
     it "handles corrupted cache file gracefully" do
       Dir.mktmpdir do |dir|
         cache_path = File.join(dir, ".hwaro_cache.json")
@@ -285,7 +322,9 @@ describe Hwaro::Core::Build::CacheEntry do
       path: "test.md",
       mtime: 1234567890_i64,
       hash: "abc123",
-      output_path: "test.html"
+      output_path: "test.html",
+      template_hash: "tmpl_hash",
+      config_hash: "cfg_hash",
     )
 
     json = entry.to_json
@@ -295,5 +334,96 @@ describe Hwaro::Core::Build::CacheEntry do
     restored.mtime.should eq(1234567890_i64)
     restored.hash.should eq("abc123")
     restored.output_path.should eq("test.html")
+    restored.template_hash.should eq("tmpl_hash")
+    restored.config_hash.should eq("cfg_hash")
+  end
+end
+
+describe Hwaro::Core::Build::Cache, "global checksums" do
+  it "invalidates all entries when template hash changes" do
+    Dir.mktmpdir do |dir|
+      cache_path = File.join(dir, ".hwaro_cache.json")
+      test_file = File.join(dir, "test.md")
+      File.write(test_file, "content")
+
+      cache = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache.set_global_checksums("tmpl_v1", "cfg_v1")
+      cache.update(test_file)
+      cache.save
+
+      # Reload with different template hash
+      cache2 = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache2.set_global_checksums("tmpl_v2", "cfg_v1")
+
+      cache2.changed?(test_file).should be_true
+    end
+  end
+
+  it "invalidates all entries when config hash changes" do
+    Dir.mktmpdir do |dir|
+      cache_path = File.join(dir, ".hwaro_cache.json")
+      test_file = File.join(dir, "test.md")
+      File.write(test_file, "content")
+
+      cache = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache.set_global_checksums("tmpl_v1", "cfg_v1")
+      cache.update(test_file)
+      cache.save
+
+      # Reload with different config hash
+      cache2 = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache2.set_global_checksums("tmpl_v1", "cfg_v2")
+
+      cache2.changed?(test_file).should be_true
+    end
+  end
+
+  it "preserves entries when checksums are unchanged" do
+    Dir.mktmpdir do |dir|
+      cache_path = File.join(dir, ".hwaro_cache.json")
+      test_file = File.join(dir, "test.md")
+      File.write(test_file, "content")
+
+      cache = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache.set_global_checksums("tmpl_v1", "cfg_v1")
+      cache.update(test_file)
+      cache.save
+
+      # Reload with same checksums
+      cache2 = Hwaro::Core::Build::Cache.new(enabled: true, cache_path: cache_path)
+      cache2.set_global_checksums("tmpl_v1", "cfg_v1")
+
+      cache2.changed?(test_file).should be_false
+    end
+  end
+end
+
+describe Hwaro::Core::Build::Cache, "compute helpers" do
+  it "computes consistent template hash" do
+    templates = {"page" => "<p>{{ content }}</p>", "default" => "<html>{{ content }}</html>"}
+    hash1 = Hwaro::Core::Build::Cache.compute_templates_hash(templates)
+    hash2 = Hwaro::Core::Build::Cache.compute_templates_hash(templates)
+    hash1.should eq(hash2)
+  end
+
+  it "produces different hash for different templates" do
+    t1 = {"page" => "<p>v1</p>"}
+    t2 = {"page" => "<p>v2</p>"}
+    Hwaro::Core::Build::Cache.compute_templates_hash(t1).should_not eq(
+      Hwaro::Core::Build::Cache.compute_templates_hash(t2)
+    )
+  end
+
+  it "computes config hash from file" do
+    Dir.mktmpdir do |dir|
+      config_path = File.join(dir, "config.toml")
+      File.write(config_path, "title = \"test\"")
+      hash = Hwaro::Core::Build::Cache.compute_config_hash(config_path)
+      hash.should_not be_empty
+    end
+  end
+
+  it "returns empty string for missing config" do
+    Hwaro::Core::Build::Cache.compute_config_hash("/nonexistent/config.toml").should eq("")
   end
 end

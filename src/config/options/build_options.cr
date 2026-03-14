@@ -9,6 +9,7 @@ module Hwaro
         property minify : Bool
         property parallel : Bool
         property cache : Bool
+        property full : Bool
         property highlight : Bool
         property verbose : Bool
         property profile : Bool
@@ -26,6 +27,7 @@ module Hwaro
           @minify : Bool = false,
           @parallel : Bool = true,
           @cache : Bool = false,
+          @full : Bool = false,
           @highlight : Bool = true,
           @verbose : Bool = false,
           @profile : Bool = false,

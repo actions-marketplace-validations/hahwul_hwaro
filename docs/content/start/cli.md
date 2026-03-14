@@ -116,7 +116,8 @@ hwaro build -i /path/to/my-site -o ./dist
 | --include-expired | Include expired content |
 | --minify | Minify output files (see below) |
 | --no-parallel | Disable parallel processing |
-| --cache | Enable build caching (see below) |
+| --cache | Enable incremental build caching (see below) |
+| --full | Force a complete rebuild, clearing the cache |
 | --skip-highlighting | Disable syntax highlighting |
 | --skip-cache-busting | Disable cache busting query parameters on CSS/JS resources |
 | --stream | Enable streaming build to reduce memory usage |
@@ -154,9 +155,17 @@ The minify flag performs conservative optimization on generated files:
 
 Code blocks (`<pre>`, `<code>`) and script/style content are always preserved intact.
 
-**About `--cache`:**
+**About `--cache` (Incremental Build):**
 
-When enabled, Hwaro tracks file modification times in a `.hwaro_cache.json` file at the project root. On subsequent builds, only files that have changed since the last build are re-processed. The cache uses millisecond-precision mtime comparison and also verifies that the output file still exists. Use `hwaro build --cache` to enable, or set `cache = true` in `[build]` config.
+When enabled, Hwaro tracks file modification times and content checksums in a `.hwaro_cache.json` file at the project root. On subsequent builds, only files that have changed since the last build are re-rendered. The cache also tracks template and config checksums — if templates or `config.toml` change, all entries are automatically invalidated and every page is rebuilt.
+
+Use `--full` together with `--cache` to force a clean rebuild while still saving the cache for the next run:
+
+```bash
+hwaro build --cache --full
+```
+
+See [Incremental Build](/features/incremental-build/) for details.
 
 **About `-i, --input`:**
 
@@ -326,6 +335,12 @@ hwaro build -i ~/projects/my-blog
 
 # Build a remote project and output to current directory
 hwaro build -i ~/projects/my-blog -o ./output
+
+# Incremental build (skip unchanged files)
+hwaro build --cache
+
+# Force full rebuild and repopulate cache
+hwaro build --cache --full
 
 # Streaming build for large sites
 hwaro build --stream

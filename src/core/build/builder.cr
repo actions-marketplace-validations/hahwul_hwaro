@@ -314,6 +314,7 @@ module Hwaro
           minify : Bool = false,
           parallel : Bool = true,
           cache : Bool = false,
+          full : Bool = false,
           highlight : Bool = true,
           verbose : Bool = false,
           profile : Bool = false,
@@ -352,6 +353,7 @@ module Hwaro
             minify: minify,
             parallel: parallel,
             cache: cache,
+            full: full,
             highlight: highlight,
             verbose: verbose,
             profile: profile,
@@ -460,8 +462,13 @@ module Hwaro
             ctx.cache = @cache
 
             if cache_enabled
-              stats = @cache.not_nil!.stats
-              Logger.info "  Cache enabled (#{stats[:valid]} valid entries)"
+              if ctx.options.full
+                @cache.not_nil!.clear
+                Logger.info "  Cache: full rebuild requested — cleared all entries."
+              else
+                stats = @cache.not_nil!.stats
+                Logger.info "  Cache enabled (#{stats[:valid]} valid entries)"
+              end
             end
 
             setup_output_dir(output_dir, cache_enabled)
@@ -485,6 +492,13 @@ module Hwaro
 
             ctx.templates = load_templates
             @templates = ctx.templates
+
+            # Compute global checksums for invalidation graph
+            if cache_enabled
+              template_hash = Cache.compute_templates_hash(ctx.templates)
+              config_hash = Cache.compute_config_hash
+              @cache.not_nil!.set_global_checksums(template_hash, config_hash)
+            end
           end
           profiler.end_phase
           result

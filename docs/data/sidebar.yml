@@ -58,6 +58,8 @@
       url: /features/content-files/
     - title: Build Hooks
       url: /features/build-hooks/
+    - title: Incremental Build
+      url: /features/incremental-build/
     - title: Streaming Build
       url: /features/streaming-build/
     - title: LLMs.txt
