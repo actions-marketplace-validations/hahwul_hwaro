@@ -99,17 +99,38 @@ base_url = "https://username.github.io"
 base_url = "https://username.github.io/repo"
 ```
 
-## Method 2: Deploy from Branch
+## Method 2: Deploy via `hwaro deploy`
 
-### Build Locally
+Add a GitHub Pages target to `config.toml`:
+
+```toml
+[[deployment.targets]]
+name = "github-pages"
+command = "cd {source} && touch .nojekyll && git init -b gh-pages && git add -A && git commit -m 'Deploy' && git push --force $(git -C $(pwd)/.. remote get-url origin) gh-pages"
+```
+
+Then build and deploy:
 
 ```bash
 hwaro build
+hwaro deploy github-pages
+
+# Preview without deploying
+hwaro deploy github-pages --dry-run
 ```
 
-### Push to gh-pages Branch
+### Configure GitHub Pages
+
+1. Go to repository **Settings** → **Pages**
+2. Under "Build and deployment", select **Deploy from a branch**
+3. Choose `gh-pages` branch, `/ (root)` folder
+4. Click **Save**
+
+## Method 3: Manual Branch Deploy
 
 ```bash
+hwaro build
+
 # Create orphan branch
 git checkout --orphan gh-pages
 
@@ -127,13 +148,6 @@ git push origin gh-pages --force
 # Return to main branch
 git checkout main
 ```
-
-### Configure GitHub Pages
-
-1. Go to repository **Settings** → **Pages**
-2. Under "Build and deployment", select **Deploy from a branch**
-3. Choose `gh-pages` branch, `/ (root)` folder
-4. Click **Save**
 
 ## Custom Domain
 

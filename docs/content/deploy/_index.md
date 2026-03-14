@@ -34,6 +34,11 @@ url = "file:///var/www/mysite"
 name = "s3"
 url = "s3://my-bucket"
 command = "aws s3 sync {source}/ {url} --delete"
+
+# GitHub Pages via command-based target
+[[deployment.targets]]
+name = "github-pages"
+command = "cd {source} && touch .nojekyll && git init -b gh-pages && git add -A && git commit -m 'Deploy' && git push --force $(git -C $(pwd)/.. remote get-url origin) gh-pages"
 ```
 
 See [CLI Reference](/start/cli/#deploy) for all deploy options and [Configuration](/start/config/#deployment) for target setup.

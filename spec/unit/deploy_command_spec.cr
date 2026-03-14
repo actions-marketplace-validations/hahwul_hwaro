@@ -63,5 +63,6 @@ describe Hwaro::CLI::Commands::DeployCommand do
       options.source_dir.should eq("dist")
       options.targets.should eq(["production"])
     end
+
   end
 end
