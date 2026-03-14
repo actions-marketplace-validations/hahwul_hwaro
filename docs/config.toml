@@ -162,3 +162,8 @@ emoji = false
 [auto_includes]
 enabled = true
 dirs = ["assets/css", "assets/js"]
+
+[assets]
+enabled = true
+minify = true
+fingerprint = true

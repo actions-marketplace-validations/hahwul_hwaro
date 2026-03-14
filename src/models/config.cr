@@ -466,6 +466,34 @@ module Hwaro
       end
     end
 
+    # Asset bundle configuration
+    class AssetBundleConfig
+      property name : String
+      property files : Array(String)
+
+      def initialize(@name : String = "", @files : Array(String) = [] of String)
+      end
+    end
+
+    # Asset pipeline configuration
+    class AssetsConfig
+      property enabled : Bool
+      property minify : Bool
+      property fingerprint : Bool
+      property source_dir : String
+      property output_dir : String
+      property bundles : Array(AssetBundleConfig)
+
+      def initialize
+        @enabled = false
+        @minify = true
+        @fingerprint = true
+        @source_dir = "static"
+        @output_dir = "assets"
+        @bundles = [] of AssetBundleConfig
+      end
+    end
+
     class Config
       property title : String
       property description : String
@@ -489,6 +517,7 @@ module Hwaro
       property series : SeriesConfig
       property related : RelatedConfig
       property deployment : DeploymentConfig
+      property assets : AssetsConfig
       property permalinks : Hash(String, String)
       property raw : Hash(String, TOML::Any)
 
@@ -515,6 +544,7 @@ module Hwaro
         @series = SeriesConfig.new
         @related = RelatedConfig.new
         @deployment = DeploymentConfig.new
+        @assets = AssetsConfig.new
         @permalinks = {} of String => String
         @raw = Hash(String, TOML::Any).new
       end
@@ -564,6 +594,7 @@ module Hwaro
         load_series(config)
         load_related(config)
         load_permalinks(config)
+        load_assets(config)
         load_deployment(config)
 
         config
@@ -837,6 +868,32 @@ module Hwaro
         s.each do |k, v|
           if target = v.as_s?
             config.permalinks[k] = target
+          end
+        end
+      end
+
+      private def self.load_assets(config : Config)
+        return unless s = config.raw["assets"]?.try(&.as_h?)
+
+        config.assets.enabled = bool_value(s["enabled"]?, config.assets.enabled)
+        config.assets.minify = bool_value(s["minify"]?, config.assets.minify)
+        config.assets.fingerprint = bool_value(s["fingerprint"]?, config.assets.fingerprint)
+        config.assets.source_dir = s["source_dir"]?.try(&.as_s?) || config.assets.source_dir
+        config.assets.output_dir = s["output_dir"]?.try(&.as_s?) || config.assets.output_dir
+
+        if bundles = s["bundles"]?.try(&.as_a?)
+          bundles.each do |bundle_any|
+            next unless b = bundle_any.as_h?
+            name = b["name"]?.try(&.as_s?) || ""
+            next if name.empty?
+
+            files = if f = b["files"]?.try(&.as_a?)
+                      f.compact_map(&.as_s?)
+                    else
+                      [] of String
+                    end
+
+            config.assets.bundles << AssetBundleConfig.new(name: name, files: files)
           end
         end
       end

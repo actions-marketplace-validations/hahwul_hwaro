@@ -62,6 +62,8 @@
       url: /features/incremental-build/
     - title: Streaming Build
       url: /features/streaming-build/
+    - title: Asset Pipeline
+      url: /features/asset-pipeline/
     - title: LLMs.txt
       url: /features/llms-txt/
 - title: Deploy

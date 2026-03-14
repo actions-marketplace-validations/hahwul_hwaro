@@ -19,4 +19,5 @@ Hwaro includes powerful features out of the box.
 - [Build Hooks](/features/build-hooks/) — Run custom shell commands before and after builds
 - [Incremental Build](/features/incremental-build/) — Only rebuild changed files for faster builds on large sites
 - [Streaming Build](/features/streaming-build/) — Reduce memory usage for large sites with batch rendering
+- [Asset Pipeline](/features/asset-pipeline/) — Built-in CSS/JS bundling, minification, and fingerprinting
 - [LLMs.txt](/features/llms-txt/) — Generate instruction files for AI/LLM crawlers

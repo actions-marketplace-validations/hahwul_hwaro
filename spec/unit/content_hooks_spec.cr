@@ -8,9 +8,9 @@ describe Hwaro::Content::Hooks do
       hooks.should be_a(Array(Hwaro::Core::Lifecycle::Hookable))
     end
 
-    it "returns exactly 3 hooks" do
+    it "returns exactly 4 hooks" do
       hooks = Hwaro::Content::Hooks.all
-      hooks.size.should eq(3)
+      hooks.size.should eq(4)
     end
 
     it "includes MarkdownHooks" do
@@ -26,6 +26,11 @@ describe Hwaro::Content::Hooks do
     it "includes TaxonomyHooks" do
       hooks = Hwaro::Content::Hooks.all
       hooks.any? { |h| h.is_a?(Hwaro::Content::Hooks::TaxonomyHooks) }.should be_true
+    end
+
+    it "includes AssetHooks" do
+      hooks = Hwaro::Content::Hooks.all
+      hooks.any? { |h| h.is_a?(Hwaro::Content::Hooks::AssetHooks) }.should be_true
     end
 
     it "returns new instances each time" do

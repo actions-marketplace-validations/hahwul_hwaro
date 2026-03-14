@@ -538,6 +538,33 @@ module Hwaro
           TOML
         end
 
+        protected def assets_config : String
+          <<-TOML
+
+          # =============================================================================
+          # Asset Pipeline (Optional)
+          # =============================================================================
+          # Bundle, minify, and fingerprint CSS/JS files for production.
+          # Use {{ asset(name="main.css") }} in templates to resolve paths.
+
+          # [assets]
+          # enabled = true
+          # minify = true
+          # fingerprint = true
+          # source_dir = "static"
+          # output_dir = "assets"
+
+          # [[assets.bundles]]
+          # name = "main.css"
+          # files = ["css/reset.css", "css/style.css"]
+
+          # [[assets.bundles]]
+          # name = "app.js"
+          # files = ["js/util.js", "js/app.js"]
+
+          TOML
+        end
+
         protected def markdown_config : String
           <<-TOML
 

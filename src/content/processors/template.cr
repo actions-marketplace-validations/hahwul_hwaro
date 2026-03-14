@@ -478,6 +478,27 @@ module Hwaro
 
             result
           end
+
+          # asset() function - resolve asset path from pipeline manifest
+          # Usage: {{ asset(name="main.css") }}
+          # Returns fingerprinted path if asset pipeline is enabled,
+          # otherwise returns the path as-is under base_url.
+          @env.functions["asset"] = Crinja.function({name: ""}) do
+            asset_name = arguments["name"].to_s
+            manifest = Content::Hooks::AssetHooks.manifest
+            base_url = env.resolve("base_url").to_s.rstrip("/")
+
+            if resolved = manifest[asset_name]?
+              Crinja::Value.new(base_url + resolved)
+            else
+              # Fallback: return path under base_url as-is
+              path = asset_name.starts_with?("/") ? asset_name : "/#{asset_name}"
+              Crinja::Value.new(base_url + path)
+            end
+          end
+
+          # asset_url is an alias for asset
+          @env.functions["asset_url"] = @env.functions["asset"]
         end
 
         private def json_to_crinja(json : JSON::Any) : Crinja::Value
