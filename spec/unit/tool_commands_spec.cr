@@ -20,9 +20,9 @@ describe Hwaro::CLI::Commands::ToolCommand do
   end
 
   describe ".subcommands" do
-    it "returns 4 subcommands" do
+    it "returns 5 subcommands" do
       subs = Hwaro::CLI::Commands::ToolCommand.subcommands
-      subs.size.should eq(4)
+      subs.size.should eq(5)
     end
 
     it "includes convert subcommand" do
@@ -43,6 +43,11 @@ describe Hwaro::CLI::Commands::ToolCommand do
     it "includes doctor subcommand" do
       subs = Hwaro::CLI::Commands::ToolCommand.subcommands
       subs.any? { |s| s.name == "doctor" }.should be_true
+    end
+
+    it "includes platform subcommand" do
+      subs = Hwaro::CLI::Commands::ToolCommand.subcommands
+      subs.any? { |s| s.name == "platform" }.should be_true
     end
   end
 end
@@ -184,6 +189,53 @@ describe Hwaro::CLI::Commands::Tool::DoctorCommand do
       flag.should_not be_nil
       flag.not_nil!.takes_value.should be_true
       flag.not_nil!.value_hint.should eq("DIR")
+    end
+  end
+end
+
+describe Hwaro::CLI::Commands::Tool::PlatformCommand do
+  describe ".metadata" do
+    it "returns correct command name" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.name.should eq("platform")
+    end
+
+    it "returns a description" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.description.should_not be_empty
+    end
+
+    it "includes output flag" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.flags.any? { |f| f.long == "--output" }.should be_true
+    end
+
+    it "includes stdout flag" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.flags.any? { |f| f.long == "--stdout" }.should be_true
+    end
+
+    it "includes help flag" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.flags.any? { |f| f.long == "--help" }.should be_true
+    end
+
+    it "has platform as positional arg" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.positional_args.should eq(["platform"])
+    end
+
+    it "has netlify, vercel, cloudflare as positional choices" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      meta.positional_choices.should eq(["netlify", "vercel", "cloudflare"])
+    end
+
+    it "output flag takes a value" do
+      meta = Hwaro::CLI::Commands::Tool::PlatformCommand.metadata
+      flag = meta.flags.find { |f| f.long == "--output" }
+      flag.should_not be_nil
+      flag.not_nil!.takes_value.should be_true
+      flag.not_nil!.value_hint.should eq("PATH")
     end
   end
 end

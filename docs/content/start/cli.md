@@ -257,6 +257,9 @@ hwaro tool list drafts          # List draft files
 hwaro tool list published       # List published files
 hwaro tool deadlink             # Check for dead external links
 hwaro tool doctor               # Diagnose config and content issues
+hwaro tool platform netlify     # Generate Netlify config
+hwaro tool platform vercel      # Generate Vercel config
+hwaro tool platform cloudflare  # Generate Cloudflare Pages config
 
 # JSON output
 hwaro tool list all --json
@@ -273,6 +276,7 @@ hwaro tool convert toYAML --json
 | list | List content files by status (all, drafts, published) |
 | deadlink | Check for dead links in content files |
 | doctor | Diagnose config and content issues |
+| platform | Generate hosting platform config files (Netlify, Vercel, Cloudflare) |
 
 **Common Options:**
 

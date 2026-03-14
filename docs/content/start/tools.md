@@ -323,6 +323,98 @@ Found 0 error(s), 3 warning(s), 1 info(s)
 }
 ```
 
+### platform — Platform Config Generator
+
+Generate hosting platform configuration files for popular providers. Reads your `config.toml` and content aliases to produce ready-to-use deploy configs.
+
+```bash
+# Generate Netlify config
+hwaro tool platform netlify
+
+# Generate Vercel config
+hwaro tool platform vercel
+
+# Generate Cloudflare Pages config
+hwaro tool platform cloudflare
+
+# Output to custom path
+hwaro tool platform netlify -o deploy/netlify.toml
+
+# Print to stdout instead of writing file
+hwaro tool platform vercel --stdout
+```
+
+**Supported Platforms:**
+
+| Platform | Output File | Description |
+|----------|-------------|-------------|
+| netlify | `netlify.toml` | Build settings, redirects, headers |
+| vercel | `vercel.json` | Build command, routing, cache headers |
+| cloudflare | `wrangler.toml` | Workers/Pages site config |
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| -o, --output PATH | Output file path (default: auto-detected) |
+| --stdout | Print to stdout instead of writing file |
+| -h, --help | Show help |
+
+**Generated config includes:**
+
+- **Build command**: `hwaro build`
+- **Output directory**: `public/`
+- **Redirects**: 301 redirects from page `aliases` in frontmatter
+- **Cache headers**: Long-lived caching for static assets
+
+**Example — Netlify output:**
+
+```toml
+[build]
+  command = "hwaro build"
+  publish = "public"
+
+[build.environment]
+  # Add environment variables here
+
+[[redirects]]
+  from = "/old-url/"
+  to = "/posts/new-post/"
+  status = 301
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+```
+
+**Example — Vercel output:**
+
+```json
+{
+  "buildCommand": "hwaro build",
+  "outputDirectory": "public",
+  "redirects": [
+    {
+      "source": "/old-url/",
+      "destination": "/posts/new-post/",
+      "statusCode": 301
+    }
+  ],
+  "headers": [
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    }
+  ]
+}
+```
+
 ---
 
 ## Shell Completion

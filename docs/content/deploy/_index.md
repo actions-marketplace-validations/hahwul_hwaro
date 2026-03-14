@@ -67,9 +67,9 @@ Static sites can be deployed anywhere:
 - [GitHub Pages](/deploy/github-pages/) — Free hosting from GitHub
 - [Docker](/deploy/docker/) — Containerized deployment
 - [GitLab CI](/deploy/gitlab-ci/) — GitLab Pages via CI/CD
-- **Netlify** — Drag and drop or Git integration
-- **Vercel** — Zero-config deployments
-- **Cloudflare Pages** — Fast global CDN
+- [Netlify](/deploy/netlify/) — Drag and drop or Git integration
+- [Vercel](/deploy/vercel/) — Zero-config deployments
+- [Cloudflare Pages](/deploy/cloudflare-pages/) — Fast global CDN
 - **AWS S3 + CloudFront** — Scalable hosting
 - **Any web server** — Nginx, Apache, etc.
 
