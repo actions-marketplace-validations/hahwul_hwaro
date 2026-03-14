@@ -428,6 +428,22 @@ module Hwaro
           TOML
         end
 
+        protected def related_config : String
+          <<-TOML
+
+          # =============================================================================
+          # Related Posts
+          # =============================================================================
+          # Recommend related content based on shared taxonomy terms
+
+          [related]
+          enabled = true
+          limit = 5
+          taxonomies = ["tags"]
+
+          TOML
+        end
+
         protected def taxonomies_config : String
           <<-TOML
 

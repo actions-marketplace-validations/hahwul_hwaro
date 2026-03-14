@@ -537,6 +537,9 @@ module Hwaro
 
           aggregate_site_authors(site)
 
+          # Compute related posts based on taxonomy similarity
+          compute_related_posts(site) if site.config.related.enabled
+
           # Build optimized lookup indices
           site.build_lookup_index
 
@@ -871,6 +874,51 @@ module Hwaro
             end
 
             site.authors[id] = Crinja::Value.new(author_hash)
+          end
+        end
+
+        # Compute related posts for each page based on shared taxonomy terms.
+        # Pages with more shared terms are ranked higher.
+        private def compute_related_posts(site : Models::Site)
+          config = site.config.related
+          taxonomy_names = config.taxonomies
+          limit = config.limit
+          pages = site.pages.reject { |p| p.draft || p.is_index || p.generated || !p.render }
+
+          # Pre-compute taxonomy terms per page for fast lookup
+          page_terms = {} of String => Hash(String, Set(String))
+          pages.each do |page|
+            terms = {} of String => Set(String)
+            taxonomy_names.each do |tax_name|
+              values = page.taxonomies[tax_name]? || (tax_name == "tags" ? page.tags : [] of String)
+              terms[tax_name] = values.to_set unless values.empty?
+            end
+            page_terms[page.path] = terms
+          end
+
+          pages.each do |page|
+            my_terms = page_terms[page.path]
+            next if my_terms.empty? || my_terms.values.all?(&.empty?)
+
+            scored = [] of {Int32, Models::Page}
+            pages.each do |other|
+              next if other.path == page.path
+              next if other.language != page.language
+
+              score = 0
+              other_terms = page_terms[other.path]
+              taxonomy_names.each do |tax_name|
+                my_set = my_terms[tax_name]?
+                other_set = other_terms[tax_name]?
+                next unless my_set && other_set
+                score += (my_set & other_set).size
+              end
+              scored << {score, other} if score > 0
+            end
+
+            page.related_posts = scored.sort_by { |s, _| -s }
+              .first(limit)
+              .map { |_, p| p }
           end
         end
 
@@ -2152,6 +2200,16 @@ module Hwaro
             "lower"           => lower_obj ? Crinja::Value.new(lower_obj) : Crinja::Value.new(nil),
             "higher"          => higher_obj ? Crinja::Value.new(higher_obj) : Crinja::Value.new(nil),
             "ancestors"       => Crinja::Value.new(ancestors_array),
+            "related_posts"   => Crinja::Value.new(page.related_posts.map { |rp|
+              Crinja::Value.new({
+                "title"       => Crinja::Value.new(rp.title),
+                "url"         => Crinja::Value.new(rp.url),
+                "description" => Crinja::Value.new(rp.description || ""),
+                "date"        => Crinja::Value.new(rp.date.try(&.to_s("%Y-%m-%d")) || ""),
+                "image"       => Crinja::Value.new(rp.image || ""),
+                "section"     => Crinja::Value.new(rp.section),
+              })
+            }),
           }
           vars["page"] = Crinja::Value.new(page_obj)
 

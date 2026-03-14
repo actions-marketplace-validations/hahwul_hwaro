@@ -45,6 +45,12 @@ module Hwaro
           sections = []   # Optional: e.g. ["blog"]
           default_language_only = true  # true: main feed = default language only, false: all languages
 
+          # Related Posts
+          [related]
+          enabled = true
+          limit = 5
+          taxonomies = ["tags"]
+
           # Plugins Configuration
           [plugins]
           processors = ["markdown"]  # List of enabled processors
@@ -128,6 +134,12 @@ module Hwaro
           limit = 10
           sections = []   # Optional: e.g. ["blog"]
           default_language_only = true  # true: main feed = default language only, false: all languages
+
+          # Related Posts
+          [related]
+          enabled = true
+          limit = 5
+          taxonomies = ["tags"]
 
           # Plugins Configuration
           [plugins]
@@ -224,6 +236,11 @@ module Hwaro
             str << "limit = 10\n"
             str << "sections = []   # Optional: e.g. [\"blog\"]\n"
             str << "default_language_only = true  # true: main feed = default language only, false: all languages\n\n"
+            str << "# Related Posts\n"
+            str << "[related]\n"
+            str << "enabled = true\n"
+            str << "limit = 5\n"
+            str << "taxonomies = [\"tags\"]\n\n"
             str << "# Plugins Configuration\n"
             str << "[plugins]\n"
             str << "processors = [\"markdown\"]  # List of enabled processors\n\n"

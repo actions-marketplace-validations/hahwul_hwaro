@@ -85,6 +85,9 @@ module Hwaro
       # New: Ancestors - parent sections chain
       property ancestors : Array(Page)
 
+      # New: Related posts (computed by taxonomy similarity)
+      property related_posts : Array(Page)
+
       # New: Redirect to - URL to redirect this page to
       property redirect_to : String?
 
@@ -124,6 +127,7 @@ module Hwaro
         @lower = nil
         @higher = nil
         @ancestors = [] of Page
+        @related_posts = [] of Page
         @redirect_to = nil
         @build_warnings = [] of String
       end

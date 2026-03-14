@@ -98,6 +98,19 @@ module Hwaro
       end
     end
 
+    # Related posts configuration
+    class RelatedConfig
+      property enabled : Bool
+      property limit : Int32
+      property taxonomies : Array(String)
+
+      def initialize
+        @enabled = false
+        @limit = 5
+        @taxonomies = ["tags"]
+      end
+    end
+
     # Plugin configuration for extensibility
     class PluginConfig
       property processors : Array(String)
@@ -464,6 +477,7 @@ module Hwaro
       property languages : Hash(String, LanguageConfig)
       property build : BuildConfig
       property markdown : MarkdownConfig
+      property related : RelatedConfig
       property deployment : DeploymentConfig
       property permalinks : Hash(String, String)
       property raw : Hash(String, TOML::Any)
@@ -488,6 +502,7 @@ module Hwaro
         @languages = {} of String => LanguageConfig
         @build = BuildConfig.new
         @markdown = MarkdownConfig.new
+        @related = RelatedConfig.new
         @deployment = DeploymentConfig.new
         @permalinks = {} of String => String
         @raw = Hash(String, TOML::Any).new
@@ -535,6 +550,7 @@ module Hwaro
         load_languages(config)
         load_build(config)
         load_markdown(config)
+        load_related(config)
         load_permalinks(config)
         load_deployment(config)
 
@@ -784,6 +800,16 @@ module Hwaro
         config.markdown.math = bool_value(s["math"]?, config.markdown.math)
         if engine = s["math_engine"]?.try(&.as_s?)
           config.markdown.math_engine = engine
+        end
+      end
+
+      private def self.load_related(config : Config)
+        return unless s = config.raw["related"]?.try(&.as_h?)
+
+        config.related.enabled = bool_value(s["enabled"]?, config.related.enabled)
+        config.related.limit = int_value(s["limit"]?, config.related.limit)
+        if taxonomies = s["taxonomies"]?.try(&.as_a?)
+          config.related.taxonomies = taxonomies.compact_map(&.as_s?)
         end
       end
 

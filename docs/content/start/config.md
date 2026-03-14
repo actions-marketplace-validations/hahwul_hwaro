@@ -245,6 +245,33 @@ per_page = 10
 
 See [Pagination](/features/pagination/) for section-level configuration and template usage.
 
+## Related Posts
+
+Recommend related content based on shared taxonomy terms.
+
+```toml
+[related]
+enabled = true
+limit = 5
+taxonomies = ["tags", "categories"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Enable related posts |
+| limit | int | 5 | Maximum related posts per page |
+| taxonomies | array | ["tags"] | Taxonomies to use for similarity scoring |
+
+Use in templates:
+
+```jinja
+{% for post in page.related_posts %}
+  <a href="{{ post.url }}">{{ post.title }}</a>
+{% endfor %}
+```
+
+Each related post exposes: `title`, `url`, `description`, `date`, `image`, `section`.
+
 ## Taxonomies
 
 ```toml
@@ -411,6 +438,11 @@ priority = 0.5
 [pagination]
 enabled = false
 per_page = 10
+
+[related]
+enabled = true
+limit = 5
+taxonomies = ["tags", "categories"]
 
 [robots]
 enabled = true
