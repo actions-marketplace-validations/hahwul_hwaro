@@ -5,6 +5,7 @@ module Hwaro
         property output_dir : String
         property base_url : String?
         property drafts : Bool
+        property include_expired : Bool
         property minify : Bool
         property parallel : Bool
         property cache : Bool
@@ -21,6 +22,7 @@ module Hwaro
           @output_dir : String = "public",
           @base_url : String? = nil,
           @drafts : Bool = false,
+          @include_expired : Bool = false,
           @minify : Bool = false,
           @parallel : Bool = true,
           @cache : Bool = false,

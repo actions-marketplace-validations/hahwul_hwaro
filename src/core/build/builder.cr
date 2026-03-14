@@ -174,6 +174,9 @@ module Hwaro
             changed_pages.reject! { |p| p.draft }
           end
 
+          # Filter out expired content
+          changed_pages.reject! { |p| p.expires.try { |e| e <= Time.utc } || false }
+
           # --- 2. Rebuild relationships that depend on the changed pages ---
           # Re-populate taxonomies (a changed page may have new/removed tags)
           all_pages = (site.pages + site.sections).as(Array(Models::Page))
@@ -985,6 +988,27 @@ module Hwaro
             ctx.sections.reject! { |s| s.draft }
             ctx.invalidate_all_pages_cache
           end
+
+          # Filter expired content and warn about pages expiring soon
+          unless ctx.options.include_expired
+            now = Time.utc
+            soon = now + 7.days
+            ctx.pages.each do |p|
+              if exp = p.expires
+                if exp > now && exp <= soon
+                  Logger.warn "  [WARN] Page '#{p.path}' expires on #{exp.to_s("%Y-%m-%d")} (within 7 days)"
+                end
+              end
+            end
+            before = ctx.pages.size
+            ctx.pages.reject! { |p| p.expires.try { |e| e <= now } || false }
+            ctx.sections.reject! { |s| s.expires.try { |e| e <= now } || false }
+            removed = before - ctx.pages.size
+            if removed > 0
+              Logger.info "  Excluded #{removed} expired page#{"s" if removed > 1}"
+              ctx.invalidate_all_pages_cache
+            end
+          end
         end
 
         # Parse a single page: read file, parse frontmatter, assign properties
@@ -1021,6 +1045,9 @@ module Hwaro
           page.in_search_index = data[:in_search_index]
           page.insert_anchor_links = data[:insert_anchor_links]
           page.weight = data[:weight]
+
+          # Expiry support
+          page.expires = data[:expires]
 
           # Series support
           page.series = data[:series]

@@ -21,6 +21,7 @@ module Hwaro
           FlagInfo.new(short: "-o", long: "--output-dir", description: "Output directory (default: public)", takes_value: true, value_hint: "DIR"),
           FlagInfo.new(short: nil, long: "--base-url", description: "Override base_url from config.toml", takes_value: true, value_hint: "URL"),
           FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content"),
+          FlagInfo.new(short: nil, long: "--include-expired", description: "Include expired content"),
           FlagInfo.new(short: nil, long: "--minify", description: "Minify HTML output (and minified json, xml)"),
           FlagInfo.new(short: nil, long: "--no-parallel", description: "Disable parallel file processing"),
           FlagInfo.new(short: nil, long: "--cache", description: "Enable build caching (skip unchanged files)"),
@@ -85,6 +86,7 @@ module Hwaro
           output_dir_explicit = false
           base_url = nil.as(String?)
           drafts = false
+          include_expired = false
           minify = false
           parallel = true
           cache = false
@@ -102,6 +104,7 @@ module Hwaro
             parser.on("-o DIR", "--output-dir DIR", "Output directory (default: public)") { |dir| output_dir = dir; output_dir_explicit = true }
             parser.on("--base-url URL", "Override base_url from config.toml") { |url| base_url = url }
             parser.on("-d", "--drafts", "Include draft content") { drafts = true }
+            parser.on("--include-expired", "Include expired content") { include_expired = true }
             parser.on("--minify", "Minify HTML output (and minified json, xml)") { minify = true }
             parser.on("--no-parallel", "Disable parallel file processing") { parallel = false }
             parser.on("--cache", "Enable build caching (skip unchanged files)") { cache = true }
@@ -119,6 +122,7 @@ module Hwaro
             output_dir: output_dir,
             base_url: base_url,
             drafts: drafts,
+            include_expired: include_expired,
             minify: minify,
             parallel: parallel,
             cache: cache,

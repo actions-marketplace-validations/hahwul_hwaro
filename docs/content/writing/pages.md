@@ -56,6 +56,9 @@ The `+++` block is TOML front matter. Content below becomes HTML.
 | insert_anchor_links | bool | Add heading anchors |
 | redirect_to | string | Redirect page to this URL |
 | render | bool | Render page to output (default: true) |
+| expires | date | Auto-exclude after this date |
+| series | string | Series name for grouping |
+| series_weight | int | Sort order within series |
 | extra | table | Custom metadata |
 
 ## Examples
@@ -87,6 +90,35 @@ Not visible in production.
 ```
 
 Build with drafts: `hwaro build --drafts`
+
+### Expiring Content
+
+```markdown
++++
+title = "Limited Time Offer"
+expires = 2025-12-31
++++
+
+Automatically excluded from builds after the expiry date.
+```
+
+Build with expired content: `hwaro build --include-expired`
+
+Pages expiring within 7 days generate a build warning.
+
+### Series Post
+
+```markdown
++++
+title = "Part 1: Introduction"
+series = "Crystal Tutorial"
+series_weight = 1
++++
+
+First part of the series.
+```
+
+In templates, access `page.series`, `page.series_index`, and `page.series_pages`.
 
 ### Custom Template
 

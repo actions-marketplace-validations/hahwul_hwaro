@@ -23,6 +23,7 @@ module Hwaro
       property description : String?
       property date : Time?
       property updated : Time?
+      property expires : Time?
       property template : String?
       property draft : Bool
       property render : Bool

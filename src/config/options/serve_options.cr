@@ -6,6 +6,7 @@ module Hwaro
         property port : Int32
         property base_url : String?
         property drafts : Bool
+        property include_expired : Bool
         property minify : Bool
         property open_browser : Bool
         property verbose : Bool
@@ -21,6 +22,7 @@ module Hwaro
           @port : Int32 = 3000,
           @base_url : String? = nil,
           @drafts : Bool = false,
+          @include_expired : Bool = false,
           @minify : Bool = false,
           @open_browser : Bool = false,
           @verbose : Bool = false,
@@ -39,6 +41,7 @@ module Hwaro
             output_dir: "public",
             base_url: @base_url,
             drafts: @drafts,
+            include_expired: @include_expired,
             minify: @minify,
             parallel: true,
             verbose: @verbose,

@@ -113,6 +113,7 @@ hwaro build -i /path/to/my-site -o ./dist
 | -o, --output-dir DIR | Output directory (default: public) |
 | --base-url URL | Temporarily override `base_url` from `config.toml` |
 | -d, --drafts | Include draft content |
+| --include-expired | Include expired content |
 | --minify | Minify output files (see below) |
 | --no-parallel | Disable parallel processing |
 | --cache | Enable build caching (see below) |
@@ -191,6 +192,7 @@ hwaro serve -i /path/to/my-site -p 8080
 | --minify | Serve minified output |
 | --open | Open browser after starting |
 | -d, --drafts | Include draft content |
+| --include-expired | Include expired content |
 | -v, --verbose | Show detailed output |
 | --debug | Print debug information after each rebuild |
 | --access-log | Show HTTP access log (e.g. GET requests) |

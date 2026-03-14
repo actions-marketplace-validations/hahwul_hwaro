@@ -49,7 +49,7 @@ module Hwaro
           "transparent", "generate_feeds", "paginate", "pagination_enabled",
           "sort_by", "reverse", "authors", "in_search_index", "insert_anchor_links",
           "page_template", "paginate_path", "redirect_to", "weight", "categories",
-          "series", "series_weight",
+          "series", "series_weight", "expires",
         }
 
         def name : String
@@ -158,6 +158,7 @@ module Hwaro
               weight:              result[:weight],
               series:              result[:series],
               series_weight:       result[:series_weight],
+              expires:             result[:expires],
             }
           else
             # No front matter found — return defaults
@@ -195,6 +196,7 @@ module Hwaro
               weight:              0,
               series:              nil.as(String?),
               series_weight:       0,
+              expires:             nil.as(Time?),
             }
           end
         end
@@ -205,6 +207,7 @@ module Hwaro
 
           date = parse_toml_time(toml_fm["date"]?)
           updated = parse_toml_time(toml_fm["updated"]?)
+          expires = parse_toml_time(toml_fm["expires"]?)
 
           extra = {} of String => String | Bool | Int64 | Float64 | Array(String)
           toml_fm.each do |key, value|
@@ -217,7 +220,8 @@ module Hwaro
           tags = toml_fm["tags"]?.try(&.as_a?.try { |a| a.map(&.as_s) }) || [] of String
           taxonomies["tags"] = tags if tags.any?
 
-          build_front_matter_result(toml_fm, date, updated, extra, front_matter_keys, taxonomies, tags)
+          result = build_front_matter_result(toml_fm, date, updated, extra, front_matter_keys, taxonomies, tags)
+          result.merge({expires: expires})
         rescue ex
           Logger.warn "  [WARN] Invalid TOML in #{file_path}: #{ex.message}" unless file_path.empty?
           nil
@@ -230,6 +234,7 @@ module Hwaro
 
           date = parse_time(yaml_fm["date"]?.try(&.as_s?))
           updated = parse_time(yaml_fm["updated"]?.try(&.as_s?))
+          expires = parse_time(yaml_fm["expires"]?.try(&.as_s?))
 
           extra = {} of String => String | Bool | Int64 | Float64 | Array(String)
           if fm_hash = yaml_fm.as_h?
@@ -246,7 +251,8 @@ module Hwaro
           tags = yaml_fm["tags"]?.try(&.as_a?.try { |a| a.map(&.as_s) }) || [] of String
           taxonomies["tags"] = tags if tags.any?
 
-          build_front_matter_result(yaml_fm, date, updated, extra, front_matter_keys, taxonomies, tags)
+          result = build_front_matter_result(yaml_fm, date, updated, extra, front_matter_keys, taxonomies, tags)
+          result.merge({expires: expires})
         rescue ex
           Logger.warn "  [WARN] Invalid YAML in #{file_path}: #{ex.message}" unless file_path.empty?
           nil
@@ -322,6 +328,7 @@ module Hwaro
             weight:              fm_int?(fm, "weight") || 0,
             series:              fm["series"]?.try(&.as_s?),
             series_weight:       fm_int?(fm, "series_weight") || 0,
+            expires:             nil.as(Time?),
             front_matter_keys:   front_matter_keys,
             taxonomies:          taxonomies,
             tags:                tags,
