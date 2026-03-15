@@ -189,7 +189,7 @@ describe Hwaro::CLI::Commands::ToolCommand do
 
   it "subcommands are loaded from subcommand classes" do
     subs = Hwaro::CLI::Commands::ToolCommand.subcommands
-    subs.size.should eq(6)
+    subs.size.should eq(7)
   end
 end
 

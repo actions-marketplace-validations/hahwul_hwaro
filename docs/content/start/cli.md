@@ -261,6 +261,9 @@ hwaro tool platform netlify     # Generate Netlify config
 hwaro tool platform vercel      # Generate Vercel config
 hwaro tool platform cloudflare  # Generate Cloudflare Pages config
 hwaro tool ci github-actions    # Generate GitHub Actions workflow
+hwaro tool import wordpress export.xml   # Import from WordPress
+hwaro tool import jekyll /path/to/site   # Import from Jekyll
+hwaro tool import hugo /path/to/site     # Import from Hugo
 
 # JSON output
 hwaro tool list all --json
@@ -279,6 +282,7 @@ hwaro tool convert toYAML --json
 | [doctor](/start/tools/doctor/) | Diagnose config and content issues |
 | [platform](/start/tools/platform/) | Generate hosting platform config files (Netlify, Vercel, Cloudflare) |
 | [ci](/start/tools/ci/) | Generate CI/CD workflow files (GitHub Actions) |
+| import | Import content from WordPress, Jekyll, or Hugo |
 
 **Common Options:**
 

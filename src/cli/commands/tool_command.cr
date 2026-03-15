@@ -20,6 +20,7 @@ require "./tool/deadlink_command"
 require "./tool/doctor_command"
 require "./tool/platform_command"
 require "./tool/ci_command"
+require "./tool/import_command"
 require "../../utils/logger"
 
 module Hwaro
@@ -45,6 +46,7 @@ module Hwaro
             Tool::DoctorCommand.metadata,
             Tool::PlatformCommand.metadata,
             Tool::CICommand.metadata,
+            Tool::ImportCommand.metadata,
           ]
         end
 
@@ -80,6 +82,8 @@ module Hwaro
             Tool::PlatformCommand.new.run(args)
           when "ci"
             Tool::CICommand.new.run(args)
+          when "import"
+            Tool::ImportCommand.new.run(args)
           when "-h", "--help", "help"
             print_help
           else
