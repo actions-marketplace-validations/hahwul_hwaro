@@ -2088,6 +2088,10 @@ module Hwaro
           vars["auto_includes_js"] = Crinja::Value.new(config.auto_includes.js_tags(config.base_url, cache_bust))
           vars["auto_includes"] = Crinja::Value.new(config.auto_includes.all_tags(config.base_url, cache_bust))
 
+          # JSON-LD: site-wide WebSite and Organization schemas
+          vars["jsonld_website"] = Crinja::Value.new(Content::Seo::JsonLd.website(config))
+          vars["jsonld_organization"] = Crinja::Value.new(Content::Seo::JsonLd.organization(config, config.og.default_image))
+
           # Time-related variables (fixed per build, not per page)
           now = Time.local
           vars["current_year"] = Crinja::Value.new(now.year)
@@ -2468,9 +2472,19 @@ module Hwaro
           jsonld_article = Content::Seo::JsonLd.article(page, config)
           needs_breadcrumb = !page.ancestors.empty? || !page.is_index
           jsonld_breadcrumb = needs_breadcrumb ? Content::Seo::JsonLd.breadcrumb(page, config) : ""
-          jsonld_all = needs_breadcrumb ? "#{jsonld_article}\n#{jsonld_breadcrumb}" : jsonld_article
+
+          # Extended schema types (FAQ, HowTo) auto-detected from extra.schema_type
+          jsonld_extra = Content::Seo::JsonLd.for_page(page, config)
+
+          jsonld_parts = [jsonld_article]
+          jsonld_parts << jsonld_breadcrumb unless jsonld_breadcrumb.empty?
+          jsonld_parts << jsonld_extra unless jsonld_extra.empty?
+          jsonld_all = jsonld_parts.join("\n")
+
           vars["jsonld_article"] = Crinja::Value.new(jsonld_article)
           vars["jsonld_breadcrumb"] = Crinja::Value.new(jsonld_breadcrumb)
+          vars["jsonld_faq"] = Crinja::Value.new(Content::Seo::JsonLd.faq_page(page, config))
+          vars["jsonld_howto"] = Crinja::Value.new(Content::Seo::JsonLd.how_to(page, config))
           vars["jsonld"] = Crinja::Value.new(jsonld_all)
 
           # Merge global vars at the end.  Page-specific keys (written above)

@@ -25,3 +25,4 @@ Hwaro includes powerful features out of the box.
 - [Environment-Specific Config](/features/env-config/) — Override config settings per deployment environment
 - [PWA](/features/pwa/) — Progressive Web App support with manifest.json and service worker
 - [AMP](/features/amp/) — Generate AMP-compliant versions of content pages
+- [Structured Data](/features/structured-data/) — Extended Schema.org JSON-LD (FAQ, HowTo, WebSite, Organization)
