@@ -257,6 +257,7 @@ hwaro tool list drafts          # List draft files
 hwaro tool list published       # List published files
 hwaro tool deadlink             # Check for dead external links
 hwaro tool doctor               # Diagnose config and content issues
+hwaro tool doctor --fix         # Add missing config sections to config.toml
 hwaro tool platform netlify     # Generate Netlify config
 hwaro tool platform vercel      # Generate Vercel config
 hwaro tool platform cloudflare  # Generate Cloudflare Pages config

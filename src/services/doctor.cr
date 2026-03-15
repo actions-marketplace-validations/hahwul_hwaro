@@ -40,6 +40,27 @@ module Hwaro
       VALID_CHANGEFREQS    = %w[always hourly daily weekly monthly yearly never]
       VALID_SEARCH_FORMATS = %w[fuse_json fuse_javascript elasticlunr_json elasticlunr_javascript]
 
+      # Config sections that can be auto-added by --fix.
+      # Only includes sections with a config_snippet_for entry.
+      # Core sections (sitemap, robots, og, highlight, etc.) are created by
+      # `hwaro init` and are not reported — only newer/optional sections are tracked.
+      KNOWN_CONFIG_SECTIONS = {
+        "pwa"        => "Progressive Web App (manifest.json, service worker)",
+        "amp"        => "AMP page generation",
+        "series"     => "Series grouping",
+        "related"    => "Related posts",
+        "search"     => "Client-side search index",
+        "pagination" => "Pagination settings",
+        "markdown"   => "Markdown parser options",
+        "assets"     => "Asset pipeline (bundling, minification)",
+        "deployment" => "Deployment targets",
+      }
+
+      # Config sections that include sub-sections users should know about
+      KNOWN_SUB_SECTIONS = {
+        {"og", "auto_image"} => "Auto-generated OG images",
+      }
+
       @content_dir : String
       @config_path : String
       @templates_dir : String
@@ -54,6 +75,219 @@ module Hwaro
         check_content(issues)
         check_directory_structure(issues)
         issues
+      end
+
+      # Returns the list of config section keys missing from the user's config.toml
+      def missing_config_sections : Array(String)
+        return [] of String unless File.exists?(@config_path)
+
+        begin
+          raw = TOML.parse_file(@config_path)
+        rescue
+          return [] of String
+        end
+
+        missing = [] of String
+
+        KNOWN_CONFIG_SECTIONS.each_key do |key|
+          unless raw.has_key?(key)
+            missing << key
+          end
+        end
+
+        # Check sub-sections (only when parent section exists)
+        KNOWN_SUB_SECTIONS.each_key do |parent, child|
+          if parent_hash = raw[parent]?.try(&.as_h?)
+            unless parent_hash.has_key?(child)
+              missing << "#{parent}.#{child}"
+            end
+          end
+          # If parent doesn't exist at all, don't report sub-section
+        end
+
+        missing
+      end
+
+      # Append missing config sections to config.toml.
+      # Returns the list of sections that were added.
+      def fix_config : Array(String)
+        return [] of String unless File.exists?(@config_path)
+
+        missing = missing_config_sections
+        return [] of String if missing.empty?
+
+        snippets = [] of String
+        added = [] of String
+
+        missing.each do |key|
+          if snippet = config_snippet_for(key)
+            snippets << snippet
+            added << key
+          end
+        end
+
+        unless snippets.empty?
+          # Ensure existing file ends with a newline before appending
+          existing = File.read(@config_path)
+          File.open(@config_path, "a") do |f|
+            f.print("\n") unless existing.ends_with?("\n")
+            snippets.each { |s| f.print(s) }
+          end
+        end
+
+        added
+      end
+
+      # Get the TOML snippet for a missing config section
+      private def config_snippet_for(key : String) : String?
+        case key
+        when "pwa"
+          <<-TOML
+
+          # =============================================================================
+          # PWA (Progressive Web App) (Optional)
+          # =============================================================================
+          # Generate manifest.json and service worker for offline access
+
+          # [pwa]
+          # enabled = true
+          # name = "My Site"
+          # short_name = "Site"
+          # theme_color = "#ffffff"
+          # background_color = "#ffffff"
+          # display = "standalone"
+          # icons = ["static/icon-192.png", "static/icon-512.png"]
+
+          TOML
+        when "amp"
+          <<-TOML
+
+          # =============================================================================
+          # AMP (Accelerated Mobile Pages) (Optional)
+          # =============================================================================
+          # Generate AMP-compliant versions of content pages
+
+          # [amp]
+          # enabled = true
+          # path_prefix = "amp"
+          # sections = ["posts"]
+
+          TOML
+        when "og.auto_image"
+          <<-TOML
+
+          # =============================================================================
+          # Auto OG Images (Optional)
+          # =============================================================================
+          # Auto-generate Open Graph preview images for social sharing
+
+          # [og.auto_image]
+          # enabled = true
+          # background = "#1a1a2e"
+          # text_color = "#ffffff"
+          # accent_color = "#e94560"
+          # font_size = 48
+          # logo = "static/logo.png"
+          # output_dir = "og-images"
+
+          TOML
+        when "series"
+          <<-TOML
+
+          # =============================================================================
+          # Series (Optional)
+          # =============================================================================
+          # Group posts into ordered series
+
+          # [series]
+          # enabled = true
+
+          TOML
+        when "related"
+          <<-TOML
+
+          # =============================================================================
+          # Related Posts (Optional)
+          # =============================================================================
+          # Recommend related content based on shared taxonomy terms
+
+          # [related]
+          # enabled = true
+          # limit = 5
+          # taxonomies = ["tags"]
+
+          TOML
+        when "search"
+          <<-TOML
+
+          # =============================================================================
+          # Search (Optional)
+          # =============================================================================
+          # Generate search index for client-side search
+
+          # [search]
+          # enabled = true
+          # format = "fuse_json"
+          # fields = ["title", "content"]
+
+          TOML
+        when "pagination"
+          <<-TOML
+
+          # =============================================================================
+          # Pagination (Optional)
+          # =============================================================================
+
+          # [pagination]
+          # enabled = false
+          # per_page = 10
+
+          TOML
+        when "markdown"
+          <<-TOML
+
+          # =============================================================================
+          # Markdown (Optional)
+          # =============================================================================
+
+          # [markdown]
+          # safe = false
+          # lazy_loading = false
+          # emoji = false
+
+          TOML
+        when "assets"
+          <<-TOML
+
+          # =============================================================================
+          # Asset Pipeline (Optional)
+          # =============================================================================
+
+          # [assets]
+          # enabled = true
+          # minify = true
+          # fingerprint = true
+
+          TOML
+        when "deployment"
+          <<-TOML
+
+          # =============================================================================
+          # Deployment (Optional)
+          # =============================================================================
+
+          # [deployment]
+          # target = "prod"
+          # source_dir = "public"
+          #
+          # [[deployment.targets]]
+          # name = "prod"
+          # url = "file://./out"
+
+          TOML
+        else
+          nil # Unknown section — skip
+        end
       end
 
       private def check_config(issues : Array(Issue))
@@ -125,6 +359,20 @@ module Hwaro
         lang_duplicates.each do |code|
           issues << Issue.new(level: :warning, category: "config", file: @config_path,
             message: "Duplicate language code: \"#{code}\"")
+        end
+
+        # Check for missing config sections
+        check_missing_config_sections(issues)
+      end
+
+      private def check_missing_config_sections(issues : Array(Issue))
+        missing = missing_config_sections
+        return if missing.empty?
+
+        missing.each do |key|
+          desc = KNOWN_CONFIG_SECTIONS[key]? || KNOWN_SUB_SECTIONS.find { |k, _| "#{k[0]}.#{k[1]}" == key }.try(&.last) || key
+          issues << Issue.new(level: :info, category: "config_missing", file: @config_path,
+            message: "Missing config section [#{key}] (#{desc}) — run 'hwaro tool doctor --fix' to add it")
         end
       end
 

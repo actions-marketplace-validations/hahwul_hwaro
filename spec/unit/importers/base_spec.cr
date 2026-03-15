@@ -33,8 +33,8 @@ describe Hwaro::Services::Importers::Base do
     it "generates TOML frontmatter with string values" do
       importer = TestImporter.new
       result = importer.test_generate_frontmatter({
-        "title" => "My Post" .as(String | Bool | Array(String) | Nil),
-        "date"  => "2024-01-15" .as(String | Bool | Array(String) | Nil),
+        "title" => "My Post".as(String | Bool | Array(String) | Nil),
+        "date"  => "2024-01-15".as(String | Bool | Array(String) | Nil),
       })
       result.should contain("+++")
       result.should contain(%(title = "My Post"))

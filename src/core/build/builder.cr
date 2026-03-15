@@ -2290,7 +2290,7 @@ module Hwaro
                 "series_index" => Crinja::Value.new(sp.series_index),
               })
             }),
-            "related_posts"   => Crinja::Value.new(page.related_posts.map { |rp|
+            "related_posts" => Crinja::Value.new(page.related_posts.map { |rp|
               Crinja::Value.new({
                 "title"       => Crinja::Value.new(rp.title),
                 "url"         => Crinja::Value.new(rp.url),

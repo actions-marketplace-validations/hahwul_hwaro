@@ -148,12 +148,12 @@ module Hwaro
         # Determine MIME type from file extension
         private def self.mime_type_for(path : String) : String
           case File.extname(path).downcase
-          when ".png"  then "image/png"
+          when ".png"          then "image/png"
           when ".jpg", ".jpeg" then "image/jpeg"
-          when ".svg"  then "image/svg+xml"
-          when ".webp" then "image/webp"
-          when ".ico"  then "image/x-icon"
-          else              "image/png"
+          when ".svg"          then "image/svg+xml"
+          when ".webp"         then "image/webp"
+          when ".ico"          then "image/x-icon"
+          else                      "image/png"
           end
         end
       end

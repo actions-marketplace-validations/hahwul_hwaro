@@ -303,6 +303,136 @@ describe Hwaro::Services::Doctor do
       end
     end
 
+    describe "missing config sections" do
+      it "reports missing config sections" do
+        # Minimal config with no sections
+        issues = run_doctor(%(title = "My Site"\nbase_url = "https://example.com"))
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+        missing_issues.should_not be_empty
+
+        # Should mention pwa, amp among others
+        messages = missing_issues.map(&.message)
+        messages.any? { |m| m.includes?("[pwa]") }.should be_true
+        messages.any? { |m| m.includes?("[amp]") }.should be_true
+      end
+
+      it "reports og.auto_image when [og] exists but sub-section is missing" do
+        config = <<-TOML
+        title = "My Site"
+        base_url = "https://example.com"
+        [og]
+        default_image = "/img.png"
+        TOML
+        issues = run_doctor(config)
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+        missing_issues.any? { |i| i.message.includes?("[og.auto_image]") }.should be_true
+      end
+
+      it "does not report og.auto_image when [og] itself is missing" do
+        issues = run_doctor(%(title = "My Site"\nbase_url = "https://example.com"))
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+        missing_issues.none? { |i| i.message.includes?("[og.auto_image]") }.should be_true
+      end
+
+      it "does not report sections that exist" do
+        config = <<-TOML
+        title = "My Site"
+        base_url = "https://example.com"
+        [pwa]
+        enabled = false
+        [amp]
+        enabled = false
+        TOML
+        issues = run_doctor(config)
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+
+        missing_issues.none? { |i| i.message.includes?("[pwa]") }.should be_true
+        missing_issues.none? { |i| i.message.includes?("[amp]") }.should be_true
+      end
+
+      it "does not report og.auto_image when it exists" do
+        config = <<-TOML
+        title = "My Site"
+        base_url = "https://example.com"
+        [og]
+        default_image = "/img.png"
+        [og.auto_image]
+        enabled = false
+        TOML
+        issues = run_doctor(config)
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+        missing_issues.none? { |i| i.message.includes?("[og.auto_image]") }.should be_true
+      end
+
+      it "suggests --fix in issue messages" do
+        issues = run_doctor(%(title = "My Site"\nbase_url = "https://example.com"))
+        missing_issues = issues.select { |i| i.category == "config_missing" }
+        missing_issues.all? { |i| i.message.includes?("--fix") }.should be_true
+      end
+    end
+
+    describe "#fix_config" do
+      it "appends missing sections to config.toml" do
+        Dir.mktmpdir do |dir|
+          config_path = File.join(dir, "config.toml")
+          File.write(config_path, %(title = "My Site"\nbase_url = "https://example.com"\n))
+
+          doctor = Hwaro::Services::Doctor.new(content_dir: File.join(dir, "content"), config_path: config_path)
+          added = doctor.fix_config
+
+          added.should_not be_empty
+          added.should contain("pwa")
+          added.should contain("amp")
+
+          content = File.read(config_path)
+          content.should contain("[pwa]")
+          content.should contain("[amp]")
+        end
+      end
+
+      it "appends og.auto_image when [og] exists but sub-section missing" do
+        Dir.mktmpdir do |dir|
+          config_path = File.join(dir, "config.toml")
+          File.write(config_path, %(title = "My Site"\nbase_url = "https://example.com"\n[og]\ndefault_image = "/img.png"\n))
+
+          doctor = Hwaro::Services::Doctor.new(content_dir: File.join(dir, "content"), config_path: config_path)
+          added = doctor.fix_config
+
+          added.should contain("og.auto_image")
+
+          content = File.read(config_path)
+          content.should contain("[og.auto_image]")
+        end
+      end
+
+      it "does not duplicate existing sections" do
+        Dir.mktmpdir do |dir|
+          config_path = File.join(dir, "config.toml")
+          File.write(config_path, %(title = "My Site"\nbase_url = "https://example.com"\n[pwa]\nenabled = false\n))
+
+          doctor = Hwaro::Services::Doctor.new(content_dir: File.join(dir, "content"), config_path: config_path)
+          added = doctor.fix_config
+
+          added.should_not contain("pwa")
+        end
+      end
+
+      it "returns empty when nothing is missing" do
+        Dir.mktmpdir do |dir|
+          config_path = File.join(dir, "config.toml")
+          # Write a config with all known sections
+          sections = Hwaro::Services::Doctor::KNOWN_CONFIG_SECTIONS.keys.map { |k|
+            "[#{k}]"
+          }.join("\n")
+          File.write(config_path, %(title = "My Site"\nbase_url = "https://example.com"\n#{sections}\n[og]\ndefault_image = "/img.png"\n[og.auto_image]\nenabled = false\n))
+
+          doctor = Hwaro::Services::Doctor.new(content_dir: File.join(dir, "content"), config_path: config_path)
+          added = doctor.fix_config
+          added.should be_empty
+        end
+      end
+    end
+
     describe "directory structure" do
       it "reports info when section dir missing _index.md" do
         Dir.mktmpdir do |dir|

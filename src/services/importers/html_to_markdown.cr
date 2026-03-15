@@ -91,7 +91,7 @@ module Hwaro
           result = decode_html_entities(result)
 
           # Clean up whitespace
-          result = result.gsub(/\n{3,}/, "\n\n")  # Max 2 consecutive newlines
+          result = result.gsub(/\n{3,}/, "\n\n") # Max 2 consecutive newlines
           result.strip
         end
 

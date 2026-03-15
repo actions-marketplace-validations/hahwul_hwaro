@@ -25,6 +25,7 @@ module Hwaro
               takes_value: true,
               value_hint: "DIR"
             ),
+            FlagInfo.new(short: nil, long: "--fix", description: "Auto-fix issues (add missing config sections)"),
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -43,12 +44,14 @@ module Hwaro
             content_dir = "content"
             config_path = "config.toml"
             json_output = false
+            fix_mode = false
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool doctor [options]"
               parser.on("-c DIR", "--content-dir DIR", "Content directory to check") do |dir|
                 content_dir = dir
               end
+              parser.on("--fix", "Auto-fix issues (add missing config sections)") { fix_mode = true }
               parser.on("-j", "--json", "Output result as JSON") { json_output = true }
               parser.on("-h", "--help", "Show this help") do
                 Logger.info parser.to_s
@@ -57,6 +60,12 @@ module Hwaro
             end
 
             doctor = Services::Doctor.new(content_dir: content_dir, config_path: config_path)
+
+            if fix_mode
+              run_fix(doctor)
+              return
+            end
+
             issues = doctor.run
 
             if json_output
@@ -96,11 +105,20 @@ module Hwaro
 
             # Group by category
             config_issues = issues.select { |i| i.category == "config" }
+            config_missing = issues.select { |i| i.category == "config_missing" }
             content_issues = issues.select { |i| i.category == "content" }
+            template_issues = issues.select { |i| i.category == "template" }
+            structure_issues = issues.select { |i| i.category == "structure" }
 
             unless config_issues.empty?
               Logger.info "Config:"
               config_issues.each { |issue| print_issue(issue) }
+              Logger.info ""
+            end
+
+            unless config_missing.empty?
+              Logger.info "Missing Config Sections (run 'hwaro tool doctor --fix' to add):"
+              config_missing.each { |issue| print_issue(issue) }
               Logger.info ""
             end
 
@@ -110,12 +128,40 @@ module Hwaro
               Logger.info ""
             end
 
+            unless template_issues.empty?
+              Logger.info "Templates:"
+              template_issues.each { |issue| print_issue(issue) }
+              Logger.info ""
+            end
+
+            unless structure_issues.empty?
+              Logger.info "Structure:"
+              structure_issues.each { |issue| print_issue(issue) }
+              Logger.info ""
+            end
+
             # Summary
             errors = issues.count { |i| i.level == :error }
             warnings = issues.count { |i| i.level == :warning }
             infos = issues.count { |i| i.level == :info }
 
             Logger.info "Found #{errors} error(s), #{warnings} warning(s), #{infos} info(s)"
+          end
+
+          private def run_fix(doctor : Services::Doctor)
+            added = doctor.fix_config
+
+            if added.empty?
+              Logger.info "#{"✔".colorize(:green)} Config is up to date — no missing sections."
+            else
+              Logger.success "Added #{added.size} missing config section(s) to config.toml:"
+              added.each do |key|
+                Logger.info "  #{"＋".colorize(:green)} [#{key}]"
+              end
+              Logger.info ""
+              Logger.info "All new sections are commented out by default."
+              Logger.info "Edit config.toml to enable the features you need."
+            end
           end
 
           private def print_issue(issue : Services::Issue)
