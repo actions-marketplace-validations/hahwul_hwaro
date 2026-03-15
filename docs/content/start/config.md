@@ -202,6 +202,31 @@ fb_app_id = "your_fb_app_id"
 | twitter_creator | string | — | Author's Twitter handle |
 | fb_app_id | string | — | Facebook App ID |
 
+### Auto OG Images
+
+Automatically generate Open Graph preview images from page titles:
+
+```toml
+[og.auto_image]
+enabled = true
+background = "#1a1a2e"
+text_color = "#ffffff"
+accent_color = "#e94560"
+font_size = 48
+logo = "static/logo.png"
+output_dir = "og-images"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | false | Auto-generate OG images for pages without a custom image |
+| background | string | "#1a1a2e" | Background color |
+| text_color | string | "#ffffff" | Title and description text color |
+| accent_color | string | "#e94560" | Accent color (top/bottom bars, site name) |
+| font_size | int | 48 | Title font size in pixels |
+| logo | string | — | Path to logo file (e.g., `static/logo.png`) |
+| output_dir | string | "og-images" | Output directory for generated images |
+
 See [SEO](/features/seo/) for template usage and output examples.
 
 ## AMP

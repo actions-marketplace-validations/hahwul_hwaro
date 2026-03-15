@@ -250,6 +250,27 @@ module Hwaro
       end
     end
 
+    # Auto-generated OG image configuration
+    class AutoImageConfig
+      property enabled : Bool
+      property background : String
+      property text_color : String
+      property accent_color : String
+      property font_size : Int32
+      property logo : String?
+      property output_dir : String
+
+      def initialize
+        @enabled = false
+        @background = "#1a1a2e"
+        @text_color = "#ffffff"
+        @accent_color = "#e94560"
+        @font_size = 48
+        @logo = nil
+        @output_dir = "og-images"
+      end
+    end
+
     # OpenGraph and Twitter Card configuration
     class OpenGraphConfig
       property default_image : String?
@@ -258,6 +279,7 @@ module Hwaro
       property twitter_creator : String?
       property fb_app_id : String?
       property og_type : String
+      property auto_image : AutoImageConfig
 
       def initialize
         @default_image = nil
@@ -266,6 +288,7 @@ module Hwaro
         @twitter_creator = nil
         @fb_app_id = nil
         @og_type = "article"
+        @auto_image = AutoImageConfig.new
       end
 
       # Generate OG meta tags
@@ -870,6 +893,16 @@ module Hwaro
         config.og.twitter_creator = s["twitter_creator"]?.try(&.as_s?)
         config.og.fb_app_id = s["fb_app_id"]?.try(&.as_s?)
         config.og.og_type = s["type"]?.try(&.as_s?) || config.og.og_type
+
+        if ai = s["auto_image"]?.try(&.as_h?)
+          config.og.auto_image.enabled = bool_value(ai["enabled"]?, config.og.auto_image.enabled)
+          config.og.auto_image.background = ai["background"]?.try(&.as_s?) || config.og.auto_image.background
+          config.og.auto_image.text_color = ai["text_color"]?.try(&.as_s?) || config.og.auto_image.text_color
+          config.og.auto_image.accent_color = ai["accent_color"]?.try(&.as_s?) || config.og.auto_image.accent_color
+          config.og.auto_image.font_size = int_value(ai["font_size"]?, config.og.auto_image.font_size)
+          config.og.auto_image.logo = ai["logo"]?.try(&.as_s?)
+          config.og.auto_image.output_dir = ai["output_dir"]?.try(&.as_s?) || config.og.auto_image.output_dir
+        end
       end
 
       private def self.load_taxonomies(config : Config)

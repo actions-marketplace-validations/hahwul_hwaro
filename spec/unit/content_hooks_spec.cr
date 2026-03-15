@@ -8,9 +8,14 @@ describe Hwaro::Content::Hooks do
       hooks.should be_a(Array(Hwaro::Core::Lifecycle::Hookable))
     end
 
-    it "returns exactly 6 hooks" do
+    it "returns exactly 7 hooks" do
       hooks = Hwaro::Content::Hooks.all
-      hooks.size.should eq(6)
+      hooks.size.should eq(7)
+    end
+
+    it "includes OgImageHooks" do
+      hooks = Hwaro::Content::Hooks.all
+      hooks.any? { |h| h.is_a?(Hwaro::Content::Hooks::OgImageHooks) }.should be_true
     end
 
     it "includes AmpHooks" do
