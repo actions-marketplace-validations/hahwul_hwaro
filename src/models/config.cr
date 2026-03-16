@@ -510,8 +510,8 @@ module Hwaro
 
     # Image processing configuration
     #
-    # Enables automatic image resizing during build using system tools
-    # (ImageMagick `magick`/`convert` or macOS `sips`).
+    # Enables automatic image resizing during build using stb (statically linked).
+    # Supports JPG, PNG, BMP. No external tools required.
     #
     # Config example (config.toml):
     #   [image_processing]
@@ -1078,9 +1078,12 @@ module Hwaro
         return unless s = config.raw["image_processing"]?.try(&.as_h?)
 
         config.image_processing.enabled = bool_value(s["enabled"]?, config.image_processing.enabled)
-        config.image_processing.quality = int_value(s["quality"]?, config.image_processing.quality)
+        config.image_processing.quality = int_value(s["quality"]?, config.image_processing.quality).clamp(1, 100)
         if widths = s["widths"]?.try(&.as_a?)
-          config.image_processing.widths = widths.compact_map { |w| w.as_i? || w.as_f?.try(&.to_i) }
+          config.image_processing.widths = widths.compact_map { |w|
+            val = w.as_i? || w.as_f?.try(&.to_i)
+            val && val > 0 ? val : nil
+          }
         end
       end
 

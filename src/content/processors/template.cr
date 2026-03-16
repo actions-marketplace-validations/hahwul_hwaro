@@ -413,15 +413,17 @@ module Hwaro
           end
 
           # resize_image() function - returns URL to a resized image variant
-          # Usage: {{ resize_image(path="/images/photo.jpg", width=800, height=600) }}
-          # Returns object with url, width, height properties.
-          # When image_processing is enabled, returns URL to the resized variant.
-          # Otherwise, returns the original URL.
-          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0, op: "fit"}) do
+          # Usage: {{ resize_image(path="/images/photo.jpg", width=800) }}
+          #        {{ resize_image(path="/images/photo.jpg", width=800).url }}
+          # Returns object with:
+          #   - url: URL to the resized variant (or original if not available)
+          #   - width: requested width (0 if not specified)
+          #   - height: requested height (0 if not specified)
+          # Note: actual output dimensions depend on aspect ratio preservation.
+          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0}) do
             path = arguments["path"].to_s
-            width = arguments["width"].as_number.to_i
-            height = arguments["height"].as_number.to_i
-            op = arguments["op"].to_s
+            width = Math.max(0, arguments["width"].as_number.to_i)
+            height = Math.max(0, arguments["height"].as_number.to_i)
 
             base_url = env.resolve("base_url").to_s
 

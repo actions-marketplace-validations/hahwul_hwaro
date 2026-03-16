@@ -3,12 +3,18 @@ require "../../src/content/processors/image_processor"
 
 describe Hwaro::Content::Processors::ImageProcessor do
   describe ".image?" do
-    it "returns true for common image extensions" do
+    it "returns true for supported image extensions" do
       Hwaro::Content::Processors::ImageProcessor.image?("photo.jpg").should be_true
       Hwaro::Content::Processors::ImageProcessor.image?("photo.jpeg").should be_true
       Hwaro::Content::Processors::ImageProcessor.image?("icon.png").should be_true
-      Hwaro::Content::Processors::ImageProcessor.image?("anim.gif").should be_true
       Hwaro::Content::Processors::ImageProcessor.image?("scan.bmp").should be_true
+    end
+
+    it "returns false for unsupported formats" do
+      Hwaro::Content::Processors::ImageProcessor.image?("anim.gif").should be_false
+      Hwaro::Content::Processors::ImageProcessor.image?("pic.webp").should be_false
+      Hwaro::Content::Processors::ImageProcessor.image?("raw.tiff").should be_false
+      Hwaro::Content::Processors::ImageProcessor.image?("photo.tga").should be_false
     end
 
     it "returns false for non-image files" do
@@ -41,12 +47,11 @@ describe Hwaro::Content::Processors::ImageProcessor do
   describe ".resize" do
     it "resizes a PNG image" do
       Dir.mktmpdir do |dir|
-        # Create a minimal 4x4 red PNG using stb
         src = File.join(dir, "test.png")
         dest = File.join(dir, "test_2w.png")
 
         # Write a 4x4 solid color PNG via stb
-        pixels = Bytes.new(4 * 4 * 3, 255_u8) # white
+        pixels = Bytes.new(4 * 4 * 3, 255_u8)
         LibStb.stbi_write_png(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 4 * 3)
 
         result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2, 0, 85)
@@ -99,6 +104,43 @@ describe Hwaro::Content::Processors::ImageProcessor do
         File.size(dest).should eq(File.size(src))
       end
     end
+
+    it "clamps quality to valid range" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "test.jpg")
+        dest = File.join(dir, "test_2w.jpg")
+
+        pixels = Bytes.new(4 * 4 * 3, 100_u8)
+        LibStb.stbi_write_jpg(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 90)
+
+        # quality = 0 should be clamped to 1, not crash
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2, 0, 0)
+        result.should eq(dest)
+      end
+    end
+
+    it "preserves aspect ratio with width-only resize" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "wide.png")
+        dest = File.join(dir, "wide_5w.png")
+
+        # Create 10x4 image
+        pixels = Bytes.new(10 * 4 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 10, 4, 3, pixels.to_unsafe.as(Void*), 10 * 3)
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 5, 0, 85)
+        result.should eq(dest)
+
+        w = uninitialized LibC::Int
+        h = uninitialized LibC::Int
+        c = uninitialized LibC::Int
+        out_pixels = LibStb.stbi_load(dest, pointerof(w), pointerof(h), pointerof(c), 0)
+        out_pixels.null?.should be_false
+        w.should eq(5)
+        h.should eq(2) # 4 * (5/10) = 2
+        LibStb.stbi_image_free(out_pixels.as(Void*))
+      end
+    end
   end
 end
 
@@ -136,6 +178,33 @@ describe "Config.load image_processing" do
       config.image_processing.enabled.should be_false
       config.image_processing.widths.should eq([] of Int32)
       config.image_processing.quality.should eq(85)
+    end
+  end
+
+  it "filters out zero and negative widths" do
+    Dir.cd(Dir.tempdir) do
+      File.write("config.toml", <<-TOML
+        title = "Test"
+        [image_processing]
+        enabled = true
+        widths = [0, -100, 320, 640]
+        TOML
+      )
+      config = Hwaro::Models::Config.load
+      config.image_processing.widths.should eq([320, 640])
+    end
+  end
+
+  it "clamps quality to 1-100" do
+    Dir.cd(Dir.tempdir) do
+      File.write("config.toml", <<-TOML
+        title = "Test"
+        [image_processing]
+        quality = 0
+        TOML
+      )
+      config = Hwaro::Models::Config.load
+      config.image_processing.quality.should eq(1)
     end
   end
 end

@@ -1,9 +1,13 @@
 # Image processor for Hwaro
 #
 # Resizes images using stb libraries (statically linked, zero runtime dependencies):
-# - stb_image.h       (decode JPG/PNG/BMP/GIF/TGA/PSD/HDR/PIC)
-# - stb_image_write.h (encode JPG/PNG/BMP)
+# - stb_image.h        (decode JPG/PNG/BMP/GIF/TGA/PSD/HDR/PIC)
+# - stb_image_write.h  (encode JPG/PNG/BMP)
 # - stb_image_resize2.h (high-quality resize)
+#
+# Only JPG/PNG/BMP are supported for output because stb_image_write
+# can only encode those formats. GIF/TGA/PSD/HDR can be decoded but
+# not written back, so they are excluded from IMAGE_EXTENSIONS.
 #
 # Usage in templates:
 #   {{ resize_image(path="images/photo.jpg", width=800, height=600) }}
@@ -23,9 +27,13 @@ module Hwaro
       module ImageProcessor
         extend self
 
-        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr"}
+        # Only formats that stb can both read AND write back correctly.
+        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
-        # Check if a file is an image based on extension
+        # Maximum pixel count to prevent excessive memory allocation (64 megapixels)
+        MAX_PIXELS = 64_000_000_i64
+
+        # Check if a file is a resizable image based on extension
         def image?(path : String) : Bool
           ext = File.extname(path).downcase
           IMAGE_EXTENSIONS.includes?(ext)
@@ -45,17 +53,34 @@ module Hwaro
         def resize(source : String, dest : String, width : Int32, height : Int32 = 0, quality : Int32 = 85) : String?
           return nil unless File.exists?(source)
 
+          # Clamp quality to valid range for stb_image_write (1-100)
+          quality = quality.clamp(1, 100)
+
           # Load source image
           src_w = uninitialized LibC::Int
           src_h = uninitialized LibC::Int
           channels = uninitialized LibC::Int
           pixels = LibStb.stbi_load(source, pointerof(src_w), pointerof(src_h), pointerof(channels), 0)
-          return nil if pixels.null?
+
+          if pixels.null?
+            reason = String.new(LibStb.stbi_failure_reason)
+            Logger.debug "Image load failed '#{source}': #{reason}"
+            return nil
+          end
 
           begin
+            # Guard against degenerate images (0 or negative dimensions)
+            if src_w <= 0 || src_h <= 0 || channels <= 0
+              Logger.debug "Image has invalid dimensions '#{source}': #{src_w}x#{src_h}x#{channels}"
+              return nil
+            end
+
             # Calculate output dimensions (preserve aspect ratio)
             out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width, height)
-            return nil if out_w <= 0 || out_h <= 0
+            if out_w <= 0 || out_h <= 0
+              Logger.debug "Calculated invalid output dimensions for '#{source}': #{out_w}x#{out_h}"
+              return nil
+            end
 
             # Skip resize if output would be larger than source
             if out_w >= src_w && out_h >= src_h
@@ -64,20 +89,43 @@ module Hwaro
               return dest
             end
 
-            # Allocate output buffer and resize
-            out_pixels = Pointer(UInt8).malloc(out_w * out_h * channels)
-            result = LibStb.stbir_resize_uint8_linear(
-              pixels, src_w, src_h, 0,
-              out_pixels, out_w, out_h, 0,
-              channels
-            )
-            return nil if result.null?
+            # Guard against excessive memory allocation (use Int64 to avoid overflow)
+            buf_size = out_w.to_i64 * out_h.to_i64 * channels.to_i64
+            if buf_size > MAX_PIXELS * 4 # 4 channels max
+              Logger.debug "Output image too large '#{source}': #{out_w}x#{out_h}x#{channels} = #{buf_size} bytes"
+              return nil
+            end
 
-            # Write output
-            FileUtils.mkdir_p(File.dirname(dest))
-            ext = File.extname(dest).downcase
-            ok = write_image(dest, ext, out_w, out_h, channels, out_pixels, quality)
-            ok ? dest : nil
+            # Allocate output buffer with LibC.malloc for deterministic C interop
+            out_pixels = LibC.malloc(buf_size).as(UInt8*)
+            if out_pixels.null?
+              Logger.debug "Failed to allocate #{buf_size} bytes for resize of '#{source}'"
+              return nil
+            end
+
+            begin
+              result = LibStb.stbir_resize_uint8_linear(
+                pixels, src_w, src_h, 0,
+                out_pixels, out_w, out_h, 0,
+                channels
+              )
+
+              if result.null?
+                Logger.debug "Resize failed for '#{source}'"
+                return nil
+              end
+
+              # Write output
+              FileUtils.mkdir_p(File.dirname(dest))
+              ext = File.extname(dest).downcase
+              ok = write_image(dest, ext, out_w, out_h, channels.to_i32, out_pixels, quality)
+              unless ok
+                Logger.debug "Failed to write resized image '#{dest}'"
+              end
+              ok ? dest : nil
+            ensure
+              LibC.free(out_pixels.as(Void*))
+            end
           ensure
             LibStb.stbi_image_free(pixels.as(Void*))
           end
@@ -109,8 +157,12 @@ module Hwaro
 
         # --- Private helpers ---
 
-        # Calculate output dimensions preserving aspect ratio
+        # Calculate output dimensions preserving aspect ratio.
+        # Returns {0, 0} for invalid inputs to signal caller to skip.
         private def calculate_dimensions(src_w : Int32, src_h : Int32, target_w : Int32, target_h : Int32) : {Int32, Int32}
+          # Guard against zero source dimensions (prevents division by zero)
+          return {0, 0} if src_w <= 0 || src_h <= 0
+
           if target_w > 0 && target_h > 0
             # Both specified: fit within the box
             scale_w = target_w.to_f / src_w
@@ -120,11 +172,11 @@ module Hwaro
           elsif target_w > 0
             # Width only: scale proportionally
             scale = target_w.to_f / src_w
-            {target_w, (src_h * scale).round.to_i32}
+            {target_w, Math.max(1, (src_h * scale).round.to_i32)}
           elsif target_h > 0
             # Height only: scale proportionally
             scale = target_h.to_f / src_h
-            {(src_w * scale).round.to_i32, target_h}
+            {Math.max(1, (src_w * scale).round.to_i32), target_h}
           else
             {src_w, src_h}
           end
@@ -140,8 +192,7 @@ module Hwaro
           when ".bmp"
             LibStb.stbi_write_bmp(path, w, h, channels, data.as(Void*)) != 0
           else
-            # Default to PNG for unsupported output formats
-            LibStb.stbi_write_png(path, w, h, channels, data.as(Void*), w * channels) != 0
+            false
           end
         end
       end

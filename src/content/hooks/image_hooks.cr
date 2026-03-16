@@ -24,8 +24,9 @@ module Hwaro
           end
         end
 
+        # Returns a snapshot copy of the resize map (safe to use outside mutex)
         def self.resize_map : Hash(String, Hash(Int32, String))
-          @@resize_map_mutex.synchronize { @@resize_map }
+          @@resize_map_mutex.synchronize { @@resize_map.dup }
         end
 
         def self.find_resized(url : String, width : Int32) : String?
@@ -64,8 +65,10 @@ module Hwaro
           widths = config.image_processing.widths
           quality = config.image_processing.quality
           output_dir = ctx.output_dir
-          resized_count = 0
           new_map = {} of String => Hash(Int32, String)
+
+          # Resolve the output directory to prevent path traversal checks from failing
+          resolved_output = File.expand_path(output_dir)
 
           # Process co-located page assets
           ctx.all_pages.each do |page|
@@ -80,6 +83,7 @@ module Hwaro
 
               source_path = File.join("content", asset_path)
               next unless File.exists?(source_path)
+              next unless safe_path?(source_path, "content")
 
               relative_to_bundle = Path[asset_path].relative_to(page_bundle_dir)
               original_url = "/" + url_path + relative_to_bundle.to_s
@@ -89,10 +93,11 @@ module Hwaro
               widths.each do |width|
                 resized_name = Processors::ImageProcessor.resized_filename(File.basename(asset_path), width)
                 dest_path = File.join(asset_dest_dir, resized_name)
+                next unless safe_path?(dest_path, resolved_output)
+
                 if Processors::ImageProcessor.resize(source_path, dest_path, width, 0, quality)
                   resized_url = "/" + url_path + File.join(File.dirname(relative_to_bundle.to_s), resized_name)
                   width_map[width] = resized_url
-                  resized_count += 1
                 end
               end
               new_map[original_url] = width_map unless width_map.empty?
@@ -101,20 +106,28 @@ module Hwaro
 
           # Process content files (non-page-bundle images)
           if config.content_files.enabled?
-            process_content_file_images(config, output_dir, widths, quality, new_map)
+            process_content_file_images(config, output_dir, resolved_output, widths, quality, new_map)
           end
 
           # Process static directory images
-          process_static_images(output_dir, widths, quality, new_map)
+          process_static_images(output_dir, resolved_output, widths, quality, new_map)
 
           @@resize_map_mutex.synchronize { @@resize_map = new_map }
           resized_count = new_map.values.sum(&.size)
           Logger.success "  Generated #{resized_count} resized image(s)." if resized_count > 0
         end
 
+        # Verify that a path resolves within the expected base directory
+        private def safe_path?(path : String, base : String) : Bool
+          resolved = File.expand_path(path)
+          resolved_base = File.expand_path(base)
+          resolved == resolved_base || resolved.starts_with?(resolved_base + "/")
+        end
+
         private def process_content_file_images(
           config : Models::Config,
           output_dir : String,
+          resolved_output : String,
           widths : Array(Int32),
           quality : Int32,
           new_map : Hash(String, Hash(Int32, String)),
@@ -122,6 +135,7 @@ module Hwaro
           Dir.glob(File.join("content", "**", "*")).each do |file|
             next unless File.file?(file)
             next unless Processors::ImageProcessor.image?(file)
+            next unless safe_path?(file, "content")
             relative = Path[file].relative_to("content").to_s
             next unless config.content_files.publish?(relative)
 
@@ -132,6 +146,8 @@ module Hwaro
             widths.each do |width|
               resized_name = Processors::ImageProcessor.resized_filename(File.basename(file), width)
               dest_path = File.join(dest_dir, resized_name)
+              next unless safe_path?(dest_path, resolved_output)
+
               if Processors::ImageProcessor.resize(file, dest_path, width, 0, quality)
                 resized_url = "/" + File.join(File.dirname(relative), resized_name)
                 width_map[width] = resized_url
@@ -143,6 +159,7 @@ module Hwaro
 
         private def process_static_images(
           output_dir : String,
+          resolved_output : String,
           widths : Array(Int32),
           quality : Int32,
           new_map : Hash(String, Hash(Int32, String)),
@@ -152,6 +169,7 @@ module Hwaro
           Dir.glob(File.join("static", "**", "*")).each do |file|
             next unless File.file?(file)
             next unless Processors::ImageProcessor.image?(file)
+            next unless safe_path?(file, "static")
 
             relative = Path[file].relative_to("static").to_s
             original_url = "/" + relative
@@ -161,6 +179,8 @@ module Hwaro
             widths.each do |width|
               resized_name = Processors::ImageProcessor.resized_filename(File.basename(file), width)
               dest_path = File.join(dest_dir, resized_name)
+              next unless safe_path?(dest_path, resolved_output)
+
               if Processors::ImageProcessor.resize(file, dest_path, width, 0, quality)
                 resized_url = "/" + File.join(File.dirname(relative), resized_name)
                 width_map[width] = resized_url
