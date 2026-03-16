@@ -86,7 +86,7 @@ module Hwaro
           logo_svg = ""
           if logo_path = ai.logo
             # Reference logo as image in SVG — strip static/ prefix and ensure leading /
-            logo_url = logo_path.sub(/\Astatic\//, "")
+            logo_url = logo_path.lchop("static/")
             logo_url = logo_url.starts_with?("/") ? logo_url : "/#{logo_url}"
             logo_svg = %(<image href="#{escape_attr(logo_url)}" x="80" y="#{HEIGHT - 100}" width="48" height="48" />)
           end

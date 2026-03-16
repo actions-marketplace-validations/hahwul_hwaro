@@ -131,7 +131,7 @@ module Hwaro
         # Preserves absolute URLs (http:// or https://) as-is.
         private def self.normalize_icon_path(path : String) : String
           return path if path.starts_with?("http://") || path.starts_with?("https://")
-          url = path.sub(/\Astatic\//, "")
+          url = path.lchop("static/")
           url.starts_with?("/") ? url : "/#{url}"
         end
 

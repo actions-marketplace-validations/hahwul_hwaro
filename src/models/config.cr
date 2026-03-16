@@ -177,8 +177,8 @@ module Hwaro
 
       def self.normalize_path(path : String) : String
         path = path.strip.gsub('\\', '/')
-        path = path.sub(/\A\//, "")
-        path = path.sub(/\Acontent\//, "")
+        path = path.lchop("/")
+        path = path.lchop("content/")
         path
       end
 

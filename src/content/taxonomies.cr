@@ -224,14 +224,14 @@ module Hwaro
       private def self.extract_terms_for(page : Models::Page, taxonomy : Models::TaxonomyConfig) : Array(String)
         name = taxonomy.name
         if page.taxonomies.has_key?(name)
-          return page.taxonomies[name].dup
+          return page.taxonomies[name]
         end
 
         if page.front_matter_keys.includes?(name)
           return [] of String
         end
 
-        return page.tags.dup if name == "tags"
+        return page.tags if name == "tags"
 
         [] of String
       end
@@ -288,8 +288,7 @@ module Hwaro
         FileUtils.mkdir_p(feed_output_dir)
         feed_title = "#{site.config.title} - #{taxonomy.name.capitalize}: #{term}"
 
-        feed_pages = pages.dup
-        feed_pages.sort! { |a, b| Utils::SortUtils.compare_by_date(a, b) }
+        feed_pages = pages.sort { |a, b| Utils::SortUtils.compare_by_date(a, b) }
 
         if site.config.feeds.limit > 0
           feed_pages = feed_pages.first(site.config.feeds.limit)
