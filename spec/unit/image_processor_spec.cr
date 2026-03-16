@@ -28,6 +28,14 @@ describe Hwaro::Content::Processors::ImageProcessor do
       Hwaro::Content::Processors::ImageProcessor.image?("PHOTO.JPG").should be_true
       Hwaro::Content::Processors::ImageProcessor.image?("Image.PNG").should be_true
     end
+
+    it "returns false for empty string" do
+      Hwaro::Content::Processors::ImageProcessor.image?("").should be_false
+    end
+
+    it "returns false for extensionless file" do
+      Hwaro::Content::Processors::ImageProcessor.image?("Makefile").should be_false
+    end
   end
 
   describe ".resized_filename" do
@@ -42,15 +50,18 @@ describe Hwaro::Content::Processors::ImageProcessor do
     it "handles filenames with dots" do
       Hwaro::Content::Processors::ImageProcessor.resized_filename("my.photo.jpg", 640).should eq("my.photo_640w.jpg")
     end
+
+    it "handles nested directory paths" do
+      Hwaro::Content::Processors::ImageProcessor.resized_filename("a/b/c/img.png", 100).should eq("a/b/c/img_100w.png")
+    end
   end
 
   describe ".resize" do
-    it "resizes a PNG image" do
+    it "resizes a PNG image and verifies dimensions" do
       Dir.mktmpdir do |dir|
         src = File.join(dir, "test.png")
         dest = File.join(dir, "test_2w.png")
 
-        # Write a 4x4 solid color PNG via stb
         pixels = Bytes.new(4 * 4 * 3, 255_u8)
         LibStb.stbi_write_png(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 4 * 3)
 
@@ -58,7 +69,6 @@ describe Hwaro::Content::Processors::ImageProcessor do
         result.should eq(dest)
         File.exists?(dest).should be_true
 
-        # Verify the output dimensions
         w = uninitialized LibC::Int
         h = uninitialized LibC::Int
         c = uninitialized LibC::Int
@@ -84,9 +94,59 @@ describe Hwaro::Content::Processors::ImageProcessor do
       end
     end
 
+    it "resizes a BMP image" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "test.bmp")
+        dest = File.join(dir, "test_2w.bmp")
+
+        pixels = Bytes.new(4 * 4 * 3, 100_u8)
+        LibStb.stbi_write_bmp(src, 4, 4, 3, pixels.to_unsafe.as(Void*))
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2, 0, 85)
+        result.should eq(dest)
+        File.exists?(dest).should be_true
+      end
+    end
+
+    it "handles RGBA (4-channel) images" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "rgba.png")
+        dest = File.join(dir, "rgba_2w.png")
+
+        # 4 channels (RGBA)
+        pixels = Bytes.new(4 * 4 * 4, 200_u8)
+        LibStb.stbi_write_png(src, 4, 4, 4, pixels.to_unsafe.as(Void*), 4 * 4)
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2, 0, 85)
+        result.should eq(dest)
+
+        w = uninitialized LibC::Int
+        h = uninitialized LibC::Int
+        c = uninitialized LibC::Int
+        out_pixels = LibStb.stbi_load(dest, pointerof(w), pointerof(h), pointerof(c), 0)
+        out_pixels.null?.should be_false
+        w.should eq(2)
+        h.should eq(2)
+        c.should eq(4) # channels preserved
+        LibStb.stbi_image_free(out_pixels.as(Void*))
+      end
+    end
+
     it "returns nil for non-existent file" do
       result = Hwaro::Content::Processors::ImageProcessor.resize("/nonexistent.png", "/tmp/out.png", 100)
       result.should be_nil
+    end
+
+    it "returns nil for corrupted file" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "corrupt.png")
+        dest = File.join(dir, "corrupt_2w.png")
+        File.write(src, "this is not an image")
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2)
+        result.should be_nil
+        File.exists?(dest).should be_false
+      end
     end
 
     it "copies file when target width >= source width" do
@@ -100,7 +160,6 @@ describe Hwaro::Content::Processors::ImageProcessor do
         result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 1000, 0, 85)
         result.should eq(dest)
         File.exists?(dest).should be_true
-        # Should be a copy (same size as source)
         File.size(dest).should eq(File.size(src))
       end
     end
@@ -140,6 +199,137 @@ describe Hwaro::Content::Processors::ImageProcessor do
         h.should eq(2) # 4 * (5/10) = 2
         LibStb.stbi_image_free(out_pixels.as(Void*))
       end
+    end
+
+    it "preserves aspect ratio with height-only resize" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "tall.png")
+        dest = File.join(dir, "tall_h2.png")
+
+        # Create 4x10 image
+        pixels = Bytes.new(4 * 10 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 4, 10, 3, pixels.to_unsafe.as(Void*), 4 * 3)
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 0, 5, 85)
+        result.should eq(dest)
+
+        w = uninitialized LibC::Int
+        h = uninitialized LibC::Int
+        c = uninitialized LibC::Int
+        out_pixels = LibStb.stbi_load(dest, pointerof(w), pointerof(h), pointerof(c), 0)
+        out_pixels.null?.should be_false
+        w.should eq(2) # 4 * (5/10) = 2
+        h.should eq(5)
+        LibStb.stbi_image_free(out_pixels.as(Void*))
+      end
+    end
+
+    it "fits within box when both width and height specified" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "rect.png")
+        dest = File.join(dir, "rect_fit.png")
+
+        # Create 20x10 image, fit into 5x5 box -> should be 5x2 (limited by width)
+        pixels = Bytes.new(20 * 10 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 20, 10, 3, pixels.to_unsafe.as(Void*), 20 * 3)
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 5, 5, 85)
+        result.should eq(dest)
+
+        w = uninitialized LibC::Int
+        h = uninitialized LibC::Int
+        c = uninitialized LibC::Int
+        out_pixels = LibStb.stbi_load(dest, pointerof(w), pointerof(h), pointerof(c), 0)
+        out_pixels.null?.should be_false
+        # scale = min(5/20, 5/10) = min(0.25, 0.5) = 0.25
+        # w=20*0.25=5, h=10*0.25=2.5 -> round=2 (banker's rounding)
+        w.should eq(5)
+        h.should eq(2)
+        LibStb.stbi_image_free(out_pixels.as(Void*))
+      end
+    end
+
+    it "creates destination directory if missing" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "test.png")
+        dest = File.join(dir, "sub", "dir", "test_2w.png")
+
+        pixels = Bytes.new(4 * 4 * 3, 255_u8)
+        LibStb.stbi_write_png(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 4 * 3)
+
+        result = Hwaro::Content::Processors::ImageProcessor.resize(src, dest, 2, 0, 85)
+        result.should eq(dest)
+        File.exists?(dest).should be_true
+      end
+    end
+  end
+
+  describe ".process_configured_widths" do
+    it "generates multiple resized variants" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "photo.png")
+        pixels = Bytes.new(100 * 80 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 100, 80, 3, pixels.to_unsafe.as(Void*), 100 * 3)
+
+        output_base = File.join(dir, "out")
+        Dir.mkdir(output_base)
+
+        results = Hwaro::Content::Processors::ImageProcessor.process_configured_widths(
+          src, output_base, "/images", [20, 50], 85
+        )
+
+        results.size.should eq(2)
+        results[0][1].should eq(20)
+        results[0][2].should eq("/images/photo_20w.png")
+        results[1][1].should eq(50)
+        results[1][2].should eq("/images/photo_50w.png")
+
+        File.exists?(File.join(output_base, "photo_20w.png")).should be_true
+        File.exists?(File.join(output_base, "photo_50w.png")).should be_true
+      end
+    end
+
+    it "returns empty array for non-existent source" do
+      results = Hwaro::Content::Processors::ImageProcessor.process_configured_widths(
+        "/nonexistent.png", "/tmp", "/images", [100], 85
+      )
+      results.should be_empty
+    end
+
+    it "skips widths larger than source" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "tiny.png")
+        pixels = Bytes.new(4 * 4 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 4 * 3)
+
+        output_base = File.join(dir, "out")
+        Dir.mkdir(output_base)
+
+        # width=2 will resize, width=1000 will copy (still succeeds)
+        results = Hwaro::Content::Processors::ImageProcessor.process_configured_widths(
+          src, output_base, "/img", [2, 1000], 85
+        )
+        results.size.should eq(2)
+      end
+    end
+  end
+end
+
+describe Hwaro::Content::Hooks::ImageHooks do
+  describe ".find_closest" do
+    it "returns nil when no resize map entry exists" do
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/nonexistent.jpg", 800).should be_nil
+    end
+
+    it "returns nil when no resize map entry for given URL" do
+      Hwaro::Content::Hooks::ImageHooks.find_resized("/nonexistent.jpg", 800).should be_nil
+    end
+  end
+
+  describe ".resize_map" do
+    it "returns a hash (snapshot)" do
+      map = Hwaro::Content::Hooks::ImageHooks.resize_map
+      map.should be_a(Hash(String, Hash(Int32, String)))
     end
   end
 end
@@ -205,6 +395,19 @@ describe "Config.load image_processing" do
       )
       config = Hwaro::Models::Config.load
       config.image_processing.quality.should eq(1)
+    end
+  end
+
+  it "clamps quality over 100 down to 100" do
+    Dir.cd(Dir.tempdir) do
+      File.write("config.toml", <<-TOML
+        title = "Test"
+        [image_processing]
+        quality = 200
+        TOML
+      )
+      config = Hwaro::Models::Config.load
+      config.image_processing.quality.should eq(100)
     end
   end
 end
