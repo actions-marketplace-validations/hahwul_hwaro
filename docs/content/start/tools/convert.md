@@ -8,16 +8,16 @@ Convert frontmatter between YAML and TOML formats across your content files.
 
 ```bash
 # Convert all frontmatter to YAML
-hwaro tool convert toYAML
+hwaro tool convert to-yaml
 
 # Convert all frontmatter to TOML
-hwaro tool convert toTOML
+hwaro tool convert to-toml
 
 # Convert only in a specific directory
-hwaro tool convert toYAML -c posts
+hwaro tool convert to-yaml -c posts
 
 # Output result as JSON
-hwaro tool convert toYAML --json
+hwaro tool convert to-yaml --json
 ```
 
 ## Options
@@ -54,7 +54,7 @@ tags = ["crystal", "tutorial"]
 Content here.
 ```
 
-After `hwaro tool convert toYAML`:
+After `hwaro tool convert to-yaml`:
 
 ```markdown
 ---

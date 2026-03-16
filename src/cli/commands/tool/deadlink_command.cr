@@ -12,7 +12,7 @@ module Hwaro
       module Tool
         class DeadlinkCommand
           # Single source of truth for command metadata
-          NAME               = "deadlink"
+          NAME               = "check-links"
           DESCRIPTION        = "Check for dead links in content files"
           POSITIONAL_ARGS    = [] of String
           POSITIONAL_CHOICES = [] of String
@@ -61,7 +61,7 @@ module Hwaro
             json_output = false
 
             OptionParser.parse(args) do |parser|
-              parser.banner = "Usage: hwaro tool deadlink [options]"
+              parser.banner = "Usage: hwaro tool check-links [options]"
               parser.on("-j", "--json", "Output result as JSON") { json_output = true }
               parser.on("-h", "--help", "Show this help") do
                 Logger.info parser.to_s

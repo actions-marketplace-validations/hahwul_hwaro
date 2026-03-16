@@ -183,7 +183,7 @@ describe Hwaro::CLI::Commands::ToolCommand do
     subcommand_names = meta.subcommands.map(&.name)
     subcommand_names.should contain("convert")
     subcommand_names.should contain("list")
-    subcommand_names.should contain("deadlink")
+    subcommand_names.should contain("check-links")
     subcommand_names.should contain("doctor")
   end
 
@@ -196,8 +196,8 @@ end
 describe Hwaro::CLI::Commands::Tool::ConvertCommand do
   it "has correct metadata with positional choices" do
     meta = Hwaro::CLI::Commands::Tool::ConvertCommand.metadata
-    meta.positional_choices.should contain("toYAML")
-    meta.positional_choices.should contain("toTOML")
+    meta.positional_choices.should contain("to-yaml")
+    meta.positional_choices.should contain("to-toml")
   end
 end
 

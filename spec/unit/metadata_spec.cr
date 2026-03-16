@@ -71,10 +71,10 @@ describe Hwaro::CLI::CommandInfo do
         name: "convert",
         description: "Convert format",
         positional_args: ["format"],
-        positional_choices: ["toYAML", "toTOML"]
+        positional_choices: ["to-yaml", "to-toml"]
       )
       cmd.positional_args.should eq(["format"])
-      cmd.positional_choices.should eq(["toYAML", "toTOML"])
+      cmd.positional_choices.should eq(["to-yaml", "to-toml"])
     end
   end
 

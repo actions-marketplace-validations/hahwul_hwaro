@@ -7,7 +7,7 @@
 # Available subcommands:
 #   convert  - Convert frontmatter between YAML and TOML formats
 #   list     - List content files by status
-#   deadlink - Check for dead links
+#   check-links - Check for dead links
 #   doctor   - Diagnose config and content issues
 #   platform - Generate hosting platform config files
 #   ci       - Generate CI/CD workflow files
@@ -29,7 +29,7 @@ module Hwaro
       class ToolCommand
         # Single source of truth for command metadata
         NAME               = "tool"
-        DESCRIPTION        = "Utility tools (convert, list, deadlink, doctor, ...)"
+        DESCRIPTION        = "Utility tools (convert, list, check-links, doctor, ...)"
         POSITIONAL_ARGS    = [] of String
         POSITIONAL_CHOICES = [] of String
 
@@ -74,7 +74,7 @@ module Hwaro
             Tool::ConvertCommand.new.run(args)
           when "list"
             Tool::ListCommand.new.run(args)
-          when "deadlink"
+          when "check-links"
             Tool::DeadlinkCommand.new.run(args)
           when "doctor"
             Tool::DoctorCommand.new.run(args)

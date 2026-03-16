@@ -3,7 +3,7 @@ require "../spec_helper"
 # =============================================================================
 # CLI tool command registration and execution functional tests
 #
-# Verifies that tool subcommands (deadlink, doctor, convert, list),
+# Verifies that tool subcommands (check-links, doctor, convert, list),
 # new, and completion commands are properly registered and functional.
 # =============================================================================
 
@@ -148,7 +148,7 @@ describe "CLI Tool Commands" do
 
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["tool", "convert", "toTOML"], chdir: project_dir, output: output_io, error: error_io)
+        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["tool", "convert", "to-toml"], chdir: project_dir, output: output_io, error: error_io)
 
         status.success?.should be_true
 

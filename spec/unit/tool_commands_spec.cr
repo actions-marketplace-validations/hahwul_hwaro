@@ -35,9 +35,9 @@ describe Hwaro::CLI::Commands::ToolCommand do
       subs.any? { |s| s.name == "list" }.should be_true
     end
 
-    it "includes deadlink subcommand" do
+    it "includes check-links subcommand" do
       subs = Hwaro::CLI::Commands::ToolCommand.subcommands
-      subs.any? { |s| s.name == "deadlink" }.should be_true
+      subs.any? { |s| s.name == "check-links" }.should be_true
     end
 
     it "includes doctor subcommand" do
@@ -89,9 +89,9 @@ describe Hwaro::CLI::Commands::Tool::ConvertCommand do
       meta.positional_args.should eq(["format"])
     end
 
-    it "has toYAML and toTOML as positional choices" do
+    it "has to-yaml and to-toml as positional choices" do
       meta = Hwaro::CLI::Commands::Tool::ConvertCommand.metadata
-      meta.positional_choices.should eq(["toYAML", "toTOML"])
+      meta.positional_choices.should eq(["to-yaml", "to-toml"])
     end
 
     it "content-dir flag takes a value" do
@@ -298,7 +298,7 @@ describe Hwaro::CLI::Commands::Tool::DeadlinkCommand do
   describe ".metadata" do
     it "returns correct command name" do
       meta = Hwaro::CLI::Commands::Tool::DeadlinkCommand.metadata
-      meta.name.should eq("deadlink")
+      meta.name.should eq("check-links")
     end
 
     it "returns a description" do

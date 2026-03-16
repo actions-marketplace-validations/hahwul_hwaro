@@ -250,12 +250,12 @@ hwaro deploy --dry-run
 Utility tools for content management:
 
 ```bash
-hwaro tool convert toYAML       # Convert frontmatter to YAML
-hwaro tool convert toTOML       # Convert frontmatter to TOML
+hwaro tool convert to-yaml      # Convert frontmatter to YAML
+hwaro tool convert to-toml      # Convert frontmatter to TOML
 hwaro tool list all             # List all content files
 hwaro tool list drafts          # List draft files
 hwaro tool list published       # List published files
-hwaro tool deadlink             # Check for dead external links
+hwaro tool check-links          # Check for dead external links
 hwaro tool doctor               # Diagnose config and content issues
 hwaro tool doctor --fix         # Add missing config sections to config.toml
 hwaro tool platform netlify     # Generate Netlify config
@@ -269,8 +269,8 @@ hwaro tool import hugo /path/to/site     # Import from Hugo
 # JSON output
 hwaro tool list all --json
 hwaro tool doctor --json
-hwaro tool deadlink --json
-hwaro tool convert toYAML --json
+hwaro tool check-links --json
+hwaro tool convert to-yaml --json
 ```
 
 **Subcommands:**
@@ -279,7 +279,7 @@ hwaro tool convert toYAML --json
 |------------|-------------|
 | [convert](/start/tools/convert/) | Convert frontmatter between YAML and TOML formats |
 | [list](/start/tools/list/) | List content files by status (all, drafts, published) |
-| [deadlink](/start/tools/deadlink/) | Check for dead links in content files |
+| [check-links](/start/tools/deadlink/) | Check for dead links in content files |
 | [doctor](/start/tools/doctor/) | Diagnose config and content issues |
 | [platform](/start/tools/platform/) | Generate hosting platform config files (Netlify, Vercel, Cloudflare) |
 | [ci](/start/tools/ci/) | Generate CI/CD workflow files (GitHub Actions) |

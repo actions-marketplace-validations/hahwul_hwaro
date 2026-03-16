@@ -1,5 +1,5 @@
 +++
-title = "deadlink"
+title = "check-links"
 description = "Check for dead links in content files"
 weight = 3
 +++
@@ -7,10 +7,10 @@ weight = 3
 Check for broken external and internal links in your content files.
 
 ```bash
-hwaro tool deadlink
+hwaro tool check-links
 
 # Output result as JSON
-hwaro tool deadlink --json
+hwaro tool check-links --json
 ```
 
 ## Options
