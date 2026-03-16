@@ -128,8 +128,10 @@ module Hwaro
 
         # Normalize icon path to a URL path.
         # Strips "static/" prefix since Hwaro copies static/ contents to the output root.
+        # Preserves absolute URLs (http:// or https://) as-is.
         private def self.normalize_icon_path(path : String) : String
-          url = path.sub(/\Astatic\//, "")
+          return path if path.starts_with?("http://") || path.starts_with?("https://")
+          url = path.lchop("static/")
           url.starts_with?("/") ? url : "/#{url}"
         end
 

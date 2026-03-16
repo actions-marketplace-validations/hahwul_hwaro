@@ -10,32 +10,32 @@ module Hwaro
 
         def canonical_tag(page : Models::Page, config : Models::Config) : String
           # Use permalink if available, otherwise construct from base_url + url
-          url = page.permalink || "#{config.base_url.rstrip("/")}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
-          %(<link rel="canonical" href="#{HTML.escape(url)}">)
+          url = page.permalink || "#{config.base_url_stripped}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+          # Fast path: skip HTML.escape when URL has no escapable chars (common case for URLs)
+          escaped = url.includes?('&') || url.includes?('"') || url.includes?('<') || url.includes?('>') ? HTML.escape(url) : url
+          %(<link rel="canonical" href="#{escaped}">)
         end
 
         def hreflang_tags(page : Models::Page, config : Models::Config) : String
           return "" unless config.multilingual?
           return "" if page.translations.empty?
 
-          tags = [] of String
+          base = config.base_url_stripped
 
-          # Add current page
-          current_url = page.permalink || "#{config.base_url.rstrip("/")}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
-          lang_code = page.language || config.default_language
-          tags << %(<link rel="alternate" hreflang="#{HTML.escape(lang_code)}" href="#{HTML.escape(current_url)}">)
+          String.build(page.translations.size * 80) do |str|
+            # Add current page
+            current_url = page.permalink || "#{base}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+            lang_code = page.language || config.default_language
+            str << %(<link rel="alternate" hreflang="#{HTML.escape(lang_code)}" href="#{HTML.escape(current_url)}">)
 
-          # Add translations
-          page.translations.each do |t|
-            next if t.is_current
-
-            # TranslationLink url is relative, so we need to make it absolute
-            abs_url = t.url.starts_with?("http") ? t.url : "#{config.base_url.rstrip("/")}#{t.url.starts_with?("/") ? t.url : "/#{t.url}"}"
-            tags << %(<link rel="alternate" hreflang="#{HTML.escape(t.code)}" href="#{HTML.escape(abs_url)}">)
+            # Add translations (already ordered by ordered_language_codes via link_translations!)
+            page.translations.each do |t|
+              next if t.is_current
+              abs_url = t.url.starts_with?("http") ? t.url : "#{base}#{t.url.starts_with?("/") ? t.url : "/#{t.url}"}"
+              str << '\n'
+              str << %(<link rel="alternate" hreflang="#{HTML.escape(t.code)}" href="#{HTML.escape(abs_url)}">)
+            end
           end
-
-          # Sort tags to ensure deterministic output
-          tags.sort.join("\n")
         end
       end
     end

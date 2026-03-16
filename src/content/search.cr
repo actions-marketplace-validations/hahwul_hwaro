@@ -22,7 +22,7 @@ module Hwaro
 
           search_pages.reject! do |page|
             page_url = page.url.starts_with?('/') ? page.url : "/#{page.url}"
-            excluded_paths.any? { |excluded| page_url.starts_with?(excluded) }
+            excluded_paths.any? { |excluded| page_url == excluded || page_url.starts_with?(excluded.ends_with?("/") ? excluded : excluded + "/") }
           end
         end
 
@@ -51,7 +51,7 @@ module Hwaro
                   end
 
         # Write search file
-        filename = config.search.filename
+        filename = File.basename(config.search.filename)
         search_path = File.join(output_dir, filename)
         File.write(search_path, content)
         Logger.action :create, search_path if verbose
@@ -107,8 +107,13 @@ module Hwaro
       end
 
       private def self.generate_javascript(search_data : Array(Hash(String, String | Array(String)))) : String
-        json_data = search_data.to_json.gsub("</", "<\\/")
-        "var searchData = #{json_data};"
+        json_str = search_data.to_json
+        # Avoid double-alloc: skip gsub when no </script> escape is needed (common case)
+        if json_str.includes?("</")
+          "var searchData = #{json_str.gsub("</", "<\\/")};"
+        else
+          "var searchData = #{json_str};"
+        end
       end
     end
   end

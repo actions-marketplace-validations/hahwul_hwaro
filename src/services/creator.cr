@@ -87,7 +87,7 @@ module Hwaro
 
         # 2. Try to find archetype based on path
         # Extract relative path from content/ directory
-        relative_path = path.sub(/^content\//, "")
+        relative_path = path.lchop("content/")
         dir_path = File.dirname(relative_path)
 
         if dir_path != "."
@@ -132,9 +132,10 @@ module Hwaro
       end
 
       private def generate_default_content(title : String, date : String, is_draft : Bool) : String
+        safe_title = title.gsub("\"", "\\\"").gsub("\n", " ")
         String.build do |str|
           str << "---\n"
-          str << "title: #{title}\n"
+          str << "title: \"#{safe_title}\"\n"
           str << "date: #{date}\n"
           str << "draft: true\n" if is_draft
           str << "---\n\n"

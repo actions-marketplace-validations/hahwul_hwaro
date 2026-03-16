@@ -21,7 +21,7 @@ module Hwaro
 
         # Render section list HTML for a paginated page
         def render_section_list(paginated_page : PaginatedPage) : String
-          String.build do |str|
+          String.build(paginated_page.pages.size * 100) do |str|
             paginated_page.pages.each do |page|
               escaped_url = HTML.escape("#{@base_url}#{page.url}")
               escaped_title = HTML.escape(page.title)
@@ -34,7 +34,7 @@ module Hwaro
         def render_pagination_nav(paginated_page : PaginatedPage) : String
           return "" unless paginated_page.total_pages > 1
 
-          String.build do |str|
+          String.build(paginated_page.total_pages * 100 + 200) do |str|
             str << "<nav class=\"pagination\" aria-label=\"Pagination\">\n"
             str << "  <ul class=\"pagination-list\">\n"
 
@@ -101,13 +101,14 @@ module Hwaro
         private def visible_pages(current : Int32, total : Int32) : Array(Int32)
           return (1..total).to_a if total <= 7
 
-          pages = Set(Int32).new
+          # Build pre-sorted array directly (no Set/sort needed for ≤7 elements)
+          pages = Array(Int32).new(7)
           pages << 1
-          pages << total
-          ((current - 2)..(current + 2)).each do |p|
-            pages << p if p >= 1 && p <= total
-          end
-          pages.to_a.sort
+          lo = {current - 2, 2}.max          # start from 2 since 1 is already added
+          hi = {current + 2, total - 1}.min  # stop before total since it's added separately
+          (lo..hi).each { |p| pages << p }
+          pages << total unless pages.last == total
+          pages
         end
 
         # Render combined section list with pagination info

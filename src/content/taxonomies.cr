@@ -224,14 +224,14 @@ module Hwaro
       private def self.extract_terms_for(page : Models::Page, taxonomy : Models::TaxonomyConfig) : Array(String)
         name = taxonomy.name
         if page.taxonomies.has_key?(name)
-          return page.taxonomies[name].dup
+          return page.taxonomies[name]
         end
 
         if page.front_matter_keys.includes?(name)
           return [] of String
         end
 
-        return page.tags.dup if name == "tags"
+        return page.tags if name == "tags"
 
         [] of String
       end
@@ -284,12 +284,11 @@ module Hwaro
       )
         return if site.config.base_url.empty?
 
-        feed_output_dir = File.join(output_dir, base_url.sub(/^\//, ""))
+        feed_output_dir = File.join(output_dir, base_url.lchop("/"))
         FileUtils.mkdir_p(feed_output_dir)
         feed_title = "#{site.config.title} - #{taxonomy.name.capitalize}: #{term}"
 
-        feed_pages = pages.dup
-        feed_pages.sort! { |a, b| Utils::SortUtils.compare_by_date(a, b) }
+        feed_pages = pages.sort { |a, b| Utils::SortUtils.compare_by_date(a, b) }
 
         if site.config.feeds.limit > 0
           feed_pages = feed_pages.first(site.config.feeds.limit)
@@ -348,13 +347,10 @@ module Hwaro
       end
 
       private def self.write_output(page : Models::Section, output_dir : String, content : String, verbose : Bool = false)
-        url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
+        url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/"))
         output_path = File.join(output_dir, url_path, "index.html")
 
-        # Ensure output path is within output directory
-        canonical_output = File.expand_path(output_path)
-        canonical_output_dir = File.expand_path(output_dir)
-        unless canonical_output.starts_with?(canonical_output_dir)
+        unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
           Logger.warn "  [WARN] Skipping taxonomy output outside output directory: #{output_path}"
           return
         end
@@ -365,13 +361,10 @@ module Hwaro
       end
 
       private def self.write_paginated_output(page : Models::Section, page_number : Int32, output_dir : String, content : String, verbose : Bool = false, paginate_path : String = "page")
-        url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
+        url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/"))
         output_path = File.join(output_dir, url_path, paginate_path, page_number.to_s, "index.html")
 
-        # Ensure output path is within output directory
-        canonical_output = File.expand_path(output_path)
-        canonical_output_dir = File.expand_path(output_dir)
-        unless canonical_output.starts_with?(canonical_output_dir)
+        unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
           Logger.warn "  [WARN] Skipping taxonomy output outside output directory: #{output_path}"
           return
         end

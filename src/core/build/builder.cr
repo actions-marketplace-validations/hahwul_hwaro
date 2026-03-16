@@ -78,6 +78,11 @@ module Hwaro
         # Per-page Crinja::Value cache — avoids repeated Page→Crinja::Value conversion
         # across build_global_vars, section page lists, and page_to_crinja_list_value
         @page_crinja_value_cache : Hash(String, Crinja::Value) = {} of String => Crinja::Value
+        @series_crinja_cache : Hash(String, Crinja::Value) = {} of String => Crinja::Value
+        # Per-section ancestors Crinja::Value cache (pages in the same section share ancestors)
+        @ancestors_crinja_cache : Hash(String, Array(Crinja::Value)) = {} of String => Array(Crinja::Value)
+        # Per-page related_posts Crinja::Value cache (avoids rebuilding the array on each build_template_variables call)
+        @related_posts_crinja_cache : Hash(String, Crinja::Value) = {} of String => Crinja::Value
 
         def initialize
           @lifecycle = Lifecycle::Manager.new
@@ -148,7 +153,7 @@ module Hwaro
             relative_path = begin
               Path[file].relative_to("content").to_s
             rescue
-              file.sub(/^content\//, "")
+              file.lchop("content/")
             end
 
             page = pages_map[relative_path]?
@@ -252,6 +257,8 @@ module Hwaro
           @section_pages_crinja_cache.clear
           @section_assets_crinja_cache.clear
           @page_crinja_value_cache.clear
+          @ancestors_crinja_cache.clear
+          @related_posts_crinja_cache.clear
           templates = load_templates
           @templates = templates
 
@@ -297,7 +304,7 @@ module Hwaro
             relative = begin
               Path[src_path].relative_to("static").to_s
             rescue
-              src_path.sub(/^static\//, "")
+              src_path.lchop("static/")
             end
             dest_path = File.join(output_dir, relative)
 
@@ -381,6 +388,8 @@ module Hwaro
           @section_assets_crinja_cache.clear
           @created_dirs.clear
           @page_crinja_value_cache.clear
+          @ancestors_crinja_cache.clear
+          @related_posts_crinja_cache.clear
 
           # Execute build phases through lifecycle
           result = execute_phases(ctx, profiler)
@@ -650,6 +659,8 @@ module Hwaro
             @section_pages_crinja_cache.clear
             @section_assets_crinja_cache.clear
             @page_crinja_value_cache.clear
+            @ancestors_crinja_cache.clear
+            @related_posts_crinja_cache.clear
             GC.collect
           end
 
@@ -932,40 +943,48 @@ module Hwaro
           limit = config.limit
           pages = site.pages.reject { |p| p.draft || p.is_index || p.generated || !p.render }
 
-          # Pre-compute taxonomy terms per page for fast lookup
-          page_terms = {} of String => Hash(String, Set(String))
+          # Build inverted index: {taxonomy_name => {term => Array(page_path)}}
+          # This avoids the O(N²) pairwise comparison
+          inverted = {} of String => Hash(String, Array(String))
+          page_lookup = {} of String => Models::Page
+
           pages.each do |page|
-            terms = {} of String => Set(String)
+            page_lookup[page.path] = page
             taxonomy_names.each do |tax_name|
               values = page.taxonomies[tax_name]? || (tax_name == "tags" ? page.tags : [] of String)
-              terms[tax_name] = values.to_set unless values.empty?
+              values.each do |term|
+                inv_tax = inverted[tax_name]? || (inverted[tax_name] = {} of String => Array(String))
+                arr = inv_tax[term]? || (inv_tax[term] = [] of String)
+                arr << page.path
+              end
             end
-            page_terms[page.path] = terms
           end
 
           pages.each do |page|
-            my_terms = page_terms[page.path]
-            next if my_terms.empty? || my_terms.values.all?(&.empty?)
-
-            scored = [] of {Int32, Models::Page}
-            pages.each do |other|
-              next if other.path == page.path
-              next if other.language != page.language
-
-              score = 0
-              other_terms = page_terms[other.path]
-              taxonomy_names.each do |tax_name|
-                my_set = my_terms[tax_name]?
-                other_set = other_terms[tax_name]?
-                next unless my_set && other_set
-                score += (my_set & other_set).size
+            # Count co-occurrences via inverted index: O(terms * avg_pages_per_term)
+            scores = Hash(String, Int32).new(0)
+            taxonomy_names.each do |tax_name|
+              values = page.taxonomies[tax_name]? || (tax_name == "tags" ? page.tags : [] of String)
+              inv_tax = inverted[tax_name]?
+              next unless inv_tax
+              values.each do |term|
+                if candidates = inv_tax[term]?
+                  candidates.each do |other_path|
+                    next if other_path == page.path
+                    scores[other_path] += 1
+                  end
+                end
               end
-              scored << {score, other} if score > 0
             end
 
-            page.related_posts = scored.sort_by { |s, _| -s }
+            next if scores.empty?
+
+            # Filter by language and build result
+            page.related_posts = scores.to_a
+              .select { |path, _| page_lookup[path]?.try(&.language) == page.language }
+              .sort_by! { |_, s| -s }
               .first(limit)
-              .map { |_, p| p }
+              .map { |path, _| page_lookup[path] }
           end
         end
 
@@ -1256,7 +1275,7 @@ module Hwaro
                 effective_dir = target
                 break
               elsif directory_path.starts_with?("#{source}/")
-                effective_dir = directory_path.sub(/^#{Regex.escape(source)}\//, "#{target}/")
+                effective_dir = target + directory_path[source.size..]
                 break
               end
             end
@@ -1270,7 +1289,7 @@ module Hwaro
                         end
 
           if page.custom_path
-            custom = page.custom_path.not_nil!.sub(/^\//, "")
+            custom = page.custom_path.not_nil!.lchop("/")
             page.url = "#{lang_prefix}/#{custom}"
             page.url += "/" unless page.url.ends_with?("/")
           elsif page.is_index
@@ -1308,7 +1327,7 @@ module Hwaro
         end
 
         private def get_output_path(page : Models::Page, output_dir : String) : String
-          url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
+          url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/"))
           output_path = File.join(output_dir, url_path, "index.html")
           Utils::OutputGuard.safe_output_path(output_path, output_dir) || File.join(output_dir, "index.html")
         end
@@ -1665,7 +1684,7 @@ module Hwaro
           redirect_url = page.redirect_to
           return unless redirect_url
 
-          output_path = File.join(output_dir, page.url.sub(/^\//, ""), "index.html")
+          output_path = File.join(output_dir, page.url.lchop("/"), "index.html")
           ensure_dir(Path[output_path].dirname.to_s)
           File.write(output_path, Utils::RedirectHtml.full_redirect(redirect_url))
           Logger.action :create, output_path if verbose
@@ -1736,7 +1755,7 @@ module Hwaro
         end
 
         private def write_paginated_output(page : Models::Page, page_number : Int32, output_dir : String, content : String, verbose : Bool, paginate_path : String = "page")
-          url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, "").rstrip("/"))
+          url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/").rstrip("/"))
           output_path = File.join(output_dir, url_path, paginate_path, page_number.to_s, "index.html")
           return unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
 
@@ -1766,7 +1785,7 @@ module Hwaro
 
         private def generate_aliases(page : Models::Page, output_dir : String, verbose : Bool)
           page.aliases.each do |alias_path|
-            alias_clean = Utils::PathUtils.sanitize_path(alias_path.sub(/^\//, ""))
+            alias_clean = Utils::PathUtils.sanitize_path(alias_path.lchop("/"))
             dest_path = File.join(output_dir, alias_clean, "index.html")
             next unless Utils::OutputGuard.within_output_dir?(dest_path, output_dir)
 
@@ -1857,8 +1876,9 @@ module Hwaro
                  end
 
           begin
-            # Process shortcodes in template first (convert to Jinja2 include syntax)
-            processed_template = process_shortcodes_jinja(template, templates, vars,
+            # Process shortcodes in template directly (skip per-line fence detection
+            # since templates don't contain markdown fenced code blocks)
+            processed_template = process_shortcodes_in_text(template, templates, vars,
               crinja_env_override: crinja_env_override)
 
             # Cache compiled Crinja templates by content hash.
@@ -1928,6 +1948,9 @@ module Hwaro
               "summary"      => Crinja::Value.new(p.effective_summary || ""),
               "word_count"   => Crinja::Value.new(p.word_count),
               "reading_time" => Crinja::Value.new(p.reading_time),
+              "tags"         => Crinja::Value.new(p.tags.map { |t| Crinja::Value.new(t) }),
+              "authors"      => Crinja::Value.new(p.authors.map { |a| Crinja::Value.new(a) }),
+              "assets"       => Crinja::Value.new(p.assets.map { |a| Crinja::Value.new(a) }),
             })
             @page_crinja_value_cache[p.path] = val
             val
@@ -2036,11 +2059,7 @@ module Hwaro
           site.taxonomies.each do |name, terms|
             terms_array = terms.map do |term, term_pages|
               term_pages_array = term_pages.map do |tp|
-                Crinja::Value.new({
-                  "title" => Crinja::Value.new(tp.title),
-                  "url"   => Crinja::Value.new(tp.url),
-                  "date"  => Crinja::Value.new(tp.date.try(&.to_s("%Y-%m-%d")) || ""),
-                })
+                cached_page_crinja_value(tp, default_lang)
               end
               Crinja::Value.new({
                 "name"  => Crinja::Value.new(term),
@@ -2127,9 +2146,9 @@ module Hwaro
 
           if has_local_highlight
             css_path = File.join("static", "assets", "css", "highlight", "#{config.highlight.theme}.min.css")
-            digest.update(File.read(css_path)) if File.exists?(css_path)
+            digest_file(digest, css_path) if File.exists?(css_path)
             js_path = File.join("static", "assets", "js", "highlight.min.js")
-            digest.update(File.read(js_path)) if File.exists?(js_path)
+            digest_file(digest, js_path) if File.exists?(js_path)
           end
 
           if has_auto_includes
@@ -2137,12 +2156,22 @@ module Hwaro
               static_dir = File.join("static", dir)
               next unless Dir.exists?(static_dir)
               Dir.glob(File.join(static_dir, "**", "*.{css,js}")).sort.each do |file|
-                digest.update(File.read(file))
+                digest_file(digest, file)
               end
             end
           end
 
           digest.hexfinal[0, 8]
+        end
+
+        # Stream file contents into digest to avoid loading entire file into memory
+        private def digest_file(digest : Digest::MD5, path : String)
+          File.open(path, "r") do |io|
+            buffer = Bytes.new(8192)
+            while (n = io.read(buffer)) > 0
+              digest.update(buffer[0, n])
+            end
+          end
         end
 
         # Build template variables hash for Crinja
@@ -2183,7 +2212,8 @@ module Hwaro
           vars["page_image"] = Crinja::Value.new(page.image || config.og.default_image || "")
           vars["taxonomy_name"] = Crinja::Value.new(page.taxonomy_name || "")
           vars["taxonomy_term"] = Crinja::Value.new(page.taxonomy_term || "")
-          page_language = page.language || config.default_language
+          default_lang = config.default_language
+          page_language = page.language || default_lang
           vars["page_language"] = Crinja::Value.new(page_language)
 
           translations = page.translations.map do |t|
@@ -2202,14 +2232,12 @@ module Hwaro
           # Generate permalink only if not already set
           page.generate_permalink(config.base_url) unless page.permalink
 
-          # Convert authors to Crinja array
-          authors_array = page.authors.map { |a| Crinja::Value.new(a) }
-
-          # Convert tags to Crinja array
-          tags_array = page.tags.map { |t| Crinja::Value.new(t) }
-
-          # Convert assets to Crinja array
-          assets_array = page.assets.map { |a| Crinja::Value.new(a) }
+          # Reuse cached Crinja arrays for tags/authors/assets (avoids per-page .map allocation)
+          cached_page_val = cached_page_crinja_value(page, default_lang)
+          cached_raw = cached_page_val.raw.as(Hash)
+          tags_crinja = cached_raw["tags"].as(Crinja::Value)
+          authors_crinja = cached_raw["authors"].as(Crinja::Value)
+          assets_crinja = cached_raw["assets"].as(Crinja::Value)
 
           # Convert extra to Crinja hash
           extra_hash = {} of String => Crinja::Value
@@ -2217,35 +2245,21 @@ module Hwaro
             extra_hash[k] = Utils::CrinjaUtils.from_extra(v)
           end
 
-          # Build lower/higher page objects
-          lower_obj = if lower = page.lower
-                        {
-                          "title"       => Crinja::Value.new(lower.title),
-                          "url"         => Crinja::Value.new(lower.url),
-                          "description" => Crinja::Value.new(lower.description || ""),
-                          "date"        => Crinja::Value.new(lower.date.try(&.to_s("%Y-%m-%d")) || ""),
-                        }
-                      else
-                        nil
-                      end
+          # Reuse cached Crinja::Value for lower/higher pages
+          lower_obj = page.lower.try { |l| cached_page_crinja_value(l, default_lang) }
+          higher_obj = page.higher.try { |h| cached_page_crinja_value(h, default_lang) }
 
-          higher_obj = if higher = page.higher
-                         {
-                           "title"       => Crinja::Value.new(higher.title),
-                           "url"         => Crinja::Value.new(higher.url),
-                           "description" => Crinja::Value.new(higher.description || ""),
-                           "date"        => Crinja::Value.new(higher.date.try(&.to_s("%Y-%m-%d")) || ""),
-                         }
-                       else
-                         nil
-                       end
-
-          # Build ancestors array
-          ancestors_array = page.ancestors.map do |ancestor|
-            Crinja::Value.new({
-              "title" => Crinja::Value.new(ancestor.title),
-              "url"   => Crinja::Value.new(ancestor.url),
-            })
+          # Build ancestors array (cached per section — pages in the same section share ancestors)
+          ancestors_cache_key = page.section
+          ancestors_array = @ancestors_crinja_cache[ancestors_cache_key]? || begin
+            arr = page.ancestors.map do |ancestor|
+              Crinja::Value.new({
+                "title" => Crinja::Value.new(ancestor.title),
+                "url"   => Crinja::Value.new(ancestor.url),
+              })
+            end
+            @ancestors_crinja_cache[ancestors_cache_key] = arr
+            arr
           end
 
           # Page object with all properties
@@ -2266,9 +2280,9 @@ module Hwaro
             "language"     => Crinja::Value.new(page_language),
             "translations" => Crinja::Value.new(translations),
             # New properties
-            "authors"         => Crinja::Value.new(authors_array),
-            "tags"            => Crinja::Value.new(tags_array),
-            "assets"          => Crinja::Value.new(assets_array),
+            "authors"         => authors_crinja,
+            "tags"            => tags_crinja,
+            "assets"          => assets_crinja,
             "extra"           => Crinja::Value.new(extra_hash),
             "summary"         => Crinja::Value.new(page.effective_summary || ""),
             "word_count"      => Crinja::Value.new(page.word_count),
@@ -2276,30 +2290,25 @@ module Hwaro
             "permalink"       => Crinja::Value.new(page.permalink || ""),
             "weight"          => Crinja::Value.new(page.weight),
             "in_search_index" => Crinja::Value.new(page.in_search_index),
-            "lower"           => lower_obj ? Crinja::Value.new(lower_obj) : Crinja::Value.new(nil),
-            "higher"          => higher_obj ? Crinja::Value.new(higher_obj) : Crinja::Value.new(nil),
+            "lower"           => lower_obj || Crinja::Value.new(nil),
+            "higher"          => higher_obj || Crinja::Value.new(nil),
             "ancestors"       => Crinja::Value.new(ancestors_array),
             "series"          => Crinja::Value.new(page.series || ""),
             "series_index"    => Crinja::Value.new(page.series_index),
-            "series_pages"    => Crinja::Value.new(page.series_pages.map { |sp|
-              Crinja::Value.new({
-                "title"        => Crinja::Value.new(sp.title),
-                "url"          => Crinja::Value.new(sp.url),
-                "description"  => Crinja::Value.new(sp.description || ""),
-                "date"         => Crinja::Value.new(sp.date.try(&.to_s("%Y-%m-%d")) || ""),
-                "series_index" => Crinja::Value.new(sp.series_index),
+            "series_pages"    => (page.series.try { |s| @series_crinja_cache[s]? } || begin
+              val = Crinja::Value.new(page.series_pages.map { |sp|
+                cached_page_crinja_value(sp, default_lang)
               })
-            }),
-            "related_posts" => Crinja::Value.new(page.related_posts.map { |rp|
-              Crinja::Value.new({
-                "title"       => Crinja::Value.new(rp.title),
-                "url"         => Crinja::Value.new(rp.url),
-                "description" => Crinja::Value.new(rp.description || ""),
-                "date"        => Crinja::Value.new(rp.date.try(&.to_s("%Y-%m-%d")) || ""),
-                "image"       => Crinja::Value.new(rp.image || ""),
-                "section"     => Crinja::Value.new(rp.section),
+              page.series.try { |s| @series_crinja_cache[s] = val }
+              val
+            end),
+            "related_posts" => (@related_posts_crinja_cache[page.path]? || begin
+              val = Crinja::Value.new(page.related_posts.map { |rp|
+                cached_page_crinja_value(rp, default_lang)
               })
-            }),
+              @related_posts_crinja_cache[page.path] = val
+              val
+            end),
           }
           vars["page"] = Crinja::Value.new(page_obj)
 
@@ -2308,8 +2317,8 @@ module Hwaro
           vars["page_word_count"] = Crinja::Value.new(page.word_count)
           vars["page_reading_time"] = Crinja::Value.new(page.reading_time)
           vars["page_permalink"] = Crinja::Value.new(page.permalink || "")
-          vars["page_authors"] = Crinja::Value.new(authors_array)
-          vars["page_tags"] = Crinja::Value.new(tags_array)
+          vars["page_authors"] = authors_crinja
+          vars["page_tags"] = tags_crinja
           vars["page_weight"] = Crinja::Value.new(page.weight)
 
           # Site variables (flat for convenience)
@@ -2325,8 +2334,7 @@ module Hwaro
 
           # Section-specific variables
           subsections_array = [] of Crinja::Value
-          # assets_array is already defined above for the page itself
-          section_assets_array = [] of Crinja::Value
+          section_assets_val = Crinja::Value.new([] of Crinja::Value)
           page_template_var = ""
           paginate_path_var = "page"
           redirect_to_var = ""
@@ -2353,7 +2361,7 @@ module Hwaro
             end
 
             # Use the page's assets as section assets
-            section_assets_array = assets_array
+            section_assets_val = assets_crinja
           elsif !page.section.empty?
             # For regular pages, find the parent section via O(1) lookup
             section_page = site.sections_by_name[page.section]?
@@ -2362,10 +2370,10 @@ module Hwaro
               section_description = section_page.description || ""
               current_section = page.section
               # Use cached section assets to avoid re-allocating per page
-              section_assets_array = @section_assets_crinja_cache[page.section]? || begin
+              section_assets_val = @section_assets_crinja_cache[page.section]?.try { |arr| Crinja::Value.new(arr) } || begin
                 arr = section_page.assets.map { |a| Crinja::Value.new(a) }
                 @section_assets_crinja_cache[page.section] = arr
-                arr
+                Crinja::Value.new(arr)
               end
             end
           end
@@ -2377,22 +2385,21 @@ module Hwaro
               section_pages_array = paginator.pages.map { |p| page_to_crinja_list_value(p, default_lang) }
             else
               # Non-paginated: use per-section cache, then exclude current page.
-              # Find the index of the current page by URL for O(1) removal
-              # instead of O(n) reject with per-element Hash access.
+              # Find index once, then build result skipping that slot (pre-sized array avoids realloc).
               all_section = cached_section_pages_crinja(current_section, page.language, site)
               page_url_str = page.url
-              exclude_idx = -1
-              all_section.each_with_index do |v, i|
+              skip_idx = all_section.index do |v|
                 raw = v.raw
-                if raw.is_a?(Hash) && raw["url"]?.try(&.to_s) == page_url_str
-                  exclude_idx = i
-                  break
-                end
+                raw.is_a?(Hash) && raw["url"]?.try(&.to_s) == page_url_str
               end
-              section_pages_array = if exclude_idx >= 0
-                                      # Build array without the excluded element (avoids full reject scan)
-                                      all_section[0...exclude_idx] + all_section[(exclude_idx + 1)..]
+              section_pages_array = if skip_idx
+                                      arr = Array(Crinja::Value).new(all_section.size - 1)
+                                      all_section.each_with_index { |v, i| arr << v unless i == skip_idx }
+                                      arr
                                     else
+                                      # NOTE: This is the cached array from @section_pages_crinja_cache.
+                                      # Safe because downstream only wraps it in Crinja::Value (read-only).
+                                      # Do NOT mutate (sort!, push, delete, etc.) — it would corrupt the cache.
                                       all_section
                                     end
             end
@@ -2411,7 +2418,7 @@ module Hwaro
             "list"        => Crinja::Value.new(section_list),
             # New section properties
             "subsections"   => Crinja::Value.new(subsections_array),
-            "assets"        => Crinja::Value.new(section_assets_array),
+            "assets"        => section_assets_val,
             "page_template" => Crinja::Value.new(page_template_var),
             "paginate_path" => Crinja::Value.new(paginate_path_var),
             "redirect_to"   => Crinja::Value.new(redirect_to_var),
@@ -2457,7 +2464,13 @@ module Hwaro
           # OG/Twitter tags (page-specific — depend on page title/description/url/image)
           og_tags = config.og.og_tags(page.title, page.description, effective_url, page.image, config.base_url)
           twitter_tags = config.og.twitter_tags(page.title, page.description, page.image, config.base_url)
-          og_all_tags = [og_tags, twitter_tags].reject(&.empty?).join("\n")
+          og_all_tags = if og_tags.empty?
+                          twitter_tags
+                        elsif twitter_tags.empty?
+                          og_tags
+                        else
+                          "#{og_tags}\n#{twitter_tags}"
+                        end
           vars["og_tags"] = Crinja::Value.new(og_tags)
           vars["twitter_tags"] = Crinja::Value.new(twitter_tags)
           vars["og_all_tags"] = Crinja::Value.new(og_all_tags)
@@ -2483,8 +2496,16 @@ module Hwaro
 
           vars["jsonld_article"] = Crinja::Value.new(jsonld_article)
           vars["jsonld_breadcrumb"] = Crinja::Value.new(jsonld_breadcrumb)
-          vars["jsonld_faq"] = Crinja::Value.new(Content::Seo::JsonLd.faq_page(page, config))
-          vars["jsonld_howto"] = Crinja::Value.new(Content::Seo::JsonLd.how_to(page, config))
+          # Only compute FAQ/HowTo JSON-LD when schema_type indicates it (avoids
+          # per-page hash lookups + array allocations for the common case)
+          schema_type_raw = page.extra["schema_type"]?.try(&.as?(String)) || ""
+          schema_lower = schema_type_raw.downcase
+          vars["jsonld_faq"] = Crinja::Value.new(
+            schema_lower == "faqpage" || schema_lower == "faq" ? Content::Seo::JsonLd.faq_page(page, config) : ""
+          )
+          vars["jsonld_howto"] = Crinja::Value.new(
+            schema_lower == "howto" || schema_lower == "how-to" ? Content::Seo::JsonLd.how_to(page, config) : ""
+          )
           vars["jsonld"] = Crinja::Value.new(jsonld_all)
 
           # Merge global vars at the end.  Page-specific keys (written above)
@@ -2544,6 +2565,12 @@ module Hwaro
           raw_files.each do |raw_file|
             output_path = File.join(output_dir, raw_file.relative_path)
 
+            # Validate output path stays within output directory
+            unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
+              Logger.warn "  [WARN] Skipping raw file outside output directory: #{raw_file.relative_path}"
+              next
+            end
+
             # Get appropriate processor
             processor = Content::Processors::Registry.for_file(raw_file.source_path).first?
 
@@ -2584,7 +2611,7 @@ module Hwaro
 
             # Destination directory matches the page's URL structure
             # page.url typically starts with / and ends with /, e.g., /blog/post/
-            url_path = page.url.sub(/^\//, "")
+            url_path = page.url.lchop("/")
             dest_dir = File.join(output_dir, url_path)
 
             FileUtils.mkdir_p(dest_dir)

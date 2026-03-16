@@ -65,8 +65,8 @@ module Hwaro
           bg = escape_attr(ai.background)
           text_color = escape_attr(ai.text_color)
           accent = escape_attr(ai.accent_color)
-          font_size = ai.font_size
-          desc_size = (font_size * 0.45).to_i
+          font_size = Math.max(ai.font_size, 1)
+          desc_size = Math.max((font_size * 0.45).to_i, 1)
           site_name = escape_xml(config.title)
           title = escape_xml(page.title)
           description = escape_xml(page.description || "")
@@ -86,7 +86,7 @@ module Hwaro
           logo_svg = ""
           if logo_path = ai.logo
             # Reference logo as image in SVG — strip static/ prefix and ensure leading /
-            logo_url = logo_path.sub(/\Astatic\//, "")
+            logo_url = logo_path.lchop("static/")
             logo_url = logo_url.starts_with?("/") ? logo_url : "/#{logo_url}"
             logo_svg = %(<image href="#{escape_attr(logo_url)}" x="80" y="#{HEIGHT - 100}" width="48" height="48" />)
           end
@@ -173,8 +173,7 @@ module Hwaro
         end
 
         private def self.escape_attr(text : String) : String
-          # & must be replaced first to avoid double-encoding (&quot; → &amp;quot;)
-          text.gsub("&", "&amp;").gsub("\"", "&quot;").gsub("<", "&lt;").gsub(">", "&gt;")
+          Utils::TextUtils.escape_xml(text)
         end
       end
     end

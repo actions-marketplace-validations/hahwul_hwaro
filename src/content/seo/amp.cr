@@ -37,6 +37,10 @@ module Hwaro
 
             # Write AMP version
             amp_output = amp_output_path(page, output_dir, prefix)
+            unless Utils::OutputGuard.within_output_dir?(amp_output, output_dir)
+              Logger.warn "  [WARN] Skipping AMP output outside output directory: #{amp_output}"
+              next
+            end
             dir = File.dirname(amp_output)
             FileUtils.mkdir_p(dir) unless Dir.exists?(dir)
             File.write(amp_output, amp_html)
@@ -112,7 +116,7 @@ module Hwaro
 
           # Add canonical link to the original page
           base_url = config.base_url.rstrip('/')
-          canonical_url = "#{base_url}#{page.url}"
+          canonical_url = Utils::TextUtils.escape_xml("#{base_url}#{page.url}")
           unless result.includes?("rel=\"canonical\"")
             result = result.sub(/<\/head>/i, %(<link rel="canonical" href="#{canonical_url}">\n</head>))
           end
@@ -131,7 +135,7 @@ module Hwaro
           return if html.includes?("rel=\"amphtml\"")
 
           base_url = config.base_url.rstrip('/')
-          amp_url = "#{base_url}/#{prefix}#{page.url}"
+          amp_url = Utils::TextUtils.escape_xml("#{base_url}/#{prefix}#{page.url}")
           link_tag = %(<link rel="amphtml" href="#{amp_url}">)
 
           updated = html.sub(/<\/head>/i, "#{link_tag}\n</head>")
@@ -139,12 +143,12 @@ module Hwaro
         end
 
         private def self.output_path_for(page : Models::Page, output_dir : String) : String
-          url_path = page.url.sub(/^\//, "")
+          url_path = page.url.lchop("/")
           File.join(output_dir, url_path, "index.html")
         end
 
         private def self.amp_output_path(page : Models::Page, output_dir : String, prefix : String) : String
-          url_path = page.url.sub(/^\//, "")
+          url_path = page.url.lchop("/")
           File.join(output_dir, prefix, url_path, "index.html")
         end
       end

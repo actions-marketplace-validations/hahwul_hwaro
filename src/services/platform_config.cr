@@ -175,7 +175,7 @@ module Hwaro
         return if aliases.empty?
 
         # Build a minimal Page to calculate its URL using the same logic as the build pipeline
-        relative_path = path.sub(/^content\//, "")
+        relative_path = path.lchop("content/")
         target_url = calculate_page_url(relative_path, data[:slug], data[:custom_path])
 
         aliases.each do |alias_path|
@@ -201,7 +201,7 @@ module Hwaro
         end
 
         if custom_path
-          custom = custom_path.sub(/^\//, "")
+          custom = custom_path.lchop("/")
           url = "/#{custom}"
           url += "/" unless url.ends_with?("/")
           return url

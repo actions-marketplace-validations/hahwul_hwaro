@@ -31,14 +31,16 @@ module Hwaro
           String.build do |io|
             in_fence = false
             fence_marker = ""
+            fence_close_regex : Regex? = nil
             buffer = String::Builder.new
 
             content.each_line(chomp: false) do |line|
               if in_fence
                 io << line
-                if line.match(/^\s*#{Regex.escape(fence_marker)}\s*$/)
+                if fence_close_regex.try(&.match(line))
                   in_fence = false
                   fence_marker = ""
+                  fence_close_regex = nil
                 end
                 next
               end
@@ -48,6 +50,8 @@ module Hwaro
                 buffer = String::Builder.new
                 in_fence = true
                 fence_marker = match[1]
+                # Compile the close-fence regex once per fenced block
+                fence_close_regex = Regex.new("^\\s*#{Regex.escape(fence_marker)}\\s*$")
                 io << line
               else
                 buffer << line
@@ -165,17 +169,27 @@ module Hwaro
         # Render a shortcode template with Crinja
         private def render_shortcode_jinja(template : String, args : Hash(String, String), context : Hash(String, Crinja::Value), crinja_env_override : Crinja? = nil) : String
           env = crinja_env_override || crinja_env
-          vars = context.dup
-          args.each do |key, value|
-            vars[key] = Crinja::Value.new(value)
-          end
+
+          # Inject args directly into shared context, then restore — avoids expensive .dup
+          args.each { |key, value| context[key] = Crinja::Value.new(value) }
 
           begin
-            crinja_template = env.from_string(template)
-            crinja_template.render(vars)
+            # Cache compiled shortcode templates by content hash to avoid
+            # re-parsing the template AST on every shortcode invocation.
+            # XOR with a salt to avoid collisions with page template cache entries
+            # that share @compiled_templates_cache.
+            cache_key = template.hash ^ 0x5C0DE_CAFE_u64
+            crinja_template = @compiled_templates_cache[cache_key]? || begin
+              compiled = env.from_string(template)
+              @compiled_templates_cache[cache_key] = compiled
+              compiled
+            end
+            crinja_template.render(context)
           rescue ex : Crinja::TemplateError
             Logger.warn "  [WARN] Shortcode template error: #{ex.message}"
             ""
+          ensure
+            args.each_key { |key| context.delete(key) }
           end
         end
 

@@ -18,7 +18,7 @@ module Hwaro
 
             # Filter by section if configured for main feed
             if !config.feeds.sections.empty?
-              site_pages.select! { |p|
+              site_pages = site_pages.select { |p|
                 config.feeds.sections.any? { |s| p.section == s || p.section.starts_with?("#{s}/") }
               }
             end
@@ -28,7 +28,7 @@ module Hwaro
             # When false, the main feed includes all languages (original behavior).
             if config.multilingual? && config.feeds.default_language_only
               default_lang = config.default_language
-              site_pages.select! { |p|
+              site_pages = site_pages.select { |p|
                 lang = p.language || default_lang
                 lang == default_lang
               }
@@ -37,19 +37,21 @@ module Hwaro
             process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose)
           end
 
-          # 2. Generate Section Feeds
+          # 2. Generate Section Feeds — pre-group pages by section for O(1) lookup
+          pages_by_section = {} of String => Array(Models::Page)
+          pages.each do |p|
+            next if p.draft || !p.render || p.is_a?(Models::Section)
+            (pages_by_section[p.section] ||= [] of Models::Page) << p
+          end
+
           pages.each do |page|
             # Check if it's a section and has feed generation enabled
             if page.is_a?(Models::Section) && page.generate_feeds && page.render && !page.draft
-              # Section feed only includes pages from that specific section (shallow)
-              # It does not include subsections or pages from other sections
-              section_pages = pages.select { |p|
-                !p.draft && p.render && !p.is_a?(Models::Section) && p.section == page.section
-              }
+              section_pages = pages_by_section[page.section]? || [] of Models::Page
 
               # Construct output path for section feed
               # e.g., output_dir/posts/rss.xml
-              section_output_dir = File.join(output_dir, page.url.sub(/^\//, ""))
+              section_output_dir = File.join(output_dir, page.url.lchop("/"))
               FileUtils.mkdir_p(section_output_dir)
 
               feed_title = "#{config.title} - #{page.title}"
@@ -76,11 +78,9 @@ module Hwaro
             # Respect per-language generate_feed setting
             next unless lang_config.generate_feed
 
-            # Filter pages for this language
-            lang_pages = pages.reject { |p|
-              p.draft || !p.render || p.is_a?(Models::Section)
-            }.select { |p|
-              p.language == lang_code
+            # Filter pages for this language (single pass)
+            lang_pages = pages.select { |p|
+              !p.draft && p.render && !p.is_a?(Models::Section) && p.language == lang_code
             }
 
             # Apply section filter if configured on the main feed
@@ -144,8 +144,8 @@ module Hwaro
                            generate_rss(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path, language)
                          end
 
-          # Write feed file
-          feed_path = File.join(output_dir, filename)
+          # Write feed file (basename prevents path traversal via config filename)
+          feed_path = File.join(output_dir, File.basename(filename))
           File.write(feed_path, feed_content)
           Logger.action :create, feed_path if verbose
         end
@@ -154,7 +154,7 @@ module Hwaro
         private def self.build_feed_url(config : Models::Config, base_path : String, filename : String) : {String, String}
           base_url = config.base_url.rstrip('/')
           feed_url_path = base_path.empty? ? filename : File.join(base_path, filename)
-          feed_url = "#{base_url}/#{feed_url_path.sub(/^\//, "")}"
+          feed_url = "#{base_url}/#{feed_url_path.lchop("/")}"
           {base_url, feed_url}
         end
 
@@ -175,7 +175,7 @@ module Hwaro
         ) : String
           base_url, feed_url = build_feed_url(config, base_path, filename)
 
-          String.build do |str|
+          String.build(500 + pages.size * 300) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             str << "<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n"
             str << "  <channel>\n"
@@ -225,7 +225,7 @@ module Hwaro
           now = Time.utc
           base_url, feed_url = build_feed_url(config, base_path, filename)
 
-          String.build do |str|
+          String.build(500 + pages.size * 350) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
 
             if language
@@ -253,7 +253,7 @@ module Hwaro
               str << "    <link href=\"#{escaped_url}\" />\n"
               str << "    <id>#{escaped_url}</id>\n"
 
-              entry_date = page.updated || page.date || now
+              entry_date = (page.updated || page.date || now).to_utc
               str << "    <updated>#{entry_date.to_rfc3339}</updated>\n"
 
               content = get_content_for_feed(page, config.feeds.truncate)

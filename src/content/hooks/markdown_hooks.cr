@@ -133,7 +133,7 @@ module Hwaro
                         end
 
           if page.custom_path
-            custom = page.custom_path.not_nil!.sub(/^\//, "")
+            custom = page.custom_path.not_nil!.lchop("/")
             page.url = "#{lang_prefix}/#{custom}"
             page.url += "/" unless page.url.ends_with?("/")
           elsif page.is_index

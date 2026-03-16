@@ -411,6 +411,7 @@ module Hwaro
           if generate_toc
             stack = [] of Models::TocHeader
             used_ids = Set(String).new
+            id_counters = Hash(String, Int32).new(0)
 
             result = result.gsub(HEADING_TAG_REGEX) do |match|
               tag_name = $1     # e.g. "h2"
@@ -418,8 +419,19 @@ module Hwaro
               attrs = $3? || "" # existing attributes (may be empty)
               inner_html = $4   # inner content (may contain inline HTML)
 
-              # Extract plain text for TOC title
-              title = inner_html.gsub(HTML_TAG_STRIP_REGEX, "").strip
+              # Extract plain text for TOC title (inline char-level strip avoids regex + alloc)
+              title = String.build(inner_html.bytesize) do |io|
+                in_tag = false
+                inner_html.each_char do |c|
+                  if c == '<'
+                    in_tag = true
+                  elsif c == '>'
+                    in_tag = false
+                  elsif !in_tag
+                    io << c
+                  end
+                end
+              end.strip
 
               # Use existing id or generate one
               existing_id = if id_match = attrs.match(ID_ATTR_REGEX)
@@ -428,15 +440,19 @@ module Hwaro
                               nil
                             end
 
-              id = existing_id || Utils::TextUtils.slugify(title)
+              slug = Utils::TextUtils.slugify(title)
+              id = existing_id || (slug.empty? ? "heading" : slug)
 
-              # Ensure uniqueness
+              # Ensure uniqueness using counter map for O(1) suffix lookup
               if used_ids.includes?(id)
-                suffix = 1
-                while used_ids.includes?("#{id}-#{suffix}")
-                  suffix += 1
+                id_counters[id] += 1
+                id = "#{id}-#{id_counters[id]}"
+                # Handle the rare case where the suffixed id also exists
+                while used_ids.includes?(id)
+                  base, _, _ = id.rpartition("-")
+                  id_counters[base] += 1
+                  id = "#{base}-#{id_counters[base]}"
                 end
-                id = "#{id}-#{suffix}"
               end
               used_ids << id
 

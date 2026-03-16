@@ -20,19 +20,26 @@ module Hwaro
       #   slugify("CJK 테스트!")   # => "cjk-테스트"
       #
       def slugify(text : String) : String
-        result = String.build do |io|
+        # Single-pass: directly emit hyphens for separators, collapsing runs.
+        # Avoids intermediate String allocation + regex gsub.
+        String.build(text.bytesize) do |io|
+          last_was_sep = true # suppress leading hyphen
           text.each_char do |char|
             if char.ascii_letter? || char.ascii_number?
               io << char.downcase
+              last_was_sep = false
             elsif char.ascii_whitespace? || char == '-' || char == '_'
-              io << ' '
+              unless last_was_sep
+                io << '-'
+                last_was_sep = true
+              end
             elsif cjk_char?(char) || unicode_letter?(char)
               io << char
+              last_was_sep = false
             end
             # All other characters (punctuation, symbols) are dropped
           end
-        end
-        result.gsub(/\s+/, "-").strip("-")
+        end.rstrip('-')
       end
 
       # Check if a character is a Unicode letter (non-ASCII)
@@ -72,23 +79,28 @@ module Hwaro
         String.build(text.bytesize) do |io|
           in_tag = false
           last_was_space = true # suppress leading space
+          pending_space = false # deferred space from tag boundary
           text.each_char do |char|
             if char == '<'
               in_tag = true
+              # Mark that we might need a space (tag boundary)
+              pending_space = true unless last_was_space
             elsif char == '>'
               in_tag = false
-              # Emit a single space in place of the tag
-              unless last_was_space
-                io << ' '
-                last_was_space = true
-              end
             elsif !in_tag
               if char.ascii_whitespace?
                 unless last_was_space
                   io << ' '
                   last_was_space = true
+                  pending_space = false
                 end
               else
+                # Emit deferred space only if the next char is alphanumeric
+                # (avoids "World !" from "</b>!")
+                if pending_space && char.alphanumeric?
+                  io << ' '
+                end
+                pending_space = false
                 io << char
                 last_was_space = false
               end

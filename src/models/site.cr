@@ -21,6 +21,7 @@ module Hwaro
       property sections_by_name : Hash(String, Section)
       property pages_for_section_cache : Hash(Tuple(String, String?), Array(Page))
       @lookup_index_built : Bool = false
+      @all_content_cache : Array(Page)?
 
       def initialize(@config : Config)
         @pages = [] of Page
@@ -47,7 +48,7 @@ module Hwaro
       end
 
       def all_content : Array(Page)
-        (pages + sections.map { |s| s.as(Page) }).sort_by! { |p| p.path }
+        @all_content_cache ||= (pages + sections.map { |s| s.as(Page) }).sort_by!(&.path)
       end
 
       def build_lookup_index
@@ -55,6 +56,7 @@ module Hwaro
         @sections_by_parent.clear
         @sections_by_name.clear
         @pages_for_section_cache.clear
+        @all_content_cache = nil
 
         @pages.each do |p|
           list = @pages_by_section[p.section]?
@@ -88,9 +90,14 @@ module Hwaro
         @lookup_index_built = true
       end
 
-      def pages_for_section(section_name : String, language : String?, items : Array(Page)? = nil) : Array(Page)
+      def pages_for_section(section_name : String, language : String?, items : Array(Page)? = nil, visited : Set(String)? = nil) : Array(Page)
         # Normalize section name: remove leading/trailing slashes and handle root
         normalized_name = section_name.strip.strip('/')
+
+        # Guard against infinite recursion from circular transparent sections
+        seen = visited || Set(String).new
+        return [] of Page if seen.includes?(normalized_name)
+        seen.add(normalized_name)
 
         if @lookup_index_built && items.nil?
           cache_key = {normalized_name, language}
@@ -118,7 +125,7 @@ module Hwaro
                 subsection_name = Path[s.path].dirname.to_s
                 subsection_name = "" if subsection_name == "."
 
-                result.concat(pages_for_section(subsection_name, language))
+                result.concat(pages_for_section(subsection_name, language, nil, seen))
               else
                 # Non-transparent sections are included as Section (Page) objects
                 result << s
@@ -151,7 +158,7 @@ module Hwaro
             if parent_dir == normalized_name
               if p.transparent
                 # Recursive bubble up: get pages from this sub-section
-                result.concat(pages_for_section(p_dirname, language, content_items))
+                result.concat(pages_for_section(p_dirname, language, content_items, seen))
               else
                 # Non-transparent sections are included as Section (Page) objects
                 result << p
