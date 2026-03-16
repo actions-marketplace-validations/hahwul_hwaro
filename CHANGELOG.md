@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.6.0
+
+### Added
+- Image resize support
+- AMP support
+- PWA support
+- Asset pipeline
+- Incremental build
+- Auto-generate OG image
+- Extended structured data
+- Series and serial post support
+- Related posts recommendation
+- Built-in shortcodes
+- Content expiry
+- Environment-specific configuration
+- Environment variable substitution
+- `hwaro tool import` for Jekyll, Hugo, etc. migration
+- `hwaro tool platform` for config generation
+- GitHub Pages deploy workflow generator
+- Config health check and auto-fix to `doctor` command
+- `blog-dark`, `docs-dark` scaffold themes
+
+### Changed
+- Improve CSS minifier and add cache mutex
+- Performance improvements and code refactoring
+
+### Fixed
+- Path traversal via symlinks in `safe_path?`
+- Command and lint fixes
+
 ## v0.5.0
 
 ### Added
