@@ -117,10 +117,12 @@ module Hwaro
           Logger.success "  Generated #{resized_count} resized image(s)." if resized_count > 0
         end
 
-        # Verify that a path resolves within the expected base directory
+        # Verify that a path resolves within the expected base directory.
+        # Uses File.realpath to resolve symlinks before the boundary check,
+        # preventing symlink-based path traversal attacks.
         private def safe_path?(path : String, base : String) : Bool
-          resolved = File.expand_path(path)
-          resolved_base = File.expand_path(base)
+          resolved = File.realpath(path) rescue return false
+          resolved_base = File.realpath(base) rescue File.expand_path(base)
           resolved == resolved_base || resolved.starts_with?(resolved_base + "/")
         end
 
