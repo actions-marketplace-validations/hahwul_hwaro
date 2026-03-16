@@ -25,7 +25,10 @@ module Hwaro
         CONCURRENCY = 8
 
         def register_hooks(manager : Core::Lifecycle::Manager)
-          manager.on(Core::Lifecycle::HookPoint::AfterWrite, priority: 30, name: "image:resize") do |ctx|
+          # Run before Render so the resize map is populated when templates
+          # call resize_image(). Source images live in content/ and static/
+          # which are available at this point.
+          manager.on(Core::Lifecycle::HookPoint::BeforeRender, priority: 20, name: "image:resize") do |ctx|
             process_images(ctx)
             Core::Lifecycle::HookResult::Continue
           end
@@ -34,6 +37,11 @@ module Hwaro
         # Returns a snapshot copy of the resize map (safe to use outside mutex)
         def self.resize_map : Hash(String, Hash(Int32, String))
           @@resize_map_mutex.synchronize { @@resize_map.dup }
+        end
+
+        # Replace the resize map (used by tests)
+        def self.set_resize_map(map : Hash(String, Hash(Int32, String)))
+          @@resize_map_mutex.synchronize { @@resize_map = map }
         end
 
         def self.find_resized(url : String, width : Int32) : String?
@@ -83,9 +91,10 @@ module Hwaro
 
           # Phase 1: Collect all image jobs (fast, single-threaded)
           jobs = [] of ImageJob
-          collect_page_asset_jobs(ctx, output_dir, resolved_output, jobs)
-          collect_content_file_jobs(config, output_dir, resolved_output, jobs) if config.content_files.enabled?
-          collect_static_jobs(output_dir, resolved_output, jobs)
+          seen = Set(String).new
+          collect_page_asset_jobs(ctx, output_dir, resolved_output, jobs, seen)
+          collect_content_file_jobs(config, output_dir, resolved_output, jobs, seen) if config.content_files.enabled?
+          collect_static_jobs(output_dir, resolved_output, jobs, seen)
 
           return if jobs.empty?
 
@@ -143,6 +152,7 @@ module Hwaro
           output_dir : String,
           resolved_output : String,
           jobs : Array(ImageJob),
+          seen : Set(String),
         )
           ctx.all_pages.each do |page|
             next if page.assets.empty?
@@ -160,12 +170,14 @@ module Hwaro
 
               relative_to_bundle = Path[asset_path].relative_to(page_bundle_dir)
               original_url = "/" + url_path + relative_to_bundle.to_s
+              next if seen.includes?(original_url)
               asset_dest_dir = File.join(dest_dir, File.dirname(relative_to_bundle.to_s))
               next unless safe_path_dest?(asset_dest_dir, resolved_output)
 
               url_prefix = "/" + url_path + File.dirname(relative_to_bundle.to_s).rstrip(".") + "/"
               url_prefix = url_prefix.gsub("//", "/")
 
+              seen.add(original_url)
               jobs << ImageJob.new(source_path, asset_dest_dir, original_url, url_prefix)
             end
           end
@@ -176,6 +188,7 @@ module Hwaro
           output_dir : String,
           resolved_output : String,
           jobs : Array(ImageJob),
+          seen : Set(String),
         )
           Dir.glob(File.join("content", "**", "*")).each do |file|
             next unless File.file?(file)
@@ -185,12 +198,14 @@ module Hwaro
             next unless config.content_files.publish?(relative)
 
             original_url = "/" + relative
+            next if seen.includes?(original_url)
             dest_dir = File.join(output_dir, File.dirname(relative))
             next unless safe_path_dest?(dest_dir, resolved_output)
 
             dir_part = File.dirname(relative)
             url_prefix = dir_part == "." ? "/" : "/#{dir_part}/"
 
+            seen.add(original_url)
             jobs << ImageJob.new(file, dest_dir, original_url, url_prefix)
           end
         end
@@ -199,6 +214,7 @@ module Hwaro
           output_dir : String,
           resolved_output : String,
           jobs : Array(ImageJob),
+          seen : Set(String),
         )
           return unless Dir.exists?("static")
 
@@ -209,12 +225,14 @@ module Hwaro
 
             relative = Path[file].relative_to("static").to_s
             original_url = "/" + relative
+            next if seen.includes?(original_url)
             dest_dir = File.join(output_dir, File.dirname(relative))
             next unless safe_path_dest?(dest_dir, resolved_output)
 
             dir_part = File.dirname(relative)
             url_prefix = dir_part == "." ? "/" : "/#{dir_part}/"
 
+            seen.add(original_url)
             jobs << ImageJob.new(file, dest_dir, original_url, url_prefix)
           end
         end

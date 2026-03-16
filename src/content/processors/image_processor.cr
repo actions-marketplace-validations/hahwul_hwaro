@@ -175,8 +175,9 @@ module Hwaro
           pixels = LibStb.stbi_load(source, pointerof(src_w), pointerof(src_h), pointerof(channels), 0)
 
           if pixels.null?
-            reason = String.new(LibStb.stbi_failure_reason)
-            Logger.debug "Image load failed '#{source}': #{reason}"
+            # Note: stbi_failure_reason() is not thread-safe, so we skip it
+            # in this method which may be called from concurrent fibers.
+            Logger.debug "Image load failed '#{source}'"
             return result_map
           end
 
@@ -241,7 +242,7 @@ module Hwaro
             scale_w = target_w.to_f / src_w
             scale_h = target_h.to_f / src_h
             scale = Math.min(scale_w, scale_h)
-            {(src_w * scale).round.to_i32, (src_h * scale).round.to_i32}
+            {Math.max(1, (src_w * scale).round.to_i32), Math.max(1, (src_h * scale).round.to_i32)}
           elsif target_w > 0
             # Width only: scale proportionally
             scale = target_w.to_f / src_w

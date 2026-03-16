@@ -387,20 +387,70 @@ describe Hwaro::Content::Processors::ImageProcessor do
 end
 
 describe Hwaro::Content::Hooks::ImageHooks do
-  describe ".find_closest" do
-    it "returns nil when no resize map entry exists" do
-      Hwaro::Content::Hooks::ImageHooks.find_closest("/nonexistent.jpg", 800).should be_nil
+  # Helper to set up and tear down test resize map
+  before_each do
+    Hwaro::Content::Hooks::ImageHooks.set_resize_map({
+      "/images/photo.jpg" => {
+        320  => "/images/photo_320w.jpg",
+        640  => "/images/photo_640w.jpg",
+        1024 => "/images/photo_1024w.jpg",
+      } of Int32 => String,
+    } of String => Hash(Int32, String))
+  end
+
+  after_each do
+    Hwaro::Content::Hooks::ImageHooks.set_resize_map({} of String => Hash(Int32, String))
+  end
+
+  describe ".find_resized" do
+    it "returns exact match" do
+      Hwaro::Content::Hooks::ImageHooks.find_resized("/images/photo.jpg", 640).should eq("/images/photo_640w.jpg")
     end
 
-    it "returns nil when no resize map entry for given URL" do
-      Hwaro::Content::Hooks::ImageHooks.find_resized("/nonexistent.jpg", 800).should be_nil
+    it "returns nil for non-matching width" do
+      Hwaro::Content::Hooks::ImageHooks.find_resized("/images/photo.jpg", 500).should be_nil
+    end
+
+    it "returns nil for unknown URL" do
+      Hwaro::Content::Hooks::ImageHooks.find_resized("/nonexistent.jpg", 640).should be_nil
+    end
+  end
+
+  describe ".find_closest" do
+    it "returns exact match when available" do
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/images/photo.jpg", 640).should eq("/images/photo_640w.jpg")
+    end
+
+    it "returns smallest width >= requested" do
+      # Request 500 -> should get 640 (smallest >= 500)
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/images/photo.jpg", 500).should eq("/images/photo_640w.jpg")
+    end
+
+    it "returns smallest width >= requested (boundary)" do
+      # Request 321 -> should get 640 (320 < 321, so 640 is smallest >=)
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/images/photo.jpg", 321).should eq("/images/photo_640w.jpg")
+    end
+
+    it "falls back to largest when nothing >= requested" do
+      # Request 2000 -> nothing >= 2000, fall back to largest (1024)
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/images/photo.jpg", 2000).should eq("/images/photo_1024w.jpg")
+    end
+
+    it "returns smallest width for very small request" do
+      # Request 1 -> should get 320 (smallest >= 1)
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/images/photo.jpg", 1).should eq("/images/photo_320w.jpg")
+    end
+
+    it "returns nil for unknown URL" do
+      Hwaro::Content::Hooks::ImageHooks.find_closest("/nonexistent.jpg", 800).should be_nil
     end
   end
 
   describe ".resize_map" do
-    it "returns a hash (snapshot)" do
+    it "returns a snapshot copy" do
       map = Hwaro::Content::Hooks::ImageHooks.resize_map
       map.should be_a(Hash(String, Hash(Int32, String)))
+      map.has_key?("/images/photo.jpg").should be_true
     end
   end
 end

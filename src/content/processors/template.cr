@@ -413,8 +413,7 @@ module Hwaro
           end
 
           # resize_image() function - returns URL to a resized image variant
-          # Usage: {{ resize_image(path="/images/photo.jpg", width=800) }}
-          #        {{ resize_image(path="/images/photo.jpg", width=800).url }}
+          # Usage: {{ resize_image(path="/images/photo.jpg", width=800).url }}
           # Returns object with:
           #   - url: URL to the resized variant (or original if not available)
           #   - width: requested width (0 if not specified)
