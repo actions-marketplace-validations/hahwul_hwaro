@@ -20,8 +20,8 @@ module Hwaro
 
           FLAGS = [
             FlagInfo.new(short: "-o", long: "--output", description: "Output content directory (default: content)", takes_value: true, value_hint: "DIR"),
-            FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content"),
-            FlagInfo.new(short: "-v", long: "--verbose", description: "Show detailed output"),
+            DRAFTS_FLAG,
+            VERBOSE_FLAG,
             HELP_FLAG,
           ]
 
@@ -83,9 +83,9 @@ module Hwaro
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool import <wordpress|jekyll|hugo> <path> [options]"
               parser.on("-o DIR", "--output DIR", "Output content directory (default: content)") { |dir| output_dir = dir }
-              parser.on("-d", "--drafts", "Include draft content") { drafts = true }
-              parser.on("-v", "--verbose", "Show detailed output") { verbose = true }
-              parser.on("-h", "--help", "Show this help") { Logger.info parser.to_s; exit }
+              CLI.register_flag(parser, DRAFTS_FLAG) { |_| drafts = true }
+              CLI.register_flag(parser, VERBOSE_FLAG) { |_| verbose = true }
+              CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
               parser.unknown_args do |remaining|
                 positional = remaining
               end

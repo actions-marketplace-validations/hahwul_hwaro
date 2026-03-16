@@ -19,6 +19,7 @@ module Hwaro
 
           # Flags defined here are used both for OptionParser and completion generation
           FLAGS = [
+            CONTENT_DIR_FLAG,
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -62,11 +63,9 @@ module Hwaro
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool check-links [options]"
-              parser.on("-j", "--json", "Output result as JSON") { json_output = true }
-              parser.on("-h", "--help", "Show this help") do
-                Logger.info parser.to_s
-                exit
-              end
+              CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| target_dir = v }
+              CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
+              CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
             end
 
             unless Dir.exists?(target_dir)

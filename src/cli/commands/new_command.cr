@@ -45,7 +45,7 @@ module Hwaro
             parser.banner = "Usage: hwaro new <path> [options]"
             parser.on("-t TITLE", "--title TITLE", "Content title") { |t| title = t }
             parser.on("-a NAME", "--archetype NAME", "Archetype to use") { |a| archetype = a }
-            parser.on("-h", "--help", "Show this help") { Logger.info parser.to_s; exit }
+            CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
             parser.unknown_args do |unknown|
               path = unknown.first if unknown.any?
             end

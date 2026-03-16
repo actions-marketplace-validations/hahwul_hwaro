@@ -66,7 +66,7 @@ module Hwaro
 
       def run
         if ARGV.empty?
-          print_help
+          Runner.print_help
           exit
         end
 
@@ -74,17 +74,17 @@ module Hwaro
         args = ARGV.dup
 
         case command
-        when "version"
+        when "-V", "--version"
           Logger.info "#{Hwaro::VERSION}"
-        when "help", "-h", "--help"
-          print_help
+        when "-h", "--help"
+          Runner.print_help
         else
           # Try to get command from registry
           if handler = CommandRegistry.get(command)
             handler.call(args)
           else
             Logger.error "Unknown command: #{command}"
-            print_help
+            Runner.print_help
             exit(1)
           end
         end
@@ -131,9 +131,19 @@ module Hwaro
         CommandRegistry.register(Commands::CompletionCommand.metadata) do |args|
           Commands::CompletionCommand.new.run(args)
         end
+
+        # Register version command
+        CommandRegistry.register(CommandInfo.new(name: "version", description: "Show version")) do |_|
+          Logger.info "#{Hwaro::VERSION}"
+        end
+
+        # Register help command
+        CommandRegistry.register(CommandInfo.new(name: "help", description: "Show help")) do |_|
+          Runner.print_help
+        end
       end
 
-      private def print_help
+      def self.print_help
         art = [
           "                             ",
           "    █████████████████████    ",
@@ -169,18 +179,16 @@ module Hwaro
         Logger.info ""
         Logger.info "Commands:"
 
-        # Define priority order
-        priority = ["init", "build", "serve", "new", "deploy"]
+        # Define display order
+        priority = ["init", "build", "serve", "new", "deploy", "tool", "completion", "version", "help"]
 
-        # Print registered commands
+        # Print registered commands in priority order
         CommandRegistry.all.sort_by { |cmd|
           priority.index(cmd[:name]) || priority.size
         }.each do |cmd|
           Logger.info "  #{cmd[:name].ljust(12)} #{cmd[:description]}"
         end
 
-        Logger.info "  #{"version".ljust(12)} Show version"
-        Logger.info "  #{"help".ljust(12)} Show this help"
         Logger.info ""
         Logger.info "Run 'hwaro <command> --help' for more information on a command."
       end

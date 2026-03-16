@@ -10,6 +10,8 @@ private def ensure_commands_registered
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::DeployCommand.metadata) { |_| }
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::ToolCommand.metadata) { |_| }
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::CompletionCommand.metadata) { |_| }
+  Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::CommandInfo.new(name: "version", description: "Show version")) { |_| }
+  Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::CommandInfo.new(name: "help", description: "Show help")) { |_| }
 end
 
 describe Hwaro::CLI::Commands::CompletionCommand do

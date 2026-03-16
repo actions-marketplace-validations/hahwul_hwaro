@@ -11,6 +11,7 @@
 #   doctor   - Diagnose config and content issues
 #   platform - Generate hosting platform config files
 #   ci       - Generate CI/CD workflow files
+#   import   - Import content from other systems
 
 require "option_parser"
 require "../metadata"
@@ -37,17 +38,26 @@ module Hwaro
           HELP_FLAG,
         ]
 
-        # Get subcommand metadata from subcommand classes
+        # Subcommand registry - single registration point for dispatch and metadata
+        @@sub_handlers = {} of String => Proc(Array(String), Nil)
+        @@sub_metadata = [] of CommandInfo
+
+        private def self.register_sub(metadata : CommandInfo, &handler : Array(String) -> Nil)
+          @@sub_handlers[metadata.name] = handler
+          @@sub_metadata << metadata
+        end
+
+        # Register all subcommands
+        register_sub(Tool::ConvertCommand.metadata) { |args| Tool::ConvertCommand.new.run(args) }
+        register_sub(Tool::ListCommand.metadata) { |args| Tool::ListCommand.new.run(args) }
+        register_sub(Tool::DeadlinkCommand.metadata) { |args| Tool::DeadlinkCommand.new.run(args) }
+        register_sub(Tool::DoctorCommand.metadata) { |args| Tool::DoctorCommand.new.run(args) }
+        register_sub(Tool::PlatformCommand.metadata) { |args| Tool::PlatformCommand.new.run(args) }
+        register_sub(Tool::CICommand.metadata) { |args| Tool::CICommand.new.run(args) }
+        register_sub(Tool::ImportCommand.metadata) { |args| Tool::ImportCommand.new.run(args) }
+
         def self.subcommands : Array(CommandInfo)
-          [
-            Tool::ConvertCommand.metadata,
-            Tool::ListCommand.metadata,
-            Tool::DeadlinkCommand.metadata,
-            Tool::DoctorCommand.metadata,
-            Tool::PlatformCommand.metadata,
-            Tool::CICommand.metadata,
-            Tool::ImportCommand.metadata,
-          ]
+          @@sub_metadata
         end
 
         def self.metadata : CommandInfo
@@ -70,35 +80,26 @@ module Hwaro
           subcommand = args.shift
 
           case subcommand
-          when "convert"
-            Tool::ConvertCommand.new.run(args)
-          when "list"
-            Tool::ListCommand.new.run(args)
-          when "check-links"
-            Tool::DeadlinkCommand.new.run(args)
-          when "doctor"
-            Tool::DoctorCommand.new.run(args)
-          when "platform"
-            Tool::PlatformCommand.new.run(args)
-          when "ci"
-            Tool::CICommand.new.run(args)
-          when "import"
-            Tool::ImportCommand.new.run(args)
           when "-h", "--help", "help"
             print_help
           else
-            Logger.error "Unknown subcommand: #{subcommand}"
-            print_help
-            exit(1)
+            if handler = @@sub_handlers[subcommand]?
+              handler.call(args)
+            else
+              Logger.error "Unknown subcommand: #{subcommand}"
+              print_help
+              exit(1)
+            end
           end
         end
 
         private def print_help
+          max_len = ToolCommand.subcommands.max_of(&.name.size)
           Logger.info "Usage: hwaro tool <subcommand> [options]"
           Logger.info ""
           Logger.info "Available subcommands:"
           ToolCommand.subcommands.each do |sub|
-            Logger.info "  #{sub.name.ljust(10)} #{sub.description}"
+            Logger.info "  #{sub.name.ljust(max_len + 2)} #{sub.description}"
           end
           Logger.info ""
           Logger.info "Run 'hwaro tool <subcommand> --help' for more information on a subcommand."

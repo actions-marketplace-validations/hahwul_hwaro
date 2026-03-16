@@ -98,7 +98,7 @@ module Hwaro
 
         private def generate_bash : String
           commands = CompletionCommand.all_commands
-          command_names = commands.map(&.name).join(" ") + " version help"
+          command_names = commands.map(&.name).join(" ")
 
           script = <<-BASH
           # hwaro bash completion script
@@ -135,9 +135,6 @@ module Hwaro
           end
 
           script += <<-BASH
-                          version|help)
-                              return 0
-                              ;;
                       esac
                       ;;
               esac
@@ -227,8 +224,6 @@ module Hwaro
           end
 
           script += <<-ZSH
-                  'version:Show version'
-                  'help:Show help'
               )
 
               local -a _command_args
@@ -291,14 +286,19 @@ module Hwaro
             result += "                    esac\n"
           elsif !cmd.positional_choices.empty?
             result += "                    _arguments \\\n"
-            result += "                        '1:#{cmd.positional_args.first? || "arg"}:(#{cmd.positional_choices.join(" ")})' \\\n"
+            trailing = cmd.flags.empty? ? "" : " \\"
+            result += "                        '1:#{cmd.positional_args.first? || "arg"}:(#{cmd.positional_choices.join(" ")})'#{trailing}\n"
             cmd.flags.each_with_index do |flag, i|
               result += generate_zsh_flag(flag, i == cmd.flags.size - 1)
             end
           else
-            result += "                    _arguments \\\n"
-            cmd.flags.each_with_index do |flag, i|
-              result += generate_zsh_flag(flag, i == cmd.flags.size - 1)
+            if cmd.flags.empty?
+              # No flags - nothing to complete
+            else
+              result += "                    _arguments \\\n"
+              cmd.flags.each_with_index do |flag, i|
+                result += generate_zsh_flag(flag, i == cmd.flags.size - 1)
+              end
             end
           end
 
@@ -308,15 +308,21 @@ module Hwaro
 
         private def generate_zsh_subcommand_args(sub : CommandInfo) : String
           result = "                                #{sub.name})\n"
-          result += "                                    _arguments \\\n"
 
-          if !sub.positional_choices.empty?
-            result += "                                        '1:#{sub.positional_args.first? || "arg"}:(#{sub.positional_choices.join(" ")})' \\\n"
-          end
+          if sub.flags.empty? && sub.positional_choices.empty?
+            # No flags or choices - nothing to complete
+          else
+            result += "                                    _arguments \\\n"
 
-          sub.flags.each_with_index do |flag, i|
-            is_last = i == sub.flags.size - 1 && sub.positional_choices.empty?
-            result += generate_zsh_flag(flag, is_last, "                                        ")
+            if !sub.positional_choices.empty?
+              trailing = sub.flags.empty? ? "" : " \\"
+              result += "                                        '1:#{sub.positional_args.first? || "arg"}:(#{sub.positional_choices.join(" ")})'#{trailing}\n"
+            end
+
+            sub.flags.each_with_index do |flag, i|
+              is_last = i == sub.flags.size - 1 && sub.positional_choices.empty?
+              result += generate_zsh_flag(flag, is_last, "                                        ")
+            end
           end
 
           result += "                                    ;;\n"
@@ -367,8 +373,6 @@ module Hwaro
             script += "complete -c hwaro -n \"__fish_use_subcommand\" -a \"#{cmd.name}\" -d \"#{escape_fish(cmd.description)}\"\n"
           end
 
-          script += "complete -c hwaro -n \"__fish_use_subcommand\" -a \"version\" -d \"Show version\"\n"
-          script += "complete -c hwaro -n \"__fish_use_subcommand\" -a \"help\" -d \"Show help\"\n"
           script += "\n"
 
           commands.each do |cmd|

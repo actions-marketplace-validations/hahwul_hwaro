@@ -306,6 +306,19 @@ describe Hwaro::CLI::Commands::Tool::DeadlinkCommand do
       meta.description.should_not be_empty
     end
 
+    it "includes content-dir flag" do
+      meta = Hwaro::CLI::Commands::Tool::DeadlinkCommand.metadata
+      meta.flags.any? { |f| f.long == "--content-dir" }.should be_true
+    end
+
+    it "content-dir flag takes a value" do
+      meta = Hwaro::CLI::Commands::Tool::DeadlinkCommand.metadata
+      flag = meta.flags.find { |f| f.long == "--content-dir" }
+      flag.should_not be_nil
+      flag.not_nil!.takes_value.should be_true
+      flag.not_nil!.value_hint.should eq("DIR")
+    end
+
     it "includes json flag" do
       meta = Hwaro::CLI::Commands::Tool::DeadlinkCommand.metadata
       meta.flags.any? { |f| f.long == "--json" }.should be_true

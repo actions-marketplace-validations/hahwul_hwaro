@@ -24,7 +24,7 @@ module Hwaro
 
           # Flags defined here are used both for OptionParser and completion generation
           FLAGS = [
-            FlagInfo.new(short: "-c", long: "--content-dir", description: "Content directory (default: content)", takes_value: true, value_hint: "DIR"),
+            CONTENT_DIR_FLAG,
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -46,9 +46,9 @@ module Hwaro
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool convert <to-yaml|to-toml> [options]"
-              parser.on("-c DIR", "--content-dir DIR", "Content directory (default: content)") { |dir| content_dir = dir }
-              parser.on("-j", "--json", "Output result as JSON") { json_output = true }
-              parser.on("-h", "--help", "Show this help") { Logger.info parser.to_s; exit }
+              CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
+              CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
+              CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
               parser.unknown_args do |unknown|
                 format = unknown.first? if unknown.any?
               end

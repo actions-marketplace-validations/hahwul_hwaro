@@ -17,23 +17,23 @@ module Hwaro
 
         # Flags defined here are used both for OptionParser and completion generation
         FLAGS = [
-          FlagInfo.new(short: "-i", long: "--input", description: "Project directory to build (default: current directory)", takes_value: true, value_hint: "DIR"),
+          INPUT_DIR_FLAG,
           FlagInfo.new(short: "-o", long: "--output", description: "Output directory (default: public)", takes_value: true, value_hint: "DIR"),
-          FlagInfo.new(short: nil, long: "--base-url", description: "Override base_url from config.toml", takes_value: true, value_hint: "URL"),
-          FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content"),
-          FlagInfo.new(short: nil, long: "--include-expired", description: "Include expired content"),
-          FlagInfo.new(short: nil, long: "--minify", description: "Minify HTML output (and minified json, xml)"),
+          BASE_URL_FLAG,
+          DRAFTS_FLAG,
+          INCLUDE_EXPIRED_FLAG,
+          MINIFY_FLAG,
           FlagInfo.new(short: nil, long: "--no-parallel", description: "Disable parallel file processing"),
           FlagInfo.new(short: nil, long: "--cache", description: "Enable build caching (skip unchanged files)"),
           FlagInfo.new(short: nil, long: "--full", description: "Force a complete rebuild (ignore cache)"),
           FlagInfo.new(short: nil, long: "--skip-highlighting", description: "Disable syntax highlighting"),
-          FlagInfo.new(short: "-v", long: "--verbose", description: "Show detailed output including generated files"),
-          FlagInfo.new(short: nil, long: "--profile", description: "Show build timing profile for each phase"),
-          FlagInfo.new(short: nil, long: "--debug", description: "Print debug information after build"),
-          FlagInfo.new(short: nil, long: "--skip-cache-busting", description: "Disable cache busting query parameters on CSS/JS resources"),
+          VERBOSE_FLAG,
+          PROFILE_FLAG,
+          DEBUG_FLAG,
+          SKIP_CACHE_BUSTING_FLAG,
           FlagInfo.new(short: nil, long: "--stream", description: "Enable streaming build to reduce memory usage"),
           FlagInfo.new(short: nil, long: "--memory-limit", description: "Memory limit for streaming build (e.g. 2G, 512M)", takes_value: true, value_hint: "SIZE"),
-          FlagInfo.new(short: "-e", long: "--env", description: "Environment name (loads config.<env>.toml override)", takes_value: true, value_hint: "ENV"),
+          ENV_FLAG,
           HELP_FLAG,
         ]
 
@@ -104,24 +104,24 @@ module Hwaro
 
           OptionParser.parse(args) do |parser|
             parser.banner = "Usage: hwaro build [options]"
-            parser.on("-i DIR", "--input DIR", "Project directory to build (default: current directory)") { |dir| input_dir = dir }
+            CLI.register_flag(parser, INPUT_DIR_FLAG) { |v| input_dir = v }
             parser.on("-o DIR", "--output DIR", "Output directory (default: public)") { |dir| output_dir = dir; output_dir_explicit = true }
-            parser.on("--base-url URL", "Override base_url from config.toml") { |url| base_url = url }
-            parser.on("-d", "--drafts", "Include draft content") { drafts = true }
-            parser.on("--include-expired", "Include expired content") { include_expired = true }
-            parser.on("--minify", "Minify HTML output (and minified json, xml)") { minify = true }
+            CLI.register_flag(parser, BASE_URL_FLAG) { |v| base_url = v }
+            CLI.register_flag(parser, DRAFTS_FLAG) { |_| drafts = true }
+            CLI.register_flag(parser, INCLUDE_EXPIRED_FLAG) { |_| include_expired = true }
+            CLI.register_flag(parser, MINIFY_FLAG) { |_| minify = true }
             parser.on("--no-parallel", "Disable parallel file processing") { parallel = false }
             parser.on("--cache", "Enable build caching (skip unchanged files)") { cache = true }
             parser.on("--full", "Force a complete rebuild (ignore cache)") { full = true }
             parser.on("--skip-highlighting", "Disable syntax highlighting") { highlight = false }
-            parser.on("-v", "--verbose", "Show detailed output including generated files") { verbose = true }
-            parser.on("--profile", "Show build timing profile for each phase") { profile = true }
-            parser.on("--debug", "Print debug information after build") { debug = true }
-            parser.on("--skip-cache-busting", "Disable cache busting query parameters on CSS/JS resources") { cache_busting = false }
+            CLI.register_flag(parser, VERBOSE_FLAG) { |_| verbose = true }
+            CLI.register_flag(parser, PROFILE_FLAG) { |_| profile = true }
+            CLI.register_flag(parser, DEBUG_FLAG) { |_| debug = true }
+            CLI.register_flag(parser, SKIP_CACHE_BUSTING_FLAG) { |_| cache_busting = false }
             parser.on("--stream", "Enable streaming build to reduce memory usage") { stream = true }
             parser.on("--memory-limit SIZE", "Memory limit for streaming build (e.g. 2G, 512M)") { |size| memory_limit = size }
-            parser.on("-e ENV", "--env ENV", "Environment name (loads config.<env>.toml override)") { |e| env_name = e }
-            parser.on("-h", "--help", "Show this help") { Logger.info parser.to_s; exit }
+            CLI.register_flag(parser, ENV_FLAG) { |v| env_name = v }
+            CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
           end
 
           { {Config::Options::BuildOptions.new(

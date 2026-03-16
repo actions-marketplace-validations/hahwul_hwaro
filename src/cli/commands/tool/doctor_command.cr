@@ -18,13 +18,7 @@ module Hwaro
 
           # Flags defined here are used both for OptionParser and completion generation
           FLAGS = [
-            FlagInfo.new(
-              short: "-c",
-              long: "--content-dir",
-              description: "Content directory to check",
-              takes_value: true,
-              value_hint: "DIR"
-            ),
+            CONTENT_DIR_FLAG,
             FlagInfo.new(short: nil, long: "--fix", description: "Auto-fix issues (add missing config sections)"),
             JSON_FLAG,
             HELP_FLAG,
@@ -48,15 +42,10 @@ module Hwaro
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool doctor [options]"
-              parser.on("-c DIR", "--content-dir DIR", "Content directory to check") do |dir|
-                content_dir = dir
-              end
+              CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
               parser.on("--fix", "Auto-fix issues (add missing config sections)") { fix_mode = true }
-              parser.on("-j", "--json", "Output result as JSON") { json_output = true }
-              parser.on("-h", "--help", "Show this help") do
-                Logger.info parser.to_s
-                exit
-              end
+              CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
+              CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
             end
 
             doctor = Services::Doctor.new(content_dir: content_dir, config_path: config_path)
