@@ -1,0 +1,150 @@
+# Image processor for Hwaro
+#
+# Resizes images using stb libraries (statically linked, zero runtime dependencies):
+# - stb_image.h       (decode JPG/PNG/BMP/GIF/TGA/PSD/HDR/PIC)
+# - stb_image_write.h (encode JPG/PNG/BMP)
+# - stb_image_resize2.h (high-quality resize)
+#
+# Usage in templates:
+#   {{ resize_image(path="images/photo.jpg", width=800, height=600) }}
+#
+# Config (config.toml):
+#   [image_processing]
+#   enabled = true
+#   widths = [320, 640, 1024, 1280]
+#   quality = 85
+
+require "../../ext/stb_bindings"
+require "../../models/config"
+
+module Hwaro
+  module Content
+    module Processors
+      module ImageProcessor
+        extend self
+
+        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr"}
+
+        # Check if a file is an image based on extension
+        def image?(path : String) : Bool
+          ext = File.extname(path).downcase
+          IMAGE_EXTENSIONS.includes?(ext)
+        end
+
+        # Generate a resized filename: photo.jpg -> photo_800w.jpg
+        def resized_filename(original : String, width : Int32) : String
+          ext = File.extname(original)
+          base = File.basename(original, ext)
+          dir = File.dirname(original)
+          name = "#{base}_#{width}w#{ext}"
+          dir == "." ? name : File.join(dir, name)
+        end
+
+        # Resize a single image to the given width, preserving aspect ratio.
+        # Returns the output path on success, nil on failure.
+        def resize(source : String, dest : String, width : Int32, height : Int32 = 0, quality : Int32 = 85) : String?
+          return nil unless File.exists?(source)
+
+          # Load source image
+          src_w = uninitialized LibC::Int
+          src_h = uninitialized LibC::Int
+          channels = uninitialized LibC::Int
+          pixels = LibStb.stbi_load(source, pointerof(src_w), pointerof(src_h), pointerof(channels), 0)
+          return nil if pixels.null?
+
+          begin
+            # Calculate output dimensions (preserve aspect ratio)
+            out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width, height)
+            return nil if out_w <= 0 || out_h <= 0
+
+            # Skip resize if output would be larger than source
+            if out_w >= src_w && out_h >= src_h
+              FileUtils.mkdir_p(File.dirname(dest))
+              FileUtils.cp(source, dest)
+              return dest
+            end
+
+            # Allocate output buffer and resize
+            out_pixels = Pointer(UInt8).malloc(out_w * out_h * channels)
+            result = LibStb.stbir_resize_uint8_linear(
+              pixels, src_w, src_h, 0,
+              out_pixels, out_w, out_h, 0,
+              channels
+            )
+            return nil if result.null?
+
+            # Write output
+            FileUtils.mkdir_p(File.dirname(dest))
+            ext = File.extname(dest).downcase
+            ok = write_image(dest, ext, out_w, out_h, channels, out_pixels, quality)
+            ok ? dest : nil
+          ensure
+            LibStb.stbi_image_free(pixels.as(Void*))
+          end
+        end
+
+        # Process all images for configured widths.
+        # Returns array of {original_url, width, resized_url} tuples.
+        def process_configured_widths(
+          source_path : String,
+          output_base : String,
+          url_prefix : String,
+          widths : Array(Int32),
+          quality : Int32 = 85,
+        ) : Array({String, Int32, String})
+          results = [] of {String, Int32, String}
+          return results unless File.exists?(source_path)
+
+          widths.each do |width|
+            resized_name = resized_filename(File.basename(source_path), width)
+            dest_path = File.join(output_base, resized_name)
+            if resize(source_path, dest_path, width, 0, quality)
+              resized_url = url_prefix.rstrip("/") + "/" + resized_name
+              results << {source_path, width, resized_url}
+            end
+          end
+
+          results
+        end
+
+        # --- Private helpers ---
+
+        # Calculate output dimensions preserving aspect ratio
+        private def calculate_dimensions(src_w : Int32, src_h : Int32, target_w : Int32, target_h : Int32) : {Int32, Int32}
+          if target_w > 0 && target_h > 0
+            # Both specified: fit within the box
+            scale_w = target_w.to_f / src_w
+            scale_h = target_h.to_f / src_h
+            scale = Math.min(scale_w, scale_h)
+            {(src_w * scale).round.to_i32, (src_h * scale).round.to_i32}
+          elsif target_w > 0
+            # Width only: scale proportionally
+            scale = target_w.to_f / src_w
+            {target_w, (src_h * scale).round.to_i32}
+          elsif target_h > 0
+            # Height only: scale proportionally
+            scale = target_h.to_f / src_h
+            {(src_w * scale).round.to_i32, target_h}
+          else
+            {src_w, src_h}
+          end
+        end
+
+        # Write image in the appropriate format based on extension
+        private def write_image(path : String, ext : String, w : Int32, h : Int32, channels : Int32, data : UInt8*, quality : Int32) : Bool
+          case ext
+          when ".png"
+            LibStb.stbi_write_png(path, w, h, channels, data.as(Void*), w * channels) != 0
+          when ".jpg", ".jpeg"
+            LibStb.stbi_write_jpg(path, w, h, channels, data.as(Void*), quality) != 0
+          when ".bmp"
+            LibStb.stbi_write_bmp(path, w, h, channels, data.as(Void*)) != 0
+          else
+            # Default to PNG for unsupported output formats
+            LibStb.stbi_write_png(path, w, h, channels, data.as(Void*), w * channels) != 0
+          end
+        end
+      end
+    end
+  end
+end
