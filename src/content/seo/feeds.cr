@@ -37,19 +37,21 @@ module Hwaro
             process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose)
           end
 
-          # 2. Generate Section Feeds
+          # 2. Generate Section Feeds — pre-group pages by section for O(1) lookup
+          pages_by_section = {} of String => Array(Models::Page)
+          pages.each do |p|
+            next if p.draft || !p.render || p.is_a?(Models::Section)
+            (pages_by_section[p.section] ||= [] of Models::Page) << p
+          end
+
           pages.each do |page|
             # Check if it's a section and has feed generation enabled
             if page.is_a?(Models::Section) && page.generate_feeds && page.render && !page.draft
-              # Section feed only includes pages from that specific section (shallow)
-              # It does not include subsections or pages from other sections
-              section_pages = pages.select { |p|
-                !p.draft && p.render && !p.is_a?(Models::Section) && p.section == page.section
-              }
+              section_pages = pages_by_section[page.section]? || [] of Models::Page
 
               # Construct output path for section feed
               # e.g., output_dir/posts/rss.xml
-              section_output_dir = File.join(output_dir, page.url.sub(/^\//, ""))
+              section_output_dir = File.join(output_dir, page.url.lchop("/"))
               FileUtils.mkdir_p(section_output_dir)
 
               feed_title = "#{config.title} - #{page.title}"
@@ -76,11 +78,9 @@ module Hwaro
             # Respect per-language generate_feed setting
             next unless lang_config.generate_feed
 
-            # Filter pages for this language
-            lang_pages = pages.reject { |p|
-              p.draft || !p.render || p.is_a?(Models::Section)
-            }.select { |p|
-              p.language == lang_code
+            # Filter pages for this language (single pass)
+            lang_pages = pages.select { |p|
+              !p.draft && p.render && !p.is_a?(Models::Section) && p.language == lang_code
             }
 
             # Apply section filter if configured on the main feed
@@ -154,7 +154,7 @@ module Hwaro
         private def self.build_feed_url(config : Models::Config, base_path : String, filename : String) : {String, String}
           base_url = config.base_url.rstrip('/')
           feed_url_path = base_path.empty? ? filename : File.join(base_path, filename)
-          feed_url = "#{base_url}/#{feed_url_path.sub(/^\//, "")}"
+          feed_url = "#{base_url}/#{feed_url_path.lchop("/")}"
           {base_url, feed_url}
         end
 

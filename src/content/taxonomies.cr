@@ -284,7 +284,7 @@ module Hwaro
       )
         return if site.config.base_url.empty?
 
-        feed_output_dir = File.join(output_dir, base_url.sub(/^\//, ""))
+        feed_output_dir = File.join(output_dir, base_url.lchop("/"))
         FileUtils.mkdir_p(feed_output_dir)
         feed_title = "#{site.config.title} - #{taxonomy.name.capitalize}: #{term}"
 
@@ -348,7 +348,7 @@ module Hwaro
       end
 
       private def self.write_output(page : Models::Section, output_dir : String, content : String, verbose : Bool = false)
-        url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
+        url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/"))
         output_path = File.join(output_dir, url_path, "index.html")
 
         unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
@@ -362,7 +362,7 @@ module Hwaro
       end
 
       private def self.write_paginated_output(page : Models::Section, page_number : Int32, output_dir : String, content : String, verbose : Bool = false, paginate_path : String = "page")
-        url_path = Utils::PathUtils.sanitize_path(page.url.sub(/^\//, ""))
+        url_path = Utils::PathUtils.sanitize_path(page.url.lchop("/"))
         output_path = File.join(output_dir, url_path, paginate_path, page_number.to_s, "index.html")
 
         unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)

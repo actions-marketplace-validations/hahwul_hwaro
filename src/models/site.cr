@@ -21,6 +21,7 @@ module Hwaro
       property sections_by_name : Hash(String, Section)
       property pages_for_section_cache : Hash(Tuple(String, String?), Array(Page))
       @lookup_index_built : Bool = false
+      @all_content_cache : Array(Page)?
 
       def initialize(@config : Config)
         @pages = [] of Page
@@ -47,7 +48,7 @@ module Hwaro
       end
 
       def all_content : Array(Page)
-        (pages + sections.map { |s| s.as(Page) }).sort_by! { |p| p.path }
+        @all_content_cache ||= (pages + sections.map { |s| s.as(Page) }).sort_by!(&.path)
       end
 
       def build_lookup_index
@@ -55,6 +56,7 @@ module Hwaro
         @sections_by_parent.clear
         @sections_by_name.clear
         @pages_for_section_cache.clear
+        @all_content_cache = nil
 
         @pages.each do |p|
           list = @pages_by_section[p.section]?

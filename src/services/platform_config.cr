@@ -201,7 +201,7 @@ module Hwaro
         end
 
         if custom_path
-          custom = custom_path.sub(/^\//, "")
+          custom = custom_path.lchop("/")
           url = "/#{custom}"
           url += "/" unless url.ends_with?("/")
           return url

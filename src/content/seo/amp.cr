@@ -143,12 +143,12 @@ module Hwaro
         end
 
         private def self.output_path_for(page : Models::Page, output_dir : String) : String
-          url_path = page.url.sub(/^\//, "")
+          url_path = page.url.lchop("/")
           File.join(output_dir, url_path, "index.html")
         end
 
         private def self.amp_output_path(page : Models::Page, output_dir : String, prefix : String) : String
-          url_path = page.url.sub(/^\//, "")
+          url_path = page.url.lchop("/")
           File.join(output_dir, prefix, url_path, "index.html")
         end
       end

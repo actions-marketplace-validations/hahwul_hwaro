@@ -20,19 +20,26 @@ module Hwaro
       #   slugify("CJK 테스트!")   # => "cjk-테스트"
       #
       def slugify(text : String) : String
-        result = String.build do |io|
+        # Single-pass: directly emit hyphens for separators, collapsing runs.
+        # Avoids intermediate String allocation + regex gsub.
+        String.build(text.bytesize) do |io|
+          last_was_sep = true # suppress leading hyphen
           text.each_char do |char|
             if char.ascii_letter? || char.ascii_number?
               io << char.downcase
+              last_was_sep = false
             elsif char.ascii_whitespace? || char == '-' || char == '_'
-              io << ' '
+              unless last_was_sep
+                io << '-'
+                last_was_sep = true
+              end
             elsif cjk_char?(char) || unicode_letter?(char)
               io << char
+              last_was_sep = false
             end
             # All other characters (punctuation, symbols) are dropped
           end
-        end
-        result.gsub(/\s+/, "-").strip("-")
+        end.rstrip('-')
       end
 
       # Check if a character is a Unicode letter (non-ASCII)

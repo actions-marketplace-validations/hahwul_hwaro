@@ -75,8 +75,12 @@ module Hwaro
                        ->compare_by_date(Models::Page, Models::Page)
                      end
 
-        sorted = pages.sort { |a, b| comparator.call(a, b) }
-        reverse ? sorted.reverse : sorted
+        # Single sort — swap arguments for reverse instead of sort + reverse (avoids extra allocation)
+        if reverse
+          pages.sort { |a, b| comparator.call(b, a) }
+        else
+          pages.sort { |a, b| comparator.call(a, b) }
+        end
       end
     end
   end
