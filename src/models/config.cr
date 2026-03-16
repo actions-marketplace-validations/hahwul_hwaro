@@ -299,25 +299,20 @@ module Hwaro
         image : String?,
         base_url : String,
       ) : String
-        tags = [] of String
-
-        tags << %(<meta property="og:title" content="#{Utils::TextUtils.escape_xml(title)}">)
-        tags << %(<meta property="og:type" content="#{Utils::TextUtils.escape_xml(@og_type)}">)
-        tags << %(<meta property="og:url" content="#{Utils::TextUtils.escape_xml(base_url)}#{Utils::TextUtils.escape_xml(url)}">)
-
-        if desc = description
-          tags << %(<meta property="og:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+        String.build(256) do |str|
+          str << %(<meta property="og:title" content="#{Utils::TextUtils.escape_xml(title)}">\n)
+          str << %(<meta property="og:type" content="#{Utils::TextUtils.escape_xml(@og_type)}">\n)
+          str << %(<meta property="og:url" content="#{Utils::TextUtils.escape_xml(base_url)}#{Utils::TextUtils.escape_xml(url)}">)
+          if desc = description
+            str << %(\n<meta property="og:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+          end
+          if img_url = resolve_image_url(image, base_url)
+            str << %(\n<meta property="og:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
+          end
+          if fb_id = @fb_app_id
+            str << %(\n<meta property="fb:app_id" content="#{Utils::TextUtils.escape_xml(fb_id)}">)
+          end
         end
-
-        if img_url = resolve_image_url(image, base_url)
-          tags << %(<meta property="og:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
-        end
-
-        if fb_id = @fb_app_id
-          tags << %(<meta property="fb:app_id" content="#{Utils::TextUtils.escape_xml(fb_id)}">)
-        end
-
-        tags.join("\n")
       end
 
       # Generate Twitter Card meta tags
@@ -327,28 +322,22 @@ module Hwaro
         image : String?,
         base_url : String,
       ) : String
-        tags = [] of String
-
-        tags << %(<meta name="twitter:card" content="#{Utils::TextUtils.escape_xml(@twitter_card)}">)
-        tags << %(<meta name="twitter:title" content="#{Utils::TextUtils.escape_xml(title)}">)
-
-        if desc = description
-          tags << %(<meta name="twitter:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+        String.build(256) do |str|
+          str << %(<meta name="twitter:card" content="#{Utils::TextUtils.escape_xml(@twitter_card)}">\n)
+          str << %(<meta name="twitter:title" content="#{Utils::TextUtils.escape_xml(title)}">)
+          if desc = description
+            str << %(\n<meta name="twitter:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+          end
+          if img_url = resolve_image_url(image, base_url)
+            str << %(\n<meta name="twitter:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
+          end
+          if site = @twitter_site
+            str << %(\n<meta name="twitter:site" content="#{Utils::TextUtils.escape_xml(site)}">)
+          end
+          if creator = @twitter_creator
+            str << %(\n<meta name="twitter:creator" content="#{Utils::TextUtils.escape_xml(creator)}">)
+          end
         end
-
-        if img_url = resolve_image_url(image, base_url)
-          tags << %(<meta name="twitter:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
-        end
-
-        if site = @twitter_site
-          tags << %(<meta name="twitter:site" content="#{Utils::TextUtils.escape_xml(site)}">)
-        end
-
-        if creator = @twitter_creator
-          tags << %(<meta name="twitter:creator" content="#{Utils::TextUtils.escape_xml(creator)}">)
-        end
-
-        tags.join("\n")
       end
 
       # Resolve an image path to an absolute URL, falling back to default_image
@@ -592,6 +581,7 @@ module Hwaro
       property amp : AmpConfig
       property permalinks : Hash(String, String)
       property raw : Hash(String, TOML::Any)
+      @base_url_stripped : String? = nil
 
       def initialize
         @title = "Hwaro Site"
@@ -621,6 +611,11 @@ module Hwaro
         @amp = AmpConfig.new
         @permalinks = {} of String => String
         @raw = Hash(String, TOML::Any).new
+      end
+
+      # Cached base_url with trailing slash stripped (avoids repeated rstrip per page)
+      def base_url_stripped : String
+        @base_url_stripped ||= @base_url.rstrip("/")
       end
 
       # Check if site is multilingual

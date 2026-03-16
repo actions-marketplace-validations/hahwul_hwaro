@@ -176,7 +176,9 @@ module Hwaro
           begin
             # Cache compiled shortcode templates by content hash to avoid
             # re-parsing the template AST on every shortcode invocation.
-            cache_key = template.hash
+            # XOR with a salt to avoid collisions with page template cache entries
+            # that share @compiled_templates_cache.
+            cache_key = template.hash ^ 0x5C0DE_CAFE_u64
             crinja_template = @compiled_templates_cache[cache_key]? || begin
               compiled = env.from_string(template)
               @compiled_templates_cache[cache_key] = compiled

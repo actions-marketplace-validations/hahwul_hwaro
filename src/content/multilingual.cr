@@ -29,13 +29,20 @@ module Hwaro
 
         # Only strip the first matching language suffix to avoid over-stripping
         # e.g., "post.en.ko.md" should strip ".ko" (if ko matches) but not both
-        codes = (config.languages.keys + [config.default_language]).uniq
+        # Uses string suffix check instead of per-call Regex compilation.
         cleaned = basename
-        codes.each do |code|
-          escaped = Regex.escape(code)
-          if cleaned.matches?(/\.#{escaped}\.md$/)
-            cleaned = cleaned.sub(/\.#{escaped}\.md$/, ".md")
+        config.languages.each_key do |code|
+          suffix = ".#{code}.md"
+          if cleaned.ends_with?(suffix)
+            cleaned = "#{cleaned[0, cleaned.size - suffix.size]}.md"
             break
+          end
+        end
+        # Also check default language if no match above
+        if cleaned == basename
+          suffix = ".#{config.default_language}.md"
+          if cleaned.ends_with?(suffix)
+            cleaned = "#{cleaned[0, cleaned.size - suffix.size]}.md"
           end
         end
 

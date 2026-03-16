@@ -101,13 +101,14 @@ module Hwaro
         private def visible_pages(current : Int32, total : Int32) : Array(Int32)
           return (1..total).to_a if total <= 7
 
-          pages = Set(Int32).new
+          # Build pre-sorted array directly (no Set/sort needed for ≤7 elements)
+          pages = Array(Int32).new(7)
           pages << 1
-          pages << total
-          ((current - 2)..(current + 2)).each do |p|
-            pages << p if p >= 1 && p <= total
-          end
-          pages.to_a.sort
+          lo = {current - 2, 2}.max          # start from 2 since 1 is already added
+          hi = {current + 2, total - 1}.min  # stop before total since it's added separately
+          (lo..hi).each { |p| pages << p }
+          pages << total unless pages.last == total
+          pages
         end
 
         # Render combined section list with pagination info

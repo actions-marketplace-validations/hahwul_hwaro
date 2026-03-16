@@ -107,8 +107,13 @@ module Hwaro
       end
 
       private def self.generate_javascript(search_data : Array(Hash(String, String | Array(String)))) : String
-        json_data = search_data.to_json.gsub("</", "<\\/")
-        "var searchData = #{json_data};"
+        json_str = search_data.to_json
+        # Avoid double-alloc: skip gsub when no </script> escape is needed (common case)
+        if json_str.includes?("</")
+          "var searchData = #{json_str.gsub("</", "<\\/")};"
+        else
+          "var searchData = #{json_str};"
+        end
       end
     end
   end

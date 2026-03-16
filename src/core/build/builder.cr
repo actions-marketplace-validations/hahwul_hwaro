@@ -1948,6 +1948,9 @@ module Hwaro
               "summary"      => Crinja::Value.new(p.effective_summary || ""),
               "word_count"   => Crinja::Value.new(p.word_count),
               "reading_time" => Crinja::Value.new(p.reading_time),
+              "tags"         => Crinja::Value.new(p.tags.map { |t| Crinja::Value.new(t) }),
+              "authors"      => Crinja::Value.new(p.authors.map { |a| Crinja::Value.new(a) }),
+              "assets"       => Crinja::Value.new(p.assets.map { |a| Crinja::Value.new(a) }),
             })
             @page_crinja_value_cache[p.path] = val
             val
@@ -2229,14 +2232,12 @@ module Hwaro
           # Generate permalink only if not already set
           page.generate_permalink(config.base_url) unless page.permalink
 
-          # Convert authors to Crinja array
-          authors_array = page.authors.map { |a| Crinja::Value.new(a) }
-
-          # Convert tags to Crinja array
-          tags_array = page.tags.map { |t| Crinja::Value.new(t) }
-
-          # Convert assets to Crinja array
-          assets_array = page.assets.map { |a| Crinja::Value.new(a) }
+          # Reuse cached Crinja arrays for tags/authors/assets (avoids per-page .map allocation)
+          cached_page_val = cached_page_crinja_value(page, default_lang)
+          cached_raw = cached_page_val.raw.as(Hash)
+          tags_crinja = cached_raw["tags"].as(Crinja::Value)
+          authors_crinja = cached_raw["authors"].as(Crinja::Value)
+          assets_crinja = cached_raw["assets"].as(Crinja::Value)
 
           # Convert extra to Crinja hash
           extra_hash = {} of String => Crinja::Value
@@ -2279,9 +2280,9 @@ module Hwaro
             "language"     => Crinja::Value.new(page_language),
             "translations" => Crinja::Value.new(translations),
             # New properties
-            "authors"         => Crinja::Value.new(authors_array),
-            "tags"            => Crinja::Value.new(tags_array),
-            "assets"          => Crinja::Value.new(assets_array),
+            "authors"         => authors_crinja,
+            "tags"            => tags_crinja,
+            "assets"          => assets_crinja,
             "extra"           => Crinja::Value.new(extra_hash),
             "summary"         => Crinja::Value.new(page.effective_summary || ""),
             "word_count"      => Crinja::Value.new(page.word_count),
@@ -2316,8 +2317,8 @@ module Hwaro
           vars["page_word_count"] = Crinja::Value.new(page.word_count)
           vars["page_reading_time"] = Crinja::Value.new(page.reading_time)
           vars["page_permalink"] = Crinja::Value.new(page.permalink || "")
-          vars["page_authors"] = Crinja::Value.new(authors_array)
-          vars["page_tags"] = Crinja::Value.new(tags_array)
+          vars["page_authors"] = authors_crinja
+          vars["page_tags"] = tags_crinja
           vars["page_weight"] = Crinja::Value.new(page.weight)
 
           # Site variables (flat for convenience)
@@ -2333,8 +2334,7 @@ module Hwaro
 
           # Section-specific variables
           subsections_array = [] of Crinja::Value
-          # assets_array is already defined above for the page itself
-          section_assets_array = [] of Crinja::Value
+          section_assets_val = Crinja::Value.new([] of Crinja::Value)
           page_template_var = ""
           paginate_path_var = "page"
           redirect_to_var = ""
@@ -2361,7 +2361,7 @@ module Hwaro
             end
 
             # Use the page's assets as section assets
-            section_assets_array = assets_array
+            section_assets_val = assets_crinja
           elsif !page.section.empty?
             # For regular pages, find the parent section via O(1) lookup
             section_page = site.sections_by_name[page.section]?
@@ -2370,10 +2370,10 @@ module Hwaro
               section_description = section_page.description || ""
               current_section = page.section
               # Use cached section assets to avoid re-allocating per page
-              section_assets_array = @section_assets_crinja_cache[page.section]? || begin
+              section_assets_val = @section_assets_crinja_cache[page.section]?.try { |arr| Crinja::Value.new(arr) } || begin
                 arr = section_page.assets.map { |a| Crinja::Value.new(a) }
                 @section_assets_crinja_cache[page.section] = arr
-                arr
+                Crinja::Value.new(arr)
               end
             end
           end
@@ -2397,6 +2397,9 @@ module Hwaro
                                       all_section.each_with_index { |v, i| arr << v unless i == skip_idx }
                                       arr
                                     else
+                                      # NOTE: This is the cached array from @section_pages_crinja_cache.
+                                      # Safe because downstream only wraps it in Crinja::Value (read-only).
+                                      # Do NOT mutate (sort!, push, delete, etc.) — it would corrupt the cache.
                                       all_section
                                     end
             end
@@ -2415,7 +2418,7 @@ module Hwaro
             "list"        => Crinja::Value.new(section_list),
             # New section properties
             "subsections"   => Crinja::Value.new(subsections_array),
-            "assets"        => Crinja::Value.new(section_assets_array),
+            "assets"        => section_assets_val,
             "page_template" => Crinja::Value.new(page_template_var),
             "paginate_path" => Crinja::Value.new(paginate_path_var),
             "redirect_to"   => Crinja::Value.new(redirect_to_var),

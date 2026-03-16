@@ -419,8 +419,19 @@ module Hwaro
               attrs = $3? || "" # existing attributes (may be empty)
               inner_html = $4   # inner content (may contain inline HTML)
 
-              # Extract plain text for TOC title
-              title = inner_html.gsub(HTML_TAG_STRIP_REGEX, "").strip
+              # Extract plain text for TOC title (inline char-level strip avoids regex + alloc)
+              title = String.build(inner_html.bytesize) do |io|
+                in_tag = false
+                inner_html.each_char do |c|
+                  if c == '<'
+                    in_tag = true
+                  elsif c == '>'
+                    in_tag = false
+                  elsif !in_tag
+                    io << c
+                  end
+                end
+              end.strip
 
               # Use existing id or generate one
               existing_id = if id_match = attrs.match(ID_ATTR_REGEX)
