@@ -3,6 +3,10 @@
 # Processes images during the Write phase, generating resized variants
 # for configured widths. The resized image map is exposed to the
 # `resize_image()` template function.
+#
+# Performance:
+# - Each source image is decoded only once (resize_multi_widths)
+# - Images are processed in parallel using fibers
 
 require "../../core/lifecycle"
 require "../processors/image_processor"
@@ -16,6 +20,9 @@ module Hwaro
         # Class-level map: original_url => { width => resized_url }
         @@resize_map = {} of String => Hash(Int32, String)
         @@resize_map_mutex = Mutex.new
+
+        # Max number of concurrent image processing fibers
+        CONCURRENCY = 8
 
         def register_hooks(manager : Core::Lifecycle::Manager)
           manager.on(Core::Lifecycle::HookPoint::AfterWrite, priority: 30, name: "image:resize") do |ctx|
@@ -56,6 +63,13 @@ module Hwaro
           end
         end
 
+        # Describes a single image to be resized
+        private record ImageJob,
+          source_path : String,
+          dest_dir : String,
+          original_url : String,
+          url_prefix : String
+
         private def process_images(ctx : Core::Lifecycle::BuildContext)
           config = ctx.config
           return unless config
@@ -65,12 +79,71 @@ module Hwaro
           widths = config.image_processing.widths
           quality = config.image_processing.quality
           output_dir = ctx.output_dir
-          new_map = {} of String => Hash(Int32, String)
-
-          # Resolve the output directory to prevent path traversal checks from failing
           resolved_output = File.expand_path(output_dir)
 
-          # Process co-located page assets
+          # Phase 1: Collect all image jobs (fast, single-threaded)
+          jobs = [] of ImageJob
+          collect_page_asset_jobs(ctx, output_dir, resolved_output, jobs)
+          collect_content_file_jobs(config, output_dir, resolved_output, jobs) if config.content_files.enabled?
+          collect_static_jobs(output_dir, resolved_output, jobs)
+
+          return if jobs.empty?
+
+          # Phase 2: Process in parallel with bounded concurrency
+          new_map = {} of String => Hash(Int32, String)
+          map_mutex = Mutex.new
+          work_channel = Channel(ImageJob?).new(CONCURRENCY)
+          done_channel = Channel(Nil).new
+
+          # Spawn worker fibers
+          CONCURRENCY.times do
+            spawn do
+              while job = work_channel.receive?
+                width_map = resize_one(job, widths, quality)
+                unless width_map.empty?
+                  map_mutex.synchronize do
+                    new_map[job.original_url] = width_map
+                  end
+                end
+              end
+              done_channel.send(nil)
+            end
+          end
+
+          # Feed jobs
+          jobs.each { |job| work_channel.send(job) }
+          CONCURRENCY.times { work_channel.send(nil) } # sentinel to stop workers
+
+          # Wait for all workers
+          CONCURRENCY.times { done_channel.receive }
+
+          @@resize_map_mutex.synchronize { @@resize_map = new_map }
+          resized_count = new_map.values.sum(&.size)
+          Logger.success "  Generated #{resized_count} resized image(s)." if resized_count > 0
+        end
+
+        # Resize a single image to all widths (one decode, N encodes)
+        private def resize_one(job : ImageJob, widths : Array(Int32), quality : Int32) : Hash(Int32, String)
+          path_map = Processors::ImageProcessor.resize_multi_widths(
+            job.source_path, job.dest_dir, widths, quality
+          )
+
+          width_url_map = {} of Int32 => String
+          path_map.each do |width, dest_path|
+            resized_name = File.basename(dest_path)
+            width_url_map[width] = job.url_prefix + resized_name
+          end
+          width_url_map
+        end
+
+        # --- Job collection helpers ---
+
+        private def collect_page_asset_jobs(
+          ctx : Core::Lifecycle::BuildContext,
+          output_dir : String,
+          resolved_output : String,
+          jobs : Array(ImageJob),
+        )
           ctx.all_pages.each do |page|
             next if page.assets.empty?
 
@@ -88,51 +161,21 @@ module Hwaro
               relative_to_bundle = Path[asset_path].relative_to(page_bundle_dir)
               original_url = "/" + url_path + relative_to_bundle.to_s
               asset_dest_dir = File.join(dest_dir, File.dirname(relative_to_bundle.to_s))
+              next unless safe_path_dest?(asset_dest_dir, resolved_output)
 
-              width_map = {} of Int32 => String
-              widths.each do |width|
-                resized_name = Processors::ImageProcessor.resized_filename(File.basename(asset_path), width)
-                dest_path = File.join(asset_dest_dir, resized_name)
-                next unless safe_path?(dest_path, resolved_output)
+              url_prefix = "/" + url_path + File.dirname(relative_to_bundle.to_s).rstrip(".") + "/"
+              url_prefix = url_prefix.gsub("//", "/")
 
-                if Processors::ImageProcessor.resize(source_path, dest_path, width, 0, quality)
-                  resized_url = "/" + url_path + File.join(File.dirname(relative_to_bundle.to_s), resized_name)
-                  width_map[width] = resized_url
-                end
-              end
-              new_map[original_url] = width_map unless width_map.empty?
+              jobs << ImageJob.new(source_path, asset_dest_dir, original_url, url_prefix)
             end
           end
-
-          # Process content files (non-page-bundle images)
-          if config.content_files.enabled?
-            process_content_file_images(config, output_dir, resolved_output, widths, quality, new_map)
-          end
-
-          # Process static directory images
-          process_static_images(output_dir, resolved_output, widths, quality, new_map)
-
-          @@resize_map_mutex.synchronize { @@resize_map = new_map }
-          resized_count = new_map.values.sum(&.size)
-          Logger.success "  Generated #{resized_count} resized image(s)." if resized_count > 0
         end
 
-        # Verify that a path resolves within the expected base directory.
-        # Uses File.realpath to resolve symlinks before the boundary check,
-        # preventing symlink-based path traversal attacks.
-        private def safe_path?(path : String, base : String) : Bool
-          resolved = File.realpath(path) rescue return false
-          resolved_base = File.realpath(base) rescue File.expand_path(base)
-          resolved == resolved_base || resolved.starts_with?(resolved_base + "/")
-        end
-
-        private def process_content_file_images(
+        private def collect_content_file_jobs(
           config : Models::Config,
           output_dir : String,
           resolved_output : String,
-          widths : Array(Int32),
-          quality : Int32,
-          new_map : Hash(String, Hash(Int32, String)),
+          jobs : Array(ImageJob),
         )
           Dir.glob(File.join("content", "**", "*")).each do |file|
             next unless File.file?(file)
@@ -143,28 +186,19 @@ module Hwaro
 
             original_url = "/" + relative
             dest_dir = File.join(output_dir, File.dirname(relative))
+            next unless safe_path_dest?(dest_dir, resolved_output)
 
-            width_map = {} of Int32 => String
-            widths.each do |width|
-              resized_name = Processors::ImageProcessor.resized_filename(File.basename(file), width)
-              dest_path = File.join(dest_dir, resized_name)
-              next unless safe_path?(dest_path, resolved_output)
+            dir_part = File.dirname(relative)
+            url_prefix = dir_part == "." ? "/" : "/#{dir_part}/"
 
-              if Processors::ImageProcessor.resize(file, dest_path, width, 0, quality)
-                resized_url = "/" + File.join(File.dirname(relative), resized_name)
-                width_map[width] = resized_url
-              end
-            end
-            new_map[original_url] = width_map unless width_map.empty?
+            jobs << ImageJob.new(file, dest_dir, original_url, url_prefix)
           end
         end
 
-        private def process_static_images(
+        private def collect_static_jobs(
           output_dir : String,
           resolved_output : String,
-          widths : Array(Int32),
-          quality : Int32,
-          new_map : Hash(String, Hash(Int32, String)),
+          jobs : Array(ImageJob),
         )
           return unless Dir.exists?("static")
 
@@ -176,20 +210,29 @@ module Hwaro
             relative = Path[file].relative_to("static").to_s
             original_url = "/" + relative
             dest_dir = File.join(output_dir, File.dirname(relative))
+            next unless safe_path_dest?(dest_dir, resolved_output)
 
-            width_map = {} of Int32 => String
-            widths.each do |width|
-              resized_name = Processors::ImageProcessor.resized_filename(File.basename(file), width)
-              dest_path = File.join(dest_dir, resized_name)
-              next unless safe_path?(dest_path, resolved_output)
+            dir_part = File.dirname(relative)
+            url_prefix = dir_part == "." ? "/" : "/#{dir_part}/"
 
-              if Processors::ImageProcessor.resize(file, dest_path, width, 0, quality)
-                resized_url = "/" + File.join(File.dirname(relative), resized_name)
-                width_map[width] = resized_url
-              end
-            end
-            new_map[original_url] = width_map unless width_map.empty?
+            jobs << ImageJob.new(file, dest_dir, original_url, url_prefix)
           end
+        end
+
+        # --- Security helpers ---
+
+        # Verify that a source path resolves within the expected base directory.
+        # Uses File.realpath to resolve symlinks before the boundary check.
+        private def safe_path?(path : String, base : String) : Bool
+          resolved = File.realpath(path) rescue return false
+          resolved_base = File.realpath(base) rescue File.expand_path(base)
+          resolved == resolved_base || resolved.starts_with?(resolved_base + "/")
+        end
+
+        # Verify destination directory is within output (dest may not exist yet)
+        private def safe_path_dest?(path : String, resolved_output : String) : Bool
+          resolved = File.expand_path(path)
+          resolved == resolved_output || resolved.starts_with?(resolved_output + "/")
         end
       end
     end

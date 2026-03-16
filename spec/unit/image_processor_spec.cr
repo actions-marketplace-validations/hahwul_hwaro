@@ -313,6 +313,77 @@ describe Hwaro::Content::Processors::ImageProcessor do
       end
     end
   end
+
+  describe ".resize_multi_widths" do
+    it "decodes once and generates all widths" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "photo.png")
+        pixels = Bytes.new(100 * 80 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 100, 80, 3, pixels.to_unsafe.as(Void*), 100 * 3)
+
+        out_dir = File.join(dir, "out")
+        result = Hwaro::Content::Processors::ImageProcessor.resize_multi_widths(src, out_dir, [20, 50], 85)
+
+        result.size.should eq(2)
+        result.has_key?(20).should be_true
+        result.has_key?(50).should be_true
+        File.exists?(result[20]).should be_true
+        File.exists?(result[50]).should be_true
+      end
+    end
+
+    it "returns empty hash for non-existent source" do
+      result = Hwaro::Content::Processors::ImageProcessor.resize_multi_widths("/nonexistent.png", "/tmp", [100], 85)
+      result.should be_empty
+    end
+
+    it "returns empty hash for corrupted file" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "corrupt.png")
+        File.write(src, "not an image")
+        result = Hwaro::Content::Processors::ImageProcessor.resize_multi_widths(src, dir, [100], 85)
+        result.should be_empty
+      end
+    end
+
+    it "copies file for widths larger than source" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "tiny.png")
+        pixels = Bytes.new(4 * 4 * 3, 150_u8)
+        LibStb.stbi_write_png(src, 4, 4, 3, pixels.to_unsafe.as(Void*), 4 * 3)
+
+        out_dir = File.join(dir, "out")
+        result = Hwaro::Content::Processors::ImageProcessor.resize_multi_widths(src, out_dir, [2, 1000], 85)
+
+        result.size.should eq(2)
+        # width=1000 should be a copy (same size as original)
+        File.size(result[1000]).should eq(File.size(src))
+      end
+    end
+
+    it "handles RGBA images" do
+      Dir.mktmpdir do |dir|
+        src = File.join(dir, "rgba.png")
+        pixels = Bytes.new(20 * 20 * 4, 200_u8)
+        LibStb.stbi_write_png(src, 20, 20, 4, pixels.to_unsafe.as(Void*), 20 * 4)
+
+        out_dir = File.join(dir, "out")
+        result = Hwaro::Content::Processors::ImageProcessor.resize_multi_widths(src, out_dir, [10], 85)
+
+        result.size.should eq(1)
+        # Verify output dimensions
+        w = uninitialized LibC::Int
+        h = uninitialized LibC::Int
+        c = uninitialized LibC::Int
+        out_pixels = LibStb.stbi_load(result[10], pointerof(w), pointerof(h), pointerof(c), 0)
+        out_pixels.null?.should be_false
+        w.should eq(10)
+        h.should eq(10)
+        c.should eq(4)
+        LibStb.stbi_image_free(out_pixels.as(Void*))
+      end
+    end
+  end
 end
 
 describe Hwaro::Content::Hooks::ImageHooks do

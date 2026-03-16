@@ -155,6 +155,79 @@ module Hwaro
           results
         end
 
+        # Resize a single source image to multiple widths with one decode pass.
+        # Returns a Hash mapping width => dest_path for successful resizes.
+        def resize_multi_widths(
+          source : String,
+          dest_dir : String,
+          widths : Array(Int32),
+          quality : Int32 = 85,
+        ) : Hash(Int32, String)
+          result_map = {} of Int32 => String
+          return result_map unless File.exists?(source)
+
+          quality = quality.clamp(1, 100)
+
+          # Single decode
+          src_w = uninitialized LibC::Int
+          src_h = uninitialized LibC::Int
+          channels = uninitialized LibC::Int
+          pixels = LibStb.stbi_load(source, pointerof(src_w), pointerof(src_h), pointerof(channels), 0)
+
+          if pixels.null?
+            reason = String.new(LibStb.stbi_failure_reason)
+            Logger.debug "Image load failed '#{source}': #{reason}"
+            return result_map
+          end
+
+          begin
+            return result_map if src_w <= 0 || src_h <= 0 || channels <= 0
+
+            ext = File.extname(source).downcase
+            basename = File.basename(source, File.extname(source))
+            FileUtils.mkdir_p(dest_dir)
+
+            widths.each do |width|
+              out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width, 0)
+              next if out_w <= 0 || out_h <= 0
+
+              dest = File.join(dest_dir, "#{basename}_#{width}w#{ext}")
+
+              # Skip resize if output would be larger than source
+              if out_w >= src_w && out_h >= src_h
+                FileUtils.cp(source, dest)
+                result_map[width] = dest
+                next
+              end
+
+              buf_size = out_w.to_i64 * out_h.to_i64 * channels.to_i64
+              next if buf_size > MAX_PIXELS * 4
+
+              out_pixels = LibC.malloc(buf_size).as(UInt8*)
+              next if out_pixels.null?
+
+              begin
+                resized = LibStb.stbir_resize_uint8_linear(
+                  pixels, src_w, src_h, 0,
+                  out_pixels, out_w, out_h, 0,
+                  channels
+                )
+                next if resized.null?
+
+                if write_image(dest, ext, out_w, out_h, channels.to_i32, out_pixels, quality)
+                  result_map[width] = dest
+                end
+              ensure
+                LibC.free(out_pixels.as(Void*))
+              end
+            end
+          ensure
+            LibStb.stbi_image_free(pixels.as(Void*))
+          end
+
+          result_map
+        end
+
         # --- Private helpers ---
 
         # Calculate output dimensions preserving aspect ratio.
