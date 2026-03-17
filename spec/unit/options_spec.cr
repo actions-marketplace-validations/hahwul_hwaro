@@ -207,6 +207,83 @@ describe Hwaro::Config::Options::InitOptions do
   end
 end
 
+describe Hwaro::Config::Options::ImportOptions do
+  it "has default values" do
+    options = Hwaro::Config::Options::ImportOptions.new
+    options.source_type.should eq("")
+    options.path.should eq("")
+    options.output_dir.should eq("content")
+    options.drafts.should eq(false)
+    options.verbose.should eq(false)
+  end
+
+  it "accepts all parameters" do
+    options = Hwaro::Config::Options::ImportOptions.new(
+      source_type: "jekyll",
+      path: "/tmp/jekyll-site",
+      output_dir: "imported",
+      drafts: true,
+      verbose: true
+    )
+    options.source_type.should eq("jekyll")
+    options.path.should eq("/tmp/jekyll-site")
+    options.output_dir.should eq("imported")
+    options.drafts.should eq(true)
+    options.verbose.should eq(true)
+  end
+
+  it "accepts partial parameters" do
+    options = Hwaro::Config::Options::ImportOptions.new(source_type: "hugo", path: "/tmp/hugo")
+    options.source_type.should eq("hugo")
+    options.path.should eq("/tmp/hugo")
+    options.output_dir.should eq("content")
+    options.drafts.should eq(false)
+  end
+end
+
+describe Hwaro::Config::Options::DeployOptions do
+  it "has default values" do
+    options = Hwaro::Config::Options::DeployOptions.new
+    options.source_dir.should be_nil
+    options.targets.should be_empty
+    options.dry_run.should be_nil
+    options.confirm.should be_nil
+    options.force.should be_nil
+    options.max_deletes.should be_nil
+    options.env.should be_nil
+  end
+
+  it "accepts all parameters" do
+    options = Hwaro::Config::Options::DeployOptions.new(
+      source_dir: "dist",
+      targets: ["production", "staging"],
+      dry_run: true,
+      confirm: false,
+      force: true,
+      max_deletes: 100,
+      env: "production"
+    )
+    options.source_dir.should eq("dist")
+    options.targets.should eq(["production", "staging"])
+    options.dry_run.should eq(true)
+    options.confirm.should eq(false)
+    options.force.should eq(true)
+    options.max_deletes.should eq(100)
+    options.env.should eq("production")
+  end
+
+  it "accepts partial parameters" do
+    options = Hwaro::Config::Options::DeployOptions.new(
+      targets: ["staging"],
+      dry_run: true
+    )
+    options.source_dir.should be_nil
+    options.targets.should eq(["staging"])
+    options.dry_run.should eq(true)
+    options.force.should be_nil
+  end
+end
+
 describe Hwaro::Config::Options::NewOptions do
   it "has default values" do
     options = Hwaro::Config::Options::NewOptions.new
