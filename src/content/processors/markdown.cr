@@ -445,13 +445,13 @@ module Hwaro
 
               # Ensure uniqueness using counter map for O(1) suffix lookup
               if used_ids.includes?(id)
-                id_counters[id] += 1
-                id = "#{id}-#{id_counters[id]}"
+                base_id = id
+                id_counters[base_id] += 1
+                id = "#{base_id}-#{id_counters[base_id]}"
                 # Handle the rare case where the suffixed id also exists
                 while used_ids.includes?(id)
-                  base, _, _ = id.rpartition("-")
-                  id_counters[base] += 1
-                  id = "#{base}-#{id_counters[base]}"
+                  id_counters[base_id] += 1
+                  id = "#{base_id}-#{id_counters[base_id]}"
                 end
               end
               used_ids << id

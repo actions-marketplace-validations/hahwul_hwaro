@@ -391,8 +391,8 @@ describe Hwaro::Content::Hooks::ImageHooks do
   before_each do
     Hwaro::Content::Hooks::ImageHooks.set_resize_map({
       "/images/photo.jpg" => {
-        320  => "/images/photo_320w.jpg",
-        640  => "/images/photo_640w.jpg",
+         320 => "/images/photo_320w.jpg",
+         640 => "/images/photo_640w.jpg",
         1024 => "/images/photo_1024w.jpg",
       } of Int32 => String,
     } of String => Hash(Int32, String))

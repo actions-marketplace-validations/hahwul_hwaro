@@ -3,6 +3,8 @@
 # Uses Crystal Fibers and Channels for efficient parallel processing.
 # Supports batch processing and worker pool patterns.
 
+require "../../utils/logger"
+
 module Hwaro
   module Core
     module Build
@@ -159,6 +161,8 @@ module Hwaro
             spawn do
               begin
                 task.call
+              rescue ex
+                Logger.warn "ParallelHelper: task failed: #{ex.message}"
               ensure
                 done.send(nil)
               end

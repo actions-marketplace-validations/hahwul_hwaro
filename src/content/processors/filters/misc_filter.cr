@@ -33,7 +33,14 @@ module Hwaro
               when Bool, Int32, Int64, Float64
                 raw.to_s
               when Array
-                "[#{target.as_a.map(&.to_s).join(", ")}]"
+                String.build do |io|
+                  io << "["
+                  target.as_a.each_with_index do |v, i|
+                    io << ", " if i > 0
+                    io << v.to_s
+                  end
+                  io << "]"
+                end
               when Hash
                 pairs = [] of String
                 target.as_h.each do |k, v|

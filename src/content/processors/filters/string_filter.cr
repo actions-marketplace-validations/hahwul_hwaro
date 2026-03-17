@@ -12,7 +12,7 @@ module Hwaro
               length = (arguments["length"].as_number rescue 50).to_i
               ending = arguments["end"].to_s
 
-              words = text.split(/\s+/)
+              words = text.split(/\s+/, limit: length + 1)
               if words.size > length
                 words[0...length].join(" ") + ending
               else

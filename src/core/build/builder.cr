@@ -202,8 +202,8 @@ module Hwaro
 
           # Previous / next pages whose navigation links reference changed pages
           changed_pages.each do |page|
-            pages_to_render << page.lower.not_nil! if page.lower
-            pages_to_render << page.higher.not_nil! if page.higher
+            page.lower.try { |l| pages_to_render << l }
+            page.higher.try { |h| pages_to_render << h }
           end
 
           render_list = pages_to_render.to_a

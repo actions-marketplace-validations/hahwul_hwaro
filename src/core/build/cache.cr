@@ -234,7 +234,12 @@ module Hwaro
           return unless @enabled
           return unless File.exists?(@cache_path)
 
-          content = File.read(@cache_path)
+          begin
+            content = File.read(@cache_path)
+          rescue ex
+            Logger.warn "Cache: failed to read cache file: #{ex.message}"
+            return
+          end
           begin
             # Try loading new format with metadata
             data = CacheData.from_json(content)

@@ -1,5 +1,6 @@
 require "html"
 require "../../models/config"
+require "../../utils/text_utils"
 
 module Hwaro
   module Content
@@ -125,8 +126,8 @@ module Hwaro
             ref_order.each do |key, num|
               text = footnotes[key]? || ""
               # Escape --> in text to prevent premature comment close, and : to prevent parsing issues
-              safe_key = key.gsub("-->", "—&gt;").gsub(":", "&#58;")
-              safe_text = text.gsub("-->", "—&gt;").gsub(":", "&#58;")
+              safe_key = key.gsub("--", "&#45;&#45;").gsub(":", "&#58;")
+              safe_text = text.gsub("--", "&#45;&#45;").gsub(":", "&#58;")
               result += "<!--HWARO-FN:#{safe_key}:#{num}:#{safe_text}-->\n"
             end
             result += "<!--HWARO-FOOTNOTES-END-->\n"
@@ -143,8 +144,8 @@ module Hwaro
           footnotes = [] of {key: String, num: Int32, text: String}
           html.scan(FOOTNOTE_COMMENT_RE) do |match|
             # Unescape the comment-safe encoding
-            key = match[1].gsub("&#58;", ":").gsub("—&gt;", "-->")
-            text = match[3].gsub("&#58;", ":").gsub("—&gt;", "-->")
+            key = match[1].gsub("&#58;", ":").gsub("&#45;&#45;", "--")
+            text = match[3].gsub("&#58;", ":").gsub("&#45;&#45;", "--")
             num = match[2].to_i? || 0
             next if num <= 0
             footnotes << {key: key, num: num, text: text}
@@ -174,13 +175,13 @@ module Hwaro
         def preprocess_math(content : String) : String
           # Display math: $$...$$ (multi-line)
           result = content.gsub(/\$\$(.*?)\$\$/m) do |_|
-            escaped = $~[1].gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+            escaped = Utils::TextUtils.escape_xml($~[1])
             "<div class=\"math math-display\">\\[#{escaped}\\]</div>"
           end
 
           # Inline math: $...$ (single line, no space after opening or before closing $)
           result = result.gsub(/(?<![\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$(?!\d)/) do |_|
-            escaped = $~[1].gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+            escaped = Utils::TextUtils.escape_xml($~[1])
             "<span class=\"math math-inline\">\\(#{escaped}\\)</span>"
           end
 
