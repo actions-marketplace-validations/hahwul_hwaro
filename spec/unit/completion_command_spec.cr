@@ -2,7 +2,7 @@ require "../spec_helper"
 
 # Ensure commands are registered for completion generation
 private def ensure_commands_registered
-  return if Hwaro::CLI::CommandRegistry.all_metadata.any?
+  return if Hwaro::CLI::CommandRegistry.all_metadata.present?
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::InitCommand.metadata) { |_| }
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::BuildCommand.metadata) { |_| }
   Hwaro::CLI::CommandRegistry.register(Hwaro::CLI::Commands::ServeCommand.metadata) { |_| }
@@ -61,6 +61,16 @@ describe Hwaro::CLI::Commands::CompletionCommand do
       output.should contain("compgen")
       output.should contain("COMPREPLY")
     end
+
+    it "includes new tool subcommands in bash" do
+      cmd = Hwaro::CLI::Commands::CompletionCommand.new
+      output = cmd.generate_bash_for_test
+
+      output.should contain("stats")
+      output.should contain("validate")
+      output.should contain("unused-assets")
+      output.should contain("export")
+    end
   end
 
   describe "zsh completion" do
@@ -95,6 +105,16 @@ describe Hwaro::CLI::Commands::CompletionCommand do
 
       # completion command should have positional choices
       output.should contain("completion)")
+    end
+
+    it "includes new tool subcommands in zsh" do
+      cmd = Hwaro::CLI::Commands::CompletionCommand.new
+      output = cmd.generate_zsh_for_test
+
+      output.should contain("stats")
+      output.should contain("validate")
+      output.should contain("unused-assets")
+      output.should contain("export")
     end
   end
 
@@ -141,6 +161,61 @@ describe Hwaro::CLI::Commands::CompletionCommand do
 
       # Should have -d for description syntax
       output.should contain("-d")
+    end
+
+    it "includes new tool subcommands in fish" do
+      cmd = Hwaro::CLI::Commands::CompletionCommand.new
+      output = cmd.generate_fish_for_test
+
+      output.should contain("stats")
+      output.should contain("validate")
+      output.should contain("unused-assets")
+      output.should contain("export")
+    end
+  end
+
+  describe "shell-metacharacter escaping" do
+    # Register a synthetic command whose flag descriptions contain the exact
+    # metacharacters escape_zsh ([ ] ') and escape_fish (" $) handle. Real
+    # flag descriptions contain parens/colons/commas but none of these chars,
+    # so without a synthetic flag the gsub branches stay uncovered.
+    before_each do
+      ensure_commands_registered
+      Hwaro::CLI::CommandRegistry.register(
+        Hwaro::CLI::CommandInfo.new(
+          name: "synthescape",
+          description: "synthetic",
+          flags: [
+            Hwaro::CLI::FlagInfo.new(
+              short: nil,
+              long: "--meta",
+              description: %q(brackets [x] and quote ' and dollar $ and dquote "z"),
+            ),
+          ],
+        )
+      ) { |_| }
+    end
+
+    it "escapes ' [ ] in the generated zsh script so the _arguments line stays well-formed" do
+      cmd = Hwaro::CLI::Commands::CompletionCommand.new
+      output = cmd.generate_zsh_for_test
+
+      # The raw description must not appear verbatim — brackets and the quote
+      # are escaped before interpolation into the '[...]' description slot.
+      output.should contain("\\[x\\]")
+      output.should contain("'\\''")
+      # No unescaped raw "[x]" leaks into the script.
+      output.should_not contain("brackets [x] and")
+    end
+
+    it "escapes \" and $ in the generated fish script" do
+      cmd = Hwaro::CLI::Commands::CompletionCommand.new
+      output = cmd.generate_fish_for_test
+
+      # $ and embedded double-quotes are escaped before going into the -d "..."
+      output.should contain("dollar \\$")
+      output.should contain("dquote \\\"z\\\"")
+      output.should_not contain("dollar $ and")
     end
   end
 end

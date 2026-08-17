@@ -49,7 +49,6 @@ describe "Cache: Rebuild with no changes" do
         builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
 
         File.exists?(".hwaro_cache.json").should be_true
-        cache_after_first = File.read(".hwaro_cache.json")
 
         # Second build (no changes)
         builder2 = Hwaro::Core::Build::Builder.new
@@ -156,6 +155,38 @@ describe "Cache: Cache with multiple files" do
       File.exists?("public/page1/index.html").should be_true
       File.exists?("public/page2/index.html").should be_true
       File.exists?("public/page3/index.html").should be_true
+    end
+  end
+end
+
+describe "Cache: i18n change invalidation" do
+  it "rebuilds pages when a translation file changes" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("i18n")
+        File.write("content/page.md", "---\ntitle: Page\n---\nBody")
+        File.write("templates/page.html", %({{ "greeting" | t }}|{{ content }}))
+        File.write("i18n/en.toml", %(greeting = "Hello"))
+
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        File.read("public/page/index.html").should contain("Hello")
+
+        sleep 100.milliseconds
+        File.write("i18n/en.toml", %(greeting = "Bonjour"))
+
+        builder2 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        html = File.read("public/page/index.html")
+        html.should contain("Bonjour")
+        html.should_not contain("Hello")
+      end
     end
   end
 end
@@ -321,6 +352,67 @@ describe "Cache: Cache with section content" do
       File.exists?("public/blog/index.html").should be_true
       File.exists?("public/blog/post1/index.html").should be_true
       File.exists?("public/blog/post2/index.html").should be_true
+    end
+  end
+end
+
+describe "Cache: empty-site hint" do
+  # The "No content found" hint must not fire on a cached no-op rebuild.
+  # `--cache` skips unchanged pages (counted as cache_hits) rather than
+  # re-rendering them, so pages_rendered is 0 even though the site is full.
+  it "does not print 'No content found' on a cached no-op rebuild" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("content/page.md", "---\ntitle: Page\n---\nContent")
+        File.write("templates/page.html", "{{ content }}")
+
+        builder1 = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+
+        # Capture the second (no-op) build's log.
+        io = IO::Memory.new
+        prev = Hwaro::Logger.io
+        Hwaro::Logger.io = io
+        begin
+          builder2 = Hwaro::Core::Build::Builder.new
+          Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
+          builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        ensure
+          Hwaro::Logger.io = prev
+        end
+
+        io.to_s.should_not contain("No content found")
+      end
+    end
+  end
+
+  # Positive control: a genuinely empty site still warns (and confirms the
+  # hint is reachable through Logger.io capture, so the assertion above is real).
+  it "still prints 'No content found' when there is no content at all" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", BASIC_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("templates/page.html", "{{ content }}")
+
+        io = IO::Memory.new
+        prev = Hwaro::Logger.io
+        Hwaro::Logger.io = io
+        begin
+          builder = Hwaro::Core::Build::Builder.new
+          Hwaro::Content::Hooks.all.each { |h| builder.register(h) }
+          builder.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        ensure
+          Hwaro::Logger.io = prev
+        end
+
+        io.to_s.should contain("No content found")
+      end
     end
   end
 end

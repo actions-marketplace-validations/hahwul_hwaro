@@ -8,14 +8,14 @@ require "./support/build_helper"
 # =============================================================================
 
 MULTILINGUAL_CONFIG = <<-TOML
-title = "Test Site"
-base_url = "http://localhost"
-default_language = "en"
+  title = "Test Site"
+  base_url = "http://localhost"
+  default_language = "en"
 
-[languages.ko]
-language_name = "한국어"
-weight = 1
-TOML
+  [languages.ko]
+  language_name = "한국어"
+  weight = 1
+  TOML
 
 describe "Multilingual: URL generation" do
   it "generates language-prefixed URLs for non-default language" do
@@ -88,6 +88,35 @@ describe "Multilingual: Translation links" do
   end
 end
 
+describe "Multilingual: section.pages translations" do
+  it "exposes translations on each page in section.pages (#540)" do
+    build_site(
+      MULTILINGUAL_CONFIG,
+      content_files: {
+        "posts/_index.md"       => "---\ntitle: Posts\n---\n",
+        "posts/_index.ko.md"    => "---\ntitle: 포스트\n---\n",
+        "posts/foo/index.md"    => "---\ntitle: Foo\n---\nEN foo",
+        "posts/foo/index.ko.md" => "---\ntitle: 푸\n---\nKO foo",
+      },
+      template_files: {
+        "page.html" => "{% set section = get_section(path=page.section) %}" \
+                       "SIB={% for p in section.pages %}" \
+                       "[{{ p.url }} t={% for t in p.translations %}{{ t.code }}:{{ t.url }},{% endfor %}]" \
+                       "{% endfor %}",
+      },
+    ) do
+      # Sibling page in section.pages must expose the same translations
+      # as the page itself does (gh#540). The previously broken output
+      # was `t=` (empty); the fix populates both language entries.
+      en_html = File.read("public/posts/foo/index.html")
+      en_html.should contain("t=en:/posts/foo/,ko:/ko/posts/foo/,")
+
+      ko_html = File.read("public/ko/posts/foo/index.html")
+      ko_html.should contain("t=en:/posts/foo/,ko:/ko/posts/foo/,")
+    end
+  end
+end
+
 describe "Multilingual: Section list isolation" do
   it "section_list only shows pages of the same language" do
     build_site(
@@ -117,18 +146,18 @@ end
 describe "Multilingual: Three or more languages" do
   it "supports more than two languages" do
     config = <<-TOML
-    title = "Test Site"
-    base_url = "http://localhost"
-    default_language = "en"
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
 
-    [languages.ko]
-    language_name = "한국어"
-    weight = 1
+      [languages.ko]
+      language_name = "한국어"
+      weight = 1
 
-    [languages.ja]
-    language_name = "日本語"
-    weight = 2
-    TOML
+      [languages.ja]
+      language_name = "日本語"
+      weight = 2
+      TOML
 
     build_site(
       config,
@@ -164,18 +193,18 @@ end
 describe "Multilingual: Translation links for three languages" do
   it "lists all translations including all languages" do
     config = <<-TOML
-    title = "Test Site"
-    base_url = "http://localhost"
-    default_language = "en"
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
 
-    [languages.ko]
-    language_name = "한국어"
-    weight = 1
+      [languages.ko]
+      language_name = "한국어"
+      weight = 1
 
-    [languages.ja]
-    language_name = "日本語"
-    weight = 2
-    TOML
+      [languages.ja]
+      language_name = "日本語"
+      weight = 2
+      TOML
 
     build_site(
       config,
@@ -236,6 +265,355 @@ describe "Multilingual: Homepage per language" do
       ko_html = File.read("public/ko/index.html")
       ko_html.should contain("TITLE=홈")
       ko_html.should contain("환영합니다")
+    end
+  end
+end
+
+describe "Multilingual: Taxonomy output" do
+  it "emits default-language taxonomies at the root and non-default under a prefix, with no duplicate /<default_language>/ tree" do
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [languages.en]
+      language_name = "English"
+      weight = 1
+      taxonomies = ["tags"]
+
+      [languages.ko]
+      language_name = "한국어"
+      weight = 2
+      taxonomies = ["tags"]
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "blog/_index.md"    => "---\ntitle: Blog\n---\n",
+        "blog/_index.ko.md" => "---\ntitle: 블로그\n---\n",
+        "blog/post.md"      => "---\ntitle: Post\ntags:\n  - crystal\n---\nEnglish post",
+        "blog/post.ko.md"   => "---\ntitle: 포스트\ntags:\n  - crystal\n---\n한국어 포스트",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "<h1>{{ taxonomy_name }}</h1>",
+        "taxonomy_term.html" => "<h1>{{ taxonomy_term }}</h1>",
+      },
+    ) do
+      # Default language (en) taxonomies live at the root.
+      File.exists?("public/tags/index.html").should be_true
+      File.exists?("public/tags/crystal/index.html").should be_true
+
+      # Non-default language (ko) taxonomies are language-prefixed.
+      File.exists?("public/ko/tags/index.html").should be_true
+      File.exists?("public/ko/tags/crystal/index.html").should be_true
+
+      # The default language must NOT also be duplicated under /en/ — that
+      # produced orphaned URLs (absent from the sitemap, no canonical).
+      File.exists?("public/en/tags/index.html").should be_false
+      File.exists?("public/en/tags/crystal/index.html").should be_false
+      Dir.exists?("public/en").should be_false
+    end
+  end
+
+  it "scopes the root taxonomy term listing to the default language (no cross-language leak)" do
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [languages.en]
+      language_name = "English"
+      taxonomies = ["tags"]
+
+      [languages.ko]
+      language_name = "한국어"
+      taxonomies = ["tags"]
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/_index.md"    => "---\ntitle: Posts\n---\n",
+        "posts/_index.ko.md" => "---\ntitle: 포스트\n---\n",
+        "posts/p.md"         => "---\ntitle: English Post\ntags:\n  - crystal\n---\nEN",
+        "posts/p.ko.md"      => "---\ntitle: 한국어 포스트\ntags:\n  - crystal\n---\nKO",
+      },
+      template_files: {
+        "page.html"     => "{{ content }}",
+        "section.html"  => "{{ content }}",
+        "taxonomy.html" => "{{ content }}",
+        # The engine renders the term's page list into `content`.
+        "taxonomy_term.html" => "{{ content }}",
+      },
+    ) do
+      # Root (default-language) term lists the English post only.
+      root = File.read("public/tags/crystal/index.html")
+      root.should contain("English Post")
+      root.should_not contain("한국어 포스트")
+      root.should_not contain("/ko/posts/")
+
+      # Korean term lists the Korean post only.
+      ko = File.read("public/ko/tags/crystal/index.html")
+      ko.should contain("한국어 포스트")
+      ko.should_not contain("English Post")
+    end
+  end
+
+  it "honors the default language's per-language taxonomies list at the root" do
+    # The default language is served at the root and must respect its own
+    # `[languages.<default>].taxonomies` list, exactly like non-default
+    # languages do. Regression: the root previously used the global
+    # `[[taxonomies]]` set, so it emitted `/authors/` even though
+    # `languages.en.taxonomies` excluded it — while `/ko/authors/` was never
+    # emitted. That asymmetry produced dead links (the multilingual blog
+    # scaffold links to `/ko/authors/`).
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [[taxonomies]]
+      name = "authors"
+
+      [languages.en]
+      language_name = "English"
+      weight = 1
+      taxonomies = ["tags"]
+
+      [languages.ko]
+      language_name = "한국어"
+      weight = 2
+      taxonomies = ["tags"]
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/_index.md"    => "---\ntitle: Posts\n---\n",
+        "posts/_index.ko.md" => "---\ntitle: 포스트\n---\n",
+        "posts/p.md"         => "---\ntitle: Post\ntags:\n  - x\nauthors:\n  - alice\n---\nEN",
+        "posts/p.ko.md"      => "---\ntitle: 글\ntags:\n  - x\nauthors:\n  - alice\n---\nKO",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "<h1>{{ taxonomy_name }}</h1>",
+        "taxonomy_term.html" => "<h1>{{ taxonomy_term }}</h1>",
+      },
+    ) do
+      # Both languages enable `tags`, so tag pages exist for both spaces.
+      File.exists?("public/tags/x/index.html").should be_true
+      File.exists?("public/ko/tags/x/index.html").should be_true
+
+      # Neither language lists `authors`, so authors pages must NOT be emitted
+      # for either — including the default language at the root.
+      File.exists?("public/authors/index.html").should be_false
+      Dir.exists?("public/authors").should be_false
+      Dir.exists?("public/ko/authors").should be_false
+    end
+  end
+
+  it "emits all global taxonomies at the root when the default language omits the taxonomies key" do
+    # A `[languages.<default>]` block without a `taxonomies` key inherits the
+    # global set, so a third taxonomy (`authors`) is still emitted at the root
+    # rather than silently dropped — guards the upgrade path for hand-written
+    # configs that predate per-language taxonomy filtering.
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [[taxonomies]]
+      name = "authors"
+
+      [languages.en]
+      language_name = "English"
+      weight = 1
+
+      [languages.ko]
+      language_name = "한국어"
+      weight = 2
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/_index.md"    => "---\ntitle: Posts\n---\n",
+        "posts/_index.ko.md" => "---\ntitle: 포스트\n---\n",
+        "posts/p.md"         => "---\ntitle: Post\ntags:\n  - x\nauthors:\n  - alice\n---\nEN",
+        "posts/p.ko.md"      => "---\ntitle: 글\ntags:\n  - x\nauthors:\n  - alice\n---\nKO",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "<h1>{{ taxonomy_name }}</h1>",
+        "taxonomy_term.html" => "<h1>{{ taxonomy_term }}</h1>",
+      },
+    ) do
+      File.exists?("public/tags/x/index.html").should be_true
+      File.exists?("public/authors/alice/index.html").should be_true
+      # Non-default language inherits the global set too.
+      File.exists?("public/ko/authors/alice/index.html").should be_true
+    end
+  end
+
+  it "emits a taxonomy for every language when each per-language list enables it" do
+    # Mirror of the scaffold's fixed config: the per-language `taxonomies`
+    # lists include `authors`, so both the root and the language-prefixed
+    # space generate it (no dead `/ko/authors/` link).
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      default_language = "en"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [[taxonomies]]
+      name = "authors"
+
+      [languages.en]
+      language_name = "English"
+      weight = 1
+      taxonomies = ["tags", "authors"]
+
+      [languages.ko]
+      language_name = "한국어"
+      weight = 2
+      taxonomies = ["tags", "authors"]
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/_index.md"    => "---\ntitle: Posts\n---\n",
+        "posts/_index.ko.md" => "---\ntitle: 포스트\n---\n",
+        "posts/p.md"         => "---\ntitle: Post\nauthors:\n  - alice\n---\nEN",
+        "posts/p.ko.md"      => "---\ntitle: 글\nauthors:\n  - alice\n---\nKO",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "<h1>{{ taxonomy_name }}</h1>",
+        "taxonomy_term.html" => "<h1>{{ taxonomy_term }}</h1>",
+      },
+    ) do
+      File.exists?("public/authors/alice/index.html").should be_true
+      File.exists?("public/ko/authors/alice/index.html").should be_true
+    end
+  end
+end
+
+# =============================================================================
+# Multilingual: taxonomy term links
+#
+# `get_taxonomy_url` used to always emit the ROOT term URL (`/tags/foo/`).
+# On a multilingual site the taxonomy generator writes `/<lang>/tags/<slug>/`
+# for every non-default language that enables the taxonomy, so a term that
+# exists only in that language had NO root page — the link was a hard 404 —
+# and a shared term pointed the reader at the default language's listing.
+# =============================================================================
+
+MULTILINGUAL_TAXONOMY_CONFIG = <<-TOML
+  title = "Test Site"
+  base_url = "http://localhost"
+  default_language = "en"
+  taxonomies = [{ name = "tags" }]
+
+  [languages.en]
+  taxonomies = ["tags"]
+
+  [languages.ko]
+  language_name = "한국어"
+  taxonomies = ["tags"]
+  TOML
+
+TAXONOMY_LINK_FILES = {
+  "posts/a.md"    => "---\ntitle: English post\ntags: [shared, onlyen]\n---\nHello",
+  "posts/a.ko.md" => "---\ntitle: 한국어 글\ntags: [shared, onlyko]\n---\n안녕",
+}
+
+TAXONOMY_LINK_TEMPLATES = {
+  "page.html" => "{% for t in page.tags %}<a href=\"{{ get_taxonomy_url(kind='tags', term=t) }}\"></a>{% endfor %}",
+}
+
+describe "Multilingual: taxonomy term links" do
+  it "links a non-default-language page at that language's term pages" do
+    build_site(
+      MULTILINGUAL_TAXONOMY_CONFIG,
+      content_files: TAXONOMY_LINK_FILES,
+      template_files: TAXONOMY_LINK_TEMPLATES,
+    ) do
+      ko_html = File.read("public/ko/posts/a/index.html")
+      ko_html.should contain("http://localhost/ko/tags/onlyko/")
+      ko_html.should contain("http://localhost/ko/tags/shared/")
+
+      # Every emitted link must be a page that was actually written.
+      File.exists?("public/ko/tags/onlyko/index.html").should be_true
+      File.exists?("public/ko/tags/shared/index.html").should be_true
+    end
+  end
+
+  it "leaves default-language pages on the root term URLs" do
+    build_site(
+      MULTILINGUAL_TAXONOMY_CONFIG,
+      content_files: TAXONOMY_LINK_FILES,
+      template_files: TAXONOMY_LINK_TEMPLATES,
+    ) do
+      en_html = File.read("public/posts/a/index.html")
+      en_html.should contain("http://localhost/tags/onlyen/")
+      en_html.should contain("http://localhost/tags/shared/")
+      en_html.should_not contain("/ko/tags/")
+
+      File.exists?("public/tags/onlyen/index.html").should be_true
+      File.exists?("public/tags/shared/index.html").should be_true
+    end
+  end
+
+  it "falls back to the root term URL when the language does not enable the taxonomy" do
+    build_site(
+      <<-TOML,
+        title = "Test Site"
+        base_url = "http://localhost"
+        default_language = "en"
+        taxonomies = [{ name = "topics" }]
+
+        [languages.en]
+        taxonomies = ["topics"]
+
+        [languages.ko]
+        language_name = "한국어"
+        taxonomies = []
+        TOML
+      content_files: {
+        "posts/a.md"    => "---\ntitle: English post\ntopics: [shared]\n---\nHello",
+        "posts/a.ko.md" => "---\ntitle: 한국어 글\ntopics: [shared]\n---\n안녕",
+      },
+      template_files: {
+        "page.html" => "{% for t in page.taxonomies['topics'] %}<a href=\"{{ get_taxonomy_url(kind='topics', term=t) }}\"></a>{% endfor %}",
+      },
+    ) do
+      # `[languages.ko].taxonomies = []` means no /ko/topics/ pages exist — the
+      # link must stay on the root URL rather than inventing one.
+      ko_html = File.read("public/ko/posts/a/index.html")
+      ko_html.should_not contain("/ko/topics/")
+      ko_html.should contain("http://localhost/topics/shared/")
+      Dir.exists?("public/ko/topics").should be_false
     end
   end
 end

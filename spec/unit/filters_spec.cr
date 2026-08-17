@@ -210,6 +210,30 @@ describe "DateFilters" do
       result = render_filter("{{ d | date }}", vars)
       result.strip.should eq("12345")
     end
+
+    it "parses ISO 8601 datetime with T separator" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00")}
+      result = render_filter("{{ d | date(format='%Y-%m-%d %H:%M') }}", vars)
+      result.strip.should eq("2024-06-15 14:30")
+    end
+
+    it "parses datetime with space separator" do
+      vars = {"d" => Crinja::Value.new("2024-06-15 14:30:00")}
+      result = render_filter("{{ d | date(format='%Y-%m-%d %H:%M') }}", vars)
+      result.strip.should eq("2024-06-15 14:30")
+    end
+
+    it "parses RFC 3339 datetime with timezone" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00Z")}
+      result = render_filter("{{ d | date(format='%Y-%m-%d') }}", vars)
+      result.strip.should eq("2024-06-15")
+    end
+
+    it "parses RFC 3339 datetime with offset timezone" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00+09:00")}
+      result = render_filter("{{ d | date(format='%Y-%m-%d') }}", vars)
+      result.strip.should eq("2024-06-15")
+    end
   end
 end
 
@@ -255,6 +279,27 @@ describe "StringFilters" do
       vars = {"text" => Crinja::Value.new("hello")}
       result = render_filter("{{ text | truncate_words(length=1) }}", vars)
       result.strip.should eq("hello")
+    end
+
+    it "returns only the ending for a non-positive length (pinned contract)" do
+      # length <= 0 is nonsensical input (e.g. a dynamically-computed length
+      # that hits 0). Pin the current behavior so a future fix is a deliberate
+      # change rather than an accidental flip — both 0 and -1 collapse to just
+      # the ending today.
+      vars = {"text" => Crinja::Value.new("one two three")}
+      render_filter("{{ text | truncate_words(length=0) }}", vars).strip.should eq("...")
+      render_filter("{{ text | truncate_words(length=-1) }}", vars).strip.should eq("...")
+    end
+
+    it "returns the text unchanged for an out-of-range length" do
+      # to_count saturates over-large input at its `max` instead of raising,
+      # but the filter then splits at `length + 1` to detect truncation — with
+      # the clamp sitting on Int32::MAX that increment raised
+      # `Arithmetic overflow` and aborted the render of the whole page.
+      vars = {"text" => Crinja::Value.new("a b c d")}
+      render_filter("{{ text | truncate_words(length=2147483647) }}", vars).strip.should eq("a b c d")
+      # Same value arriving as a string, which is all a shortcode can forward.
+      render_filter(%({{ text | truncate_words(length="2147483647") }}), vars).strip.should eq("a b c d")
     end
   end
 
@@ -375,6 +420,73 @@ describe "MiscFilters" do
       result = render_filter("{{ text | jsonify }}", vars)
       result.strip.should eq("\"\"")
     end
+
+    it "escapes script tag closing to prevent XSS" do
+      vars = {"text" => Crinja::Value.new("</script>")}
+      result = render_filter("{{ text | jsonify }}", vars)
+      result.should_not contain("</script>")
+      result.should contain("<\\/script>")
+    end
+  end
+
+  # Regression: Crinja's stock `tojson` wraps its output in
+  # `SafeString.escape`, HTML-entity-escaping the JSON (`"` -> `&quot;`),
+  # which is invalid JSON in a standalone output-format file (and unusable
+  # inside a <script>). Hwaro overrides it to emit real JSON like `jsonify`.
+  describe "tojson (hwaro override)" do
+    it "produces valid, non-HTML-escaped JSON for a string" do
+      vars = {"text" => Crinja::Value.new("hello world")}
+      result = render_filter("{{ text | tojson }}", vars)
+      result.strip.should eq("\"hello world\"")
+      result.should_not contain("&quot;")
+    end
+
+    it "escapes an embedded quote as a JSON escape, not an HTML entity" do
+      vars = {"text" => Crinja::Value.new(%(say "hi"))}
+      result = render_filter("{{ text | tojson }}", vars).strip
+      result.should eq(%("say \\"hi\\""))
+      result.should_not contain("&quot;")
+      JSON.parse(result).as_s.should eq(%(say "hi"))
+    end
+
+    it "emits raw JSON for an array (round-trips)" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new("a"), Crinja::Value.new("b")])}
+      result = render_filter("{{ items | tojson }}", vars).strip
+      result.should eq(%(["a","b"]))
+      JSON.parse(result).as_a.map(&.as_s).should eq(["a", "b"])
+    end
+
+    it "keeps </script> script-safe while staying valid JSON" do
+      vars = {"text" => Crinja::Value.new("</script>")}
+      result = render_filter("{{ text | tojson }}", vars).strip
+      result.should_not contain("</script>")
+      result.should contain("<\\/script>")
+      JSON.parse(result).as_s.should eq("</script>")
+    end
+
+    it "supports the indent argument" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new(2)])}
+      result = render_filter("{{ items | tojson(indent=2) }}", vars).strip
+      result.should contain("\n")
+      JSON.parse(result).as_a.map(&.as_i).should eq([1, 2])
+    end
+
+    # A negative indent would make `String#*` raise ArgumentError (aborting the
+    # whole build); a huge one would overflow/allocate a giant string. Both are
+    # clamped to a sane range instead of crashing.
+    it "clamps a negative indent to compact output instead of crashing" do
+      vars = {"text" => Crinja::Value.new("hi")}
+      result = render_filter("{{ text | tojson(indent=-5) }}", vars).strip
+      result.should eq(%("hi"))
+    end
+
+    it "clamps an oversized indent instead of overflowing or exhausting memory" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new(1)])}
+      result = render_filter("{{ items | tojson(indent=999999999999) }}", vars).strip
+      JSON.parse(result).as_a.map(&.as_i).should eq([1])
+      # Clamped to <= 16 spaces per level, not billions.
+      result.should_not match(/ {17,}/)
+    end
   end
 
   describe "default" do
@@ -457,6 +569,41 @@ describe "HtmlFilters" do
       vars = {"md" => Crinja::Value.new("**bold**")}
       result = render_filter("{{ md | markdownify }}", vars)
       result.should contain("<strong>bold</strong>")
+    end
+
+    it "honors the site's safe mode when the build config is published" do
+      cfg = Hwaro::Models::MarkdownConfig.new
+      cfg.safe = true
+      Hwaro::Processor::Markdown.filter_markdown_config = cfg
+      begin
+        vars = {"md" => Crinja::Value.new("<script>x()</script>\n\ntext")}
+        result = render_filter("{{ md | markdownify }}", vars)
+        result.should_not contain("<script>")
+        result.should contain("text")
+      ensure
+        Hwaro::Processor::Markdown.filter_markdown_config = nil
+      end
+    end
+
+    it "honors the site's smart_punctuation setting" do
+      cfg = Hwaro::Models::MarkdownConfig.new
+      cfg.smart_punctuation = true
+      Hwaro::Processor::Markdown.filter_markdown_config = cfg
+      begin
+        vars = {"md" => Crinja::Value.new(%(say "hi" -- ok))}
+        result = render_filter("{{ md | markdownify }}", vars)
+        result.should contain("“hi”")
+        result.should contain("–")
+      ensure
+        Hwaro::Processor::Markdown.filter_markdown_config = nil
+      end
+    end
+
+    it "keeps bare defaults when no build config is published" do
+      Hwaro::Processor::Markdown.filter_markdown_config = nil
+      vars = {"md" => Crinja::Value.new(%(say "hi"))}
+      result = render_filter("{{ md | markdownify }}", vars)
+      result.should contain(%(&quot;hi&quot;))
     end
 
     it "converts markdown headings" do
@@ -654,6 +801,151 @@ describe "UrlFilters" do
       result.strip.should eq("/subdir/about/")
     end
   end
+
+  describe "values that already carry their own origin" do
+    # `absolute_url`/`relative_url` only special-cased http(s)://, so a
+    # `mailto:` link came back as https://example.com/mailto:a@b.com and a
+    # protocol-relative CDN URL (which starts with "/") became
+    # https://example.com//cdn.example.com/x.js.
+    {
+      "mailto:hello@example.com",
+      "tel:+15551234",
+      "data:image/png;base64,AAAA",
+      "//cdn.example.com/lib.js",
+      "ftp://files.example.com/x.zip",
+    }.each do |url|
+      it "absolute_url passes #{url} through unchanged" do
+        page = Hwaro::Models::Page.new("test.md")
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com"
+
+        context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+        context.add("my_url", url)
+
+        result = Hwaro::Content::Processors::Template.process("{{ my_url | absolute_url }}", context).strip
+        result.should eq(url)
+      end
+
+      it "relative_url passes #{url} through unchanged" do
+        page = Hwaro::Models::Page.new("test.md")
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com/sub/"
+
+        context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+        context.add("my_url", url)
+
+        result = Hwaro::Content::Processors::Template.process("{{ my_url | relative_url }}", context).strip
+        result.should eq(url)
+      end
+
+      it "url_for passes #{url} through unchanged" do
+        page = Hwaro::Models::Page.new("test.md")
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com"
+
+        context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+        context.add("my_url", url)
+
+        result = Hwaro::Content::Processors::Template.process("{{ url_for(path=my_url) }}", context).strip
+        result.should eq(url)
+      end
+    end
+
+    it "relative_url survives a malformed base_url instead of aborting the build" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      config.base_url = "http://[bad"
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("my_url", "/about/")
+
+      result = Hwaro::Content::Processors::Template.process("{{ my_url | relative_url }}", context).strip
+      result.should eq("/about/")
+    end
+  end
+
+  describe "numeric arguments given as strings" do
+    # Every shortcode argument is parsed into a String, so a numeric argument
+    # forwarded from a shortcode always arrives quoted. `as_number` raised
+    # Crinja::TypeError on those and the raise aborted the whole page render.
+    it "truncate_words accepts a quoted length" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("text", "one two three four five")
+
+      result = Hwaro::Content::Processors::Template.process(%({{ text | truncate_words(length="2", end="…") }}), context).strip
+      result.should eq("one two…")
+    end
+
+    it "truncate_words falls back to the default for a non-numeric length" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("text", "one two three")
+
+      result = Hwaro::Content::Processors::Template.process(%({{ text | truncate_words(length="wat") }}), context).strip
+      result.should eq("one two three")
+    end
+
+    it "truncate_words does not drop trailing words for a negative length" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("text", "one two three")
+
+      result = Hwaro::Content::Processors::Template.process(%({{ text | truncate_words(length=-5, end="…") }}), context).strip
+      result.should eq("…")
+    end
+
+    it "resize_image accepts a quoted width instead of aborting the render" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      result = Hwaro::Content::Processors::Template.process(%({{ resize_image(path="/img/a.png", width="800").width }}), context).strip
+      result.should eq("800")
+    end
+
+    it "resize_image clamps an out-of-range width instead of raising" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      result = Hwaro::Content::Processors::Template.process(%({{ resize_image(path="/img/a.png", width="999999999999").width }}), context).strip
+      result.should eq(Int32::MAX.to_s)
+    end
+  end
+
+  describe "empty base_url (pre-deploy state)" do
+    it "absolute_url returns the path unchanged and never emits a // prefix" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      config.base_url = ""
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("my_url", "/about/")
+
+      result = Hwaro::Content::Processors::Template.process("{{ my_url | absolute_url }}", context).strip
+      result.should eq("/about/")
+      result.starts_with?("//").should be_false
+    end
+
+    it "relative_url returns the path unchanged and never emits a // prefix" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      config.base_url = ""
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("my_url", "/about/")
+
+      result = Hwaro::Content::Processors::Template.process("{{ my_url | relative_url }}", context).strip
+      result.should eq("/about/")
+      result.starts_with?("//").should be_false
+    end
+  end
 end
 
 # =============================================================================
@@ -793,6 +1085,24 @@ describe "MathFilters" do
       result = render_filter("{{ val | ceil }}", vars)
       result.should eq("-2")
     end
+
+    it "handles integer input" do
+      vars = {"val" => Crinja::Value.new(7)}
+      result = render_filter("{{ val | ceil }}", vars)
+      result.should eq("7")
+    end
+
+    it "handles zero" do
+      vars = {"val" => Crinja::Value.new(0.0)}
+      result = render_filter("{{ val | ceil }}", vars)
+      result.should eq("0")
+    end
+
+    it "returns target for non-numeric input" do
+      vars = {"val" => Crinja::Value.new("hello")}
+      result = render_filter("{{ val | ceil }}", vars)
+      result.should eq("hello")
+    end
   end
 
   describe "floor" do
@@ -812,6 +1122,24 @@ describe "MathFilters" do
       vars = {"val" => Crinja::Value.new(-2.3)}
       result = render_filter("{{ val | floor }}", vars)
       result.should eq("-3")
+    end
+
+    it "handles integer input" do
+      vars = {"val" => Crinja::Value.new(7)}
+      result = render_filter("{{ val | floor }}", vars)
+      result.should eq("7")
+    end
+
+    it "handles zero" do
+      vars = {"val" => Crinja::Value.new(0.0)}
+      result = render_filter("{{ val | floor }}", vars)
+      result.should eq("0")
+    end
+
+    it "returns target for non-numeric input" do
+      vars = {"val" => Crinja::Value.new("hello")}
+      result = render_filter("{{ val | floor }}", vars)
+      result.should eq("hello")
     end
   end
 end
@@ -850,6 +1178,230 @@ describe "MiscFilters (extended)" do
       vars = {"val" => Crinja::Value.new(true)}
       result = render_filter("{{ val | inspect }}", vars)
       result.should eq("true")
+    end
+
+    it "inspects false boolean" do
+      vars = {"val" => Crinja::Value.new(false)}
+      result = render_filter("{{ val | inspect }}", vars)
+      result.should eq("false")
+    end
+
+    it "inspects a float" do
+      vars = {"val" => Crinja::Value.new(3.14)}
+      result = render_filter("{{ val | inspect }}", vars)
+      result.should eq("3.14")
+    end
+
+    it "inspects an empty array" do
+      items = Crinja::Value.new([] of Crinja::Value)
+      vars = {"val" => items}
+      result = render_filter("{{ val | inspect }}", vars)
+      result.should eq("[]")
+    end
+
+    it "inspects a string with special characters" do
+      vars = {"val" => Crinja::Value.new("hello \"world\"")}
+      result = render_filter("{{ val | inspect }}", vars)
+      result.should contain("hello")
+      result.should contain("world")
+    end
+  end
+end
+
+# =============================================================================
+# I18n Filters
+# =============================================================================
+describe "I18nFilters" do
+  describe "t (translate)" do
+    it "translates key using current language" do
+      translations = {
+        Crinja::Value.new("ko") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("안녕하세요"),
+        }),
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("Hello"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("ko"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_filter("{{ \"greeting\" | t }}", vars)
+      result.should eq("안녕하세요")
+    end
+
+    it "falls back to default language when key missing in current language" do
+      translations = {
+        Crinja::Value.new("ko") => Crinja::Value.new({} of Crinja::Value => Crinja::Value),
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("Hello"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("ko"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_filter("{{ \"greeting\" | t }}", vars)
+      result.should eq("Hello")
+    end
+
+    it "returns key itself when no translation found" do
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new({} of Crinja::Value => Crinja::Value),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_filter("{{ \"missing_key\" | t }}", vars)
+      result.should eq("missing_key")
+    end
+
+    it "returns key when no translations data available" do
+      vars = {} of String => Crinja::Value
+      result = render_filter("{{ \"hello\" | t }}", vars)
+      result.should eq("hello")
+    end
+
+    it "defaults language to en when page_language is empty" do
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("title") => Crinja::Value.new("Title"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new(""),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_filter("{{ \"title\" | t }}", vars)
+      result.should eq("Title")
+    end
+
+    it "falls back to the key when a language entry is not a hash" do
+      # A translations file where a language maps to a scalar/array instead of
+      # a table must not crash render (the blanket rescue returns the key).
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new("not-a-hash"),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      render_filter("{{ \"k\" | t }}", vars).should eq("k")
+    end
+
+    it "falls back to the key when the translations table itself is not a hash" do
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new("not-a-hash"),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      render_filter("{{ \"k\" | t }}", vars).should eq("k")
+    end
+  end
+
+  describe "pluralize" do
+    it "returns singular when count is 1" do
+      vars = {"count" => Crinja::Value.new(1)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("item")
+    end
+
+    it "returns plural when count is 0" do
+      vars = {"count" => Crinja::Value.new(0)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "returns plural when count is greater than 1" do
+      vars = {"count" => Crinja::Value.new(5)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "returns plural for negative count" do
+      vars = {"count" => Crinja::Value.new(-1)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "defaults to 0 for non-numeric input" do
+      vars = {"count" => Crinja::Value.new("abc")}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "selects plural for a fractional count above 1 (no truncation to singular)" do
+      # 1.9 must not be truncated to 1 and wrongly rendered singular.
+      vars = {"count" => Crinja::Value.new(1.9)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "treats an exact 1.0 as singular" do
+      vars = {"count" => Crinja::Value.new(1.0)}
+      result = render_filter("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("item")
+    end
+  end
+end
+
+describe "MenuFilters" do
+  describe "active_path" do
+    it "matches the current page's own url exactly" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_filter("{{ '/posts/' | active_path }}", vars).should eq("true")
+    end
+
+    it "does not match a sibling url" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_filter("{{ '/about/' | active_path }}", vars).should eq("false")
+    end
+
+    it "treats missing/present trailing slash as equal" do
+      vars = {"page_url" => Crinja::Value.new("/posts")}
+      render_filter("{{ '/posts/' | active_path }}", vars).should eq("true")
+    end
+
+    it "does not match a descendant page without ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_filter("{{ '/posts/' | active_path }}", vars).should eq("false")
+    end
+
+    it "matches a descendant page with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_filter("{{ '/posts/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "still matches the entry's own url exactly with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_filter("{{ '/posts/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "does not treat every page as a descendant of the root entry, even with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_filter("{{ '/' | active_path(ancestor=true) }}", vars).should eq("false")
+    end
+
+    it "matches the root entry only on the homepage itself" do
+      vars = {"page_url" => Crinja::Value.new("/")}
+      render_filter("{{ '/' | active_path }}", vars).should eq("true")
+      render_filter("{{ '/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "never matches an external http(s) entry" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_filter("{{ 'https://example.com' | active_path }}", vars).should eq("false")
+    end
+
+    it "never matches an external protocol-relative entry" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_filter("{{ '//cdn.example.com/x' | active_path }}", vars).should eq("false")
     end
   end
 end

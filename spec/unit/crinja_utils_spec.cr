@@ -87,13 +87,13 @@ describe Hwaro::Utils::CrinjaUtils do
 
     it "converts nested YAML structures" do
       yaml_str = <<-YAML
-      person:
-        name: Bob
-        hobbies:
-          - reading
-          - coding
-        active: true
-      YAML
+        person:
+          name: Bob
+          hobbies:
+            - reading
+            - coding
+          active: true
+        YAML
       yaml = YAML.parse(yaml_str)
       result = Hwaro::Utils::CrinjaUtils.from_yaml(yaml)
       vars = {"data" => result}
@@ -124,6 +124,23 @@ describe Hwaro::Utils::CrinjaUtils do
       render(vars, "{{ items | length }}").should eq("3")
       render(vars, "{{ items[0] }}").should eq("hello")
       render(vars, "{{ items[1] }}").should eq("42")
+    end
+
+    # Regression: an unquoted ISO date resolves to a `Time` node, which matched
+    # none of the accessors, so the value fell through to nil and templates
+    # rendered `none` — while the identical TOML data file rendered the date.
+    it "converts an unquoted YAML date instead of dropping it" do
+      yaml = YAML.parse("d: 2021-01-02")
+      result = Hwaro::Utils::CrinjaUtils.from_yaml(yaml["d"])
+      vars = {"val" => result}
+      render(vars, "{{ val }}").should eq("2021-01-02 00:00:00 UTC")
+    end
+
+    it "converts a nested YAML date" do
+      yaml = YAML.parse("meta:\n  updated: 2021-01-02\n")
+      result = Hwaro::Utils::CrinjaUtils.from_yaml(yaml)
+      vars = {"data" => result}
+      render(vars, "{{ data.meta.updated }}").should_not eq("none")
     end
   end
 
@@ -257,10 +274,10 @@ describe Hwaro::Utils::CrinjaUtils do
 
     it "converts a nested TOML table" do
       toml_str = <<-TOML
-      [server]
-      host = "localhost"
-      port = 8080
-      TOML
+        [server]
+        host = "localhost"
+        port = 8080
+        TOML
       toml = TOML.parse(toml_str)
       result = Hwaro::Utils::CrinjaUtils.from_toml(toml)
       vars = {"data" => result}
@@ -277,17 +294,36 @@ describe Hwaro::Utils::CrinjaUtils do
 
     it "converts TOML with array of tables" do
       toml_str = <<-TOML
-      [[items]]
-      name = "first"
+        [[items]]
+        name = "first"
 
-      [[items]]
-      name = "second"
-      TOML
+        [[items]]
+        name = "second"
+        TOML
       toml = TOML.parse(toml_str)
       result = Hwaro::Utils::CrinjaUtils.from_toml(toml)
       vars = {"data" => result}
       render(vars, "{{ data.items | length }}").should eq("2")
       render(vars, "{% for item in data.items %}{{ item.name }},{% endfor %}").should eq("first,second,")
+    end
+
+    # Regression: TOML integers are 64-bit, but the converter narrowed through
+    # `as_i?` (a type guard with no range guard), so a 13-digit value raised
+    # OverflowError and the caller's rescue dropped the WHOLE data file —
+    # sibling keys and all — from site.data.
+    it "converts a TOML integer above Int32::MAX without raising" do
+      toml = TOML.parse("name = \"Acme\"\ndownloads = 4200000000\n")
+      result = Hwaro::Utils::CrinjaUtils.from_toml(toml)
+      vars = {"data" => result}
+      render(vars, "{{ data.downloads }}").should eq("4200000000")
+      render(vars, "{{ data.name }}").should eq("Acme")
+    end
+
+    it "converts a standalone oversized TOML integer value" do
+      toml = TOML.parse("n = 4200000000")
+      result = Hwaro::Utils::CrinjaUtils.from_toml(toml["n"])
+      vars = {"val" => result}
+      render(vars, "{{ val }}").should eq("4200000000")
     end
   end
 
@@ -346,6 +382,28 @@ describe Hwaro::Utils::CrinjaUtils do
       expected.should eq("localhost:8080")
       render({"data" => yaml_r}, tpl).should eq(expected)
       render({"data" => toml_r}, tpl).should eq(expected)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cyclic YAML (self-referencing anchor)
+  # ---------------------------------------------------------------------------
+  describe "cyclic YAML" do
+    # `YAML.parse` accepts a self-referencing anchor and returns a CYCLIC
+    # YAML::Any. Every recursive walker over that graph used to run until the
+    # stack died — an unrescuable `Stack overflow`, exit 11, from two lines of
+    # a data file. The depth guard turns it into an ordinary exception the
+    # existing "skip this data file" rescues already handle.
+    it "raises TooDeep instead of overflowing the stack" do
+      cyclic = YAML.parse("x: &a\n  b: *a\n")
+      expect_raises(Hwaro::Utils::Nesting::TooDeep) do
+        Hwaro::Utils::CrinjaUtils.from_yaml(cyclic)
+      end
+    end
+
+    it "still converts deeply-but-finitely nested YAML" do
+      deep = YAML.parse("a: " + "[" * 100 + "]" * 100)
+      Hwaro::Utils::CrinjaUtils.from_yaml(deep).should_not be_nil
     end
   end
 end

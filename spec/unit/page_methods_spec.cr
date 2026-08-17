@@ -25,6 +25,24 @@ describe Hwaro::Models::Page do
       count.should eq(3)
     end
 
+    it "treats a bare '<' as a literal, not an unterminated tag" do
+      # Regression: a lone less-than ("n < 1000") used to flip into tag mode
+      # with no closing '>', swallowing the rest of the document and collapsing
+      # the count (here it returned 3 instead of counting every word).
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "The value a < b is true and here are many more words"
+      count = page.calculate_word_count
+      count.should eq(12)
+    end
+
+    it "still skips a real tag that follows a bare '<' earlier in the line" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "if 0 < x then <b>bold</b> word"
+      count = page.calculate_word_count
+      # if 0 x then bold word  (the <b>..</b> tag is stripped, '<' literal)
+      count.should eq(6)
+    end
+
     it "strips markdown syntax elements" do
       page = Hwaro::Models::Page.new("test.md")
       page.raw_content = "# Heading\n\n**bold** _italic_ `code` [link](url)"
@@ -60,6 +78,24 @@ describe Hwaro::Models::Page do
       page.raw_content = "one two three"
       page.calculate_word_count
       page.word_count.should eq(3)
+    end
+
+    it "counts space-separated CJK runs as whitespace-delimited words (documented limitation)" do
+      # The single-pass scanner counts any run of non-delimiter chars as one
+      # word, so a space-separated CJK string counts space-runs as 3 words
+      # (a space-less CJK paragraph would collapse to 1). Pin the contract.
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "한국어 테스트 문서"
+      page.calculate_word_count.should eq(3)
+    end
+
+    it "does not raise on an opened-but-never-closed real tag (swallows the tail)" do
+      # `<a` flips into tag mode; with no closing '>' the rest of the document
+      # is swallowed. This pins graceful degradation (count of pre-tag words,
+      # no crash) on truncated/malformed HTML.
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "hello <a href=foo and more text"
+      page.calculate_word_count.should eq(1)
     end
   end
 
@@ -164,6 +200,20 @@ describe Hwaro::Models::Page do
       summary.not_nil!.should eq("Summary text.")
     end
 
+    it "ignores a marker shown inside a fenced code block" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "Intro.\n\n```html\n<!-- more -->\n```\n\nBody.\n\n<!-- more -->\n\nRest."
+      summary = page.extract_summary
+      summary.should_not be_nil
+      summary.not_nil!.should eq("Intro.\n\n```html\n<!-- more -->\n```\n\nBody.")
+    end
+
+    it "returns nil when the only marker sits inside a fence" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.raw_content = "Docs example:\n\n```\n<!-- more -->\n```\n\nNo real marker."
+      page.extract_summary.should be_nil
+    end
+
     it "returns nil for empty content" do
       page = Hwaro::Models::Page.new("test.md")
       page.raw_content = ""
@@ -185,6 +235,86 @@ describe Hwaro::Models::Page do
       page.raw_content = "My summary.\n\n<!-- more -->\n\nRest."
       page.extract_summary
       page.summary.should eq("My summary.")
+    end
+  end
+
+  describe "#plain_summary" do
+    it "returns nil when the page has no summary" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.plain_summary.should be_nil
+    end
+
+    it "strips markup and collapses whitespace from the rendered summary (gh#491)" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.summary = "## Heading\n\nbody"
+      page.summary_html = "<h2>Heading</h2>\n<p>body</p>"
+      # No literal newlines, headings, or tags — safe for a meta attribute.
+      page.plain_summary.should eq("Heading body")
+    end
+
+    it "decodes HTML entities so escaped chars aren't double-escaped (gh#491)" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.summary = "code"
+      page.summary_html = "<pre><code>A--&gt;B</code></pre>"
+      page.plain_summary.should eq("A-->B")
+    end
+
+    it "soft-truncates on a word boundary with an ellipsis" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.summary_html = "<p>#{"word " * 60}</p>"
+      result = page.plain_summary(20).not_nil!
+      result.size.should be <= 21 # 20 chars + ellipsis, trimmed at a space
+      result.ends_with?("…").should be_true
+      result.should_not contain("  ")
+    end
+
+    it "falls back to the raw summary when summary_html is unset" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.summary = "Just plain text."
+      page.plain_summary.should eq("Just plain text.")
+    end
+  end
+
+  # `#` and `?` end the path component of a URL, so a page whose filename (or
+  # slug/path) contains one published to `public/posts/a#b/index.html` while
+  # every link, permalink and sitemap <loc> hwaro emitted for it pointed at
+  # `/posts/a` — a 404.
+  describe "#url=" do
+    it "percent-encodes a fragment or query delimiter in the path" do
+      page = Hwaro::Models::Page.new("posts/a#b.md")
+      page.url = "/posts/a#b/"
+      page.url.should eq("/posts/a%23b/")
+      page.generate_permalink("https://example.com").should eq("https://example.com/posts/a%23b/")
+
+      page.url = "/posts/a?b/"
+      page.url.should eq("/posts/a%3Fb/")
+    end
+
+    it "leaves an ordinary URL byte-identical" do
+      page = Hwaro::Models::Page.new("posts/a.md")
+      ["/posts/hello-world/", "/ko/posts/한글/", "/404.html", "/"].each do |url|
+        page.url = url
+        page.url.should eq(url)
+      end
+    end
+
+    # `%` itself is deliberately untouched, so assigning an already-encoded
+    # URL back onto the page cannot grow a `%2523`.
+    it "is idempotent" do
+      page = Hwaro::Models::Page.new("posts/a#b.md")
+      page.url = "/posts/a#b/"
+      page.url = page.url
+      page.url.should eq("/posts/a%23b/")
+    end
+
+    # The escaped URL must still resolve to the directory the page actually
+    # writes to, which the output-path computation reaches by decoding again.
+    it "still names the directory the page is written to" do
+      page = Hwaro::Models::Page.new("posts/a#b.md")
+      page.url = "/posts/a#b/"
+      segments, refused = Hwaro::Utils::PathUtils.split_safe_segments(page.url.lchop("/"))
+      refused.should be_false
+      segments.should eq(["posts", "a#b"])
     end
   end
 
@@ -300,7 +430,7 @@ describe Hwaro::Models::Page do
 
     it "initializes extra as empty hash" do
       page = Hwaro::Models::Page.new("test.md")
-      page.extra.should eq({} of String => String | Bool | Int64 | Float64 | Array(String))
+      page.extra.should eq({} of String => Hwaro::Models::ExtraValue)
     end
 
     it "can set extra metadata" do
@@ -318,7 +448,7 @@ describe Hwaro::Models::Page do
       page.extra["array_val"] = ["a", "b"]
 
       page.extra["string_val"].should eq("hello")
-      page.extra["bool_val"].should eq(true)
+      page.extra["bool_val"].should be_true
       page.extra["int_val"].should eq(42_i64)
       page.extra["float_val"].should eq(3.14)
       page.extra["array_val"].should eq(["a", "b"])
@@ -346,9 +476,9 @@ describe Hwaro::Models::Page do
       page.in_search_index.should be_false
     end
 
-    it "initializes insert_anchor_links as false" do
+    it "initializes insert_anchor_links as nil (site config decides)" do
       page = Hwaro::Models::Page.new("test.md")
-      page.insert_anchor_links.should be_false
+      page.insert_anchor_links.should be_nil
     end
 
     it "can set insert_anchor_links" do
@@ -472,6 +602,93 @@ describe Hwaro::Models::Page do
         assets.should_not contain("blog/other.markdown")
       end
     end
+
+    it "honors [content.files] allow/disallow when content_files is enabled" do
+      Dir.mktmpdir do |dir|
+        bundle = File.join(dir, "post")
+        nested = File.join(bundle, "private")
+        FileUtils.mkdir_p(nested)
+        File.write(File.join(bundle, "index.md"), "# Post")
+        File.write(File.join(nested, "robots.txt"), "User-agent: *")
+        File.write(File.join(bundle, "photo.png"), "fake png")
+
+        page = Hwaro::Models::Page.new("post/index.md")
+        page.is_index = true
+
+        content_files = Hwaro::Models::ContentFilesConfig.new
+        content_files.allow_extensions = Hwaro::Models::ContentFilesConfig.normalize_extensions(["png"])
+
+        assets = page.collect_assets(dir, content_files)
+        assets.should contain("post/photo.png")
+        assets.should_not contain("post/private/robots.txt")
+      end
+    end
+
+    # Regression: `content/index.md` is the homepage, not a bundle spanning the
+    # whole site. Treating it as one republished every non-markdown file
+    # anywhere under content/ into the output root — including files no
+    # `[content.files]` allowlist had opted in, because a config without that
+    # section disables the filter entirely. Root-level files publish through
+    # `[content.files]` instead, which is the documented path for them.
+    it "never treats the content root itself as a page bundle" do
+      Dir.mktmpdir do |dir|
+        FileUtils.mkdir_p(File.join(dir, "private"))
+        File.write(File.join(dir, "index.md"), "# Home")
+        File.write(File.join(dir, "photo.png"), "fake png")
+        File.write(File.join(dir, "private", "internal.pdf"), "secret")
+
+        page = Hwaro::Models::Page.new("index.md")
+        page.is_index = true
+
+        # No [content.files] configured — the unfiltered path.
+        page.collect_assets(dir, Hwaro::Models::ContentFilesConfig.new).should be_empty
+      end
+    end
+
+    # Regression: a nested `index.md`/`_index.md` is a separate page that
+    # publishes its own assets; recursing into it made every ancestor index
+    # re-copy the same files (and, once a nested bundle's `slug` moved its
+    # URL, publish them at a second, stale location).
+    it "stops recursion at nested bundles and sections" do
+      Dir.mktmpdir do |dir|
+        bundle = File.join(dir, "post")
+        FileUtils.mkdir_p(File.join(bundle, "gallery"))
+        FileUtils.mkdir_p(File.join(bundle, "child"))
+        FileUtils.mkdir_p(File.join(bundle, "sub-section"))
+        File.write(File.join(bundle, "index.md"), "# Post")
+        File.write(File.join(bundle, "gallery", "a.png"), "own asset")
+        File.write(File.join(bundle, "child", "index.md"), "# Child")
+        File.write(File.join(bundle, "child", "b.png"), "child asset")
+        File.write(File.join(bundle, "sub-section", "_index.md"), "# Sub")
+        File.write(File.join(bundle, "sub-section", "c.png"), "section asset")
+
+        page = Hwaro::Models::Page.new("post/index.md")
+        page.is_index = true
+
+        assets = page.collect_assets(dir)
+        assets.should contain("post/gallery/a.png")
+        assets.should_not contain("post/child/b.png")
+        assets.should_not contain("post/sub-section/c.png")
+      end
+    end
+
+    it "collects every non-md file when content_files is not configured" do
+      Dir.mktmpdir do |dir|
+        page_dir = File.join(dir, "bundle")
+        FileUtils.mkdir_p(page_dir)
+        File.write(File.join(page_dir, "index.md"), "# Test")
+        File.write(File.join(page_dir, "notes.txt"), "notes")
+        File.write(File.join(page_dir, "image.png"), "fake png")
+
+        page = Hwaro::Models::Page.new("bundle/index.md")
+        page.is_index = true
+
+        # Disabled config (no allow_extensions) must preserve legacy behavior.
+        assets = page.collect_assets(dir, Hwaro::Models::ContentFilesConfig.new)
+        assets.should contain("bundle/notes.txt")
+        assets.should contain("bundle/image.png")
+      end
+    end
   end
 end
 
@@ -533,5 +750,38 @@ describe "#has_redirect?" do
     page = Hwaro::Models::Page.new("test.md")
     page.redirect_to = "/target"
     page.has_redirect?.should be_true
+  end
+end
+
+# test case for taxonomy_values method:
+describe "#taxonomy_values" do
+  it "returns values from @taxonomies when the key exists" do
+    page = Hwaro::Models::Page.new("test.md")
+    page.taxonomies["categories"] = ["news", "tech"]
+    page.taxonomy_values("categories").should eq(["news", "tech"])
+  end
+
+  it "falls back to @tags when name is 'tags' and not in taxonomies" do
+    page = Hwaro::Models::Page.new("test.md")
+    page.tags = ["crystal", "oss"]
+    page.taxonomy_values("tags").should eq(["crystal", "oss"])
+  end
+
+  it "falls back to @authors when name is 'authors' and not in taxonomies" do
+    page = Hwaro::Models::Page.new("test.md")
+    page.authors = ["A", "B"]
+    page.taxonomy_values("authors").should eq(["A", "B"])
+  end
+
+  it "returns an empty array for an unknown taxonomy name" do
+    page = Hwaro::Models::Page.new("test.md")
+    page.taxonomy_values("series").should eq([] of String)
+  end
+
+  it "@taxonomies entry wins over @tags when both are set" do
+    page = Hwaro::Models::Page.new("test.md")
+    page.tags = ["from-field"]
+    page.taxonomies["tags"] = ["from-taxonomies"]
+    page.taxonomy_values("tags").should eq(["from-taxonomies"])
   end
 end

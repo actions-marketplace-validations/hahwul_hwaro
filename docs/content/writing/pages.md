@@ -1,11 +1,11 @@
 +++
 title = "Pages"
 description = "Create pages from Markdown with front matter metadata"
-weight = 2
+weight = 1
 toc = true
 +++
 
-Pages are Markdown files that become HTML pages on your site.
+Pages are Markdown files that become HTML pages on your site. This page covers **how to write content** — front matter fields, Markdown syntax, and file organization. For how these fields are accessed in templates, see the [Data Model](/templates/data-model/#page).
 
 ## Basic Structure
 
@@ -18,7 +18,27 @@ date = "2024-01-15"
 Your content in **Markdown**.
 ```
 
-The `+++` block is TOML front matter. Content below becomes HTML.
+The `+++` block is TOML front matter. YAML (`---` delimiters) and JSON (a top-level `{...}` object at the start of the file) are also supported. Content below becomes HTML.
+
+```markdown
+---
+title: "My Page"
+date: "2024-01-15"
+---
+
+Your content in **Markdown**.
+```
+
+```markdown
+{
+  "title": "My Page",
+  "date": "2024-01-15"
+}
+
+Your content in **Markdown**.
+```
+
+For JSON, the first balanced `{...}` at the very start of the file is the front matter — no fence is needed. The file must begin with `{` (no leading whitespace).
 
 ## Front Matter
 
@@ -32,7 +52,7 @@ The `+++` block is TOML front matter. Content below becomes HTML.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| date | string | — | Publication date (YYYY-MM-DD) |
+| date | string | — | Publication date: `YYYY-MM-DD`, optionally with time (`YYYY-MM-DD HH:MM:SS` or RFC 3339 datetime); unquoted TOML/YAML dates also work |
 | description | string | — | SEO description |
 | draft | bool | false | Exclude from production builds |
 | template | string | "page" | Template to use |
@@ -106,6 +126,21 @@ Build with expired content: `hwaro build --include-expired`
 
 Pages expiring within 7 days generate a build warning.
 
+### Future-Dated Content
+
+Pages with a `date` in the future are automatically excluded from builds. This is useful for scheduling content.
+
+```markdown
++++
+title = "Coming Soon"
+date = 2099-01-01
++++
+
+Published only after the date arrives.
+```
+
+Build with future content: `hwaro build --include-future`
+
 ### Series Post
 
 ```markdown
@@ -118,7 +153,7 @@ series_weight = 1
 First part of the series.
 ```
 
-In templates, access `page.series`, `page.series_index`, and `page.series_pages`.
+With `[series]` enabled in `config.toml`, `page.series_index` (1-based position) and `page.series_pages` (all pages in the series) are computed at build time — they are template-only values, not front matter fields. See [Data Model](/templates/data-model/#computed-properties).
 
 ### Custom Template
 
@@ -175,6 +210,41 @@ pros = ["Fast", "Reliable"]
 
 Access in templates: `{{ page.extra.rating }}`
 
+## Full Front Matter Reference
+
+All available fields in one block. Copy and remove what you don't need.
+
+```toml
++++
+title = "Page Title"
+date = "2024-01-15"
+updated = "2024-02-01"
+description = "SEO description"
+draft = false
+template = "page"
+weight = 0
+slug = "custom-slug"
+path = "custom/path"
+aliases = ["/old-url/"]
+image = "/images/cover.png"
+tags = ["tag1", "tag2"]
+categories = ["category1"]
+authors = ["Author Name"]
+toc = true
+in_search_index = true
+in_sitemap = true
+insert_anchor_links = true
+render = true
+redirect_to = ""
+expires = 2025-12-31
+series = "Series Name"
+series_weight = 1
+
+[extra]
+custom_field = "value"
++++
+```
+
 ## Content Summary
 
 Use `<!-- more -->` to define a summary:
@@ -228,7 +298,7 @@ console.log("Hello");
 | Cell   | Cell   |
 ```
 
-Table cells support inline Markdown: **bold**, *italic*, `code spans`, [links](url), ![images](url), and ~~strikethrough~~.
+Table cells support inline Markdown: **bold**, *italic*, `code spans`, `[links](url)`, `![images](url)`, and ~~strikethrough~~.
 
 ```markdown
 | Feature        | Example                          |
@@ -259,11 +329,74 @@ This is useful because you don't need to know the final URL — Hwaro calculates
 | `@/blog/_index.md` | `/blog/` |
 | `@/blog/post.md#section` | `/blog/post/#section` |
 
+#### Strict mode
+
+To fail the build instead of just warning, opt in via `config.toml`:
+
+```toml
+[links]
+broken_internal = "error"  # default: "warn"
+```
+
+In error mode the build collects every unresolved `@/` link across all pages and fails with a single aggregated list (`source.md → @/target (reason)`), mapping to exit code 5 for CI. During `hwaro serve` the failure appears in the error overlay and the server keeps running.
+
+Caveat with `--cache`: only re-rendered pages are re-checked on warm builds, so a broken link inside an unchanged page won't resurface until that page renders again. CI should run a cold build (no `--cache`) for a complete check.
+
 ### Blockquotes
 
 ```markdown
 > Quote text
 ```
+
+### Admonitions
+
+GitHub-style alert blocks render as styled callouts. Recognised types: `NOTE`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`.
+
+```markdown
+> [!NOTE]
+> Pay attention to this paragraph.
+
+> [!WARNING]
+>
+> Body can also live in its own paragraph.
+```
+
+The output is a `<div class="admonition admonition-{type}">` with a title paragraph (`<p class="admonition-title">`) followed by the body. Style it from your CSS — Hwaro emits semantic markup only.
+
+Disable by setting `admonitions = false` under `[markdown]` in `config.toml`.
+
+Limitations: matching is type-case-sensitive (`[!NOTE]` only, not `[!note]`), and a nested blockquote inside an admonition body closes the outer admonition early. There is no inline escape — backslash-escaping (`\[!NOTE\]`) renders the same characters and still triggers the admonition, so disable the feature if you need to render the literal token.
+
+### Custom Heading IDs
+
+Append `{#custom-id}` to a heading line to override the auto-generated slug. Useful when you want stable anchor URLs that don't break on title edits.
+
+```markdown
+## Installation Guide {#install}
+```
+
+Renders as `<h2 id="install">Installation Guide</h2>`. The TOC and any `[link](#install)` will use the custom id.
+
+Allowed id characters: letters, digits, `_`, `-`, `:`. The id must start with a letter. CommonMark allows up to 3 leading spaces before an ATX heading; deeper indentation makes the line a code block, in which case `{#id}` is not applied.
+
+Disable by setting `heading_ids = false` under `[markdown]` in `config.toml`.
+
+Custom heading IDs require `markdown.safe = false`. Under safe mode the `{#id}` syntax is stripped from the rendered output and no id is applied — use raw HTML headings if you need both safe mode and explicit ids. Writing the same `{#id}` twice in one page produces duplicate id attributes; the first anchor wins.
+
+This `{#id}` shorthand is a special case of the more general `{#id .class key=val}` attribute block (`[markdown] attributes = true`), which also applies to inline images — see [Markdown Extensions](/features/markdown-extensions/).
+
+### Definition Lists
+
+```markdown
+Term
+: Definition body
+
+Another term
+: Definition with **bold**, *italic*, `code`, [a link](https://example.com), and ~~strikethrough~~
+: A second definition for the same term
+```
+
+Inline Markdown works inside both terms and definitions. Raw HTML is escaped for safety.
 
 ## Asset Colocation
 

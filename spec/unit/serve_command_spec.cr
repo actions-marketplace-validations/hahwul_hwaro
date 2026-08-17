@@ -47,6 +47,27 @@ describe Hwaro::CLI::Commands::ServeCommand do
       options.port.should eq(8080)
     end
 
+    it "raises HwaroError(HWARO_E_USAGE) when --port is out of range or non-numeric" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+
+      ["0", "-1", "99999", "abc", ""].each do |bad|
+        err = expect_raises(Hwaro::HwaroError) do
+          cmd.test_parse_options(["--port", bad])
+        end
+        err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      end
+    end
+
+    it "accepts the inclusive --port boundary values 1 and 65535" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+
+      _, options = cmd.test_parse_options(["--port", "1"])
+      options.port.should eq(1)
+
+      _, options = cmd.test_parse_options(["--port", "65535"])
+      options.port.should eq(65535)
+    end
+
     it "parses --bind flag" do
       cmd = Hwaro::CLI::Commands::ServeCommand.new
       _, options = cmd.test_parse_options(["--bind", "127.0.0.1"])
@@ -68,16 +89,242 @@ describe Hwaro::CLI::Commands::ServeCommand do
       options.port.should eq(4000)
     end
 
-    it "defaults live_reload to false" do
+    it "defaults live_reload to true" do
       cmd = Hwaro::CLI::Commands::ServeCommand.new
       _, options = cmd.test_parse_options([] of String)
-      options.live_reload.should be_false
+      options.live_reload.should be_true
     end
 
-    it "sets live_reload to true when --live-reload is passed" do
+    it "keeps live_reload true when --live-reload is passed (backwards compat no-op)" do
       cmd = Hwaro::CLI::Commands::ServeCommand.new
       _, options = cmd.test_parse_options(["--live-reload"])
       options.live_reload.should be_true
+    end
+
+    it "sets live_reload to false when --no-live-reload is passed" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--no-live-reload"])
+      options.live_reload.should be_false
+    end
+
+    it "defaults skip_og_image to false" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.skip_og_image.should be_false
+    end
+
+    it "sets skip_og_image to true when --skip-og-image is passed" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--skip-og-image"])
+      options.skip_og_image.should be_true
+    end
+
+    it "defaults skip_image_processing to false" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.skip_image_processing.should be_false
+    end
+
+    it "sets skip_image_processing to true when --skip-image-processing is passed" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--skip-image-processing"])
+      options.skip_image_processing.should be_true
+    end
+
+    it "propagates skip flags to build options" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--skip-og-image", "--skip-image-processing"])
+      build_options = options.to_build_options
+      build_options.skip_og_image.should be_true
+      build_options.skip_image_processing.should be_true
+    end
+
+    it "defaults cache to false" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.cache.should be_false
+    end
+
+    it "parses --cache flag" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--cache"])
+      options.cache.should be_true
+    end
+
+    it "defaults stream to false" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.stream.should be_false
+    end
+
+    it "parses --stream flag" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--stream"])
+      options.stream.should be_true
+    end
+
+    it "defaults memory_limit to nil" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.memory_limit.should be_nil
+    end
+
+    it "parses --memory-limit flag" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--memory-limit", "512M"])
+      options.memory_limit.should eq("512M")
+    end
+
+    it "propagates cache/stream/memory-limit to build options" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--cache", "--stream", "--memory-limit", "2G"])
+      build_options = options.to_build_options
+      build_options.cache.should be_true
+      build_options.stream.should be_true
+      build_options.memory_limit.should eq("2G")
+      build_options.streaming?.should be_true
+    end
+
+    it "defaults fast_start to false" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.fast_start.should be_false
+      options.fast_start_count.should eq(20)
+    end
+
+    it "enables fast_start when --fast-start is passed" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--fast-start"])
+      options.fast_start.should be_true
+      options.fast_start_count.should eq(20)
+    end
+
+    it "parses --fast-start-count and implies --fast-start" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--fast-start-count", "50"])
+      options.fast_start.should be_true
+      options.fast_start_count.should eq(50)
+    end
+
+    it "raises HwaroError(HWARO_E_USAGE) when --fast-start-count is not a positive integer" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+
+      ["0", "-1", "abc", ""].each do |bad|
+        err = expect_raises(Hwaro::HwaroError) do
+          cmd.test_parse_options(["--fast-start-count", bad])
+        end
+        err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      end
+    end
+
+    it "propagates fast_start fields to build options" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--fast-start", "--fast-start-count", "5"])
+      build_options = options.to_build_options
+      build_options.fast_start.should be_true
+      build_options.fast_start_count.should eq(5)
+    end
+
+    it "defaults workers to 0 (auto)" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([] of String)
+      options.workers.should eq(0)
+    end
+
+    it "parses --jobs into the worker count" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--jobs", "2"])
+      options.workers.should eq(2)
+    end
+
+    it "raises HwaroError(HWARO_E_USAGE) when --jobs is not a positive integer" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+
+      ["0", "-1", "abc", ""].each do |bad|
+        err = expect_raises(Hwaro::HwaroError) do
+          cmd.test_parse_options(["--jobs", bad])
+        end
+        err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      end
+    end
+
+    it "propagates workers to build options via to_build_options" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--jobs", "3"])
+      options.to_build_options.workers.should eq(3)
+    end
+
+    it "parses --header and stores in options.headers (CLI only at parse time)" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--header", "X-Test: hello", "--header", "Cache-Control=no-store"])
+      options.headers["X-Test"].should eq("hello")
+      options.headers["Cache-Control"].should eq("no-store")
+      options.headers.size.should eq(2)
+    end
+
+    it "supports --header with = separator and whitespace" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options(["--header", "X-Foo = bar baz"])
+      options.headers["X-Foo"].should eq("bar baz")
+    end
+
+    it "preserves a colon inside the --header value (split on first colon only)" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      _, options = cmd.test_parse_options([
+        "--header", "Refresh: 5; url=https://example.com",
+        "--header", "CSP: default-src https://a.com",
+      ])
+      # Value is .strip-ped, but the colon(s) after the first are kept intact.
+      options.headers["Refresh"].should eq("5; url=https://example.com")
+      options.headers["CSP"].should eq("default-src https://a.com")
+    end
+
+    it "raises on invalid --header (empty key)" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.test_parse_options(["--header", ": value"])
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+    end
+
+    it "handles bare --header token (no separator) gracefully instead of IndexError" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.test_parse_options(["--header", "JustKeyNoValue"])
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      # Use to_s because Exception#message is String? in the base class
+      err.message.to_s.should contain("Invalid --header value")
+    end
+
+    it "raises on --header containing control characters (CRLF injection guard)" do
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+      # Pass the flag and the bad value as two separate argv elements (the value itself contains \n)
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.test_parse_options(["--header", "X-Bad: foo\nbar"])
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+
+      err2 = expect_raises(Hwaro::HwaroError) do
+        cmd.test_parse_options(["--header", "X-Bad2: foo\r\nX-Inject: evil"])
+      end
+      err2.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+    end
+  end
+
+  describe "#run" do
+    it "raises HwaroError(HWARO_E_IO) when the input directory is missing" do
+      missing = File.join(Dir.tempdir, "hwaro-does-not-exist-#{Random.rand(1_000_000)}")
+      cmd = Hwaro::CLI::Commands::ServeCommand.new
+
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.run(["-i", missing])
+      end
+
+      err.code.should eq(Hwaro::Errors::HWARO_E_IO)
+      err.exit_code.should eq(6)
+      err.category.should eq(:io)
+      err.message.not_nil!.should contain(missing)
     end
   end
 
@@ -164,15 +411,40 @@ describe Hwaro::CLI::Commands::ServeCommand do
       flag.not_nil!.takes_value.should be_false
     end
 
+    it "has skip-og-image flag" do
+      meta = Hwaro::CLI::Commands::ServeCommand.metadata
+      flag_longs = meta.flags.map(&.long)
+      flag_longs.should contain("--skip-og-image")
+    end
+
+    it "has skip-image-processing flag" do
+      meta = Hwaro::CLI::Commands::ServeCommand.metadata
+      flag_longs = meta.flags.map(&.long)
+      flag_longs.should contain("--skip-image-processing")
+    end
+
     it "has live-reload flag" do
       meta = Hwaro::CLI::Commands::ServeCommand.metadata
       flag_longs = meta.flags.map(&.long)
       flag_longs.should contain("--live-reload")
     end
 
+    it "has no-live-reload flag" do
+      meta = Hwaro::CLI::Commands::ServeCommand.metadata
+      flag_longs = meta.flags.map(&.long)
+      flag_longs.should contain("--no-live-reload")
+    end
+
     it "live-reload flag does not take a value" do
       meta = Hwaro::CLI::Commands::ServeCommand.metadata
       flag = meta.flags.find { |f| f.long == "--live-reload" }
+      flag.should_not be_nil
+      flag.not_nil!.takes_value.should be_false
+    end
+
+    it "no-live-reload flag does not take a value" do
+      meta = Hwaro::CLI::Commands::ServeCommand.metadata
+      flag = meta.flags.find { |f| f.long == "--no-live-reload" }
       flag.should_not be_nil
       flag.not_nil!.takes_value.should be_false
     end
@@ -278,14 +550,7 @@ end
 describe Hwaro::CLI::Commands::CompletionCommand do
   describe "bash completion generation" do
     it "generates bash completion script" do
-      cmd = Hwaro::CLI::Commands::CompletionCommand.new
-      io = IO::Memory.new
-      original_io = Hwaro::Logger
-      Hwaro::Logger.io = io
-
-      # Use a pipe to capture stdout
-      reader, writer = IO.pipe
-      original_stdout = STDOUT
+      Hwaro::Logger.io = IO::Memory.new
 
       # We'll test the generate methods indirectly through metadata
       # The script generation is private, so we test the command structure

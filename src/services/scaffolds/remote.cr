@@ -9,8 +9,10 @@
 
 require "http/client"
 require "json"
+require "socket"
 require "uri"
 require "./base"
+require "../../utils/errors"
 require "../../utils/path_utils"
 
 module Hwaro
@@ -60,8 +62,25 @@ module Hwaro
           @shortcode_data
         end
 
-        def config_content(skip_taxonomies : Bool = false) : String
+        # Remote scaffolds mirror the upstream repo verbatim; we don't
+        # inject a built-in `default.md` because the remote might deliberately
+        # not use archetypes, or already ship its own under `archetypes/`.
+        def archetype_files : Hash(String, String)
+          {} of String => String
+        end
+
+        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
           @config_data
+        end
+
+        # If the remote provided a config.toml, use it as-is (even for --minimal-config).
+        # If not (remote can be templates-only), fall back to the built-in minimal generator.
+        def minimal_config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
+          if @config_data.strip.empty?
+            super
+          else
+            @config_data
+          end
         end
 
         # Check if a scaffold source string represents a remote scaffold
@@ -74,7 +93,9 @@ module Hwaro
 
         # Parse a remote source string into {owner, repo, subpath}
         def self.parse_source(source : String) : {String, String, String}
-          if source.starts_with?("github:") || source.starts_with?("git:")
+          # `git://github.com/owner/repo` is a protocol URL, not the `git:owner/repo`
+          # shorthand — route it to the URL parser below, which handles it correctly.
+          if source.starts_with?("github:") || (source.starts_with?("git:") && !source.starts_with?("git://"))
             raw = source.sub(/^(?:github|git):/, "")
             parts = raw.split("/")
             if parts.size < 2 || parts[0].empty? || parts[1].empty?
@@ -120,8 +141,9 @@ module Hwaro
           targets = [] of {category: Symbol, key: String, full_path: String, display: String}
 
           tree.each do |entry|
-            full_path = entry["path"].as_s
-            next unless entry["type"].as_s == "blob"
+            full_path = entry["path"]?.try(&.as_s?)
+            next unless full_path
+            next unless entry["type"]?.try(&.as_s?) == "blob"
 
             unless prefix.empty?
               next unless full_path.starts_with?(prefix)
@@ -151,9 +173,11 @@ module Hwaro
           end
 
           if targets.empty?
-            Logger.warn "No scaffold files found in #{label}."
-            Logger.warn "Expected: config.toml, templates/, or static/ directories."
-            return
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_CONTENT,
+              message: "No scaffold files found in #{label}.",
+              hint: "Remote scaffolds must contain a config.toml, templates/, static/, or content/ directory.",
+            )
           end
 
           # Download files in parallel using fibers
@@ -161,13 +185,11 @@ module Hwaro
 
           targets.each do |target|
             spawn do
-              begin
-                body = fetch_file(owner, repo, default_branch, target[:full_path])
-                channel.send({category: target[:category], key: target[:key], display: target[:display], body: body})
-              rescue ex
-                Logger.warn "Failed to fetch #{target[:display]}: #{ex.message}"
-                channel.send({category: target[:category], key: target[:key], display: target[:display], body: ""})
-              end
+              body = fetch_file(owner, repo, default_branch, target[:full_path])
+              channel.send({category: target[:category], key: target[:key], display: target[:display], body: body})
+            rescue ex
+              Logger.warn "Failed to fetch #{target[:display]}: #{ex.message}"
+              channel.send({category: target[:category], key: target[:key], display: target[:display], body: ""})
             end
           end
 
@@ -245,27 +267,53 @@ module Hwaro
           unless response.status_code == 200
             case response.status_code
             when 404
-              raise "Repository not found: #{owner}/#{repo}"
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_NETWORK,
+                message: "Remote scaffold not found: #{owner}/#{repo}",
+                hint: "Check the repository name and that it is public.",
+              )
             when 403
-              raise "GitHub API rate limit exceeded. Try again later."
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_NETWORK,
+                message: "GitHub API rate limit exceeded while fetching #{owner}/#{repo}",
+                hint: "Try again later or set GITHUB_TOKEN for higher limits.",
+              )
             else
-              raise "Failed to fetch repository info: HTTP #{response.status_code}"
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_NETWORK,
+                message: "Failed to fetch repository info for #{owner}/#{repo}: HTTP #{response.status_code}",
+              )
             end
           end
 
           data = JSON.parse(response.body)
-          data["default_branch"].as_s
+          data["default_branch"]?.try(&.as_s?) || raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_NETWORK,
+            message: "GitHub repo info for #{owner}/#{repo} is missing 'default_branch'",
+          )
         end
 
         private def fetch_tree(owner : String, repo : String, branch : String) : Array(JSON::Any)
           response = github_api_get("/repos/#{owner}/#{repo}/git/trees/#{branch}?recursive=1")
 
           unless response.status_code == 200
-            raise "Failed to fetch repository tree: HTTP #{response.status_code}"
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_NETWORK,
+              message: "Failed to fetch repository tree for #{owner}/#{repo}@#{branch}: HTTP #{response.status_code}",
+            )
           end
 
           data = JSON.parse(response.body)
-          data["tree"].as_a
+          # GitHub sets `truncated` when the recursive tree exceeds its size
+          # limit and returns a PARTIAL listing — warn so silently-dropped
+          # scaffold files don't read as a clean checkout.
+          if data["truncated"]?.try(&.as_bool?)
+            Logger.warn "GitHub truncated the recursive tree for #{owner}/#{repo}@#{branch}; the scaffold may be incomplete (large repository)."
+          end
+          data["tree"]?.try(&.as_a?) || raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_NETWORK,
+            message: "GitHub tree response for #{owner}/#{repo}@#{branch} is missing 'tree'",
+          )
         end
 
         private def fetch_file(owner : String, repo : String, branch : String, path : String) : String
@@ -308,6 +356,12 @@ module Hwaro
 
           begin
             client.get(path, headers: headers)
+          rescue ex : Socket::Error | IO::Error | OpenSSL::SSL::Error
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_NETWORK,
+              message: "Failed to reach GitHub API (#{path}): #{ex.message}",
+              hint: "Check your network connection and try again.",
+            )
           ensure
             client.close
           end

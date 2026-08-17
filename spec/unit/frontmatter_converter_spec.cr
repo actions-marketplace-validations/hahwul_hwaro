@@ -42,6 +42,26 @@ describe Hwaro::Services::FrontmatterConverter do
       content = "Some text\n---\ntitle: Test\n---\n"
       converter.detect_format(content).should eq(Hwaro::Services::FrontmatterFormat::Unknown)
     end
+
+    it "detects JSON frontmatter" do
+      content = %({"title": "Test"}\n\n# Content)
+      converter.detect_format(content).should eq(Hwaro::Services::FrontmatterFormat::JSON)
+    end
+
+    it "detects multiline JSON frontmatter" do
+      content = "{\n  \"title\": \"Test\",\n  \"draft\": false\n}\n\n# Content"
+      converter.detect_format(content).should eq(Hwaro::Services::FrontmatterFormat::JSON)
+    end
+
+    it "does not detect JSON when braces never balance" do
+      content = %({"title": "Test")
+      converter.detect_format(content).should eq(Hwaro::Services::FrontmatterFormat::Unknown)
+    end
+
+    it "does not detect JSON when { is not at start" do
+      content = %( {"title": "Test"}\n\n# Content)
+      converter.detect_format(content).should eq(Hwaro::Services::FrontmatterFormat::Unknown)
+    end
   end
 
   describe "#convert_file" do
@@ -265,6 +285,29 @@ describe Hwaro::Services::FrontmatterConverter do
       result.success.should be_false
       result.message.should contain("not found")
     end
+
+    it "skips unfollowable symlinks instead of counting them as errors" do
+      # Regression: `Dir.glob` hands a symlink cycle back as a plain path, so
+      # `File.read` failed with ELOOP and the file landed in `error_count` —
+      # `tool convert` reported failure (exit non-zero) on a content tree
+      # `hwaro build` walks fine.
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\n+++\n\n# Post")
+        File.symlink("loop.md", File.join(content_dir, "loop.md"))
+        File.symlink("gone.md", File.join(content_dir, "dangling.md"))
+
+        converter = Hwaro::Services::FrontmatterConverter.new(content_dir)
+        result = converter.convert_to_yaml
+
+        result.success.should be_true
+        result.converted_count.should eq(1)
+        result.error_count.should eq(0)
+        File.read(File.join(content_dir, "post.md")).should start_with("---\n")
+      end
+    end
   end
 
   describe "#convert_to_toml" do
@@ -353,6 +396,102 @@ describe Hwaro::Services::FrontmatterConverter do
     end
   end
 
+  describe "JSON conversions" do
+    it "converts YAML file to JSON" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+        File.write(file_path, "---\ntitle: Hello\ndraft: false\ntags:\n  - a\n  - b\n---\n\n# Body")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::JSON).should be_true
+
+        converted = File.read(file_path)
+        converted.should start_with("{")
+        parsed = JSON.parse(converted[0, converted.index!("}\n") + 1])
+        parsed["title"].as_s.should eq("Hello")
+        parsed["draft"].as_bool.should be_false
+        parsed["tags"].as_a.map(&.as_s).should eq(["a", "b"])
+        converted.should contain("# Body")
+      end
+    end
+
+    it "converts TOML file to JSON" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+        File.write(file_path, "+++\ntitle = \"Hello\"\nweight = 5\n+++\n\n# Body")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::JSON).should be_true
+
+        converted = File.read(file_path)
+        parsed = JSON.parse(converted[0, converted.index!("}\n") + 1])
+        parsed["title"].as_s.should eq("Hello")
+        parsed["weight"].as_i.should eq(5)
+      end
+    end
+
+    it "converts JSON file to TOML" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+        File.write(file_path, %({"title": "Hi", "draft": true}\n\n# Body))
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        converted.should start_with("+++\n")
+        converted.should contain(%(title = "Hi"))
+        converted.should contain("draft = true")
+        converted.should contain("# Body")
+      end
+    end
+
+    it "converts JSON file to YAML" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+        File.write(file_path, %({"title": "Hi", "tags": ["x", "y"]}\n\n# Body))
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::YAML).should be_true
+
+        converted = File.read(file_path)
+        converted.should start_with("---\n")
+        converted.should contain("title:")
+        converted.should contain("Hi")
+        converted.should contain("# Body")
+      end
+    end
+
+    it "skips JSON files already in target JSON format" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+        original = %({"title": "Hi"}\n\n# Body)
+        File.write(file_path, original)
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::JSON).should be_false
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    it "convert_to_json converts a mixed directory" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+        File.write(File.join(content_dir, "a.md"), "+++\ntitle = \"A\"\n+++\n\n# A")
+        File.write(File.join(content_dir, "b.md"), "---\ntitle: B\n---\n\n# B")
+        File.write(File.join(content_dir, "c.md"), %({"title": "C"}\n\n# C))
+
+        converter = Hwaro::Services::FrontmatterConverter.new(content_dir)
+        result = converter.convert_to_json
+
+        result.success.should be_true
+        result.converted_count.should eq(2)
+        result.skipped_count.should eq(1)
+      end
+    end
+  end
+
   describe "round-trip conversion" do
     it "preserves data through YAML -> TOML -> YAML" do
       Dir.mktmpdir do |dir|
@@ -375,6 +514,74 @@ describe Hwaro::Services::FrontmatterConverter do
         final.should start_with("---\n")
         final.should contain("Round Trip")
         final.should contain("draft: true")
+        final.should contain(original_body)
+      end
+    end
+
+    # Regression: the close-delimiter regex `\s*$\n?` greedily ate two
+    # trailing newlines, so a blank line between the front matter and the
+    # body was silently dropped on every conversion. Round-tripping a
+    # well-formatted file would visibly change its whitespace.
+    it "preserves the blank line between front matter and body on round-trip" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "spaced.md")
+        original = "+++\ntitle = \"Spaced\"\n+++\n\nFirst paragraph.\n"
+        File.write(file_path, original)
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::YAML).should be_true
+        intermediate = File.read(file_path)
+        # YAML auto-decides quoting; what matters is the blank line is preserved
+        # between the closing `---` and the first body paragraph.
+        intermediate.should contain("---\n\nFirst paragraph.\n")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    # When the author didn't include a blank line, conversion must not add
+    # one either — otherwise a "fix" would still drift formatting.
+    it "does not invent a blank line that wasn't there" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "tight.md")
+        original = "+++\ntitle = \"Tight\"\n+++\nFirst paragraph.\n"
+        File.write(file_path, original)
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::YAML).should be_true
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    it "preserves data through JSON -> TOML -> YAML -> JSON" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "test.md")
+
+        original_body = "\n# Trip\n\nBody paragraph.\n"
+        File.write(file_path, %({"title": "Round Trip", "draft": true, "weight": 5, "tags": ["a", "b"]}\n#{original_body}))
+
+        # JSON -> TOML
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+        File.read(file_path).should start_with("+++\n")
+
+        # TOML -> YAML
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::YAML).should be_true
+        File.read(file_path).should start_with("---\n")
+
+        # YAML -> JSON
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::JSON).should be_true
+        final = File.read(file_path)
+        final.should start_with("{")
+
+        end_idx = final.index!("}\n") + 1
+        parsed = JSON.parse(final[0, end_idx])
+        parsed["title"].as_s.should eq("Round Trip")
+        parsed["draft"].as_bool.should be_true
+        parsed["weight"].as_i.should eq(5)
+        parsed["tags"].as_a.map(&.as_s).should eq(["a", "b"])
         final.should contain(original_body)
       end
     end
@@ -449,13 +656,13 @@ describe Hwaro::Services::FrontmatterConverter do
         file_path = File.join(dir, "nested.md")
 
         yaml_content = <<-YAML
-title: Nested Test
-owner:
-  name: John Doe
-  details:
-    age: 30
-    city: New York
-YAML
+          title: Nested Test
+          owner:
+            name: John Doe
+            details:
+              age: 30
+              city: New York
+          YAML
         File.write(file_path, "---\n#{yaml_content}\n---\n\nContent")
 
         result = converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML)
@@ -480,13 +687,13 @@ YAML
         file_path = File.join(dir, "array_tables.md")
 
         yaml_content = <<-YAML
-title: Array Tables
-servers:
-  - name: alpha
-    ip: 10.0.0.1
-  - name: beta
-    ip: 10.0.0.2
-YAML
+          title: Array Tables
+          servers:
+            - name: alpha
+              ip: 10.0.0.1
+            - name: beta
+              ip: 10.0.0.2
+          YAML
         File.write(file_path, "---\n#{yaml_content}\n---\n\nContent")
 
         result = converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML)
@@ -517,6 +724,10 @@ describe Hwaro::Services::FrontmatterFormat do
     Hwaro::Services::FrontmatterFormat::TOML.should_not be_nil
   end
 
+  it "has JSON variant" do
+    Hwaro::Services::FrontmatterFormat::JSON.should_not be_nil
+  end
+
   it "has Unknown variant" do
     Hwaro::Services::FrontmatterFormat::Unknown.should_not be_nil
   end
@@ -545,5 +756,283 @@ describe Hwaro::Services::ConversionResult do
     result.converted_count.should eq(5)
     result.skipped_count.should eq(3)
     result.error_count.should eq(1)
+  end
+
+  describe ".serialize_time" do
+    # A TOML/YAML local date (e.g. `2026-05-20`) parses to midnight in the local
+    # zone. Forcing it through `to_rfc3339` (UTC) rolls the day back in any
+    # positive-offset zone; these cases must keep the calendar day regardless of
+    # the zone the value was parsed in.
+    it "keeps the calendar day for a positive-offset midnight (no UTC rollback)" do
+      time = Time.local(2026, 5, 20, 0, 0, 0, location: Time::Location.fixed(9 * 3600))
+      Hwaro::Services::FrontmatterConverter.serialize_time(time).should eq("2026-05-20")
+    end
+
+    it "emits a bare date for a UTC midnight (no spurious time component)" do
+      time = Time.utc(2026, 5, 20, 0, 0, 0)
+      Hwaro::Services::FrontmatterConverter.serialize_time(time).should eq("2026-05-20")
+    end
+
+    it "keeps the calendar day for a negative-offset midnight" do
+      time = Time.local(2026, 5, 20, 0, 0, 0, location: Time::Location.fixed(-5 * 3600))
+      Hwaro::Services::FrontmatterConverter.serialize_time(time).should eq("2026-05-20")
+    end
+
+    it "preserves genuine timestamps as RFC 3339" do
+      time = Time.utc(2026, 5, 20, 1, 30, 0)
+      Hwaro::Services::FrontmatterConverter.serialize_time(time).should eq("2026-05-20T01:30:00Z")
+    end
+  end
+
+  describe "date round-trip" do
+    # Regression: converting a file's frontmatter format must not shift a
+    # date-only value by a day or graft a spurious time onto it.
+    it "preserves a TOML local date when converting to YAML" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "post.md")
+        File.write(file_path, "+++\ntitle = \"Post\"\ndate = 2026-05-20\n+++\n\n# Content")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::YAML).should be_true
+
+        converted = File.read(file_path)
+        converted.should contain("2026-05-20")
+        converted.should_not contain("2026-05-20T") # no time-of-day grafted on
+        converted.should_not contain("2026-05-19")  # no day rollback
+      end
+    end
+
+    it "preserves a TOML local date when converting to JSON" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "post.md")
+        File.write(file_path, "+++\ntitle = \"Post\"\ndate = 2026-05-20\n+++\n\n# Content")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::JSON).should be_true
+
+        converted = File.read(file_path)
+        converted.should contain("\"date\": \"2026-05-20\"")
+        converted.should_not contain("2026-05-19")
+      end
+    end
+
+    it "preserves the authored offset of a YAML timestamp when converting to TOML" do
+      # Regression: `to_rfc3339` converted `08:00+09:00` to the *previous
+      # day's* `23:00Z`, silently changing the post's calendar date.
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "post.md")
+        File.write(file_path, "---\ntitle: Post\ndate: 2026-07-01T08:00:00+09:00\n---\n\nContent")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        converted.should contain("2026-07-01T08:00:00+09:00")
+        converted.should_not contain("2026-06-30")
+      end
+    end
+  end
+
+  describe "non-frontmatter leading blocks" do
+    # Regression: a document whose first lines form a `---` … `---` pair that
+    # is NOT a mapping (horizontal rule + prose, a list, an unclosed rule) was
+    # "converted" by replacing the block with empty frontmatter — silently
+    # deleting the author's content.
+    it "skips a horizontal-rule pair without touching the file" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "hr.md")
+        original = "---\nIntro paragraph between two rules.\n---\n\nRest of document.\n"
+        File.write(file_path, original)
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_false
+        File.read(file_path).should eq(original)
+
+        result = converter.convert_to_toml
+        result.success.should be_true
+        result.skipped_count.should eq(1)
+        result.error_count.should eq(0)
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    it "skips a list-shaped leading block without destroying it" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "list.md")
+        original = "---\n- a\n- b\n---\n\nBody.\n"
+        File.write(file_path, original)
+
+        result = converter.convert_to_json
+        result.success.should be_true
+        result.error_count.should eq(0)
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    it "skips a lone leading rule with no closing delimiter (no error exit)" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "lone.md")
+        original = "---\n\nJust a thematic break at the top.\n"
+        File.write(file_path, original)
+
+        result = converter.convert_to_toml
+        result.success.should be_true
+        result.error_count.should eq(0)
+        File.read(file_path).should eq(original)
+      end
+    end
+
+    it "does not mistake a leading shortcode brace block for JSON frontmatter" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "shortcode.md")
+        original = "{{< figure src=\"x.png\" >}}\n\nBody text.\n"
+        File.write(file_path, original)
+
+        converter.detect_format(original).should eq(Hwaro::Services::FrontmatterFormat::Unknown)
+
+        result = converter.convert_to_yaml
+        result.success.should be_true
+        result.error_count.should eq(0)
+        File.read(file_path).should eq(original)
+      end
+    end
+  end
+
+  describe "TOML value emission" do
+    it "emits non-finite floats as TOML inf/nan and reparses cleanly" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "floats.md")
+        File.write(file_path, "---\ntitle: F\nscore: .inf\npenalty: -.inf\nmiss: .nan\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        converted.should contain("score = inf")
+        converted.should contain("penalty = -inf")
+        converted.should contain("miss = nan")
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        TOML.parse(fm)["score"].raw.as(Float64).infinite?.should eq(1)
+      end
+    end
+
+    # This in-place rewrite must never hand the next build front matter hwaro
+    # can no longer read. Int64::MIN is legal TOML but the only in-range
+    # integer toml.cr overflows on (it accumulates the digits positively and
+    # applies the sign last), and it used to be emitted verbatim: the draft
+    # below was correctly skipped by the build, then `convert to-toml`
+    # reported success and left a file whose whole front matter — `draft`
+    # included — no longer parsed.
+    it "keeps a draft readable after converting an Int64::MIN value" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "min.md")
+        File.write(file_path, "---\ntitle: D\ndraft: true\noffset: -9223372036854775808\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        parsed = TOML.parse(fm)
+        parsed["draft"].raw.should be_true
+        parsed["offset"].raw.should eq("-9223372036854775808")
+      end
+    end
+
+    it "keeps a large int promoted into a float array reparseable" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "promoted.md")
+        File.write(file_path, "---\ntitle: P\nratio:\n  - 9223372036854775807\n  - 2.5\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        TOML.parse(fm)["ratio"].raw.as(Array).map(&.as(TOML::Any).raw)
+          .should eq([Int64::MAX.to_f64, 2.5])
+      end
+    end
+
+    it "coerces mixed-type arrays so toml.cr can reparse the file" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "mixed.md")
+        File.write(file_path, "---\ntitle: M\nstuff:\n  - 1\n  - two\nratio:\n  - 1\n  - 2.5\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        parsed = TOML.parse(fm)
+        parsed["stuff"].raw.as(Array).map(&.as(TOML::Any).raw).should eq(["1", "two"])
+        parsed["ratio"].raw.as(Array).map(&.as(TOML::Any).raw).should eq([1.0, 2.5])
+      end
+    end
+
+    it "emits maps nested inside arrays as inline tables" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "inline.md")
+        # An array OF arrays: the inner array is homogeneous, so its map member
+        # can keep inline-table form and still reparse.
+        File.write(file_path, "---\ntitle: I\ngroups:\n  - - name: home\n      url: /\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        converted.should contain("{name = \"home\", url = \"/\"}")
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        TOML.parse(fm)["groups"].as_a.first.as_a.first.as_h["name"].should eq("home")
+      end
+    end
+
+    # Regression: a map mixed with a scalar used to keep its inline-table form,
+    # producing `["plain", {name = "home"}]` — the mixed array toml.cr refuses.
+    # The converted file then failed the very next build with "cannot mix types
+    # in array", so `tool convert to-toml` corrupted its own output.
+    it "keeps a map mixed with a scalar parseable rather than inline" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "mixed_inline.md")
+        File.write(file_path, "---\ntitle: I\nlinks:\n  - name: home\n    url: /\n  - plain\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        fm = File.read(file_path).match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        links = TOML.parse(fm)["links"].as_a
+        links.size.should eq(2)
+        links.last.should eq("plain")
+        links.first.as_s.should contain(%q("name":"home"))
+      end
+    end
+
+    it "keeps an empty table's key instead of dropping it" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "empty.md")
+        File.write(file_path, "---\ntitle: E\nextra: {}\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+        File.read(file_path).should contain("[extra]")
+      end
+    end
+
+    it "escapes control characters with TOML-legal sequences" do
+      Dir.mktmpdir do |dir|
+        converter = Hwaro::Services::FrontmatterConverter.new(dir)
+        file_path = File.join(dir, "ctrl.md")
+        File.write(file_path, "---\ntitle: \"ding\\a dong\"\n---\n\nBody")
+
+        converter.convert_file(file_path, Hwaro::Services::FrontmatterFormat::TOML).should be_true
+
+        converted = File.read(file_path)
+        fm = converted.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        TOML.parse(fm)["title"].raw.as(String).should contain("ding")
+      end
+    end
   end
 end

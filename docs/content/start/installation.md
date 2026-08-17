@@ -10,7 +10,7 @@ Hwaro is written in Crystal. You can install it from source or use a pre-built b
 ## Homebrew
 
 ```bash
-brew tap hwaro/hwaro
+brew tap hahwul/hwaro
 brew install hwaro
 ```
 
@@ -18,6 +18,69 @@ brew install hwaro
 
 ```bash
 sudo snap install hwaro
+```
+
+## APK (Alpine Linux)
+
+Download the `.apk` package from the [latest release](https://github.com/hahwul/hwaro/releases/latest) and install it:
+
+```bash
+apk add --allow-untrusted hwaro-*.apk
+```
+
+## DEB (Debian/Ubuntu)
+
+Download the `.deb` package from the [latest release](https://github.com/hahwul/hwaro/releases/latest) and install it:
+
+```bash
+sudo dpkg -i hwaro_*_amd64.deb
+```
+
+## RPM (Fedora/RHEL/CentOS)
+
+Download the `.rpm` package from the [latest release](https://github.com/hahwul/hwaro/releases/latest) and install it:
+
+```bash
+sudo rpm -i hwaro-*.x86_64.rpm
+```
+
+## AUR (Arch Linux)
+
+```bash
+yay -S hwaro
+```
+
+## Nix
+
+### Install
+
+```bash
+nix profile install github:hahwul/hwaro
+```
+
+### Run without installing
+
+```bash
+nix run github:hahwul/hwaro -- --version
+```
+
+### Development shell
+
+```bash
+nix develop github:hahwul/hwaro
+```
+
+## Pre-built Binary
+
+Pre-built binaries for macOS and Linux are available on the [GitHub Releases](https://github.com/hahwul/hwaro/releases) page.
+
+1. Download the binary for your platform from the [latest release](https://github.com/hahwul/hwaro/releases/latest).
+2. Move the binary to a directory in your PATH.
+
+```bash
+# Example for Linux (amd64)
+chmod +x hwaro-v*-linux-x86_64
+sudo mv hwaro-v*-linux-x86_64 /usr/local/bin/hwaro
 ```
 
 ## From Source
@@ -33,10 +96,24 @@ sudo snap install hwaro
 git clone https://github.com/hahwul/hwaro
 cd hwaro
 shards install
-shards build --release
+shards build --release --no-debug
 ```
 
 The binary is created at `./bin/hwaro`.
+
+> Requires Crystal **1.21 or newer**. Parallel page rendering is enabled in
+> `src/main.cr`, which resizes Crystal's default execution context — no build
+> flag needed. Set `CRYSTAL_WORKERS=N` to override the worker count (it
+> defaults to the CPU count). Do not pass the old `-Dpreview_mt` flag:
+> Crystal 1.21 deprecated it and its scheduler can hang at process exit.
+>
+> For `hwaro build` (any install method, not just source builds), Hwaro
+> tunes the Boehm GC at startup (`GC_MARKERS=1` and
+> `GC_INITIAL_HEAP_SIZE=256M`) — measured 3-5x faster builds on
+> allocation-heavy sites, at the cost of a higher peak memory floor during
+> the build. Exporting either variable overrides the built-in default, and
+> the heap presize is skipped when `--memory-limit` is used. See the
+> [global flags table](@/start/cli.md) for details.
 
 ### Add to PATH (Optional)
 

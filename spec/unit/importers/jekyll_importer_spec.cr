@@ -10,18 +10,18 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "Hello World"
-        date: 2024-01-15
-        layout: post
-        categories:
-          - ruby
-          - web
-        tags:
-          - tutorial
-        ---
-        This is my first post.
-        JEKYLL
+          ---
+          title: "Hello World"
+          date: 2024-01-15
+          layout: post
+          categories:
+            - ruby
+            - web
+          tags:
+            - tutorial
+          ---
+          This is my first post.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2024-01-15-hello-world.md"), post_content)
 
@@ -47,8 +47,41 @@ describe Hwaro::Services::Importers::JekyllImporter do
         content.should contain("+++")
         content.should contain("title = \"Hello World\"")
         content.should contain("template = \"post\"")
-        content.should contain("tags = [\"ruby\", \"web\", \"tutorial\"]")
+        content.should contain(%(categories = ["ruby", "web"]))
+        content.should contain(%(tags = ["tutorial"]))
         content.should contain("This is my first post.")
+      end
+    end
+
+    it "imports a post whose `header` frontmatter is a scalar string" do
+      # Regression: `header: banner.jpg` (scalar, not a hash) made
+      # `header["image"]?` raise "Expected Array or Hash, not String", which
+      # the per-file rescue swallowed — silently dropping the whole post.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Scalar Header"
+          header: banner.jpg
+          ---
+          Post body.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-02-02-scalar-header.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        result = Hwaro::Services::Importers::JekyllImporter.new.run(options)
+        result.imported_count.should eq(1)
+        result.error_count.should eq(0)
+        File.exists?(File.join(output_dir, "posts", "scalar-header.md")).should be_true
       end
     end
 
@@ -58,11 +91,11 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "My Great Post"
-        ---
-        Content here.
-        JEKYLL
+          ---
+          title: "My Great Post"
+          ---
+          Content here.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2023-06-10-my-great-post.md"), post_content)
 
@@ -86,11 +119,11 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "No Date Post"
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "No Date Post"
+          ---
+          Content.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2023-12-25-no-date-post.md"), post_content)
 
@@ -105,7 +138,7 @@ describe Hwaro::Services::Importers::JekyllImporter do
         importer.run(options)
 
         content = File.read(File.join(output_dir, "posts", "no-date-post.md"))
-        content.should contain("date = \"2023-12-25 00:00:00\"")
+        content.should contain("date = \"2023-12-25\"")
       end
     end
 
@@ -115,12 +148,12 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "Unpublished Post"
-        published: false
-        ---
-        Draft content.
-        JEKYLL
+          ---
+          title: "Unpublished Post"
+          published: false
+          ---
+          Draft content.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2024-02-01-unpublished.md"), post_content)
 
@@ -147,19 +180,19 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(drafts_dir)
 
         File.write(File.join(posts_dir, "2024-01-01-published.md"), <<-JEKYLL
-        ---
-        title: "Published"
-        ---
-        Published content.
-        JEKYLL
+          ---
+          title: "Published"
+          ---
+          Published content.
+          JEKYLL
         )
 
         File.write(File.join(drafts_dir, "my-draft.md"), <<-JEKYLL
-        ---
-        title: "My Draft"
-        ---
-        Draft content.
-        JEKYLL
+          ---
+          title: "My Draft"
+          ---
+          Draft content.
+          JEKYLL
         )
 
         output_dir = File.join(dir, "output")
@@ -189,19 +222,19 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(drafts_dir)
 
         File.write(File.join(posts_dir, "2024-01-01-published.md"), <<-JEKYLL
-        ---
-        title: "Published"
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "Published"
+          ---
+          Content.
+          JEKYLL
         )
 
         File.write(File.join(drafts_dir, "secret-draft.md"), <<-JEKYLL
-        ---
-        title: "Secret Draft"
-        ---
-        Secret.
-        JEKYLL
+          ---
+          title: "Secret Draft"
+          ---
+          Secret.
+          JEKYLL
         )
 
         output_dir = File.join(dir, "output")
@@ -226,12 +259,12 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "With Excerpt"
-        excerpt: "A short summary of the post"
-        ---
-        Full content here.
-        JEKYLL
+          ---
+          title: "With Excerpt"
+          excerpt: "A short summary of the post"
+          ---
+          Full content here.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2024-03-01-with-excerpt.md"), post_content)
 
@@ -256,13 +289,13 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "With Header Image"
-        header:
-          image: /assets/images/hero.jpg
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "With Header Image"
+          header:
+            image: /assets/images/hero.jpg
+          ---
+          Content.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2024-04-01-with-image.md"), post_content)
 
@@ -281,23 +314,70 @@ describe Hwaro::Services::Importers::JekyllImporter do
       end
     end
 
-    it "merges categories and tags into a single tags field" do
+    it "reports how many files contain unconverted Liquid constructs" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-liquid.md"), <<-JEKYLL
+          ---
+          title: "Liquid"
+          ---
+          Body with {% include header.html %}.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-01-02-clean.md"), <<-JEKYLL
+          ---
+          title: "Clean"
+          ---
+          Plain body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        # Capture the warning stream so the spec sees the summary log.
+        err = IO::Memory.new
+        original = Hwaro::Logger.err_io
+        Hwaro::Logger.err_io = err
+        begin
+          importer = Hwaro::Services::Importers::JekyllImporter.new
+          result = importer.run(options)
+          result.imported_count.should eq(2)
+        ensure
+          Hwaro::Logger.err_io = original
+        end
+
+        # Summary must include the count and the platform name so a user
+        # skimming the log knows how many files need manual cleanup.
+        err.to_s.should contain("1 file(s) contained unconverted Liquid")
+        # The clean file must not trip the per-file warning.
+        err.to_s.scan(/Liquid tags detected/).size.should eq(1)
+      end
+    end
+
+    it "keeps categories and tags as separate taxonomy fields" do
       Dir.mktmpdir do |dir|
         posts_dir = File.join(dir, "_posts")
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "Merged Tags"
-        category: programming
-        tags:
-          - crystal
-          - programming
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "Split Taxonomies"
+          category: programming
+          tags:
+            - crystal
+            - tutorial
+          ---
+          Content.
+          JEKYLL
 
-        File.write(File.join(posts_dir, "2024-05-01-merged-tags.md"), post_content)
+        File.write(File.join(posts_dir, "2024-05-01-split-taxonomies.md"), post_content)
 
         output_dir = File.join(dir, "output")
         options = Hwaro::Config::Options::ImportOptions.new(
@@ -309,9 +389,9 @@ describe Hwaro::Services::Importers::JekyllImporter do
         importer = Hwaro::Services::Importers::JekyllImporter.new
         importer.run(options)
 
-        content = File.read(File.join(output_dir, "posts", "merged-tags.md"))
-        # "programming" should appear only once (deduplication)
-        content.should contain("tags = [\"programming\", \"crystal\"]")
+        content = File.read(File.join(output_dir, "posts", "split-taxonomies.md"))
+        content.should contain(%(categories = ["programming"]))
+        content.should contain(%(tags = ["crystal", "tutorial"]))
       end
     end
 
@@ -321,11 +401,11 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         post_content = <<-JEKYLL
-        ---
-        title: "Markdown Extension"
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "Markdown Extension"
+          ---
+          Content.
+          JEKYLL
 
         File.write(File.join(posts_dir, "2024-06-01-markdown-ext.markdown"), post_content)
 
@@ -382,11 +462,11 @@ describe Hwaro::Services::Importers::JekyllImporter do
         FileUtils.mkdir_p(posts_dir)
 
         File.write(File.join(posts_dir, "2024-01-01-existing.md"), <<-JEKYLL
-        ---
-        title: "Existing"
-        ---
-        Content.
-        JEKYLL
+          ---
+          title: "Existing"
+          ---
+          Content.
+          JEKYLL
         )
 
         output_dir = File.join(dir, "output")
@@ -408,6 +488,42 @@ describe Hwaro::Services::Importers::JekyllImporter do
       end
     end
 
+    it "overwrites existing output file when force is true" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-existing.md"), <<-JEKYLL
+          ---
+          title: "Existing"
+          ---
+          Fresh content.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        FileUtils.mkdir_p(File.join(output_dir, "posts"))
+        File.write(File.join(output_dir, "posts", "existing.md"), "stale")
+
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+          force: true,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        result.skipped_count.should eq(0)
+
+        content = File.read(File.join(output_dir, "posts", "existing.md"))
+        content.should contain("Fresh content.")
+        content.should_not contain("stale")
+      end
+    end
+
     it "imports multiple posts" do
       Dir.mktmpdir do |dir|
         posts_dir = File.join(dir, "_posts")
@@ -415,11 +531,11 @@ describe Hwaro::Services::Importers::JekyllImporter do
 
         3.times do |i|
           File.write(File.join(posts_dir, "2024-01-0#{i + 1}-post-#{i + 1}.md"), <<-JEKYLL
-          ---
-          title: "Post #{i + 1}"
-          ---
-          Content #{i + 1}.
-          JEKYLL
+            ---
+            title: "Post #{i + 1}"
+            ---
+            Content #{i + 1}.
+            JEKYLL
           )
         end
 
@@ -434,6 +550,94 @@ describe Hwaro::Services::Importers::JekyllImporter do
         result = importer.run(options)
 
         result.imported_count.should eq(3)
+      end
+    end
+
+    it "disambiguates two source files that collide on the same date-stripped slug" do
+      # Two distinct posts whose date-stripped slug is identical ("hello")
+      # used to both map to posts/hello.md, silently dropping the second in
+      # a one-shot migration; the later file now gets a date-suffixed slug.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-hello.md"), <<-JEKYLL
+          ---
+          title: "First Hello"
+          ---
+          First post body.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-06-02-hello.md"), <<-JEKYLL
+          ---
+          title: "Second Hello"
+          ---
+          Second post body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        # Both survive; the later (sorted) file gets a date-suffixed slug.
+        result.imported_count.should eq(2)
+        result.skipped_count.should eq(0)
+
+        first = File.read(File.join(output_dir, "posts", "hello.md"))
+        first.should contain("First post body.")
+        second = File.read(File.join(output_dir, "posts", "hello-2024-06-02.md"))
+        second.should contain("Second post body.")
+      end
+    end
+
+    it "counts a malformed-YAML post as an error while still importing valid posts" do
+      # Jekyll's YAML.parse has no local rescue, so a malformed `---` block
+      # raises YAML::ParseException and the entire post (body included) is
+      # dropped via run's per-file rescue (error_count++). The valid post in
+      # the same run still imports. Unlike Hugo, the broken-YAML body is lost.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-bad.md"), <<-JEKYLL
+          ---
+          title: "unterminated
+          ---
+          Bad post body.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-01-02-good.md"), <<-JEKYLL
+          ---
+          title: "Good Post"
+          ---
+          Good post body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        result.error_count.should eq(1)
+        # success = imported > 0 || errors == 0 -> true here.
+        result.success.should be_true
+
+        File.exists?(File.join(output_dir, "posts", "good.md")).should be_true
+        File.exists?(File.join(output_dir, "posts", "bad.md")).should be_false
       end
     end
 

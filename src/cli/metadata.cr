@@ -42,17 +42,24 @@ module Hwaro
     JSON_FLAG = FlagInfo.new(short: "-j", long: "--json", description: "Output result as JSON")
 
     # Global flags - shared across multiple commands
-    VERBOSE_FLAG            = FlagInfo.new(short: "-v", long: "--verbose", description: "Show detailed output")
-    DEBUG_FLAG              = FlagInfo.new(short: nil, long: "--debug", description: "Print debug information")
-    ENV_FLAG                = FlagInfo.new(short: "-e", long: "--env", description: "Environment name (loads config.<env>.toml override)", takes_value: true, value_hint: "ENV")
-    PROFILE_FLAG            = FlagInfo.new(short: nil, long: "--profile", description: "Show build timing profile")
-    DRAFTS_FLAG             = FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content")
-    INCLUDE_EXPIRED_FLAG    = FlagInfo.new(short: nil, long: "--include-expired", description: "Include expired content")
-    MINIFY_FLAG             = FlagInfo.new(short: nil, long: "--minify", description: "Minify HTML output (and minified json, xml)")
-    BASE_URL_FLAG           = FlagInfo.new(short: nil, long: "--base-url", description: "Override base_url from config.toml", takes_value: true, value_hint: "URL")
-    SKIP_CACHE_BUSTING_FLAG = FlagInfo.new(short: nil, long: "--skip-cache-busting", description: "Disable cache busting query parameters on CSS/JS resources")
-    INPUT_DIR_FLAG          = FlagInfo.new(short: "-i", long: "--input", description: "Input directory (default: current directory)", takes_value: true, value_hint: "DIR")
-    CONTENT_DIR_FLAG        = FlagInfo.new(short: "-c", long: "--content-dir", description: "Content directory (default: content)", takes_value: true, value_hint: "DIR")
+    VERBOSE_FLAG               = FlagInfo.new(short: "-v", long: "--verbose", description: "Show detailed output")
+    QUIET_FLAG                 = FlagInfo.new(short: "-q", long: "--quiet", description: "Suppress info output and banner (errors still shown on stderr)")
+    DEBUG_FLAG                 = FlagInfo.new(short: nil, long: "--debug", description: "Print debug information")
+    ENV_FLAG                   = FlagInfo.new(short: "-e", long: "--env", description: "Environment name (loads config.<env>.toml override)", takes_value: true, value_hint: "ENV")
+    PROFILE_FLAG               = FlagInfo.new(short: nil, long: "--profile", description: "Show build timing profile")
+    JOBS_FLAG                  = FlagInfo.new(short: nil, long: "--jobs", description: "Concurrent render workers (default: auto, from the site listing fan-out)", takes_value: true, value_hint: "N")
+    DRAFTS_FLAG                = FlagInfo.new(short: "-d", long: "--drafts", description: "Include draft content")
+    INCLUDE_EXPIRED_FLAG       = FlagInfo.new(short: nil, long: "--include-expired", description: "Include expired content")
+    INCLUDE_FUTURE_FLAG        = FlagInfo.new(short: nil, long: "--include-future", description: "Include future-dated content")
+    MINIFY_FLAG                = FlagInfo.new(short: nil, long: "--minify", description: "Minify HTML/JSON/XML output (strips comments, intra-tag and inter-tag whitespace by neighbour class; preserves pre/code/script/style/svg/math/textarea/noscript)")
+    BASE_URL_FLAG              = FlagInfo.new(short: nil, long: "--base-url", description: "Override base_url from config.toml", takes_value: true, value_hint: "URL")
+    SKIP_CACHE_BUSTING_FLAG    = FlagInfo.new(short: nil, long: "--skip-cache-busting", description: "Disable cache busting query parameters on CSS/JS resources")
+    SKIP_OG_IMAGE_FLAG         = FlagInfo.new(short: nil, long: "--skip-og-image", description: "Skip auto OG image generation")
+    SKIP_IMAGE_PROCESSING_FLAG = FlagInfo.new(short: nil, long: "--skip-image-processing", description: "Skip image resizing and LQIP generation")
+    OPEN_BROWSER_FLAG          = FlagInfo.new(short: nil, long: "--open", description: "Open browser after starting server")
+    NO_OPEN_BROWSER_FLAG       = FlagInfo.new(short: nil, long: "--no-open", description: "Do not open browser after starting server (default behavior)")
+    INPUT_DIR_FLAG             = FlagInfo.new(short: "-i", long: "--input", description: "Input directory (default: current directory)", takes_value: true, value_hint: "DIR")
+    CONTENT_DIR_FLAG           = FlagInfo.new(short: "-c", long: "--content-dir", description: "Content directory (default: content)", takes_value: true, value_hint: "DIR")
 
     # Register a FlagInfo on an OptionParser, eliminating manual duplication
     # between FLAGS metadata and OptionParser definitions.
@@ -70,6 +77,39 @@ module Hwaro
         else
           parser.on(flag.long, flag.description) { block.call("") }
         end
+      end
+    end
+
+    # Register the shared --base-url flag, validating the value and raising a
+    # usage error on a malformed URL. Yields the validated value to `block`.
+    def self.register_base_url(parser : OptionParser, &block : String ->)
+      register_flag(parser, BASE_URL_FLAG) do |v|
+        begin
+          Models::Config.validate_base_url!(v)
+        rescue ex : ArgumentError
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: ex.message || "Invalid --base-url",
+            hint: "Examples: https://example.com, https://example.com/subpath, http://localhost:3000.",
+          )
+        end
+        block.call(v)
+      end
+    end
+
+    # Register the shared --jobs flag, parsing a positive worker count and
+    # raising a usage error otherwise. Yields the parsed Int32 to `block`.
+    def self.register_jobs(parser : OptionParser, &block : Int32 ->)
+      register_flag(parser, JOBS_FLAG) do |v|
+        n = v.to_i?
+        if n.nil? || n < 1
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: "Invalid --jobs value: #{v}",
+            hint: "Pass a positive integer, e.g. --jobs 2. Omit it for automatic (CPU-based) parallelism.",
+          )
+        end
+        block.call(n)
       end
     end
   end

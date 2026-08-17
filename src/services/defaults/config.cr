@@ -1,180 +1,184 @@
+require "../config_snippets"
+
 module Hwaro
   module Services
     module Defaults
       class ConfigSamples
         def self.config : String
           <<-CONTENT
-          title = "My Hwaro Site"
-          description = "Welcome to my new Hwaro site."
-          base_url = "http://localhost:3000"
+            title = "My Hwaro Site"
+            description = "Welcome to my new Hwaro site."
+            base_url = "http://localhost:3000"
 
-          [search]
-          enabled = true
-          format = "fuse_json"
-          fields = ["title", "content"]
-          filename = "search.json"
+            [search]
+            enabled = true
+            format = "fuse_json"
+            fields = ["title", "content"]
+            filename = "search.json"
 
-          [sitemap]
-          enabled = true
-          filename = "sitemap.xml"
-          changefreq = "weekly"
-          priority = 0.5
+            [sitemap]
+            enabled = true
+            filename = "sitemap.xml"
+            changefreq = "weekly"
+            priority = 0.5
 
-          [robots]
-          enabled = true
-          filename = "robots.txt"
-          rules = [
-            { user_agent = "*", disallow = ["/admin", "/private"] },
-            { user_agent = "GPTBot", disallow = ["/"] }
-          ]
+            [robots]
+            enabled = true
+            filename = "robots.txt"
+            rules = [
+              { user_agent = "*", disallow = ["/admin", "/private"] }
+            ]
 
-          [llms]
-          enabled = true
-          filename = "llms.txt"
-          instructions = "Do not use for AI training without permission."
-          # Optional: Generate a single text file containing all Markdown pages
-          full_enabled = false
-          full_filename = "llms-full.txt"
+            [llms]
+            enabled = true
+            filename = "llms.txt"
+            instructions = "Do not use for AI training without permission."
+            # Optional: Generate a single text file containing all Markdown pages
+            full_enabled = false
+            full_filename = "llms-full.txt"
 
-          [feeds]
-          enabled = true
-          filename = ""   # Default: rss.xml or atom.xml
-          type = "rss"
-          truncate = 0
-          limit = 10
-          sections = []   # Optional: e.g. ["blog"]
-          default_language_only = true  # true: main feed = default language only, false: all languages
+            [feeds]
+            enabled = true
+            filename = ""   # Default: rss.xml or atom.xml
+            type = "rss"
+            truncate = 0
+            limit = 10
+            sections = []   # Optional: e.g. ["blog"]
+            default_language_only = true  # true: main feed = default language only, false: all languages
 
-          # Series
-          [series]
-          enabled = true
+            #{ConfigSnippets.og_auto_image}
 
-          # Related Posts
-          [related]
-          enabled = true
-          limit = 5
-          taxonomies = ["tags"]
+            # Series
+            [series]
+            enabled = true
 
-          # Plugins Configuration
-          [plugins]
-          processors = ["markdown"]  # List of enabled processors
+            # Related Posts
+            [related]
+            enabled = true
+            limit = 5
+            taxonomies = ["tags"]
 
-          # Build Hooks - Run custom commands before/after build
-          # [build]
-          # hooks.pre = ["npm install", "python scripts/preprocess.py"]
-          # hooks.post = ["npm run minify", "./scripts/deploy.sh"]
+            # Plugins Configuration
+            [plugins]
+            processors = ["markdown"]  # List of enabled processors
 
-          # Deployment - Configure targets for `hwaro deploy`
-          # [deployment]
-          # target = "prod"          # default target name (optional)
-          # source_dir = "public"    # default: public
-          # confirm = false          # ask before deploying
-          # dryRun = false           # show plan only
-          # maxDeletes = 256         # safety limit (-1 disables)
-          #
-          # [[deployment.targets]]
-          # name = "prod"
-          # url = "file://./out"
-          #
-          # [[deployment.targets]]
-          # name = "s3"
-          # url = "s3://my-bucket"
-          # command = "aws s3 sync {source}/ {url} --delete"
+            # Build Hooks - Run custom commands before/after build
+            # [build]
+            # hooks.pre = ["npm install", "python scripts/preprocess.py"]
+            # hooks.post = ["npm run minify", "./scripts/deploy.sh"]
 
-          # Taxonomies (root level configuration)
-          [[taxonomies]]
-          name = "tags"
-          feed = true
-          sitemap = false
+            # Deployment - Configure targets for `hwaro deploy`
+            # [deployment]
+            # target = "prod"          # default target name (optional)
+            # source_dir = "public"    # default: public
+            # confirm = false          # ask before deploying
+            # dryRun = false           # show plan only
+            # maxDeletes = 256         # safety limit (-1 disables)
+            #
+            # [[deployment.targets]]
+            # name = "prod"
+            # url = "file://./out"
+            #
+            # [[deployment.targets]]
+            # name = "s3"
+            # url = "s3://my-bucket"
+            # command = "aws s3 sync {source}/ {url} --delete"
 
-          [[taxonomies]]
-          name = "categories"
-          paginate_by = 5
+            # Taxonomies (root level configuration)
+            [[taxonomies]]
+            name = "tags"
+            feed = true
+            sitemap = false
 
-          [[taxonomies]]
-          name = "authors"
-          CONTENT
+            [[taxonomies]]
+            name = "categories"
+            paginate_by = 5
+
+            [[taxonomies]]
+            name = "authors"
+            CONTENT
         end
 
         def self.config_without_taxonomies : String
           <<-CONTENT
-          title = "My Hwaro Site"
-          description = "Welcome to my new Hwaro site."
-          base_url = "http://localhost:3000"
+            title = "My Hwaro Site"
+            description = "Welcome to my new Hwaro site."
+            base_url = "http://localhost:3000"
 
-          [search]
-          enabled = true
-          format = "fuse_json"
-          fields = ["title", "content"]
-          filename = "search.json"
+            [search]
+            enabled = true
+            format = "fuse_json"
+            fields = ["title", "content"]
+            filename = "search.json"
 
-          [sitemap]
-          enabled = true
-          filename = "sitemap.xml"
-          changefreq = "weekly"
-          priority = 0.5
+            [sitemap]
+            enabled = true
+            filename = "sitemap.xml"
+            changefreq = "weekly"
+            priority = 0.5
 
-          [robots]
-          enabled = true
-          filename = "robots.txt"
-          rules = [
-            { user_agent = "*", disallow = ["/admin", "/private"] },
-            { user_agent = "GPTBot", disallow = ["/"] }
-          ]
+            [robots]
+            enabled = true
+            filename = "robots.txt"
+            rules = [
+              { user_agent = "*", disallow = ["/admin", "/private"] }
+            ]
 
-          [llms]
-          enabled = true
-          filename = "llms.txt"
-          instructions = "Do not use for AI training without permission."
-          # Optional: Generate a single text file containing all Markdown pages
-          full_enabled = false
-          full_filename = "llms-full.txt"
+            [llms]
+            enabled = true
+            filename = "llms.txt"
+            instructions = "Do not use for AI training without permission."
+            # Optional: Generate a single text file containing all Markdown pages
+            full_enabled = false
+            full_filename = "llms-full.txt"
 
-          [feeds]
-          enabled = true
-          filename = ""   # Default: rss.xml or atom.xml
-          type = "rss"
-          truncate = 0
-          limit = 10
-          sections = []   # Optional: e.g. ["blog"]
-          default_language_only = true  # true: main feed = default language only, false: all languages
+            [feeds]
+            enabled = true
+            filename = ""   # Default: rss.xml or atom.xml
+            type = "rss"
+            truncate = 0
+            limit = 10
+            sections = []   # Optional: e.g. ["blog"]
+            default_language_only = true  # true: main feed = default language only, false: all languages
 
-          # Series
-          [series]
-          enabled = true
+            #{ConfigSnippets.og_auto_image}
 
-          # Related Posts
-          [related]
-          enabled = true
-          limit = 5
-          taxonomies = ["tags"]
+            # Series
+            [series]
+            enabled = true
 
-          # Plugins Configuration
-          [plugins]
-          processors = ["markdown"]  # List of enabled processors
+            # Related Posts
+            [related]
+            enabled = true
+            limit = 5
+            taxonomies = ["tags"]
 
-          # Build Hooks - Run custom commands before/after build
-          # [build]
-          # hooks.pre = ["npm install", "python scripts/preprocess.py"]
-          # hooks.post = ["npm run minify", "./scripts/deploy.sh"]
+            # Plugins Configuration
+            [plugins]
+            processors = ["markdown"]  # List of enabled processors
 
-          # Deployment - Configure targets for `hwaro deploy`
-          # [deployment]
-          # target = "prod"          # default target name (optional)
-          # source_dir = "public"    # default: public
-          # confirm = false          # ask before deploying
-          # dryRun = false           # show plan only
-          # maxDeletes = 256         # safety limit (-1 disables)
-          #
-          # [[deployment.targets]]
-          # name = "prod"
-          # url = "file://./out"
-          #
-          # [[deployment.targets]]
-          # name = "s3"
-          # url = "s3://my-bucket"
-          # command = "aws s3 sync {source}/ {url} --delete"
-          CONTENT
+            # Build Hooks - Run custom commands before/after build
+            # [build]
+            # hooks.pre = ["npm install", "python scripts/preprocess.py"]
+            # hooks.post = ["npm run minify", "./scripts/deploy.sh"]
+
+            # Deployment - Configure targets for `hwaro deploy`
+            # [deployment]
+            # target = "prod"          # default target name (optional)
+            # source_dir = "public"    # default: public
+            # confirm = false          # ask before deploying
+            # dryRun = false           # show plan only
+            # maxDeletes = 256         # safety limit (-1 disables)
+            #
+            # [[deployment.targets]]
+            # name = "prod"
+            # url = "file://./out"
+            #
+            # [[deployment.targets]]
+            # name = "s3"
+            # url = "s3://my-bucket"
+            # command = "aws s3 sync {source}/ {url} --delete"
+            CONTENT
         end
 
         # Generate config with multilingual support
@@ -229,8 +233,7 @@ module Hwaro
             str << "enabled = true\n"
             str << "filename = \"robots.txt\"\n"
             str << "rules = [\n"
-            str << "  { user_agent = \"*\", disallow = [\"/admin\", \"/private\"] },\n"
-            str << "  { user_agent = \"GPTBot\", disallow = [\"/\"] }\n"
+            str << "  { user_agent = \"*\", disallow = [\"/admin\", \"/private\"] }\n"
             str << "]\n\n"
             str << "[llms]\n"
             str << "enabled = true\n"
@@ -244,6 +247,7 @@ module Hwaro
             str << "limit = 10\n"
             str << "sections = []   # Optional: e.g. [\"blog\"]\n"
             str << "default_language_only = true  # true: main feed = default language only, false: all languages\n\n"
+            str << ConfigSnippets.og_auto_image
             str << "# Series\n"
             str << "[series]\n"
             str << "enabled = true\n\n"
@@ -282,25 +286,7 @@ module Hwaro
 
         # Get display name for language code
         private def self.language_display_name(code : String) : String
-          case code.downcase
-          when "en" then "English"
-          when "ko" then "한국어"
-          when "ja" then "日本語"
-          when "zh" then "中文"
-          when "es" then "Español"
-          when "fr" then "Français"
-          when "de" then "Deutsch"
-          when "pt" then "Português"
-          when "ru" then "Русский"
-          when "it" then "Italiano"
-          when "nl" then "Nederlands"
-          when "pl" then "Polski"
-          when "vi" then "Tiếng Việt"
-          when "th" then "ไทย"
-          when "ar" then "العربية"
-          when "hi" then "हिन्दी"
-          else           code.upcase
-          end
+          Utils::TextUtils.language_display_name(code)
         end
       end
     end

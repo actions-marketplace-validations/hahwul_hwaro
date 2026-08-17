@@ -1,7 +1,7 @@
 +++
 title = "Taxonomies"
 description = "Organize content with tags, categories, and custom groups"
-weight = 4
+weight = 3
 toc = true
 +++
 
@@ -15,7 +15,7 @@ Define taxonomies in `config.toml`:
 [[taxonomies]]
 name = "tags"
 feed = true
-paginate = 10
+paginate_by = 10
 
 [[taxonomies]]
 name = "categories"
@@ -30,7 +30,41 @@ name = "authors"
 | `name` | string | — | Taxonomy name (used in front matter) |
 | `feed` | bool | false | Generate RSS feed for each term |
 | `sitemap` | bool | true | Include taxonomy pages in sitemap |
-| `paginate` | int | — | Pages per pagination page |
+| `paginate_by` | int | — | Items per page on term pages |
+| `sort_by` | string | "date" | Order of pages within a term: `"date"`, `"title"`, or `"weight"` (see [Sorting](#sorting)) |
+| `reverse` | bool | false | Flip whichever order `sort_by` produced |
+| `terms_sort_by` | string | "name" | Order of the terms list: `"name"` or `"count"` (see [Sorting](#sorting)) |
+
+## Sorting
+
+`sort_by` controls the order of pages within each term — on the written
+term pages, in `term.pages` from `get_taxonomy()`, and in per-term
+pagination. The semantics match section sorting exactly:
+
+- `"date"` (default) — newest first; `reverse = true` gives oldest first.
+- `"title"` — alphabetical ascending; `reverse = true` descends.
+- `"weight"` — lowest weight first; `reverse = true` descends.
+
+An invalid `sort_by` value logs a warning and keeps the `"date"` default.
+
+`terms_sort_by` controls the order of the terms list — on the taxonomy
+index page and in `get_taxonomy().items`:
+
+- `"name"` (default) — alphabetical ascending.
+- `"count"` — page count descending, name-ascending tiebreak. On a
+  multilingual site, each language's index uses that language's own page
+  counts.
+
+**Term feeds are exempt.** With `feed = true`, each term's RSS feed stays
+reverse-chronological regardless of `sort_by` — RSS consumers assume
+newest-first entries.
+
+```toml
+[[taxonomies]]
+name = "tags"
+sort_by = "title"
+terms_sort_by = "count"
+```
 
 ## Using Taxonomies
 
@@ -45,6 +79,22 @@ authors = ["Alice"]
 +++
 ```
 
+A Zola-style `[taxonomies]` table works too (both spellings are equivalent;
+an explicit top-level key wins if both are present):
+
+```markdown
++++
+title = "My Post"
+[taxonomies]
+tags = ["crystal", "tutorial"]
+tech = ["crystal", "security"]
++++
+```
+
+In templates, a page's own terms are available as `page.taxonomies.<name>`
+(e.g. `{% for t in page.taxonomies.tech %}`) — also on the page objects
+inside `section.pages`, `site.pages`, and term page lists.
+
 ## Generated URLs
 
 For a taxonomy named `tags` with term `crystal`:
@@ -54,7 +104,11 @@ For a taxonomy named `tags` with term `crystal`:
 | `/tags/` | List of all tags |
 | `/tags/crystal/` | Pages tagged "crystal" |
 
+With `paginate_by` set, term pages paginate at `/tags/crystal/page/2/`, `/tags/crystal/page/3/`, … (page 1 stays at `/tags/crystal/`). The pager object is described in [Data Model › Paginator](/templates/data-model/#paginator).
+
 ## Templates
+
+Both templates receive a ready-made listing as `{{ content }}` — the term list in `taxonomy.html`, the page list in `taxonomy_term.html`. For custom markup, use [`get_taxonomy()`](#get-taxonomy-function) instead of `content`.
 
 ### Taxonomy Index
 
@@ -64,17 +118,24 @@ For a taxonomy named `tags` with term `crystal`:
 {% extends "base.html" %}
 
 {% block content %}
-<h1>{{ taxonomy_name | capitalize }}</h1>
+<h1>{{ page.title }}</h1>
+{{ content }}
+{% endblock %}
+```
+
+Custom term list:
+
+```jinja
+{% set tax = get_taxonomy(kind=taxonomy_name) %}
 <ul>
-{% for term in taxonomy_terms %}
+{% for term in tax.items %}
   <li>
-    <a href="/{{ taxonomy_name }}/{{ term.slug }}/">
+    <a href="{{ get_taxonomy_url(kind=taxonomy_name, term=term.name) }}">
       {{ term.name }} ({{ term.count }})
     </a>
   </li>
 {% endfor %}
 </ul>
-{% endblock %}
 ```
 
 ### Taxonomy Term
@@ -86,33 +147,32 @@ For a taxonomy named `tags` with term `crystal`:
 
 {% block content %}
 <h1>{{ taxonomy_name }}: {{ taxonomy_term }}</h1>
+{{ content }}
+{% endblock %}
+```
+
+Custom page list — look up the current term's pages via `get_taxonomy()`:
+
+```jinja
+{% set tax = get_taxonomy(kind=taxonomy_name) %}
+{% for term in tax.items if term.name == taxonomy_term %}
 <ul>
-{% for p in taxonomy_pages %}
-  <li>
-    <a href="{{ p.url }}">{{ p.title }}</a>
-    <time>{{ p.date }}</time>
-  </li>
+{% for p in term.pages %}
+  <li><a href="{{ p.url }}">{{ p.title }}</a></li>
 {% endfor %}
 </ul>
-{% endblock %}
+{% endfor %}
 ```
 
 ## Template Variables
 
-### In taxonomy.html
+Available in both `taxonomy.html` and `taxonomy_term.html`:
 
 | Variable | Type | Description |
 |----------|------|-------------|
 | taxonomy_name | String | Taxonomy name ("tags") |
-| taxonomy_terms | Array | All terms (in taxonomy.html) |
-
-### In taxonomy_term.html
-
-| Variable | Type | Description |
-|----------|------|-------------|
-| taxonomy_name | String | Taxonomy name |
-| taxonomy_term | String | Current term name |
-| taxonomy_pages | Array<Page> | Pages for term |
+| taxonomy_term | String | Current term name (empty on the index page) |
+| content | String | Pre-rendered listing HTML (terms or pages) |
 
 ### Term Object
 
@@ -120,6 +180,7 @@ For a taxonomy named `tags` with term `crystal`:
 |----------|------|-------------|
 | name | String | Term name |
 | slug | String | URL-safe name |
+| pages | Array<Page> | Pages with this term |
 | count | Int | Number of pages |
 
 ## get_taxonomy() Function
@@ -187,3 +248,9 @@ Generate taxonomy term URL:
 {% endfor %}
 </nav>
 ```
+
+## See Also
+
+- [Sections](/writing/sections/) — Group content with directories
+- [Configuration](/start/config/) — Taxonomy config reference
+- [Data Model](/templates/data-model/) — Taxonomy variables in templates

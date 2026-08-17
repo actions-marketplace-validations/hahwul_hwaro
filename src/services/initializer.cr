@@ -3,15 +3,33 @@
 # Creates the initial project structure with sample content,
 # templates, and configuration based on the selected scaffold.
 
+require "file_utils"
 require "../config/options/init_options"
+require "../utils/errors"
+require "../utils/file_safe"
 require "../utils/logger"
 require "../services/scaffolds/registry"
 require "../services/scaffolds/remote"
 require "./defaults/agents_md"
+require "./doctor"
+require "./config_snippets"
 
 module Hwaro
   module Services
     class Initializer
+      # One scaffold write, remembered instead of streamed: TTY output renders
+      # the collected entries as a grouped tree at the end (24 near-identical
+      # "create" lines collapse into one line per top-level entry), while
+      # plain/piped output replays them as the historical per-file
+      # "      create  path" lines, byte-for-byte.
+      private record ScaffoldEntry, action : Symbol, path : String, dir : Bool
+
+      # Counts files/directories actually created so the closing receipt can
+      # report "N files" (existing entries left in place are not counted).
+      @created_count = 0
+
+      @entries = [] of ScaffoldEntry
+
       def run(options : Config::Options::InitOptions)
         scaffold = if remote = options.scaffold_remote
                      Scaffolds::Remote.new(remote)
@@ -26,7 +44,13 @@ module Hwaro
           options.skip_sample_content,
           options.skip_taxonomies,
           options.multilingual_languages,
-          scaffold
+          scaffold,
+          options.agents_mode,
+          options.minimal_config,
+          options.full_config,
+          options.clean,
+          options.site_title,
+          options.from_wizard
         )
       end
 
@@ -38,9 +62,13 @@ module Hwaro
         skip_taxonomies : Bool = false,
         multilingual_languages : Array(String) = [] of String,
         scaffold_type : Config::Options::ScaffoldType = Config::Options::ScaffoldType::Simple,
+        agents_mode : Config::Options::AgentsMode = Config::Options::AgentsMode::Remote,
+        minimal_config : Bool = false,
+        full_config : Bool = false,
+        clean : Bool = false,
       )
         scaffold = Scaffolds::Registry.get(scaffold_type)
-        run_with_scaffold(target_path, force, skip_agents_md, skip_sample_content, skip_taxonomies, multilingual_languages, scaffold)
+        run_with_scaffold(target_path, force, skip_agents_md, skip_sample_content, skip_taxonomies, multilingual_languages, scaffold, agents_mode, minimal_config, full_config, clean)
       end
 
       private def run_with_scaffold(
@@ -51,21 +79,61 @@ module Hwaro
         skip_taxonomies : Bool,
         multilingual_languages : Array(String),
         scaffold : Scaffolds::Base,
+        agents_mode : Config::Options::AgentsMode = Config::Options::AgentsMode::Remote,
+        minimal_config : Bool = false,
+        full_config : Bool = false,
+        clean : Bool = false,
+        site_title : String? = nil,
+        from_wizard : Bool = false,
       )
+        if clean && Dir.exists?(target_path) && !Dir.empty?(target_path)
+          clean_target(target_path)
+        end
+
         unless Dir.exists?(target_path)
-          Dir.mkdir_p(target_path)
+          begin
+            Hwaro::Utils::FileSafe.mkdir_p(target_path)
+          rescue ex : File::Error
+            # A target that is an existing file, or a parent the process
+            # cannot write to, is a filesystem failure — classify it so
+            # callers get HWARO_E_IO (6) instead of the generic exit 1.
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_IO,
+              message: "Cannot create project directory '#{target_path}': #{ex.os_error.try(&.message) || ex.message}",
+              hint: "Pick a path that is not an existing file and whose parent directory is writable.",
+            )
+          end
         end
 
-        unless force || Dir.empty?(target_path)
-          Logger.error "Directory '#{target_path}' is not empty."
-          Logger.error "Use --force to overwrite."
-          exit(1)
+        # --clean wipes the dir up front; --force allows non-empty target but
+        # keeps any existing files in place (only adds missing scaffold files).
+        # Neither blindly overwrites user content.
+        unless force || clean || occupied_entries(target_path).empty?
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: "Directory '#{target_path}' is not empty.",
+            hint: "Use --force to proceed (keeps existing files, adds missing scaffold files), or --clean to remove existing files first.",
+          )
         end
 
-        Logger.info "Initializing new Hwaro project in #{target_path}..."
-        Logger.info "Using scaffold: #{scaffold.description}"
+        # The wizard already rendered the heading and a scaffold/title receipt;
+        # printing them again here would double the header beat. The TTY form
+        # sits on the 2-space grid with the tree below it; the plain form
+        # keeps its historical 2-space indent.
+        unless from_wizard
+          Logger.heading("init", target_path == "." ? nil : target_path)
+          if Logger.color_enabled?
+            Logger.info "  #{Logger.paint("scaffold", Logger::Role::Dim)}  #{Logger.paint(scaffold.description, Logger::Role::Dim)}"
+          else
+            Logger.info "  scaffold  #{scaffold.description}"
+          end
+        end
 
         is_multilingual = multilingual_languages.size > 1
+
+        if multilingual_languages.size == 1
+          Logger.warn "  --include-multilingual needs 2+ languages; '#{multilingual_languages.first}' alone is treated as non-multilingual."
+        end
 
         # Create content structure
         create_directory(File.join(target_path, "content"))
@@ -87,72 +155,235 @@ module Hwaro
         # Create static files
         create_scaffold_static_files(target_path, scaffold)
 
+        # Create archetype files so `hwaro new` has templates to match
+        # against and the archetype convention is discoverable.
+        create_scaffold_archetypes(target_path, scaffold)
+
         # Create config.toml
-        config_content = if is_multilingual
-                           create_multilingual_config(multilingual_languages, skip_taxonomies, scaffold)
-                         else
-                           scaffold.config_content(skip_taxonomies)
-                         end
+        # Hybrid philosophy (C):
+        # - minimal_config : bare essentials, no comments
+        # - full_config    : maximum discoverability (current verbose behavior + doctor injection)
+        # - default        : balanced (core + commonly useful sections with light comments)
+        if scaffold.is_a?(Scaffolds::Remote)
+          remote_config = scaffold.config_content(skip_taxonomies, multilingual_languages)
+          if remote_config.strip.empty?
+            # Remote scaffold had no config.toml (allowed for content/templates-only remotes).
+            # Fall back to normal generation logic so we don't write an empty config.toml.
+            Logger.warn "Remote scaffold did not include a config.toml; generating a default one."
+            if minimal_config
+              config_content = scaffold.minimal_config_content(skip_taxonomies, multilingual_languages)
+            elsif full_config
+              # For --full-config without upstream config, use the balanced discoverable default
+              # (we can't easily reconstruct a "full" from a non-remote scaffold here).
+              config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
+            else
+              config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
+            end
+          else
+            # Use the remote's config as-is (respecting its custom settings), ignore --min/--full.
+            config_content = remote_config
+          end
+        elsif minimal_config
+          config_content = scaffold.minimal_config_content(skip_taxonomies, multilingual_languages)
+        elsif full_config
+          config_content = scaffold.config_content(skip_taxonomies, multilingual_languages)
+        else
+          config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
+        end
+
+        # Wizard-collected site title: substitute the first `title = "…"` line
+        # of the generated config. Built-in scaffolds only — a remote
+        # scaffold's config is used verbatim.
+        if (title = site_title) && !title.empty? && !scaffold.is_a?(Scaffolds::Remote)
+          escaped = title.gsub("\\", "\\\\").gsub("\"", "\\\"")
+          config_content = config_content.sub(/^title\s*=\s*"[^"\n]*"/m, "title = \"#{escaped}\"")
+        end
+
         create_file(File.join(target_path, "config.toml"), config_content)
 
         # Create AGENTS.md unless skipped
         unless skip_agents_md
-          create_file(File.join(target_path, "AGENTS.md"), Defaults::AgentsMd.content)
+          agents_content = case agents_mode
+                           when Config::Options::AgentsMode::Local
+                             Defaults::AgentsMd.content
+                           when Config::Options::AgentsMode::Remote
+                             Defaults::AgentsMd.remote_content
+                           else
+                             Defaults::AgentsMd.remote_content
+                           end
+          create_file(File.join(target_path, "AGENTS.md"), agents_content)
         end
 
-        Logger.success "Done! Run `hwaro build` to generate the site."
+        # Auto-add missing optional config sections (commented out).
+        # Only for built-in scaffolds + full_config (remote provides its own config).
+        if full_config && !scaffold.is_a?(Scaffolds::Remote)
+          config_path = File.join(target_path, "config.toml")
+          doctor = Services::Doctor.new(
+            content_dir: File.join(target_path, "content"),
+            config_path: config_path
+          )
+          summary = doctor.fix_config(approve_sections: true)
+          unless summary.sections_added.empty?
+            Logger.debug "Added #{summary.sections_added.size} optional config section(s) (commented out)."
+          end
+        end
+
+        display_target = target_path == "." ? "." : "#{target_path}/"
+        emit_scaffold_log(target_path)
+        if Logger.color_enabled?
+          # Close the block like a Receipt: a blank line, the ember spark
+          # outcome, then hint rows aligned with each other on the 2-space grid.
+          Logger.info ""
+          Logger.outcome("created", "#{@created_count} files · #{display_target}")
+          hint_col = "deploy".size
+          Logger.info "  #{Logger.paint("next".ljust(hint_col), Logger::Role::Dim)}  hwaro build · hwaro serve to preview"
+          Logger.info "  #{Logger.paint("deploy".ljust(hint_col), Logger::Role::Dim)}  set base_url in config.toml first (defaults to http://localhost:3000)"
+        else
+          Logger.outcome("created", "#{@created_count} files · #{display_target}")
+          Logger.info "Run `hwaro build` to generate the site, then `hwaro serve` to preview."
+          Logger.info "Set `base_url` in config.toml before deploying (defaults to http://localhost:3000)."
+        end
+      rescue ex : File::Error
+        # Every write after the target directory itself — content/, templates/,
+        # static/, archetypes/, config.toml, AGENTS.md — can fail the same way
+        # (disk full, read-only mount, a directory made unwritable mid-run).
+        # Classifying only the first `mkdir_p` left those on the unclassified
+        # `Error:` / exit 1 path, which is the exact inconsistency this was
+        # meant to close. `HwaroError` is not a `File::Error`, so the usage
+        # errors raised above pass through untouched.
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_IO,
+          message: "Failed to scaffold '#{target_path}': #{ex.os_error.try(&.message) || ex.message}",
+          hint: "Check free space and that every path under the target directory is writable, then re-run (existing files are kept).",
+        )
+      end
+
+      # Emit the collected scaffold writes. Plain output replays the exact
+      # per-file action lines the CLI has always printed (scripts and specs
+      # match on them); a colored TTY gets the grouped tree instead.
+      private def emit_scaffold_log(target_path : String)
+        return if Logger.quiet?
+        if Logger.color_enabled?
+          emit_scaffold_tree(target_path)
+        else
+          @entries.each do |entry|
+            role = entry.action == :exist ? Logger::Role::Dim : Logger::Role::Success
+            Logger.action entry.action, entry.path, role
+          end
+        end
+      end
+
+      # Grouped tree summary of the scaffold: one row per top-level entry in
+      # creation order, with a dim per-group note (file count, notable
+      # subdirectories, kept-existing count). Dirs get a trailing slash.
+      private def emit_scaffold_tree(target_path : String)
+        group_order = [] of String
+        group_dir = {} of String => Bool
+        created = Hash(String, Int32).new(0)
+        kept = Hash(String, Int32).new(0)
+        subdirs = {} of String => Array(String)
+
+        @entries.each do |entry|
+          rel = Path[entry.path].relative_to(target_path).to_s
+          next if rel == "." || rel.empty?
+          parts = rel.split('/')
+          top = parts.first
+          unless group_dir.has_key?(top)
+            group_order << top
+            group_dir[top] = entry.dir || parts.size > 1
+          end
+          if parts.size == 1
+            kept[top] += 1 if entry.action == :exist && !entry.dir
+          elsif entry.dir
+            (subdirs[top] ||= [] of String) << parts[1] if parts.size == 2
+          else
+            entry.action == :exist ? (kept[top] += 1) : (created[top] += 1)
+          end
+        end
+        return if group_order.empty?
+
+        width = group_order.max_of { |name| name.size + (group_dir[name] ? 1 : 0) }
+        group_order.each_with_index do |name, i|
+          connector = Logger.glyph(i == group_order.size - 1 ? :tree_last : :tree_mid)
+          display = group_dir[name] ? "#{name}/" : name
+          notes = [] of String
+          if group_dir[name]
+            n = created[name]
+            notes << "#{n} #{n == 1 ? "file" : "files"}" if n > 0
+            subdirs[name]?.try(&.uniq.each { |d| notes << "#{d}/" })
+          end
+          notes << "#{kept[name]} kept" if kept[name] > 0
+          # Pad only when a note follows, so bare rows carry no trailing blanks.
+          line = "  #{connector} "
+          if notes.empty?
+            line += display
+          else
+            line += "#{display.ljust(width)}  #{Logger.paint(notes.join(" · "), Logger::Role::Dim)}"
+          end
+          Logger.info line
+        end
+      end
+
+      # Write each {relative_path => content} entry under base_dir, creating
+      # parent directories on demand. Hash iteration order is preserved, so the
+      # @created_count tally and the recorded entry sequence are unchanged.
+      private def write_files(base_dir : String, files : Hash(String, String))
+        files.each do |relative_path, content|
+          full_path = File.join(base_dir, relative_path)
+          dir_path = File.dirname(full_path)
+          create_directory(dir_path) unless Dir.exists?(dir_path)
+          create_file(full_path, content)
+        end
       end
 
       private def create_scaffold_content(target_path : String, scaffold : Scaffolds::Base, skip_taxonomies : Bool)
         content_files = scaffold.content_files(skip_taxonomies)
-
-        content_files.each do |relative_path, content|
-          full_path = File.join(target_path, "content", relative_path)
-          dir_path = File.dirname(full_path)
-
-          # Create directory if it doesn't exist
-          unless Dir.exists?(dir_path)
-            create_directory(dir_path)
-          end
-
-          create_file(full_path, content)
-        end
+        write_files(File.join(target_path, "content"), content_files)
       end
 
       private def create_scaffold_templates(target_path : String, scaffold : Scaffolds::Base, skip_taxonomies : Bool)
         templates_dir = File.join(target_path, "templates")
         create_directory(templates_dir)
 
-        # Create template files
+        # Create template files. Some scaffolds emit nested paths
+        # (e.g. `partials/nav.html`) so the parent directory is
+        # created on demand instead of relying on a flat layout.
         template_files = scaffold.template_files(skip_taxonomies)
-        template_files.each do |relative_path, content|
-          create_file(File.join(templates_dir, relative_path), content)
-        end
+        write_files(templates_dir, template_files)
 
-        # Create shortcodes directory and files
-        shortcodes_dir = File.join(templates_dir, "shortcodes")
-        create_directory(shortcodes_dir)
-
+        # Create shortcodes directory and files only if the scaffold ships any.
+        # (Bare scaffold returns empty to stay truly minimal.)
         shortcode_files = scaffold.shortcode_files
-        shortcode_files.each do |relative_path, content|
-          full_path = File.join(templates_dir, relative_path)
-          create_file(full_path, content)
+        unless shortcode_files.empty?
+          shortcodes_dir = File.join(templates_dir, "shortcodes")
+          create_directory(shortcodes_dir)
+
+          shortcode_files.each do |relative_path, content|
+            full_path = File.join(templates_dir, relative_path)
+            create_file(full_path, content)
+          end
         end
+      end
+
+      # Writes the scaffold's archetype files under `archetypes/` so
+      # `hwaro new` can match them via `Services::Creator#find_archetype`.
+      # Creating the directory — even for scaffolds that ship no archetype
+      # files (e.g. remote) — would leave a confusing empty folder, so we
+      # skip both directory creation and file writes when the scaffold
+      # returns no archetypes.
+      private def create_scaffold_archetypes(target_path : String, scaffold : Scaffolds::Base)
+        archetype_files = scaffold.archetype_files
+        return if archetype_files.empty?
+
+        archetypes_dir = File.join(target_path, "archetypes")
+        create_directory(archetypes_dir)
+
+        write_files(archetypes_dir, archetype_files)
       end
 
       private def create_scaffold_static_files(target_path : String, scaffold : Scaffolds::Base)
         static_dir = File.join(target_path, "static")
-
-        scaffold.static_files.each do |relative_path, content|
-          full_path = File.join(static_dir, relative_path)
-          dir_path = File.dirname(full_path)
-
-          unless Dir.exists?(dir_path)
-            create_directory(dir_path)
-          end
-
-          create_file(full_path, content)
-        end
+        write_files(static_dir, scaffold.static_files)
       end
 
       private def create_multilingual_content(
@@ -161,596 +392,114 @@ module Hwaro
         skip_taxonomies : Bool,
         scaffold : Scaffolds::Base,
       )
-        # For multilingual, we use the simple scaffold content with language variations
-        # This is a simplified approach - in a full implementation, each scaffold
-        # could provide its own multilingual content
         content_dir = File.join(target_path, "content")
+        write_files(content_dir, scaffold.multilingual_content_files(languages, skip_taxonomies))
+      end
 
-        languages.each_with_index do |lang, index|
-          is_default = index == 0
-
-          if is_default
-            # Default language content
-            create_file(
-              File.join(content_dir, "index.md"),
-              multilingual_index_content(lang, true, skip_taxonomies)
-            )
-            create_file(
-              File.join(content_dir, "about.md"),
-              multilingual_about_content(lang, skip_taxonomies)
-            )
-
-            unless skip_taxonomies
-              create_directory(File.join(content_dir, "blog"))
-              create_file(
-                File.join(content_dir, "blog", "_index.md"),
-                multilingual_blog_index_content(lang)
-              )
-              create_file(
-                File.join(content_dir, "blog", "hello-world.md"),
-                multilingual_blog_post_content(lang, skip_taxonomies)
-              )
-            end
-          else
-            # Non-default languages
-            create_file(
-              File.join(content_dir, "index.#{lang}.md"),
-              multilingual_index_content(lang, false, skip_taxonomies)
-            )
-            create_file(
-              File.join(content_dir, "about.#{lang}.md"),
-              multilingual_about_content(lang, skip_taxonomies)
-            )
-
-            unless skip_taxonomies
-              create_file(
-                File.join(content_dir, "blog", "_index.#{lang}.md"),
-                multilingual_blog_index_content(lang)
-              )
-              create_file(
-                File.join(content_dir, "blog", "hello-world.#{lang}.md"),
-                multilingual_blog_post_content(lang, skip_taxonomies)
-              )
-            end
-          end
+      # Remove every entry inside `target_path`, keeping the directory
+      # itself. Refuses to touch a target that contains `.git/` so a
+      # typo'd path or an accidental `--clean .` in a real repo can't
+      # wipe the user's work.
+      # Entries that do NOT make a target directory count as "not empty". VCS
+      # and OS metadata are ignored: `git init && hwaro init .` is the
+      # canonical first-site workflow, and a stray `.DS_Store` (created by
+      # merely opening a folder in Finder) should not force `--force` on a
+      # directory that is otherwise pristine.
+      #
+      # Deliberately the same set the build already refuses to publish, rather
+      # than a second hand-maintained list: a shorter local copy meant a
+      # submodule-only checkout holding just `.gitmodules` was refused while
+      # `.gitkeep` alone was accepted, with no rationale for the difference,
+      # and the two lists would have drifted. Broadening it is safe because
+      # `create_file`/`create_directory` never overwrite — an ignored entry is
+      # left untouched and the scaffold is written alongside it.
+      private def occupied_entries(target_path : String) : Array(String)
+        return [] of String unless Dir.exists?(target_path)
+        Dir.children(target_path).reject do |entry|
+          Models::StaticConfig::DEFAULT_EXCLUDE_NAMES.includes?(entry)
         end
       end
 
-      private def create_multilingual_config(
-        languages : Array(String),
-        skip_taxonomies : Bool,
-        scaffold : Scaffolds::Base,
-      ) : String
-        default_lang = languages.first? || "en"
-
-        lang_configs = languages.map_with_index do |lang, index|
-          lang_name = language_display_name(lang)
-          taxonomies_line = skip_taxonomies ? "" : "\n  taxonomies = [\"tags\", \"categories\"]"
-          "  [languages.#{lang}]\n" \
-          "  language_name = \"#{lang_name}\"\n" \
-          "  weight = #{index + 1}\n" \
-          "  generate_feed = true\n" \
-          "  build_search_index = true#{taxonomies_line}"
-        end.join("\n\n")
-
-        taxonomies_config = if skip_taxonomies
-                              ""
-                            else
-                              "# =============================================================================\n" \
-                              "# Taxonomies\n" \
-                              "# =============================================================================\n" \
-                              "# Define content classification systems (tags, categories, etc.)\n\n" \
-                              "[[taxonomies]]\n" \
-                              "name = \"tags\"\n" \
-                              "feed = true\n" \
-                              "sitemap = false\n\n" \
-                              "[[taxonomies]]\n" \
-                              "name = \"categories\"\n" \
-                              "paginate_by = 5\n\n" \
-                              "[[taxonomies]]\n" \
-                              "name = \"authors\"\n\n"
-                            end
-
-        String.build do |str|
-          # Site basics
-          str << "# =============================================================================\n"
-          str << "# Site Configuration\n"
-          str << "# =============================================================================\n\n"
-          str << "title = \"My Hwaro Site\"\n"
-          str << "description = \"Welcome to my new Hwaro site.\"\n"
-          str << "base_url = \"http://localhost:3000\"\n\n"
-
-          # Multilingual
-          str << "# =============================================================================\n"
-          str << "# Multilingual Configuration\n"
-          str << "# =============================================================================\n\n"
-          str << "default_language = \"#{default_lang}\"\n\n"
-          str << "[languages]\n"
-          str << lang_configs
-          str << "\n\n"
-
-          # Content & Processing
-          str << "# =============================================================================\n"
-          str << "# Plugins\n"
-          str << "# =============================================================================\n"
-          str << "# Configure content processors and extensions\n\n"
-          str << "[plugins]\n"
-          str << "processors = [\"markdown\"]\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Markdown Configuration\n"
-          str << "# =============================================================================\n"
-          str << "# Configure markdown parser behavior\n\n"
-          str << "[markdown]\n"
-          str << "safe = false          # If true, raw HTML in markdown will be stripped\n"
-          str << "lazy_loading = false  # If true, automatically add loading=\"lazy\" to img tags\n"
-          str << "emoji = false         # If true, convert emoji shortcodes (e.g. :smile:) to emoji characters\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Content Files\n"
-          str << "# =============================================================================\n"
-          str << "# Publish non-Markdown files from `content/` into the output directory.\n"
-          str << "# Example: content/about/profile.jpg -> /about/profile.jpg\n\n"
-          str << "[content.files]\n"
-          str << "allow_extensions = [\"jpg\", \"jpeg\", \"png\", \"gif\", \"svg\", \"webp\"]\n"
-          str << "# disallow_extensions = [\"psd\"]\n"
-          str << "# disallow_paths = [\"private/**\", \"**/_*\"]\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Syntax Highlighting\n"
-          str << "# =============================================================================\n"
-          str << "# Code block syntax highlighting using Highlight.js\n\n"
-          str << "[highlight]\n"
-          str << "enabled = true\n"
-          str << "theme = \"github\"          # Available: github, monokai, atom-one-dark, vs2015, etc.\n"
-          str << "use_cdn = true            # Set to false to use local assets\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# OpenGraph & Twitter Cards\n"
-          str << "# =============================================================================\n"
-          str << "# Default meta tags for social sharing\n"
-          str << "# Page-level settings (front matter) override these defaults\n\n"
-          str << "[og]\n"
-          str << "default_image = \"/images/og-default.png\"   # Default image for social sharing\n"
-          str << "type = \"article\"                           # OpenGraph type (website, article, etc.)\n"
-          str << "twitter_card = \"summary_large_image\"       # Twitter card type (summary, summary_large_image)\n"
-          str << "# twitter_site = \"@yourusername\"           # Twitter @username for the site\n"
-          str << "# twitter_creator = \"@authorusername\"      # Twitter @username for content creator\n"
-          str << "# fb_app_id = \"your_fb_app_id\"             # Facebook App ID (optional)\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Search Configuration\n"
-          str << "# =============================================================================\n"
-          str << "# Generates a search index for client-side search (e.g., Fuse.js)\n\n"
-          str << "[search]\n"
-          str << "enabled = true\n"
-          str << "format = \"fuse_json\"\n"
-          str << "fields = [\"title\", \"content\"]\n"
-          str << "filename = \"search.json\"\n"
-          str << "exclude = []              # Exclude paths or patterns from search index\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Pagination\n"
-          str << "# =============================================================================\n"
-          str << "# Enable pagination for section listing pages (e.g., /blog/).\n"
-          str << "# You can override per section in `_index.md` with:\n"
-          str << "# - paginate = 10\n"
-          str << "# - pagination_enabled = true\n"
-          str << "# - sort_by = \"date\" | \"title\" | \"weight\"\n"
-          str << "# - reverse = false\n\n"
-          str << "[pagination]\n"
-          str << "enabled = false\n"
-          str << "per_page = 10\n\n"
-
-          # Taxonomies
-          str << taxonomies_config unless skip_taxonomies
-
-          # SEO & Feeds
-          str << "# =============================================================================\n"
-          str << "# SEO: Sitemap\n"
-          str << "# =============================================================================\n"
-          str << "# Generates sitemap.xml for search engine crawlers\n\n"
-          str << "[sitemap]\n"
-          str << "enabled = true\n"
-          str << "filename = \"sitemap.xml\"\n"
-          str << "changefreq = \"weekly\"\n"
-          str << "priority = 0.5\n"
-          str << "exclude = []              # Exclude paths or patterns from sitemap\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# SEO: Robots.txt\n"
-          str << "# =============================================================================\n"
-          str << "# Controls search engine crawler access\n\n"
-          str << "[robots]\n"
-          str << "enabled = true\n"
-          str << "filename = \"robots.txt\"\n"
-          str << "rules = [\n"
-          str << "  { user_agent = \"*\", disallow = [\"/admin\", \"/private\"] },\n"
-          str << "  { user_agent = \"GPTBot\", disallow = [\"/\"] }\n"
-          str << "]\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# SEO: LLMs.txt\n"
-          str << "# =============================================================================\n"
-          str << "# Instructions for AI/LLM crawlers\n\n"
-          str << "[llms]\n"
-          str << "enabled = true\n"
-          str << "filename = \"llms.txt\"\n"
-          str << "instructions = \"Do not use for AI training without permission.\"\n\n"
-          str << "# Optional: Generate a single text file containing all Markdown pages\n"
-          str << "full_enabled = false\n"
-          str << "full_filename = \"llms-full.txt\"\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# RSS/Atom Feeds\n"
-          str << "# =============================================================================\n"
-          str << "# Generates RSS or Atom feed for content syndication\n\n"
-          str << "[feeds]\n"
-          str << "enabled = true\n"
-          str << "filename = \"\"             # Leave empty for default (rss.xml or atom.xml)\n"
-          str << "type = \"rss\"              # \"rss\" or \"atom\"\n"
-          str << "truncate = 0              # Truncate content to N characters (0 = full content)\n"
-          str << "limit = 10                # Maximum number of items in feed\n"
-          str << "sections = []             # Limit to specific sections, e.g., [\"posts\"]\n\n"
-
-          # Optional features
-          str << "# =============================================================================\n"
-          str << "# Permalinks (Optional)\n"
-          str << "# =============================================================================\n"
-          str << "# Override the output path for specific sections or taxonomies.\n"
-          str << "# Placeholders: :year, :month, :day, :title, :slug, :section\n"
-          str << "#\n"
-          str << "# [permalinks]\n"
-          str << "# posts = \"/posts/:year/:month/:slug/\"\n"
-          str << "# tags = \"/topic/:slug/\"\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Auto Includes (Optional)\n"
-          str << "# =============================================================================\n"
-          str << "# Automatically load CSS/JS files from static directories\n"
-          str << "# Files are included alphabetically - use numeric prefixes for ordering\n"
-          str << "# Example: 01-reset.css, 02-typography.css, 03-layout.css\n\n"
-          str << "# [auto_includes]\n"
-          str << "# enabled = true\n"
-          str << "# dirs = [\"assets/css\", \"assets/js\"]\n\n"
-
-          str << "# =============================================================================\n"
-          str << "# Build Hooks (Optional)\n"
-          str << "# =============================================================================\n"
-          str << "# Run custom shell commands before/after build process\n\n"
-          str << "# [build]\n"
-          str << "# hooks.pre = [\"npm install\", \"python scripts/preprocess.py\"]\n"
-          str << "# hooks.post = [\"npm run minify\", \"./scripts/deploy.sh\"]\n"
-
-          str << "\n"
-          str << "# =============================================================================\n"
-          str << "# Deployment (Optional)\n"
-          str << "# =============================================================================\n"
-          str << "# Configure deploy targets for `hwaro deploy`\n"
-          str << "#\n"
-          str << "# [deployment]\n"
-          str << "# target = \"prod\"\n"
-          str << "# source_dir = \"public\"\n"
-          str << "# confirm = false\n"
-          str << "# dryRun = false\n"
-          str << "# maxDeletes = 256      # safety limit (-1 disables)\n"
-          str << "#\n"
-          str << "# [[deployment.targets]]\n"
-          str << "# name = \"prod\"\n"
-          str << "# url = \"file://./out\"\n"
-          str << "#\n"
-          str << "# [[deployment.targets]]\n"
-          str << "# name = \"s3\"\n"
-          str << "# url = \"s3://my-bucket\"\n"
-          str << "# command = \"aws s3 sync {source}/ {url} --delete\"\n"
+      private def clean_target(target_path : String)
+        if Dir.exists?(File.join(target_path, ".git"))
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: "Refusing to --clean '#{target_path}': target contains a .git directory.",
+            hint: "Delete .git manually if you really want to wipe this directory.",
+          )
         end
-      end
 
-      # Multilingual content helpers
-      private def multilingual_index_content(lang : String, is_default : Bool, skip_taxonomies : Bool) : String
-        title = index_title(lang)
-        greeting = index_greeting(lang)
-        description = index_description(lang)
-        getting_started = getting_started_title(lang)
-        steps = getting_started_steps(lang, is_default)
-        taxonomies_section = skip_taxonomies ? "" : taxonomies_intro(lang)
+        entries = Dir.children(target_path)
+        return if entries.empty?
 
-        String.build do |str|
-          str << "+++\n"
-          str << "title = \"#{title}\"\n"
-          str << "tags = [\"welcome\", \"getting-started\"]\n" unless skip_taxonomies
-          str << "+++\n\n"
-          str << "# #{greeting}\n\n"
-          str << "#{description}\n\n"
-          str << "## #{getting_started}\n\n"
-          str << "#{steps}\n"
-          str << "#{taxonomies_section}\n" unless taxonomies_section.empty?
-        end
-      end
-
-      private def multilingual_about_content(lang : String, skip_taxonomies : Bool) : String
-        title = about_title(lang)
-        heading = about_heading(lang)
-        body = about_body(lang)
-
-        if skip_taxonomies
-          String.build do |str|
-            str << "+++\n"
-            str << "title = \"#{title}\"\n"
-            str << "+++\n\n"
-            str << "# #{heading}\n\n"
-            str << "#{body}\n"
-          end
-        else
-          String.build do |str|
-            str << "+++\n"
-            str << "title = \"#{title}\"\n"
-            str << "tags = [\"about\", \"info\"]\n"
-            str << "categories = [\"pages\"]\n"
-            str << "+++\n\n"
-            str << "# #{heading}\n\n"
-            str << "#{body}\n"
-          end
-        end
-      end
-
-      private def multilingual_blog_index_content(lang : String) : String
-        title = blog_title(lang)
-        intro = blog_intro(lang)
-
-        <<-CONTENT
-+++
-title = "#{title}"
-paginate = 10
-pagination_enabled = true
-+++
-
-# #{title}
-
-#{intro}
-CONTENT
-      end
-
-      private def multilingual_blog_post_content(lang : String, skip_taxonomies : Bool) : String
-        title = hello_world_title(lang)
-        body = hello_world_body(lang)
-
-        if skip_taxonomies
-          String.build do |str|
-            str << "+++\n"
-            str << "title = \"#{title}\"\n"
-            str << "date = \"2024-01-01\"\n"
-            str << "+++\n\n"
-            str << "# #{title}\n\n"
-            str << "#{body}\n"
-          end
-        else
-          String.build do |str|
-            str << "+++\n"
-            str << "title = \"#{title}\"\n"
-            str << "date = \"2024-01-01\"\n"
-            str << "tags = [\"hello\", \"getting-started\"]\n"
-            str << "categories = [\"blog\"]\n"
-            str << "authors = [\"hwaro\"]\n"
-            str << "+++\n\n"
-            str << "# #{title}\n\n"
-            str << "#{body}\n"
-          end
-        end
-      end
-
-      # Language-specific strings
-      private def index_title(lang : String) : String
-        case lang
-        when "ko" then "Hwaro에 오신 것을 환영합니다"
-        when "ja" then "Hwaroへようこそ"
-        when "zh" then "欢迎使用Hwaro"
-        when "es" then "Bienvenido a Hwaro"
-        when "fr" then "Bienvenue sur Hwaro"
-        when "de" then "Willkommen bei Hwaro"
-        else           "Welcome to Hwaro"
-        end
-      end
-
-      private def index_greeting(lang : String) : String
-        case lang
-        when "ko" then "안녕하세요, Hwaro!"
-        when "ja" then "こんにちは、Hwaro！"
-        when "zh" then "你好，Hwaro！"
-        when "es" then "¡Hola, Hwaro!"
-        when "fr" then "Bonjour, Hwaro !"
-        when "de" then "Hallo, Hwaro!"
-        else           "Hello, Hwaro!"
-        end
-      end
-
-      private def index_description(lang : String) : String
-        case lang
-        when "ko" then "[Hwaro](https://github.com/hahwul/hwaro)로 생성된 정적 사이트입니다."
-        when "ja" then "[Hwaro](https://github.com/hahwul/hwaro)で生成された静的サイトです。"
-        when "zh" then "这是一个由[Hwaro](https://github.com/hahwul/hwaro)生成的静态网站。"
-        when "es" then "Este es un sitio estático generado por [Hwaro](https://github.com/hahwul/hwaro)."
-        when "fr" then "Ceci est un site statique généré par [Hwaro](https://github.com/hahwul/hwaro)."
-        when "de" then "Dies ist eine statische Website, die mit [Hwaro](https://github.com/hahwul/hwaro) erstellt wurde."
-        else           "This is a fresh static site generated by [Hwaro](https://github.com/hahwul/hwaro)."
-        end
-      end
-
-      private def getting_started_title(lang : String) : String
-        case lang
-        when "ko" then "시작하기"
-        when "ja" then "はじめに"
-        when "zh" then "开始使用"
-        when "es" then "Primeros pasos"
-        when "fr" then "Pour commencer"
-        when "de" then "Erste Schritte"
-        else           "Getting Started"
-        end
-      end
-
-      private def getting_started_steps(lang : String, is_default : Bool) : String
-        content_path = is_default ? "content" : "content/#{lang}"
-        case lang
-        when "ko"
-          "1. `#{content_path}/index.md`를 편집하여 이 페이지를 수정하세요.\n" \
-          "2. `#{content_path}/`에 새 `.md` 파일을 추가하여 새 페이지를 만드세요.\n" \
-          "3. `hwaro build`를 실행하여 사이트를 다시 생성하세요.\n" \
-          "4. `hwaro serve`를 실행하여 로컬에서 미리보기 하세요."
-        when "ja"
-          "1. `#{content_path}/index.md`を編集してこのページを変更します。\n" \
-          "2. `#{content_path}/`に新しい`.md`ファイルを追加して新しいページを作成します。\n" \
-          "3. `hwaro build`を実行してサイトを再生成します。\n" \
-          "4. `hwaro serve`を実行してローカルでプレビューします。"
-        else
-          "1. Edit `#{content_path}/index.md` to change this page.\n" \
-          "2. Add new `.md` files in `#{content_path}/` to create new pages.\n" \
-          "3. Run `hwaro build` to regenerate the site.\n" \
-          "4. Run `hwaro serve` to preview changes locally."
-        end
-      end
-
-      private def taxonomies_intro(lang : String) : String
-        case lang
-        when "ko"
-          "\n## 분류 체계\n\n" \
-          "Hwaro는 태그와 카테고리 같은 분류 체계를 지원합니다:\n\n" \
-          "- [모든 태그](/ko/tags/)\n" \
-          "- [모든 카테고리](/ko/categories/)"
-        when "ja"
-          "\n## タクソノミー\n\n" \
-          "Hwaroはタグやカテゴリなどのタクソノミーをサポートしています：\n\n" \
-          "- [すべてのタグ](/ja/tags/)\n" \
-          "- [すべてのカテゴリ](/ja/categories/)"
-        else
-          "\n## Taxonomies\n\n" \
-          "Hwaro supports taxonomies like tags and categories. Check out:\n\n" \
-          "- [All Tags](/tags/)\n" \
-          "- [All Categories](/categories/)"
-        end
-      end
-
-      private def about_title(lang : String) : String
-        case lang
-        when "ko" then "소개"
-        when "ja" then "について"
-        when "zh" then "关于"
-        when "es" then "Acerca de"
-        when "fr" then "À propos"
-        when "de" then "Über uns"
-        else           "About"
-        end
-      end
-
-      private def about_heading(lang : String) : String
-        case lang
-        when "ko" then "소개"
-        when "ja" then "私たちについて"
-        when "zh" then "关于我们"
-        when "es" then "Sobre nosotros"
-        when "fr" then "À propos de nous"
-        when "de" then "Über uns"
-        else           "About Us"
-        end
-      end
-
-      private def about_body(lang : String) : String
-        case lang
-        when "ko" then "여러 페이지를 보여주기 위한 소개 페이지입니다."
-        when "ja" then "複数のページを示すための紹介ページです。"
-        when "zh" then "这是一个展示多页面的关于页面。"
-        when "es" then "Esta es una página de presentación para demostrar múltiples páginas."
-        when "fr" then "Ceci est une page de présentation pour démontrer plusieurs pages."
-        when "de" then "Dies ist eine Über-uns-Seite, um mehrere Seiten zu demonstrieren."
-        else           "This is an about page to demonstrate multiple pages."
-        end
-      end
-
-      private def blog_title(lang : String) : String
-        case lang
-        when "ko" then "블로그"
-        when "ja" then "ブログ"
-        when "zh" then "博客"
-        when "es" then "Blog"
-        when "fr" then "Blog"
-        when "de" then "Blog"
-        else           "Blog"
-        end
-      end
-
-      private def blog_intro(lang : String) : String
-        case lang
-        when "ko" then "블로그 섹션에 오신 것을 환영합니다. 여기서 모든 게시물을 확인하실 수 있습니다."
-        when "ja" then "ブログセクションへようこそ。ここですべての投稿をご覧いただけます。"
-        when "zh" then "欢迎来到博客区。在这里您可以找到所有的文章。"
-        when "es" then "Bienvenido a la sección del blog. Aquí encontrarás todas nuestras publicaciones."
-        when "fr" then "Bienvenue dans la section blog. Vous trouverez ici tous nos articles."
-        when "de" then "Willkommen im Blog-Bereich. Hier finden Sie alle unsere Beiträge."
-        else           "Welcome to the blog section. Here you'll find all our posts."
-        end
-      end
-
-      private def hello_world_title(lang : String) : String
-        case lang
-        when "ko" then "안녕 세상"
-        when "ja" then "ハローワールド"
-        when "zh" then "你好世界"
-        when "es" then "Hola Mundo"
-        when "fr" then "Bonjour le monde"
-        when "de" then "Hallo Welt"
-        else           "Hello World"
-        end
-      end
-
-      private def hello_world_body(lang : String) : String
-        case lang
-        when "ko" then "Hwaro의 분류 체계를 보여주는 샘플 블로그 포스트입니다."
-        when "ja" then "Hwaroのタクソノミーを示すサンプルブログ記事です。"
-        when "zh" then "这是一个展示Hwaro分类功能的示例博客文章。"
-        when "es" then "Esta es una publicación de blog de ejemplo que demuestra las taxonomías en Hwaro."
-        when "fr" then "Ceci est un exemple d'article de blog démontrant les taxonomies dans Hwaro."
-        when "de" then "Dies ist ein Beispiel-Blogbeitrag, der Taxonomien in Hwaro demonstriert."
-        else           "This is a sample blog post demonstrating taxonomies in Hwaro."
-        end
-      end
-
-      private def language_display_name(code : String) : String
-        case code.downcase
-        when "en" then "English"
-        when "ko" then "한국어"
-        when "ja" then "日本語"
-        when "zh" then "中文"
-        when "es" then "Español"
-        when "fr" then "Français"
-        when "de" then "Deutsch"
-        when "pt" then "Português"
-        when "ru" then "Русский"
-        when "it" then "Italiano"
-        when "nl" then "Nederlands"
-        when "pl" then "Polski"
-        when "vi" then "Tiếng Việt"
-        when "th" then "ไทย"
-        when "ar" then "العربية"
-        when "hi" then "हिन्दी"
-        else           code.upcase
+        Logger.info "Cleaning #{entries.size} existing entr#{entries.size == 1 ? "y" : "ies"} from '#{target_path}'..."
+        entries.each do |entry|
+          full = File.join(target_path, entry)
+          FileUtils.rm_rf(full)
+          Logger.action :remove, full, Logger::Role::Warn
         end
       end
 
       private def create_directory(path : String)
-        unless Dir.exists?(path)
-          Dir.mkdir_p(path)
-          Logger.action :create, path
+        if Dir.exists?(path)
+          @entries << ScaffoldEntry.new(:exist, path, dir: true)
         else
-          Logger.action :exist, path, :blue
+          Hwaro::Utils::FileSafe.mkdir_p(path)
+          @created_count += 1
+          @entries << ScaffoldEntry.new(:create, path, dir: true)
         end
       end
 
       private def create_file(path : String, content : String)
-        unless File.exists?(path)
-          File.write(path, content)
-          Logger.action :create, path
+        if File.exists?(path)
+          @entries << ScaffoldEntry.new(:exist, path, dir: false)
         else
-          Logger.action :exist, path, :blue
+          File.write(path, content)
+          @created_count += 1
+          @entries << ScaffoldEntry.new(:create, path, dir: false)
         end
+      end
+
+      # Builds a balanced default config for Hybrid C.
+      # Starts from the minimal base and adds the most commonly useful sections
+      # with relatively light comments (not the full verbose monster).
+      private def build_balanced_default_config(
+        scaffold : Scaffolds::Base,
+        skip_taxonomies : Bool,
+        is_multilingual : Bool,
+        multilingual_languages : Array(String),
+      ) : String
+        # Start with the clean minimal content (which now includes multilingual
+        # block when languages.size > 1, plus sitemap/feeds/search etc.)
+        base = scaffold.minimal_config_content(skip_taxonomies, multilingual_languages)
+
+        str = String.build do |io|
+          io << base
+
+          # Add a few high-value sections with light comments (not full examples).
+          # Note: sitemap/feeds are already provided by minimal_config_content
+          # (avoiding the previous duplicate-key TOML errors).
+          io << "\n# =============================================================================\n"
+          io << "# OpenGraph & Twitter Cards (recommended for social sharing)\n"
+          io << "# =============================================================================\n\n"
+          io << "[og]\n"
+          io << "type = \"article\"\n"
+          io << "twitter_card = \"summary_large_image\"\n\n"
+
+          io << "# =============================================================================\n"
+          io << "# Markdown (commonly customized)\n"
+          io << "# =============================================================================\n\n"
+          io << "[markdown]\n"
+          io << "emoji = true\n"
+          io << "task_lists = true\n"
+          io << "definition_lists = true\n"
+          io << "footnotes = true\n"
+          io << "mermaid = false        # Render ```mermaid code blocks as diagrams (loads mermaid.js)\n"
+          io << "math = false           # Inline ($...$) and block ($$...$$) math (loads math_engine)\n"
+          io << "math_engine = \"katex\"  # \"katex\" or \"mathjax\"\n\n"
+        end
+
+        str
       end
     end
   end

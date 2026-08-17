@@ -1,0 +1,1221 @@
+# Recursive-descent parser for the SCSS subset.
+#
+# Statement-level constructs ($var decls, @mixin/@include/@use/@import,
+# rules, declarations, at-rules) are parsed structurally; selectors,
+# property names, values, and at-rule preludes are captured as
+# `TextTemplate`s — verbatim text with `#{...}` / `$var` pieces — so that
+# any CSS we don't model passes through untouched.
+#
+# The classic SCSS ambiguity (declaration vs nested rule) is resolved by
+# scanning the prelude to its terminator: `{` starts a rule, `;`/`}` ends
+# a declaration split at its first top-level colon. A colon immediately
+# followed by an identifier (`a:hover`) is treated as a pseudo-selector
+# colon for the nested-property check only.
+
+require "./scanner"
+require "./ast"
+
+module Hwaro
+  module Assets
+    module Sass
+      class Parser
+        private record TemplateScan,
+          template : Ast::TextTemplate,
+          terminator : Char?,
+          first_colon : {Int32, Int32}?,
+          first_decl_colon : {Int32, Int32}?
+
+        # Mutable text accumulator shared between the template scanner and
+        # its string/url sub-scanners. A plain String::Builder can't be
+        # passed around because flushing replaces the builder instance.
+        private class Buf
+          getter size : Int32
+
+          def initialize
+            @io = String::Builder.new
+            @size = 0
+          end
+
+          def <<(c : Char) : self
+            @io << c
+            @size += 1
+            self
+          end
+
+          def append(s : String) : self
+            @io << s
+            @size += s.size
+            self
+          end
+
+          def flush_into(pieces : Array(Ast::Piece)) : Nil
+            return if @size == 0
+            pieces << @io.to_s
+            @io = String::Builder.new
+            @size = 0
+          end
+        end
+
+        def initialize(source : String, path : String)
+          @s = Scanner.new(source, path)
+          @block_depth = 0
+        end
+
+        def self.parse(source : String, path : String) : Ast::Stylesheet
+          new(source, path).parse
+        end
+
+        def parse : Ast::Stylesheet
+          children = parse_statements(top_level: true)
+          Ast::Stylesheet.new(children)
+        end
+
+        # Splits selector-ish text on commas outside strings/brackets/parens.
+        # Shared with the evaluator's selector resolution.
+        def self.split_top_level_commas(text : String) : Array(String)
+          parts = [] of String
+          depth = 0
+          current = String::Builder.new
+          chars = text.chars
+          i = 0
+          while i < chars.size
+            c = chars[i]
+            case c
+            when '(', '['
+              depth += 1
+              current << c
+            when ')', ']'
+              depth -= 1
+              current << c
+            when '"', '\''
+              quote = c
+              current << c
+              i += 1
+              while i < chars.size
+                sc = chars[i]
+                current << sc
+                if sc == '\\' && i + 1 < chars.size
+                  i += 1
+                  current << chars[i]
+                elsif sc == quote
+                  break
+                end
+                i += 1
+              end
+            when ','
+              if depth == 0
+                parts << current.to_s
+                current = String::Builder.new
+              else
+                current << c
+              end
+            else
+              current << c
+            end
+            i += 1
+          end
+          parts << current.to_s
+          parts
+        end
+
+        private def parse_statements(top_level : Bool) : Array(Ast::Node)
+          nodes = [] of Ast::Node
+          loop do
+            @s.skip_ws do |text, line, col|
+              template = text.includes?("\#{") ? Parser.comment_template(text, @s.path, line, col) : nil
+              nodes << Ast::CommentNode.new(text, line, col, template)
+            end
+            break if @s.eof?
+            case @s.peek
+            when '}'
+              @s.error("unmatched \"}\"") if top_level
+              break
+            when ';'
+              @s.advance
+            when '$'
+              nodes << parse_var_decl
+            when '@'
+              parse_at_rule(nodes)
+            else
+              nodes << parse_rule_or_declaration
+            end
+          end
+          nodes
+        end
+
+        # Far beyond any real stylesheet's nesting; parse recursion past this
+        # must error instead of overflowing the stack — a stack overflow is
+        # unrescuable and would kill `hwaro serve` outright.
+        MAX_BLOCK_DEPTH = 256
+
+        # Consumes "{ ... }" (cursor on the opening brace).
+        private def parse_block : Array(Ast::Node)
+          open_line = @s.line
+          open_col = @s.column
+          @block_depth += 1
+          if @block_depth > MAX_BLOCK_DEPTH
+            @s.error("blocks nested more than #{MAX_BLOCK_DEPTH} levels deep", open_line, open_col)
+          end
+          @s.advance # '{'
+          nodes = parse_statements(top_level: false)
+          @s.error("unterminated block", open_line, open_col) if @s.eof?
+          @s.advance # '}'
+          nodes
+        ensure
+          @block_depth -= 1
+        end
+
+        private def parse_var_decl : Ast::Node
+          line = @s.line
+          column = @s.column
+          @s.advance # '$'
+          name = @s.read_ident
+          @s.error("expected variable name after \"$\"", line, column) if name.empty?
+          @s.skip_ws
+          @s.error("expected \":\" after $#{name}") unless @s.peek == ':'
+          @s.advance
+          scan = read_template(stops: ";}", value_vars: true)
+          template, flags = strip_flags(scan.template, {"default", "global"})
+          template = trim_template(template)
+          @s.error("expected value for $#{name}", line, column) if template.empty?
+          @s.advance if scan.terminator == ';'
+          Ast::VarDeclNode.new(name, template, flags.includes?("default"), flags.includes?("global"), line, column)
+        end
+
+        private def parse_at_rule(nodes : Array(Ast::Node)) : Nil
+          line = @s.line
+          column = @s.column
+          @s.advance # '@'
+          name = @s.read_ident
+          @s.error("expected at-rule name after \"@\"", line, column) if name.empty?
+
+          case name
+          when "use"
+            nodes << parse_use(line, column)
+          when "import"
+            parse_import(nodes, line, column)
+          when "mixin"
+            nodes << parse_mixin(line, column)
+          when "include"
+            nodes << parse_include(line, column)
+          when "if"
+            nodes << parse_if(line, column)
+          when "else"
+            @s.error("@else without a preceding @if", line, column)
+          when "each"
+            nodes << parse_each(line, column)
+          when "for"
+            nodes << parse_for(line, column)
+          when "while"
+            nodes << parse_while(line, column)
+          when "function"
+            nodes << parse_function(line, column)
+          when "return"
+            nodes << parse_return(line, column)
+          when "debug"
+            nodes << parse_message(:debug, line, column)
+          when "warn"
+            nodes << parse_message(:warn, line, column)
+          when "error"
+            nodes << parse_message(:error, line, column)
+          when "at-root"
+            nodes << parse_at_root(line, column)
+          when "extend"
+            nodes << parse_extend(line, column)
+          when "forward"
+            nodes << parse_forward(line, column)
+          when "content"
+            @s.skip_ws
+            if @s.peek == '('
+              @s.error("@content arguments are not supported", line, column)
+            end
+            @s.advance if @s.peek == ';'
+            nodes << Ast::ContentNode.new(line, column)
+          else
+            nodes << parse_raw_at_rule(name, line, column)
+          end
+        end
+
+        private def parse_use(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          unless @s.peek == '"' || @s.peek == '\''
+            @s.error("expected quoted url after @use", line, column)
+          end
+          url = unquote(@s.read_quoted)
+          namespace = nil
+          config = [] of Ast::UseConfig
+          loop do
+            @s.skip_ws
+            break unless @s.ident_start?(@s.peek)
+            word_line = @s.line
+            word_col = @s.column
+            word = @s.read_ident
+            case word
+            when "as"
+              @s.skip_ws
+              if @s.peek == '*'
+                @s.advance
+                namespace = "*"
+              else
+                ns = @s.read_ident
+                @s.error("expected namespace after \"as\"", word_line, word_col) if ns.empty?
+                namespace = ns
+              end
+            when "with"
+              config = parse_use_config(word_line, word_col)
+            else
+              @s.error("unexpected \"#{word}\" in @use", word_line, word_col)
+            end
+          end
+          @s.error("expected \";\" after @use") unless @s.peek == ';'
+          @s.advance
+          Ast::UseNode.new(url, namespace, line, column, config)
+        end
+
+        # `with ($name: value, $other: value !default)`.
+        private def parse_use_config(line : Int32, column : Int32) : Array(Ast::UseConfig)
+          @s.skip_ws
+          @s.error("expected \"(\" after \"with\"", line, column) unless @s.peek == '('
+          @s.advance
+          entries = [] of Ast::UseConfig
+          loop do
+            @s.skip_ws
+            break if @s.peek == ')'
+            @s.error("unterminated @use configuration", line, column) if @s.eof?
+            @s.error("expected \"$\" in @use configuration") unless @s.peek == '$'
+            @s.advance
+            name = @s.read_ident
+            @s.error("expected variable name in @use configuration") if name.empty?
+            @s.skip_ws
+            @s.error("expected \":\" after $#{name}") unless @s.peek == ':'
+            @s.advance
+            scan = read_template(stops: ",)", value_vars: true)
+            template, flags = strip_flags(scan.template, {"default"})
+            template = trim_template(template)
+            @s.error("expected value for $#{name} in @use configuration") if template.empty?
+            entries << Ast::UseConfig.new(name, template, flags.includes?("default"))
+            @s.skip_ws
+            @s.advance if @s.peek == ','
+          end
+          @s.advance # ')'
+          entries
+        end
+
+        # ---------------------------------------------------------------
+        # Control flow & friends
+        # ---------------------------------------------------------------
+
+        private def parse_if(line : Int32, column : Int32) : Ast::Node
+          branches = [] of Ast::IfBranch
+          branches << parse_if_branch("@if", line, column)
+          loop do
+            snap = @s.snapshot
+            @s.skip_ws
+            unless @s.peek == '@'
+              @s.restore(snap)
+              break
+            end
+            @s.advance # '@'
+            word = @s.read_ident
+            unless word == "else"
+              @s.restore(snap)
+              break
+            end
+            @s.skip_ws
+            if @s.ident_start?(@s.peek)
+              kw_line = @s.line
+              kw_col = @s.column
+              kw = @s.read_ident
+              @s.error("expected \"if\" or \"{\" after @else", kw_line, kw_col) unless kw == "if"
+              branches << parse_if_branch("@else if", kw_line, kw_col)
+            else
+              @s.error("expected \"{\" after @else") unless @s.peek == '{'
+              branches << Ast::IfBranch.new(nil, parse_block)
+              break
+            end
+          end
+          Ast::IfNode.new(branches, line, column)
+        end
+
+        private def parse_if_branch(label : String, line : Int32, column : Int32) : Ast::IfBranch
+          scan = read_template(stops: "{;}", value_vars: true)
+          condition = trim_template(scan.template)
+          @s.error("expected condition after #{label}", line, column) if condition.empty?
+          @s.error("expected \"{\" after #{label} condition", line, column) unless scan.terminator == '{'
+          Ast::IfBranch.new(condition, parse_block)
+        end
+
+        private def parse_each(line : Int32, column : Int32) : Ast::Node
+          vars = [] of String
+          loop do
+            @s.skip_ws
+            @s.error("expected \"$\" variable after @each", line, column) unless @s.peek == '$'
+            @s.advance
+            name = @s.read_ident
+            @s.error("expected variable name after \"$\"", line, column) if name.empty?
+            vars << name
+            @s.skip_ws
+            break unless @s.peek == ','
+            @s.advance
+          end
+          word_line = @s.line
+          word_col = @s.column
+          word = @s.read_ident
+          @s.error("expected \"in\" after @each variables", word_line, word_col) unless word == "in"
+          scan = read_template(stops: "{;}", value_vars: true)
+          list = trim_template(scan.template)
+          @s.error("expected list after \"in\"", line, column) if list.empty?
+          @s.error("expected \"{\" after @each", line, column) unless scan.terminator == '{'
+          Ast::EachNode.new(vars, list, parse_block, line, column)
+        end
+
+        private def parse_for(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          @s.error("expected \"$\" variable after @for", line, column) unless @s.peek == '$'
+          @s.advance
+          var = @s.read_ident
+          @s.error("expected variable name after \"$\"", line, column) if var.empty?
+          @s.skip_ws
+          word_line = @s.line
+          word_col = @s.column
+          word = @s.read_ident
+          @s.error("expected \"from\" after @for $#{var}", word_line, word_col) unless word == "from"
+          scan = read_template(stops: "{;}", value_vars: true)
+          @s.error("expected \"{\" after @for", line, column) unless scan.terminator == '{'
+          bounds = split_for_bounds(scan.template)
+          @s.error("expected \"through\" or \"to\" in @for", line, column) unless bounds
+          from_t, to_t, exclusive = bounds
+          from_t = trim_template(from_t)
+          to_t = trim_template(to_t)
+          @s.error("expected range start after \"from\"", line, column) if from_t.empty?
+          @s.error("expected range end in @for", line, column) if to_t.empty?
+          Ast::ForNode.new(var, from_t, to_t, exclusive, parse_block, line, column)
+        end
+
+        private def parse_while(line : Int32, column : Int32) : Ast::Node
+          scan = read_template(stops: "{;}", value_vars: true)
+          condition = trim_template(scan.template)
+          @s.error("expected condition after @while", line, column) if condition.empty?
+          @s.error("expected \"{\" after @while condition", line, column) unless scan.terminator == '{'
+          Ast::WhileNode.new(condition, parse_block, line, column)
+        end
+
+        private def parse_function(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          name = @s.read_ident
+          @s.error("expected function name after @function", line, column) if name.empty?
+          @s.skip_ws
+          @s.error("expected \"(\" after @function #{name}", line, column) unless @s.peek == '('
+          params = parse_params
+          @s.skip_ws
+          @s.error("expected \"{\" for @function #{name}", line, column) unless @s.peek == '{'
+          Ast::FunctionDefNode.new(name, params, parse_block, line, column)
+        end
+
+        private def parse_return(line : Int32, column : Int32) : Ast::Node
+          scan = read_template(stops: ";}", value_vars: true)
+          value = trim_template(scan.template)
+          @s.error("expected value after @return", line, column) if value.empty?
+          @s.advance if scan.terminator == ';'
+          Ast::ReturnNode.new(value, line, column)
+        end
+
+        private def parse_message(kind : Symbol, line : Int32, column : Int32) : Ast::Node
+          scan = read_template(stops: ";}", value_vars: true)
+          value = trim_template(scan.template)
+          @s.error("expected message after @#{kind}", line, column) if value.empty?
+          @s.advance if scan.terminator == ';'
+          Ast::MessageNode.new(kind, value, line, column)
+        end
+
+        private def parse_at_root(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          if @s.peek == '('
+            @s.error("@at-root (with: ...) / (without: ...) queries are not supported", line, column)
+          end
+          if @s.peek == '{'
+            Ast::AtRootNode.new(nil, parse_block, line, column)
+          else
+            scan = read_template(stops: "{;}", value_vars: true)
+            @s.error("expected \"{\" after @at-root", line, column) unless scan.terminator == '{'
+            selector = trim_template(scan.template)
+            @s.error("expected selector or \"{\" after @at-root", line, column) if selector.empty?
+            Ast::AtRootNode.new(selector, parse_block, line, column)
+          end
+        end
+
+        # `@extend .target[, .other] [!optional];` — the selector template
+        # may contain interpolation (`.item-#{$i}`) but, like rule
+        # selectors, no bare `$var` substitution.
+        private def parse_extend(line : Int32, column : Int32) : Ast::Node
+          scan = read_template(stops: ";}", value_vars: false)
+          template, flags = strip_flags(scan.template, {"optional"})
+          template = trim_template(template)
+          @s.error("expected selector after @extend", line, column) if template.empty?
+          @s.advance if scan.terminator == ';'
+          Ast::ExtendNode.new(template, flags.includes?("optional"), line, column)
+        end
+
+        private def parse_forward(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          unless @s.peek == '"' || @s.peek == '\''
+            @s.error("expected quoted url after @forward", line, column)
+          end
+          url = unquote(@s.read_quoted)
+          shown = nil
+          hidden = nil
+          prefix = nil
+          loop do
+            @s.skip_ws
+            break unless @s.ident_start?(@s.peek)
+            word_line = @s.line
+            word_col = @s.column
+            word = @s.read_ident
+            case word
+            when "show"
+              shown = parse_forward_names(word_line, word_col)
+            when "hide"
+              hidden = parse_forward_names(word_line, word_col)
+            when "as"
+              @s.skip_ws
+              p = @s.read_ident
+              @s.error("expected prefix after \"as\"", word_line, word_col) if p.empty?
+              @s.error("expected \"*\" after @forward prefix", word_line, word_col) unless @s.peek == '*'
+              @s.advance
+              prefix = p
+            when "with"
+              @s.error("@forward ... with (...) is not supported", word_line, word_col)
+            else
+              @s.error("unexpected \"#{word}\" in @forward", word_line, word_col)
+            end
+          end
+          if shown && hidden
+            @s.error("@forward may not use both show and hide", line, column)
+          end
+          @s.error("expected \";\" after @forward") unless @s.peek == ';'
+          @s.advance
+          Ast::ForwardNode.new(url, shown, hidden, prefix, line, column)
+        end
+
+        # `show`/`hide` member lists: `$name` marks a variable, a bare
+        # name covers mixins and functions.
+        private def parse_forward_names(line : Int32, column : Int32) : Set(String)
+          names = Set(String).new
+          loop do
+            @s.skip_ws
+            marker = ""
+            if @s.peek == '$'
+              @s.advance
+              marker = "$"
+            end
+            name = @s.read_ident
+            @s.error("expected member name in @forward list", line, column) if name.empty?
+            names << marker + Sass.normalize_ident(name)
+            @s.skip_ws
+            break unless @s.peek == ','
+            @s.advance
+          end
+          names
+        end
+
+        # Splits a `from ... {` template at the top-level `through` / `to`
+        # keyword. Returns nil when neither occurs outside
+        # parens/brackets/strings.
+        private def split_for_bounds(template : Ast::TextTemplate) : {Ast::TextTemplate, Ast::TextTemplate, Bool}?
+          depth = 0
+          template.pieces.each_with_index do |piece, piece_idx|
+            next unless piece.is_a?(String)
+            chars = piece.chars
+            i = 0
+            while i < chars.size
+              c = chars[i]
+              case c
+              when '(', '['
+                depth += 1
+              when ')', ']'
+                depth -= 1
+              when '"', '\''
+                quote = c
+                i += 1
+                while i < chars.size
+                  if chars[i] == '\\'
+                    i += 1
+                  elsif chars[i] == quote
+                    break
+                  end
+                  i += 1
+                end
+              else
+                if depth == 0 && (c == 't' || c == 'T')
+                  boundary = i == 0 ? piece_idx == 0 : !ident_like?(chars[i - 1])
+                  if boundary
+                    %w[through to].each do |kw|
+                      next unless word_at?(chars, i, kw)
+                      left, right = split_template_span(template, piece_idx, i, kw.size)
+                      return {left, right, kw == "to"}
+                    end
+                  end
+                end
+              end
+              i += 1
+            end
+          end
+          nil
+        end
+
+        private def ident_like?(c : Char) : Bool
+          c.ascii_alphanumeric? || c == '_' || c == '-' || c.ord > 0x7F
+        end
+
+        private def word_at?(chars : Array(Char), i : Int32, word : String) : Bool
+          return false if i + word.size > chars.size
+          word.each_char_with_index do |wc, off|
+            return false unless chars[i + off] == wc
+          end
+          after = i + word.size < chars.size ? chars[i + word.size] : nil
+          after.nil? || !ident_like?(after)
+        end
+
+        # Splits a template around chars [i, i+width) of piece piece_idx.
+        private def split_template_span(template : Ast::TextTemplate, piece_idx : Int32,
+                                        offset : Int32, width : Int32) : {Ast::TextTemplate, Ast::TextTemplate}
+          left = [] of Ast::Piece
+          right = [] of Ast::Piece
+          template.pieces.each_with_index do |piece, i|
+            if i < piece_idx
+              left << piece
+            elsif i == piece_idx
+              text = piece.as(String)
+              head = text[0, offset]
+              tail = text[(offset + width)..]
+              left << head unless head.empty?
+              right << tail unless tail.empty?
+            else
+              right << piece
+            end
+          end
+          {Ast::TextTemplate.new(left, template.line, template.column),
+           Ast::TextTemplate.new(right, template.line, template.column)}
+        end
+
+        # Sass imports of local files become ImportNodes; plain-CSS forms
+        # (url(...), remote urls, ".css", media-query suffixes) pass through
+        # as raw statement at-rules.
+        private def parse_import(nodes : Array(Ast::Node), line : Int32, column : Int32) : Nil
+          scan = read_template(stops: ";}", value_vars: false)
+          @s.advance if scan.terminator == ';'
+          template = trim_template(scan.template)
+
+          if template.pieces.size == 1 && (text = template.pieces[0].as?(String))
+            parts = Parser.split_top_level_commas(text)
+            if parts.all? { |p| quoted_string?(p.strip) }
+              parts.each do |part|
+                url = unquote(part.strip)
+                if plain_css_import?(url)
+                  prelude = Ast::TextTemplate.new([part.strip.as(Ast::Piece)], line, column)
+                  nodes << Ast::RawAtRuleNode.new("import", prelude, nil, line, column)
+                else
+                  nodes << Ast::ImportNode.new(url, line, column)
+                end
+              end
+              return
+            end
+          end
+          # url(...), media-query suffixes, interpolation: plain CSS passthrough.
+          nodes << Ast::RawAtRuleNode.new("import", template, nil, line, column)
+        end
+
+        private def plain_css_import?(url : String) : Bool
+          url.starts_with?("http://") || url.starts_with?("https://") ||
+            url.starts_with?("//") || url.ends_with?(".css")
+        end
+
+        # True only for a single closed string literal — `"a" + "b"` has
+        # matching first/last quotes but is NOT one string and must fall
+        # through to plain-CSS passthrough instead of being mis-unquoted.
+        private def quoted_string?(text : String) : Bool
+          return false if text.size < 2
+          quote = text[0]
+          return false unless quote == '"' || quote == '\''
+          chars = text.chars
+          i = 1
+          while i < chars.size
+            case chars[i]
+            when '\\'
+              i += 2
+            when quote
+              # The first unescaped closing quote must be the final char.
+              return i == chars.size - 1
+            else
+              i += 1
+            end
+          end
+          false
+        end
+
+        private def parse_mixin(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          name = @s.read_ident
+          @s.error("expected mixin name after @mixin", line, column) if name.empty?
+          @s.skip_ws
+          params = @s.peek == '(' ? parse_params : [] of Ast::Param
+          @s.skip_ws
+          @s.error("expected \"{\" for @mixin #{name}", line, column) unless @s.peek == '{'
+          body = parse_block
+          Ast::MixinDefNode.new(name, params, body, line, column)
+        end
+
+        private def parse_params : Array(Ast::Param)
+          params = [] of Ast::Param
+          @s.advance # '('
+          loop do
+            @s.skip_ws
+            break if @s.peek == ')'
+            @s.error("unterminated parameter list") if @s.eof?
+            @s.error("expected \"$\" in mixin parameter list") unless @s.peek == '$'
+            @s.advance
+            name = @s.read_ident
+            @s.error("expected parameter name after \"$\"") if name.empty?
+            @s.skip_ws
+            if @s.peek == '.' && @s.peek(1) == '.' && @s.peek(2) == '.'
+              @s.advance
+              @s.advance
+              @s.advance
+              @s.skip_ws
+              @s.error("variadic parameter $#{name}... must be last") unless @s.peek == ')'
+              params << Ast::Param.new(name, nil, variadic: true)
+              break
+            end
+            default = nil
+            if @s.peek == ':'
+              @s.advance
+              scan = read_template(stops: ",)", value_vars: true)
+              default = trim_template(scan.template)
+            end
+            params << Ast::Param.new(name, default)
+            @s.skip_ws
+            @s.advance if @s.peek == ','
+          end
+          @s.error("unterminated parameter list") if @s.eof?
+          @s.advance # ')'
+          params
+        end
+
+        private def parse_include(line : Int32, column : Int32) : Ast::Node
+          @s.skip_ws
+          first = @s.read_ident
+          @s.error("expected mixin name after @include", line, column) if first.empty?
+          namespace = nil
+          name = first
+          if @s.peek == '.'
+            @s.advance
+            namespace = first
+            name = @s.read_ident
+            @s.error("expected mixin name after \"#{first}.\"", line, column) if name.empty?
+          end
+          @s.skip_ws
+          args = @s.peek == '(' ? parse_args : [] of Ast::Arg
+          @s.skip_ws
+          body = nil
+          if @s.ident_start?(@s.peek)
+            word_line = @s.line
+            word_col = @s.column
+            word = @s.read_ident
+            if word == "using"
+              @s.error("@include ... using (...) is not supported", word_line, word_col)
+            else
+              @s.error("unexpected \"#{word}\" after @include #{name}", word_line, word_col)
+            end
+          end
+          if @s.peek == '{'
+            body = parse_block
+          elsif @s.peek == ';'
+            @s.advance
+          end
+          Ast::IncludeNode.new(name, namespace, args, body, line, column)
+        end
+
+        private def parse_args : Array(Ast::Arg)
+          args = [] of Ast::Arg
+          @s.advance # '('
+          loop do
+            @s.skip_ws
+            break if @s.peek == ')'
+            @s.error("unterminated argument list") if @s.eof?
+            kwarg = nil
+            if @s.peek == '$'
+              # `$name: value` is a keyword argument; a bare `$var` is a
+              # positional value. Peek past the identifier for the colon.
+              offset = 1
+              while @s.ident_char?(@s.peek(offset))
+                offset += 1
+              end
+              while @s.peek(offset).try(&.ascii_whitespace?)
+                offset += 1
+              end
+              if @s.peek(offset) == ':' && @s.peek(offset + 1) != ':'
+                @s.advance # '$'
+                kwarg = @s.read_ident
+                @s.skip_ws
+                @s.advance # ':'
+              end
+            end
+            scan = read_template(stops: ",)", value_vars: true)
+            value = trim_template(scan.template)
+            # A trailing `...` spreads the (list) value into positional
+            # arguments; map spreads become keyword arguments.
+            spread = false
+            if (last = value.pieces.last?) && last.is_a?(String) && last.ends_with?("...")
+              stripped = last[0...-3].rstrip
+              pieces = value.pieces.dup
+              if stripped.empty?
+                pieces.pop
+              else
+                pieces[-1] = stripped
+              end
+              value = Ast::TextTemplate.new(pieces, value.line, value.column)
+              spread = true
+              @s.error("expected value before \"...\"") if value.empty?
+              @s.error("a spread argument can't be named") if kwarg
+            end
+            @s.error("expected argument value") if value.empty?
+            args << Ast::Arg.new(kwarg, value, spread)
+            @s.skip_ws
+            @s.advance if @s.peek == ','
+          end
+          @s.error("unterminated argument list") if @s.eof?
+          @s.advance # ')'
+          args
+        end
+
+        private def parse_raw_at_rule(name : String, line : Int32, column : Int32) : Ast::Node
+          # Preludes get variable substitution too: `@media (min-width: $bp)`
+          # is the standard breakpoint-mixin pattern (dart-sass parity).
+          scan = read_template(stops: "{;}", value_vars: true)
+          prelude = trim_template(scan.template)
+          if scan.terminator == '{'
+            children = parse_block
+            Ast::RawAtRuleNode.new(name, prelude, children, line, column)
+          else
+            @s.advance if scan.terminator == ';'
+            Ast::RawAtRuleNode.new(name, prelude, nil, line, column)
+          end
+        end
+
+        private def parse_rule_or_declaration : Ast::Node
+          line = @s.line
+          column = @s.column
+          scan = read_template(stops: "{;}", value_vars: true)
+
+          if scan.terminator == '{'
+            if (colon = scan.first_decl_colon) && blank_after?(scan.template, colon)
+              cp_name = trim_template(split_at(scan.template, colon)[0])
+              if cp_name.pieces[0]?.as?(String).try(&.starts_with?("--"))
+                # `--x: { ... }` is a custom property whose value happens to
+                # be a brace block — legal CSS, since custom-property values
+                # are an almost free-form token stream. Only the
+                # `font: { family: x }` nested-property shape is unsupported,
+                # so `--` names must not be swept up by that check. The block
+                # is kept fully verbatim.
+                raw = read_raw_block
+                @s.skip_ws { }
+                @s.advance if @s.peek == ';'
+                return Ast::DeclarationNode.new(
+                  cp_name, Ast::TextTemplate.new(Array(Ast::Piece){raw}, line, column),
+                  false, true, line, column)
+              end
+              @s.error("nested properties are not supported", line, column)
+            end
+            selector = trim_template(scan.template)
+            @s.error("expected selector", line, column) if selector.empty?
+            children = parse_block
+            return Ast::RuleNode.new(selector, children, line, column)
+          end
+
+          # Declaration: split at the first top-level colon.
+          colon = scan.first_colon
+          @s.error("expected \"{\"", line, column) unless colon
+          @s.advance if scan.terminator == ';'
+          name_t, value_t = split_at(scan.template, colon)
+          name_t = trim_template(name_t)
+          @s.error("expected property name", line, column) if name_t.empty?
+          custom = name_t.pieces[0].as?(String).try(&.starts_with?("--")) || false
+          important = false
+          if custom
+            # Custom property values are verbatim: `$var` stays literal,
+            # only `#{...}` interpolates (dart-sass semantics).
+            value_t = literalize_vars(value_t)
+          else
+            value_t, flags = strip_flags(value_t, {"important"})
+            important = flags.includes?("important")
+            value_t = trim_template(value_t)
+            @s.error("expected value for property", line, column) if value_t.empty? && !important
+          end
+          Ast::DeclarationNode.new(name_t, value_t, important, custom, line, column)
+        end
+
+        # ---------------------------------------------------------------
+        # Template scanning
+        # ---------------------------------------------------------------
+
+        # Reads verbatim text until one of `stops` at nesting depth 0 (the
+        # terminator is not consumed; nil terminator = EOF). Handles quoted
+        # strings, url(...) spans, comments (dropped, replaced by a space),
+        # `#{...}` interpolation, and — when `value_vars` — `$var` and
+        # `ns.$var` references. A `)` listed in `stops` terminates at depth 0
+        # before the unmatched-paren check, so callers that already consumed
+        # an opening paren (arg/param lists) need no special casing.
+        # Reads a balanced `{ ... }` run verbatim, braces included, with the
+        # cursor on the opening brace. Quoted strings and comments are
+        # consumed as units so a `}` inside them does not close the block.
+        private def read_raw_block : String
+          start_line = @s.line
+          start_col = @s.column
+          depth = 0
+          String.build do |io|
+            loop do
+              c = @s.peek
+              @s.error("unterminated block", start_line, start_col) unless c
+              case c
+              when '"', '\'' then io << @s.read_quoted
+              when '/'
+                if @s.peek(1) == '*'
+                  io << @s.read_loud_comment
+                else
+                  io << @s.advance
+                end
+              when '{'
+                depth += 1
+                io << @s.advance
+              when '}'
+                depth -= 1
+                io << @s.advance
+                break if depth == 0
+              else
+                io << @s.advance
+              end
+            end
+          end
+        end
+
+        private def read_template(stops : String, value_vars : Bool) : TemplateScan
+          start_line = @s.line
+          start_col = @s.column
+          pieces = [] of Ast::Piece
+          buf = Buf.new
+          depth = 0
+          terminator = nil
+          first_colon = nil
+          first_decl_colon = nil
+
+          while c = @s.peek
+            if depth == 0 && stops.includes?(c)
+              terminator = c
+              break
+            end
+
+            case c
+            when '\\'
+              # An escaped character is never structural. `.a\}b`, `.a\;b`
+              # and `url(a\)b.png)` are valid CSS, and their escaped
+              # delimiter must not close the block/declaration/span.
+              buf << @s.advance
+              buf << @s.advance unless @s.eof?
+            when '"', '\''
+              read_string_into(buf, pieces)
+            when '/'
+              if @s.peek(1) == '*'
+                @s.read_loud_comment
+                buf << ' '
+              elsif @s.peek(1) == '/'
+                @s.advance
+                @s.advance
+                until @s.eof? || @s.peek == '\n'
+                  @s.advance
+                end
+              else
+                buf << @s.advance
+              end
+            when '#'
+              if @s.peek(1) == '{'
+                buf.flush_into(pieces)
+                pieces << parse_interp
+              else
+                buf << @s.advance
+              end
+            when '$'
+              # Only a `$` that starts a real identifier is a variable
+              # sigil. Bare `$` is ordinary text — notably the `$=`
+              # "ends with" attribute operator (`a[href$=".pdf"]`), which
+              # would otherwise hard-fail on plain CSS.
+              if value_vars && @s.ident_start?(@s.peek(1))
+                var_line = @s.line
+                var_col = @s.column
+                @s.advance
+                name = @s.read_ident
+                @s.error("expected identifier after \"$\"", var_line, var_col) if name.empty?
+                buf.flush_into(pieces)
+                pieces << Ast::VarRef.new(name, nil, var_line, var_col)
+              else
+                buf << @s.advance
+              end
+            when '(', '['
+              depth += 1
+              buf << @s.advance
+            when ')'
+              @s.error("unmatched \")\"") if depth == 0
+              depth -= 1
+              buf << @s.advance
+            when ']'
+              @s.error("unmatched \"]\"") if depth == 0
+              depth -= 1
+              buf << @s.advance
+            when ':'
+              if depth == 0
+                first_colon ||= {pieces.size, buf.size}
+                nxt = @s.peek(1)
+                pseudo_like = @s.ident_start?(nxt) || nxt == ':'
+                first_decl_colon ||= {pieces.size, buf.size} unless pseudo_like
+              end
+              buf << @s.advance
+            else
+              if value_vars && @s.ident_start?(c)
+                ident = @s.read_ident
+                if @s.peek == '.' && @s.peek(1) == '$'
+                  # `ns.$var` — namespaced variable reference.
+                  var_line = @s.line
+                  var_col = @s.column
+                  @s.advance # '.'
+                  @s.advance # '$'
+                  name = @s.read_ident
+                  @s.error("expected identifier after \"#{ident}.$\"", var_line, var_col) if name.empty?
+                  buf.flush_into(pieces)
+                  pieces << Ast::VarRef.new(name, ident, var_line, var_col)
+                elsif ident.compare("url", case_insensitive: true) == 0 && @s.peek == '('
+                  buf.append(ident)
+                  read_url_span(buf, pieces)
+                else
+                  buf.append(ident)
+                end
+              else
+                buf << @s.advance
+              end
+            end
+          end
+
+          buf.flush_into(pieces)
+          template = Ast::TextTemplate.new(pieces, start_line, start_col)
+          TemplateScan.new(template, terminator, first_colon, first_decl_colon)
+        end
+
+        # Quoted string with `#{...}` support (cursor on the opening quote).
+        private def read_string_into(buf : Buf, pieces : Array(Ast::Piece)) : Nil
+          start_line = @s.line
+          start_col = @s.column
+          quote = @s.peek || @s.error("expected string", start_line, start_col)
+          buf << @s.advance
+          loop do
+            c = @s.peek || @s.error("unterminated string", start_line, start_col)
+            if c == '\\'
+              buf << @s.advance
+              buf << @s.advance unless @s.eof?
+            elsif c == '#' && @s.peek(1) == '{'
+              buf.flush_into(pieces)
+              pieces << parse_interp
+            elsif c == quote
+              buf << @s.advance
+              break
+            else
+              buf << @s.advance
+            end
+          end
+        end
+
+        # Raw `url(...)` span (cursor on '('): unquoted url contents are
+        # token soup (data URIs contain `;` and `,`), so everything up to
+        # the closing paren is verbatim except quoted strings and `#{...}`.
+        private def read_url_span(buf : Buf, pieces : Array(Ast::Piece)) : Nil
+          start_line = @s.line
+          start_col = @s.column
+          buf << @s.advance # '('
+          loop do
+            c = @s.peek || @s.error("unterminated url(", start_line, start_col)
+            case c
+            when '\\'
+              buf << @s.advance
+              buf << @s.advance unless @s.eof?
+            when ')'
+              buf << @s.advance
+              break
+            when '"', '\''
+              read_string_into(buf, pieces)
+            when '#'
+              if @s.peek(1) == '{'
+                buf.flush_into(pieces)
+                pieces << parse_interp
+              else
+                buf << @s.advance
+              end
+            else
+              buf << @s.advance
+            end
+          end
+        end
+
+        # Splits a loud comment's text into literal runs and `#{...}`
+        # interpolations. Positions inside the returned template are
+        # relative to the comment body, so errors carry the comment's own
+        # location instead. nil when the text doesn't parse as a template
+        # (a literal `#{` with no closing brace) — plain-CSS comments must
+        # keep passing through verbatim, never become parse errors.
+        def self.comment_template(text : String, path : String,
+                                  line : Int32, column : Int32) : Ast::TextTemplate?
+          new(text, path).scan_comment_template(line, column)
+        rescue SyntaxError
+          nil
+        end
+
+        protected def scan_comment_template(line : Int32, column : Int32) : Ast::TextTemplate
+          pieces = [] of Ast::Piece
+          buf = Buf.new
+          until @s.eof?
+            if @s.peek == '#' && @s.peek(1) == '{'
+              buf.flush_into(pieces)
+              pieces << parse_interp
+            else
+              buf << @s.advance
+            end
+          end
+          buf.flush_into(pieces)
+          Ast::TextTemplate.new(pieces, line, column)
+        end
+
+        # `#{ ... }` (cursor on '#').
+        private def parse_interp : Ast::Interp
+          line = @s.line
+          column = @s.column
+          @s.advance # '#'
+          @s.advance # '{'
+          scan = read_template(stops: "}", value_vars: true)
+          @s.error("unterminated \"\#{\"", line, column) unless scan.terminator == '}'
+          @s.advance # '}'
+          inner = trim_template(scan.template)
+          @s.error("empty \"\#{}\"", line, column) if inner.empty?
+          Ast::Interp.new(inner, line, column)
+        end
+
+        # ---------------------------------------------------------------
+        # Template helpers
+        # ---------------------------------------------------------------
+
+        private def unquote(text : String) : String
+          text[1...-1]
+        end
+
+        private def split_at(template : Ast::TextTemplate, colon : {Int32, Int32}) : {Ast::TextTemplate, Ast::TextTemplate}
+          piece_idx, offset = colon
+          left = [] of Ast::Piece
+          right = [] of Ast::Piece
+          template.pieces.each_with_index do |piece, i|
+            if i < piece_idx
+              left << piece
+            elsif i == piece_idx
+              text = piece.as(String)
+              head = text[0, offset]
+              tail = text[offset + 1..]
+              left << head unless head.empty?
+              right << tail unless tail.empty?
+            else
+              right << piece
+            end
+          end
+          {Ast::TextTemplate.new(left, template.line, template.column),
+           Ast::TextTemplate.new(right, template.line, template.column)}
+        end
+
+        private def trim_template(template : Ast::TextTemplate) : Ast::TextTemplate
+          pieces = template.pieces.dup
+          if (first = pieces.first?) && first.is_a?(String)
+            stripped = first.lstrip
+            if stripped.empty?
+              pieces.shift
+            else
+              pieces[0] = stripped
+            end
+          end
+          if (last = pieces.last?) && last.is_a?(String)
+            stripped = last.rstrip
+            if stripped.empty?
+              pieces.pop
+            else
+              pieces[-1] = stripped
+            end
+          end
+          Ast::TextTemplate.new(pieces, template.line, template.column)
+        end
+
+        # Strips trailing `!flag` markers (!default, !global, !important)
+        # off a value template.
+        private def strip_flags(template : Ast::TextTemplate, allowed : Tuple) : {Ast::TextTemplate, Set(String)}
+          flags = Set(String).new
+          pieces = template.pieces.dup
+          loop do
+            last = pieces.last?
+            break unless last.is_a?(String)
+            stripped = last.rstrip
+            matched = false
+            allowed.each do |flag|
+              marker = "!#{flag}"
+              next unless stripped.downcase.ends_with?(marker)
+              flags << flag
+              stripped = stripped[0, stripped.size - marker.size].rstrip
+              matched = true
+              break
+            end
+            break unless matched
+            if stripped.empty?
+              pieces.pop
+            else
+              pieces[-1] = stripped
+            end
+          end
+          {Ast::TextTemplate.new(pieces, template.line, template.column), flags}
+        end
+
+        # Converts VarRef pieces back into literal `$name` text (custom
+        # property values must not substitute variables).
+        private def literalize_vars(template : Ast::TextTemplate) : Ast::TextTemplate
+          pieces = [] of Ast::Piece
+          template.pieces.each do |piece|
+            if piece.is_a?(Ast::VarRef)
+              if (last = pieces.last?) && last.is_a?(String)
+                pieces[-1] = last + piece.lexeme
+              else
+                pieces << piece.lexeme
+              end
+            else
+              pieces << piece
+            end
+          end
+          Ast::TextTemplate.new(pieces, template.line, template.column)
+        end
+
+        # True when nothing but whitespace follows the given colon position
+        # (the `font: { ... }` nested-property shape).
+        private def blank_after?(template : Ast::TextTemplate, colon : {Int32, Int32}) : Bool
+          piece_idx, offset = colon
+          template.pieces.each_with_index do |piece, i|
+            next if i < piece_idx
+            if i == piece_idx
+              tail = piece.as(String)[offset + 1..]
+              return false unless tail.blank?
+            else
+              return false unless piece.is_a?(String) && piece.blank?
+            end
+          end
+          true
+        end
+      end
+    end
+  end
+end

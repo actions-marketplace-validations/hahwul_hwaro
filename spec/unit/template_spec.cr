@@ -1,5 +1,22 @@
 require "../spec_helper"
 
+# Builds a minimal `__menus__` Crinja value shape ({lang => {menu_name =>
+# [{"name" => ...}]}}) for the `get_menu function` tests below — just
+# enough for the function's own language-resolution logic to exercise,
+# not the full Entry shape `Content::Menus`/`build_global_vars` produce.
+private def menus_value(structure : Hash(String, Hash(String, Array(String)))) : Crinja::Value
+  lang_hash = {} of String => Crinja::Value
+  structure.each do |lang, menus|
+    menu_hash = {} of String => Crinja::Value
+    menus.each do |menu_name, names|
+      entries = names.map { |n| Crinja::Value.new({"name" => Crinja::Value.new(n)}) }
+      menu_hash[menu_name] = Crinja::Value.new(entries)
+    end
+    lang_hash[lang] = Crinja::Value.new(menu_hash)
+  end
+  Crinja::Value.new(lang_hash)
+end
+
 describe Hwaro::Content::Processors::Template do
   describe ".process" do
     it "processes simple if condition (true)" do
@@ -10,10 +27,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_url == "/about/" %}
-      <p>About page</p>
-      {% endif %}
-      TPL
+        {% if page_url == "/about/" %}
+        <p>About page</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>About page</p>")
@@ -27,10 +44,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_url == "/about/" %}
-      <p>About page</p>
-      {% endif %}
-      TPL
+        {% if page_url == "/about/" %}
+        <p>About page</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should_not contain("<p>About page</p>")
@@ -44,12 +61,12 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_url == "/about/" %}
-      <p>About page</p>
-      {% else %}
-      <p>Other page</p>
-      {% endif %}
-      TPL
+        {% if page_url == "/about/" %}
+        <p>About page</p>
+        {% else %}
+        <p>Other page</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>About page</p>")
@@ -64,12 +81,12 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_url == "/about/" %}
-      <p>About page</p>
-      {% else %}
-      <p>Other page</p>
-      {% endif %}
-      TPL
+        {% if page_url == "/about/" %}
+        <p>About page</p>
+        {% else %}
+        <p>Other page</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should_not contain("<p>About page</p>")
@@ -84,10 +101,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_section != "docs" %}
-      <p>Not docs</p>
-      {% endif %}
-      TPL
+        {% if page_section != "docs" %}
+        <p>Not docs</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Not docs</p>")
@@ -104,10 +121,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <h1>{{ page_title }}</h1>
-      <p>Section: {{ page_section }}</p>
-      <p>Site: {{ site_title }}</p>
-      TPL
+        <h1>{{ page_title }}</h1>
+        <p>Section: {{ page_section }}</p>
+        <p>Site: {{ site_title }}</p>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<h1>Test Page</h1>")
@@ -124,10 +141,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page.draft %}
-      <p>Draft</p>
-      {% endif %}
-      TPL
+        {% if page.draft %}
+        <p>Draft</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Draft</p>")
@@ -142,10 +159,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if not page.draft %}
-      <p>Published</p>
-      {% endif %}
-      TPL
+        {% if not page.draft %}
+        <p>Published</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Published</p>")
@@ -159,8 +176,8 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <h1>{{ page_title | upper }}</h1>
-      TPL
+        <h1>{{ page_title | upper }}</h1>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<h1>HELLO WORLD</h1>")
@@ -176,8 +193,8 @@ describe Hwaro::Content::Processors::Template do
       context.add("empty_var", nil)
 
       template = <<-TPL
-      <p>{{ empty_var | default("No description") }}</p>
-      TPL
+        <p>{{ empty_var | default("No description") }}</p>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>No description</p>")
@@ -191,14 +208,14 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_section == "blog" %}
-      <p>Blog</p>
-      {% elif page_section == "docs" %}
-      <p>Documentation</p>
-      {% else %}
-      <p>Other</p>
-      {% endif %}
-      TPL
+        {% if page_section == "blog" %}
+        <p>Blog</p>
+        {% elif page_section == "docs" %}
+        <p>Documentation</p>
+        {% else %}
+        <p>Other</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should_not contain("<p>Blog</p>")
@@ -214,12 +231,12 @@ describe Hwaro::Content::Processors::Template do
       context.add("items", ["apple", "banana", "cherry"])
 
       template = <<-TPL
-      <ul>
-      {% for item in items %}
-      <li>{{ item }}</li>
-      {% endfor %}
-      </ul>
-      TPL
+        <ul>
+        {% for item in items %}
+        <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<li>apple</li>")
@@ -236,12 +253,12 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_section == "blog" %}
-        {% if not page.draft %}
-        <p>Published blog post</p>
+        {% if page_section == "blog" %}
+          {% if not page.draft %}
+          <p>Published blog post</p>
+          {% endif %}
         {% endif %}
-      {% endif %}
-      TPL
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Published blog post</p>")
@@ -256,10 +273,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_section == "blog" and not page.draft %}
-      <p>Published blog post</p>
-      {% endif %}
-      TPL
+        {% if page_section == "blog" and not page.draft %}
+        <p>Published blog post</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Published blog post</p>")
@@ -273,10 +290,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_section == "blog" or page_section == "news" %}
-      <p>Content section</p>
-      {% endif %}
-      TPL
+        {% if page_section == "blog" or page_section == "news" %}
+        <p>Content section</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Content section</p>")
@@ -290,10 +307,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page_url is startswith("/blog/") %}
-      <p>Blog post</p>
-      {% endif %}
-      TPL
+        {% if page_url is startswith("/blog/") %}
+        <p>Blog post</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>Blog post</p>")
@@ -309,10 +326,10 @@ describe Hwaro::Content::Processors::Template do
       context.add("empty_var", "")
 
       template = <<-TPL
-      {% if empty_var == "" %}
-      <p>No description</p>
-      {% endif %}
-      TPL
+        {% if empty_var == "" %}
+        <p>No description</p>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>No description</p>")
@@ -326,10 +343,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      {% if page.toc %}
-      <div class="toc">Table of Contents</div>
-      {% endif %}
-      TPL
+        {% if page.toc %}
+        <div class="toc">Table of Contents</div>
+        {% endif %}
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<div class=\"toc\">Table of Contents</div>")
@@ -343,8 +360,8 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <a href="{{ base_url }}/about/">About</a>
-      TPL
+        <a href="{{ base_url }}/about/">About</a>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<a href=\"https://example.com/about/\">About</a>")
@@ -360,10 +377,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <h1>{{ site.title }}</h1>
-      <p>{{ site.description }}</p>
-      <a href="{{ site.base_url }}">Home</a>
-      TPL
+        <h1>{{ site.title }}</h1>
+        <p>{{ site.description }}</p>
+        <a href="{{ site.base_url }}">Home</a>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<h1>My Site</h1>")
@@ -382,11 +399,11 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <h1>{{ page.title }}</h1>
-      <p>{{ page.description }}</p>
-      <a href="{{ page.url }}">Link</a>
-      <span>{{ page.section }}</span>
-      TPL
+        <h1>{{ page.title }}</h1>
+        <p>{{ page.description }}</p>
+        <a href="{{ page.url }}">Link</a>
+        <span>{{ page.section }}</span>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<h1>My Page</h1>")
@@ -402,10 +419,10 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <h1>{{ section.title }}</h1>
-      <p>{{ section.description }}</p>
-      <div>{{ section.list }}</div>
-      TPL
+        <h1>{{ section.title }}</h1>
+        <p>{{ section.description }}</p>
+        <div>{{ section.list }}</div>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<h1></h1>")
@@ -420,11 +437,26 @@ describe Hwaro::Content::Processors::Template do
       context = Hwaro::Content::Processors::TemplateContext.new(page, config)
 
       template = <<-TPL
-      <div>{{ toc_obj.html }}</div>
-      TPL
+        <div>{{ toc_obj.html }}</div><span>{% for h in toc_obj.headers %}H{% endfor %}</span>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<div></div>")
+      result.should contain("<span></span>")
+    end
+
+    it "provides seo object with empty defaults" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      template = <<-TPL
+        {{ seo.canonical_url }}|{{ seo.og_type }}|{{ seo.twitter_card }}
+        TPL
+
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      result.should contain("||")
     end
 
     it "adds custom variables to context" do
@@ -437,10 +469,10 @@ describe Hwaro::Content::Processors::Template do
       context.add("count", 42)
 
       template = <<-TPL
-      <p>{{ custom_var }}</p>
-      {% if is_special %}<p>Special!</p>{% endif %}
-      <p>Count: {{ count }}</p>
-      TPL
+        <p>{{ custom_var }}</p>
+        {% if is_special %}<p>Special!</p>{% endif %}
+        <p>Count: {{ count }}</p>
+        TPL
 
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should contain("<p>custom value</p>")
@@ -747,6 +779,33 @@ describe Hwaro::Content::Processors::Template do
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should eq("yes")
     end
+
+    it "returns false for matching test with an invalid regex (no raise)" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("u", "anything")
+
+      # Unbalanced bracket "[" is an invalid regex; the rescue ArgumentError
+      # branch must return false rather than letting the error abort the build.
+      template = "{% if u is matching(\"[\") %}HIT{% else %}MISS{% endif %}"
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      result.should eq("MISS")
+    end
+
+    it "matches consistently across repeated renders with a valid regex (cached)" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("u", "photo.png")
+
+      template = "{% if u is matching(\"[.](jpg|png)$\") %}HIT{% else %}MISS{% endif %}"
+      Hwaro::Content::Processors::Template.process(template, context).should eq("HIT")
+      # Second render hits the cached compiled regex and must yield the same result.
+      Hwaro::Content::Processors::Template.process(template, context).should eq("HIT")
+    end
   end
 
   describe "Custom Functions" do
@@ -760,6 +819,19 @@ describe Hwaro::Content::Processors::Template do
       result = Hwaro::Content::Processors::Template.process(template, context)
       # Should contain a date-like string
       result.should match(/\d{4}-\d{2}-\d{2}/)
+    end
+
+    it "processes now function with explicit format argument" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      template = "{{ now(format=\"%Y\") }}"
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      # Explicit format branch should pass the format through to time.to_s
+      result.should match(/^\d{4}$/)
+      result.should eq(Time.local.year.to_s)
     end
 
     it "processes env function with set variable" do
@@ -821,6 +893,79 @@ describe Hwaro::Content::Processors::Template do
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should eq("https://example.com/about/")
     end
+
+    it "load_data parses CSV cells (stripped) from a project-relative path" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          # Cells include surrounding whitespace to confirm .strip is applied.
+          File.write("data/menu.csv", "name , price\n Tea , 3 \n")
+
+          page = Hwaro::Models::Page.new("test.md")
+          config = Hwaro::Models::Config.new
+          context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+          template = "{% set d = load_data(path=\"data/menu.csv\") %}{{ d[1][0] }}|{{ d[1][1] }}"
+          result = Hwaro::Content::Processors::Template.process(template, context)
+          result.should eq("Tea|3")
+        end
+      end
+    end
+
+    it "load_data blocks path traversal outside the project root" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          page = Hwaro::Models::Page.new("test.md")
+          config = Hwaro::Models::Config.new
+          context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+          template = "[{{ load_data(path=\"../../../etc/passwd\") }}]"
+          result = Hwaro::Content::Processors::Template.process(template, context)
+          # Boundary check fails -> result stays Crinja nil. Crinja renders nil
+          # as the literal "none", so the traversal yields no file contents.
+          result.should eq("[none]")
+        end
+      end
+    end
+
+    it "load_data returns nil (empty render) for a malformed JSON data file" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/bad.json", "{ not valid json ")
+
+          page = Hwaro::Models::Page.new("test.md")
+          config = Hwaro::Models::Config.new
+          context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+          # The rescue at the parse site swallows the error into Crinja nil
+          # (no exception escapes the build); Crinja renders nil as "none".
+          template = "[{{ load_data(path=\"data/bad.json\") }}]"
+          result = Hwaro::Content::Processors::Template.process(template, context)
+          result.should eq("[none]")
+        end
+      end
+    end
+
+    it "load_data returns nil (empty render) for an unsupported extension" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          # File must exist inside project_root to reach the else (unsupported)
+          # branch; otherwise the boundary/exists check short-circuits.
+          File.write("data/notes.txt", "hello")
+
+          page = Hwaro::Models::Page.new("test.md")
+          config = Hwaro::Models::Config.new
+          context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+          template = "[{{ load_data(path=\"data/notes.txt\") }}]"
+          result = Hwaro::Content::Processors::Template.process(template, context)
+          # Unsupported extension -> result stays Crinja nil -> renders "none".
+          result.should eq("[none]")
+        end
+      end
+    end
   end
 
   describe "Time-related Variables" do
@@ -866,6 +1011,115 @@ describe Hwaro::Content::Processors::Template do
       template = "© {{ current_year }} My Site"
       result = Hwaro::Content::Processors::Template.process(template, context)
       result.should eq("© #{Time.local.year} My Site")
+    end
+  end
+
+  describe "error classification" do
+    it "raises HwaroError(HWARO_E_TEMPLATE) for a broken template string" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/about/"
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      # Unclosed `{{` — Crinja raises a parse error which the engine
+      # wraps as HwaroError(HWARO_E_TEMPLATE).
+      err = expect_raises(Hwaro::HwaroError) do
+        Hwaro::Content::Processors::Template.process("{{ unclosed", context)
+      end
+
+      err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+      err.category.should eq(:template)
+      err.exit_code.should eq(4)
+      (err.message || "").should contain("Template error")
+    end
+
+    it "raises HwaroError(HWARO_E_TEMPLATE) for an unclosed block tag" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      err = expect_raises(Hwaro::HwaroError) do
+        Hwaro::Content::Processors::Template.process("{% if true %}oops", context)
+      end
+
+      err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+      err.exit_code.should eq(4)
+    end
+
+    it "includes the page path in the error message for context-based render" do
+      page = Hwaro::Models::Page.new("posts/broken.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      err = expect_raises(Hwaro::HwaroError) do
+        Hwaro::Content::Processors::Template.process("{{ unclosed", context)
+      end
+
+      (err.message || "").should contain("posts/broken.md")
+    end
+
+    it "preserves the original Crinja exception as cause" do
+      page = Hwaro::Models::Page.new("posts/broken.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+
+      err = expect_raises(Hwaro::HwaroError) do
+        Hwaro::Content::Processors::Template.process("{{ unclosed", context)
+      end
+
+      err.cause.should be_a(Crinja::Error)
+    end
+  end
+
+  # `get_menu()` reads the `__menus__` global built by `build_global_vars`
+  # (see render.cr / Content::Menus.build). These tests inject a minimal
+  # `__menus__` shape directly via `context.add` so they exercise only the
+  # function's own language-resolution logic, not the full menu builder
+  # (covered separately by spec/unit/menus_spec.cr).
+  describe "get_menu function" do
+    it "resolves a named menu for the current page's language" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("page_language", "ko")
+      context.add("_i18n_default_language", "en")
+      context.add("__menus__", menus_value({
+        "en" => {"main" => ["Home"]},
+        "ko" => {"main" => ["홈"]},
+      }))
+
+      template = "{% for item in get_menu(name=\"main\") %}{{ item.name }}{% endfor %}"
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      result.should eq("홈")
+    end
+
+    it "falls back to the default language when the current language has no entries for that menu" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("page_language", "ko")
+      context.add("_i18n_default_language", "en")
+      context.add("__menus__", menus_value({
+        "en" => {"main" => ["Home"]},
+        "ko" => {} of String => Array(String),
+      }))
+
+      template = "{% for item in get_menu(name=\"main\") %}{{ item.name }}{% endfor %}"
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      result.should eq("Home")
+    end
+
+    it "returns an empty array (not an error) for an unregistered menu name" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+      context = Hwaro::Content::Processors::TemplateContext.new(page, config)
+      context.add("page_language", "en")
+      context.add("_i18n_default_language", "en")
+      context.add("__menus__", menus_value({"en" => {"main" => ["Home"]}}))
+
+      template = "[{% for item in get_menu(name=\"missing\") %}{{ item.name }}{% endfor %}]"
+      result = Hwaro::Content::Processors::Template.process(template, context)
+      result.should eq("[]")
     end
   end
 end

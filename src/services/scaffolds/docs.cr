@@ -17,6 +17,17 @@ module Hwaro
           "Documentation-focused structure with organized sections and sidebar"
         end
 
+        protected def config_title : String
+          # Distinct from the homepage `title = "Documentation"` so the
+          # rendered <title> and the `{{ site.title }} <span>Documentation</span>`
+          # logo don't collapse into "Documentation - Documentation".
+          "My Docs"
+        end
+
+        protected def config_description : String
+          "Project documentation powered by Hwaro."
+        end
+
         def content_files(skip_taxonomies : Bool = false) : Hash(String, String)
           files = {} of String => String
 
@@ -43,30 +54,74 @@ module Hwaro
           files
         end
 
+        # Docs ships section-specific archetypes so `hwaro new
+        # getting-started/foo.md`, `guide/foo.md`, and `reference/foo.md`
+        # each auto-match (see `Services::Creator#find_archetype`) with
+        # docs-shaped front matter (weight/toc) that a generic
+        # `default.md` would miss.
+        def archetype_files : Hash(String, String)
+          super.merge({
+            "getting-started.md" => docs_archetype,
+            "guide.md"           => docs_archetype,
+            "reference.md"       => docs_archetype,
+          })
+        end
+
+        protected def docs_archetype : String
+          # `weight` is commented out intentionally: every docs section
+          # page shouldn't default to the same weight or ordering becomes
+          # non-deterministic. Users who care about ordering should set
+          # it explicitly per page.
+          #
+          # Body intentionally empty — docs `page.html` renders the title
+          # as `<h1>` already, so a `# {{ title }}` here would duplicate
+          # it (gh#525).
+          <<-MD
+            +++
+            title = "{{ title }}"
+            date = "{{ date }}"
+            draft = {{ draft }}
+            description = "{{ description }}"
+            # weight = 10
+            toc = true
+            tags = {{ tags }}
+            +++
+
+            MD
+        end
+
+        # Docs templates share nav, search, and sidebar across page,
+        # section, taxonomy, and 404 — extracting those into `partials/`
+        # makes "edit the nav" a one-file change and keeps 404/taxonomy
+        # inside the docs-container so `footer.html`'s closing tags
+        # actually match what the body opens.
         def template_files(skip_taxonomies : Bool = false) : Hash(String, String)
           files = {
-            "header.html"  => header_template,
-            "footer.html"  => footer_template,
-            "page.html"    => docs_page_template,
-            "section.html" => docs_section_template,
-            "404.html"     => not_found_template,
+            "header.html"           => header_template,
+            "footer.html"           => footer_template,
+            "partials/nav.html"     => docs_nav_html,
+            "partials/search.html"  => search_overlay_html("Search documentation..."),
+            "partials/sidebar.html" => docs_sidebar_html,
+            "page.html"             => docs_page_template,
+            "section.html"          => docs_section_template,
+            "404.html"              => docs_not_found_template,
           }
 
           unless skip_taxonomies
-            files["taxonomy.html"] = taxonomy_template
-            files["taxonomy_term.html"] = taxonomy_term_template
+            files["taxonomy.html"] = docs_taxonomy_template
+            files["taxonomy_term.html"] = docs_taxonomy_term_template
           end
 
           files
         end
 
-        def config_content(skip_taxonomies : Bool = false) : String
+        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
           config = String.build do |str|
             # Site basics
-            str << base_config("Documentation", "Project documentation powered by Hwaro.")
+            str << base_config(config_title, config_description)
 
             # Content & Processing
-            str << multilingual_config
+            str << multilingual_config(multilingual_languages)
             str << plugins_config
             str << content_files_config
             str << highlight_config
@@ -81,1454 +136,1785 @@ module Hwaro
             str << sitemap_config
             str << robots_config
             str << llms_config
-            str << feeds_config
+            str << feeds_config(feed_sections)
 
             # Optional features (commented out by default)
             str << permalinks_config
             str << auto_includes_config
             str << assets_config
             str << markdown_config
+            str << content_new_config
+            str << image_processing_config
             str << build_hooks_config
             str << pwa_config
             str << amp_config
             str << og_auto_image_config
+            str << doctor_config
             str << deployment_config
           end
           config
         end
 
-        # Override header for docs - minimal header integrated with layout (Jinja2 syntax)
+        # Override header for docs - minimal header integrated with layout
+        # (Jinja2 syntax). `page.title` and `page.description` are guarded
+        # so untitled pages don't render `<title> - Site</title>` or an
+        # empty description meta.
         protected def header_template : String
           <<-HTML
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta name="description" content="{{ page.description }}">
-            <title>{{ page.title }} - {{ site.title }}</title>
-            {{ og_all_tags }}
-            #{styles}
-            {{ highlight_css }}
-            {{ auto_includes_css }}
-          </head>
-          <body data-section="{{ page.section }}">
-          HTML
+            <!DOCTYPE html>
+            <html lang="{{ page_language }}">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <meta name="description" content="{{ page.description | default(site.description, true) | e }}">
+              <title>{% if page.title is present %}{{ page.title | e }} - {% endif %}{{ site.title | e }}</title>
+              <link rel="icon" type="image/svg+xml" href="{{ base_url }}/favicon.svg">
+              #{theme_head_script}
+              {{ og_all_tags }}
+              {{ canonical_tag }}
+              {{ jsonld }}
+              {{ hreflang_tags }}
+              {{ pagination_seo_links }}
+              #{styles}
+              {# The syntax theme is inlined in css/style.css, so no highlight theme
+                 stylesheet link is emitted here (sub-path safe). Highlight.js itself
+                 still loads from the footer. #}
+              {{ math_tags }}
+              {{ mermaid_tags }}
+              {{ auto_includes_css }}
+            </head>
+            <body data-section="{{ page.section }}">
+              <a class="skip-link" href="#main">Skip to content</a>
+            HTML
         end
 
         # Override styles for docs - modern unified layout
         protected def styles : String
           <<-CSS
             <link rel="stylesheet" href="{{ base_url }}/css/style.css">
-          CSS
+            CSS
         end
 
         def static_files : Hash(String, String)
-          {
+          super.merge({
             "css/style.css" => css_content,
-            "js/search.js"  => search_js_content,
-          }
+            "js/search.js"  => search_js_content(docs_heading_anchor_js),
+          }).merge(font_files)
         end
 
         private def css_content : String
           <<-CSS
-          :root {
-            --primary: #0071e3;
-            --primary-hover: #0077ed;
-            --text: #1d1d1f;
-            --text-secondary: #6e6e73;
-            --text-muted: #86868b;
-            --border: #d2d2d7;
-            --border-light: #e8e8ed;
-            --bg: #ffffff;
-            --bg-secondary: #f5f5f7;
-            --bg-code: #f5f5f7;
-            --header-h: 52px;
-            --sidebar-w: 260px;
-            --content-max-w: 780px;
-            --radius: 10px;
-            --radius-sm: 6px;
-          }
-
-          *,
-          *::before,
-          *::after {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-          }
-
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
-            font-size: 15px;
-            line-height: 1.6;
-            color: var(--text);
-            background: var(--bg);
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-          }
-
-          /* Header */
-          .docs-header {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: var(--header-h);
-            background: rgba(255, 255, 255, 0.8);
-            backdrop-filter: saturate(180%) blur(20px);
-            -webkit-backdrop-filter: saturate(180%) blur(20px);
-            border-bottom: 1px solid var(--border-light);
-            display: flex;
-            align-items: center;
-            padding: 0 1.5rem;
-            z-index: 100;
-          }
-
-          .docs-header .logo {
-            font-weight: 600;
-            font-size: 1.05rem;
-            color: var(--text);
-            text-decoration: none;
-            margin-right: 2rem;
-            letter-spacing: -0.01em;
-          }
-
-          .docs-header .logo span {
-            color: var(--text-muted);
-            font-weight: 400;
-            margin-left: 0.25rem;
-            font-size: 0.8rem;
-          }
-
-          .docs-header nav {
-            display: flex;
-            gap: 1.25rem;
-          }
-
-          .docs-header nav a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: 0.85rem;
-            font-weight: 400;
-            padding: 0.25rem 0;
-            transition: color 0.15s;
-          }
-
-          .docs-header nav a:hover {
-            color: var(--text);
-          }
-
-          .header-right {
-            margin-left: auto;
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-          }
-
-          .header-right a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: 0.85rem;
-            transition: color 0.15s;
-          }
-
-          .header-right a:hover {
-            color: var(--text);
-          }
-
-          /* Layout */
-          .docs-container {
-            display: flex;
-            padding-top: var(--header-h);
-            min-height: 100vh;
-          }
-
-          /* Sidebar */
-          .docs-sidebar {
-            position: fixed;
-            top: var(--header-h);
-            left: 0;
-            width: var(--sidebar-w);
-            height: calc(100vh - var(--header-h));
-            background: var(--bg);
-            border-right: 1px solid var(--border-light);
-            padding: 1.25rem 0.75rem;
-            overflow-y: auto;
-            scrollbar-width: thin;
-          }
-
-          .docs-sidebar::-webkit-scrollbar {
-            width: 4px;
-          }
-
-          .docs-sidebar::-webkit-scrollbar-thumb {
-            background: var(--border);
-            border-radius: 2px;
-          }
-
-          .sidebar-section {
-            margin-bottom: 1.5rem;
-          }
-
-          .sidebar-title {
-            font-size: 0.7rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            color: var(--text-muted);
-            margin-bottom: 0.4rem;
-            letter-spacing: 0.04em;
-            padding-left: 0.75rem;
-          }
-
-          .sidebar-links {
-            list-style: none;
-          }
-
-          .sidebar-links li {
-            margin-bottom: 1px;
-          }
-
-          .sidebar-links a {
-            display: block;
-            padding: 0.3rem 0.75rem;
-            color: var(--text-secondary);
-            text-decoration: none;
-            border-radius: var(--radius-sm);
-            font-size: 0.85rem;
-            transition: all 0.15s;
-            line-height: 1.4;
-          }
-
-          .sidebar-links a:hover {
-            background: var(--bg-secondary);
-            color: var(--text);
-          }
-
-          .sidebar-links a.active {
-            background: var(--primary);
-            color: white;
-            font-weight: 500;
-          }
-
-          /* Main content */
-          .docs-main {
-            flex: 1;
-            margin-left: var(--sidebar-w);
-            padding: 2.5rem 3rem;
-            max-width: calc(var(--content-max-w) + var(--sidebar-w) + 6rem);
-          }
-
-          .docs-main h1 {
-            font-size: 2rem;
-            font-weight: 700;
-            margin: 0 0 0.5rem 0;
-            letter-spacing: -0.025em;
-            line-height: 1.2;
-          }
-
-          .docs-main h2 {
-            font-size: 1.4rem;
-            font-weight: 600;
-            margin: 2.5rem 0 0.75rem 0;
-            letter-spacing: -0.015em;
-            color: var(--text);
-          }
-
-          .docs-main h3 {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin: 2rem 0 0.5rem 0;
-            color: var(--text);
-          }
-
-          .docs-main h4 {
-            font-size: 0.95rem;
-            font-weight: 600;
-            margin: 1.5rem 0 0.5rem 0;
-            color: var(--text);
-          }
-
-          .docs-main p {
-            margin-bottom: 1rem;
-            line-height: 1.7;
-          }
-
-          .docs-main ul,
-          .docs-main ol {
-            margin-bottom: 1rem;
-            padding-left: 1.5rem;
-          }
-
-          .docs-main li {
-            margin-bottom: 0.35rem;
-            line-height: 1.6;
-          }
-
-          /* Links */
-          a {
-            color: var(--primary);
-            text-decoration: none;
-          }
-
-          a:hover {
-            text-decoration: underline;
-          }
-
-          /* Code */
-          code {
-            background: var(--bg-code);
-            padding: 0.15rem 0.4rem;
-            border-radius: 4px;
-            font-size: 0.85em;
-            font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
-            color: var(--text);
-          }
-
-          pre {
-            padding: 1rem 1.25rem;
-            border-radius: var(--radius);
-            overflow-x: auto;
-            border: 1px solid var(--border-light);
-            margin: 1rem 0 1.5rem 0;
-            line-height: 1.5;
-          }
-
-          pre code {
-            background: none;
-            padding: 0;
-            font-size: 0.82rem;
-          }
-
-          /* Tables */
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 1rem 0 1.5rem 0;
-            font-size: 0.9rem;
-          }
-
-          th {
-            text-align: left;
-            padding: 0.6rem 0.75rem;
-            border-bottom: 2px solid var(--border);
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-            color: var(--text-secondary);
-          }
-
-          td {
-            padding: 0.5rem 0.75rem;
-            border-bottom: 1px solid var(--border-light);
-            vertical-align: top;
-          }
-
-          /* Blockquote */
-          blockquote {
-            border-left: 3px solid var(--primary);
-            padding: 0.5rem 1rem;
-            margin: 1rem 0;
-            background: var(--bg-secondary);
-            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-            color: var(--text-secondary);
-          }
-
-          blockquote p {
-            margin-bottom: 0;
-          }
-
-          /* Info boxes */
-          .info-box {
-            padding: 0.75rem 1rem;
-            border-radius: var(--radius-sm);
-            margin: 1rem 0;
-            border-left: 3px solid;
-            font-size: 0.9rem;
-          }
-
-          .info-box.note {
-            background: #eef6ff;
-            border-color: var(--primary);
-          }
-
-          .info-box.warning {
-            background: #fff8e6;
-            border-color: #bf5600;
-          }
-
-          .info-box.tip {
-            background: #eefbf1;
-            border-color: #1a7f37;
-          }
-
-          /* Section list */
-          ul.section-list {
-            list-style: none;
-            padding: 0;
-          }
-
-          ul.section-list li {
-            margin-bottom: 0.5rem;
-            padding: 0.75rem 1rem;
-            background: var(--bg-secondary);
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--border-light);
-            transition: border-color 0.15s;
-          }
-
-          ul.section-list li:hover {
-            border-color: var(--border);
-          }
-
-          ul.section-list li a {
-            font-weight: 500;
-            color: var(--primary);
-          }
-
-          /* Navigation pagination */
-          nav.pagination {
-            margin: 1.5rem 0;
-          }
-
-          nav.pagination .pagination-list {
-            list-style: none;
-            display: flex;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-            align-items: center;
-          }
-
-          nav.pagination a {
-            display: inline-block;
-            padding: 0.25rem 0.55rem;
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--border-light);
-            color: var(--text-secondary);
-            text-decoration: none;
-          }
-
-          nav.pagination a:hover {
-            color: var(--primary);
-            border-color: var(--primary);
-          }
-
-          .pagination-current span {
-            display: inline-block;
-            padding: 0.25rem 0.55rem;
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--primary);
-            background: color-mix(in srgb, var(--primary) 8%, transparent);
-            color: var(--primary);
-          }
-
-          .pagination-disabled span {
-            display: inline-block;
-            padding: 0.25rem 0.55rem;
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--border-light);
-            color: var(--text-muted);
-            opacity: 0.5;
-          }
-
-          /* Footer */
-          .docs-footer {
-            margin-top: 3rem;
-            padding-top: 1.5rem;
-            border-top: 1px solid var(--border-light);
-            color: var(--text-muted);
-            font-size: 0.8rem;
-          }
-
-          /* Search trigger button */
-          .search-trigger {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-            padding: 0.3rem 0.6rem;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            background: var(--bg);
-            color: var(--text-secondary);
-            font-size: 0.8rem;
-            cursor: pointer;
-            transition: all 0.15s;
-            font-family: inherit;
-          }
-
-          .search-trigger:hover {
-            border-color: var(--text-muted);
-            color: var(--text);
-          }
-
-          .search-trigger kbd {
-            font-size: 0.65rem;
-            padding: 0.1rem 0.35rem;
-            border: 1px solid var(--border);
-            border-radius: 3px;
-            background: var(--bg-secondary);
-            color: var(--text-muted);
-            font-family: inherit;
-            line-height: 1.4;
-          }
-
-          /* Search overlay */
-          .search-overlay {
-            display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(0, 0, 0, 0.4);
-            backdrop-filter: blur(4px);
-            -webkit-backdrop-filter: blur(4px);
-            z-index: 200;
-            justify-content: center;
-            padding-top: 12vh;
-          }
-
-          .search-overlay.active {
-            display: flex;
-          }
-
-          .search-modal {
-            width: 560px;
-            max-width: 90vw;
-            max-height: 70vh;
-            background: var(--bg);
-            border-radius: var(--radius);
-            box-shadow: 0 16px 70px rgba(0, 0, 0, 0.2);
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            align-self: flex-start;
-          }
-
-          .search-input-wrap {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-light);
-          }
-
-          .search-input-wrap svg {
-            flex-shrink: 0;
-            color: var(--text-muted);
-          }
-
-          .search-input-wrap input {
-            flex: 1;
-            border: none;
-            outline: none;
-            font-size: 1rem;
-            font-family: inherit;
-            color: var(--text);
-            background: transparent;
-          }
-
-          .search-input-wrap input::placeholder {
-            color: var(--text-muted);
-          }
-
-          .search-input-wrap kbd {
-            font-size: 0.65rem;
-            padding: 0.15rem 0.4rem;
-            border: 1px solid var(--border);
-            border-radius: 3px;
-            background: var(--bg-secondary);
-            color: var(--text-muted);
-            font-family: inherit;
-            cursor: pointer;
-            line-height: 1.4;
-          }
-
-          .search-results {
-            overflow-y: auto;
-            padding: 0.5rem;
-          }
-
-          .search-result-item {
-            display: block;
-            padding: 0.6rem 0.75rem;
-            border-radius: var(--radius-sm);
-            text-decoration: none;
-            color: var(--text);
-            cursor: pointer;
-            transition: background 0.1s;
-          }
-
-          .search-result-item:hover,
-          .search-result-item.active {
-            background: var(--bg-secondary);
-            text-decoration: none;
-          }
-
-          .search-result-item .search-result-title {
-            font-weight: 500;
-            font-size: 0.9rem;
-            margin-bottom: 0.15rem;
-          }
-
-          .search-result-item .search-result-snippet {
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-            line-height: 1.4;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
-          }
-
-          .search-result-item .search-result-snippet mark {
-            background: rgba(0, 113, 227, 0.15);
-            color: var(--primary);
-            border-radius: 2px;
-            padding: 0 1px;
-          }
-
-          .search-no-results {
-            padding: 2rem 1rem;
-            text-align: center;
-            color: var(--text-muted);
-            font-size: 0.9rem;
-          }
-
-          .search-hint {
-            padding: 0.5rem 0.75rem;
-            display: flex;
-            gap: 1rem;
-            justify-content: center;
-            border-top: 1px solid var(--border-light);
-            color: var(--text-muted);
-            font-size: 0.7rem;
-          }
-
-          .search-hint kbd {
-            font-size: 0.65rem;
-            padding: 0 0.3rem;
-            border: 1px solid var(--border);
-            border-radius: 3px;
-            background: var(--bg-secondary);
-            font-family: inherit;
-            line-height: 1.4;
-          }
-
-          /* Responsive */
-          @media (max-width: 768px) {
+            #{font_face_css("../fonts")}
+
+            #{design_root("--header-h: 52px;\n--sidebar-w: 260px;\n--content-max-w: 780px;\n--bg-sidebar: light-dark(#f4f0e8, #181513);")}
+
+            *,
+            *::before,
+            *::after {
+              box-sizing: border-box;
+              margin: 0;
+              padding: 0;
+            }
+
+            body {
+              font-family: var(--font-sans);
+              font-size: 15px;
+              line-height: 1.6;
+              color: var(--text);
+              background: var(--bg);
+              -webkit-font-smoothing: antialiased;
+              -moz-osx-font-smoothing: grayscale;
+            }
+
+            ::selection { background: var(--selection); }
+
+            /* Header */
+            .docs-header {
+              position: fixed;
+              top: 0;
+              left: 0;
+              right: 0;
+              height: var(--header-h);
+              background: var(--glass);
+              backdrop-filter: saturate(180%) blur(20px);
+              -webkit-backdrop-filter: saturate(180%) blur(20px);
+              border-bottom: 1px solid var(--border-subtle);
+              display: flex;
+              align-items: center;
+              padding: 0 1.5rem;
+              z-index: 100;
+            }
+
+            .docs-header .logo {
+              display: inline-flex;
+              align-items: center;
+              gap: 0.55rem;
+              font-family: var(--font-serif);
+              font-weight: 700;
+              font-size: 1.15rem;
+              color: var(--text);
+              text-decoration: none;
+              margin-right: 2rem;
+              letter-spacing: -0.01em;
+            }
+
+            /* The ember spark — the same diamond the favicon, dividers, and
+               footer colophon share. */
+            .docs-header .logo::before {
+              content: "";
+              width: 8px;
+              height: 8px;
+              flex: none;
+              border-radius: 2px;
+              transform: rotate(45deg);
+              background: var(--spark);
+            }
+
+            .docs-header .logo span {
+              color: var(--text-muted);
+              font-weight: 400;
+              margin-left: 0.25rem;
+              font-size: 0.8rem;
+            }
+
+            .docs-header nav {
+              display: flex;
+              gap: 1.25rem;
+            }
+
+            .docs-header nav a {
+              color: var(--text-secondary);
+              text-decoration: none;
+              font-size: 0.85rem;
+              font-weight: 400;
+              padding: 0.25rem 0;
+              transition: color var(--transition);
+            }
+
+            .docs-header nav a:hover {
+              color: var(--text);
+            }
+
+            .header-right {
+              margin-left: auto;
+              display: flex;
+              align-items: center;
+              gap: 1rem;
+            }
+
+            .header-right a {
+              color: var(--text-secondary);
+              text-decoration: none;
+              font-size: 0.85rem;
+              transition: color var(--transition);
+            }
+
+            .header-right a:hover {
+              color: var(--text);
+            }
+
+            /* Layout */
+            .docs-container {
+              display: flex;
+              padding-top: var(--header-h);
+              min-height: 100vh;
+            }
+
+            /* Sidebar: a warm background step below the main canvas so the
+               two surfaces read as distinct without heavy borders. */
             .docs-sidebar {
-              display: none;
+              position: fixed;
+              top: var(--header-h);
+              left: 0;
+              width: var(--sidebar-w);
+              height: calc(100vh - var(--header-h));
+              background: var(--bg-sidebar);
+              border-right: 1px solid var(--border-subtle);
+              padding: 1.25rem 0.75rem;
+              overflow-y: auto;
+              scrollbar-width: thin;
+              scrollbar-color: var(--border) transparent;
             }
+
+            .docs-sidebar::-webkit-scrollbar {
+              width: 4px;
+            }
+
+            .docs-sidebar::-webkit-scrollbar-thumb {
+              background: var(--border);
+              border-radius: 2px;
+            }
+
+            .sidebar-section {
+              margin-bottom: 1.5rem;
+            }
+
+            /* Section titles wear the overline treatment: small caps-feel
+               tracking that reads as structure, not content. */
+            .sidebar-title {
+              font-size: 0.7rem;
+              font-weight: 600;
+              text-transform: uppercase;
+              color: var(--text-muted);
+              margin-bottom: 0.4rem;
+              letter-spacing: 0.08em;
+              padding-left: 0.75rem;
+            }
+
+            .sidebar-links {
+              list-style: none;
+            }
+
+            .sidebar-links li {
+              margin-bottom: 1px;
+            }
+
+            /* A 2px rail carries the active state; hover stays neutral so
+               the ember accent means "you are here", nothing else. */
+            .sidebar-links a {
+              display: block;
+              padding: 0.34rem 0.75rem;
+              color: var(--text-secondary);
+              text-decoration: none;
+              border-left: 2px solid transparent;
+              border-radius: 0 999px 999px 0;
+              font-size: 0.85rem;
+              transition: all var(--transition);
+              line-height: 1.4;
+            }
+
+            .sidebar-links a:hover {
+              background: var(--bg-subtle);
+              color: var(--text);
+            }
+
+            .sidebar-links a.active,
+            .sidebar-links a[aria-current="page"] {
+              background: var(--primary-tint);
+              border-left-color: var(--primary);
+              color: var(--primary);
+              font-weight: 600;
+            }
+
+            /* Main content */
             .docs-main {
-              margin-left: 0;
-              padding: 1.5rem 1rem;
+              flex: 1;
+              margin-left: var(--sidebar-w);
+              padding: 2.5rem 3rem;
+              max-width: calc(var(--content-max-w) + var(--sidebar-w) + 6rem);
             }
-          }
-          CSS
+
+            .docs-main h1 {
+              font-family: var(--font-serif);
+              font-size: var(--step-4);
+              font-weight: 700;
+              margin: 0 0 0.5rem 0;
+              letter-spacing: -0.022em;
+              line-height: 1.15;
+              color: var(--heading);
+              text-wrap: balance;
+            }
+
+            /* Page title gets a short ember rule — the one mark every
+               hwaro scaffold shares. */
+            .docs-main > h1:first-child {
+              position: relative;
+              padding-bottom: 0.9rem;
+            }
+
+            .docs-main > h1:first-child::after {
+              content: "";
+              position: absolute;
+              left: 0;
+              bottom: 0;
+              width: 2.75rem;
+              height: 3px;
+              border-radius: 999px;
+              background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
+            }
+
+            /* The first paragraph under the page title reads as a serif
+               lede — the same focal move simple and blog make. */
+            .docs-main > h1:first-child + p {
+              font-family: var(--font-serif);
+              font-size: var(--step-1);
+              line-height: 1.55;
+              color: var(--text-secondary);
+            }
+
+            /* Landing wayfinding: one raised card per section. The border
+               warms and the arrow nudges on hover — quiet, not boxy. */
+            .link-cards {
+              display: grid;
+              grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+              gap: var(--space-3);
+              margin: var(--space-5) 0 var(--space-6);
+            }
+
+            a.link-card {
+              display: block;
+              padding: var(--space-4) var(--space-5);
+              background: var(--bg-raised);
+              border: 1px solid var(--border);
+              border-radius: var(--radius);
+              text-decoration: none;
+              transition: border-color var(--transition), box-shadow var(--transition), transform 0.18s var(--ease-out);
+            }
+
+            /* Getting Started is the intended entry point, so the first
+               card carries a faint ember wash the others don't. */
+            .link-cards a.link-card:first-child {
+              border-color: color-mix(in srgb, var(--primary) 30%, transparent);
+              background-image: linear-gradient(135deg, var(--primary-tint), transparent 55%);
+            }
+
+            a.link-card strong {
+              display: block;
+              font-family: var(--font-serif);
+              font-size: var(--step-1);
+              font-weight: 700;
+              color: var(--heading);
+              margin-bottom: 0.3rem;
+            }
+
+            a.link-card strong::after {
+              content: "\\2192";
+              display: inline-block;
+              margin-left: 0.4rem;
+              color: var(--primary);
+              opacity: 0;
+              transform: translateX(-4px);
+              transition: opacity var(--transition), transform var(--transition);
+            }
+
+            a.link-card span {
+              display: block;
+              font-size: var(--step--1);
+              line-height: 1.55;
+              color: var(--text-secondary);
+            }
+
+            a.link-card:hover {
+              border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+              box-shadow: var(--shadow);
+              transform: translateY(-2px);
+            }
+
+            @media (hover: hover) {
+              a.link-card:hover strong::after { opacity: 1; transform: translateX(0); }
+            }
+
+            /* Feature grid — typography-led, no boxes: a hairline rail
+               (the sidebar's structural language) carries each entry. */
+            .feature-grid {
+              display: grid;
+              grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+              gap: var(--space-4) var(--space-6);
+              margin: var(--space-5) 0;
+            }
+
+            .feature {
+              padding-left: 0.9rem;
+              border-left: 2px solid var(--border-subtle);
+            }
+
+            .feature strong {
+              display: block;
+              font-family: var(--font-serif);
+              font-size: 1.02rem;
+              color: var(--heading);
+              margin-bottom: 0.15rem;
+            }
+
+            .feature span {
+              display: block;
+              font-size: var(--step--1);
+              line-height: 1.55;
+              color: var(--text-secondary);
+            }
+
+            /* TOC: a hairline rail instead of a boxed grey card — quieter,
+               and it mirrors the sidebar's active-rail language. */
+            .docs-toc {
+              margin: 1.5rem 0 2rem 0;
+              padding: 0.25rem 0 0.25rem 1.1rem;
+              border-left: 2px solid var(--border-subtle);
+            }
+
+            .docs-toc-title {
+              margin: 0 0 0.5rem 0;
+              font-size: 0.7rem;
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.08em;
+              color: var(--text-muted);
+            }
+
+            .docs-toc ul {
+              margin: 0;
+              padding-left: 1.1rem;
+              list-style: none;
+            }
+
+            .docs-toc ul ul {
+              padding-left: 1rem;
+            }
+
+            .docs-toc li {
+              margin: 0.25rem 0;
+              line-height: 1.5;
+            }
+
+            .docs-toc a {
+              color: var(--text-secondary);
+              text-decoration: none;
+              font-size: var(--step--1);
+            }
+
+            .docs-toc a:hover {
+              color: var(--primary);
+              text-decoration: underline;
+            }
+
+            /* h2 marks a section break: generous air above and a hairline
+               rule — the classic docs rhythm. */
+            .docs-main h2 {
+              font-family: var(--font-serif);
+              font-size: var(--step-2);
+              font-weight: 700;
+              margin: var(--space-7) 0 0.75rem 0;
+              padding-top: var(--space-5);
+              border-top: 1px solid var(--border-subtle);
+              letter-spacing: -0.008em;
+              color: var(--heading);
+              text-wrap: balance;
+            }
+
+            /* The first h2 after the title/TOC doesn't need the divider. */
+            .docs-main > h1:first-child + h2,
+            .docs-toc + h2 {
+              margin-top: var(--space-6);
+              padding-top: 0;
+              border-top: none;
+            }
+
+            .docs-main h3 {
+              font-size: var(--step-1);
+              font-family: var(--font-serif);
+              font-weight: 700;
+              margin: 2rem 0 0.5rem 0;
+              color: var(--heading);
+            }
+
+            .docs-main h4 {
+              font-size: 0.95rem;
+              font-weight: 600;
+              margin: 1.5rem 0 0.5rem 0;
+              color: var(--heading);
+            }
+
+            .docs-main p {
+              margin-bottom: 1rem;
+              line-height: 1.7;
+            }
+
+            .docs-main ul,
+            .docs-main ol {
+              margin-bottom: 1rem;
+              padding-left: 1.5rem;
+            }
+
+            .docs-main li {
+              margin-bottom: 0.35rem;
+              line-height: 1.6;
+            }
+
+            /* Lists carry the ember in their punctuation: serif numerals on
+               ordered lists, warmed discs on unordered ones. (Sidebar, TOC,
+               and section lists set list-style: none, so no marker paints
+               there.) */
+            .docs-main ol > li::marker { font-family: var(--font-serif); font-weight: 700; color: var(--primary); font-variant-numeric: tabular-nums; }
+            .docs-main ul > li::marker { color: var(--primary); }
+
+            /* Thematic break as an ember spark on a fading hairline — the
+               scaffold's asterism. */
+            hr { border: none; height: 1px; margin: var(--space-7) 0; position: relative; overflow: visible; background: linear-gradient(90deg, transparent, var(--border), var(--border), transparent); }
+            hr::after { content: ""; position: absolute; left: 50%; top: 50%; width: 7px; height: 7px; border-radius: 1px; transform: translate(-50%, -50%) rotate(45deg); background: var(--spark); box-shadow: 0 0 0 7px var(--bg); }
+
+            /* Links: ember, with an underline that warms up on hover.
+               Navigation surfaces opt out below. */
+            a {
+              color: var(--primary);
+              text-decoration: underline;
+              text-decoration-color: color-mix(in srgb, var(--primary) 35%, transparent);
+              text-underline-offset: 3px;
+              transition: color var(--transition), text-decoration-color var(--transition);
+            }
+
+            a:hover {
+              color: var(--primary-strong);
+              text-decoration-color: currentColor;
+            }
+
+            .docs-header a, .skip-link, .sidebar-links a, .docs-toc a,
+            ul.section-list a, nav.pagination a, .search-result-item {
+              text-decoration: none;
+            }
+
+            /* Code */
+            code {
+              background: var(--bg-code);
+              padding: 0.15rem 0.4rem;
+              border-radius: 4px;
+              font-size: 0.85em;
+              font-family: var(--font-mono);
+              color: var(--text);
+              overflow-wrap: break-word;
+            }
+
+            pre {
+              padding: var(--space-4) var(--space-5);
+              border-radius: var(--radius-sm);
+              overflow-x: auto;
+              border: 1px solid var(--border-subtle);
+              margin: 1rem 0 1.5rem 0;
+              line-height: 1.5;
+              background: var(--bg-code);
+              scrollbar-width: thin;
+              scrollbar-color: var(--border) transparent;
+            }
+
+            /* Drop the highlight theme's own white background so syntax tokens
+               sit on the warm code well instead of a white box. `pre code.hljs`
+               (0,1,2) outranks the theme's `.hljs` (0,1,0). */
+            pre code, pre code.hljs {
+              background: transparent;
+              padding: 0;
+              font-size: 0.82rem;
+            }
+            #{highlight_theme_css}
+
+            #{theme_toggle_css}
+
+            /* Tables */
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              margin: 1rem 0 1.5rem 0;
+              font-size: 0.9rem;
+            }
+
+            th {
+              text-align: left;
+              padding: 0.6rem 0.75rem;
+              border-bottom: 2px solid var(--border);
+              font-weight: 600;
+              font-size: 0.8rem;
+              text-transform: uppercase;
+              letter-spacing: 0.03em;
+              color: var(--text-secondary);
+            }
+
+            td {
+              padding: 0.5rem 0.75rem;
+              border-bottom: 1px solid var(--border-subtle);
+              vertical-align: top;
+            }
+
+            tbody tr { transition: background var(--transition); }
+            @media (hover: hover) { tbody tr:hover { background: var(--primary-tint); } }
+
+            /* Blockquote as pulled voice: a hanging ember quote instead of
+               a fence, set a touch larger in the serif italic. */
+            blockquote {
+              font-family: var(--font-serif);
+              font-style: italic;
+              font-size: 1.06em;
+              margin: var(--space-5) 0;
+              padding: 0 0 0 var(--space-6);
+              position: relative;
+              color: var(--text-secondary);
+            }
+
+            blockquote::before {
+              content: "\\201C";
+              position: absolute;
+              left: 0;
+              top: -0.08em;
+              font-size: 2.6em;
+              line-height: 1;
+              font-style: normal;
+              color: var(--primary);
+              opacity: 0.45;
+            }
+
+            blockquote p {
+              margin-bottom: 0.35rem;
+            }
+
+            blockquote p:last-child {
+              margin-bottom: 0;
+            }
+
+            /* Info boxes: tinted surfaces with a hairline border in the
+               same hue — no heavy accent bars. */
+            .info-box {
+              padding: 0.875rem 1.125rem;
+              border-radius: var(--radius-sm);
+              margin: 1rem 0;
+              border: 1px solid;
+              font-size: 0.9rem;
+            }
+
+            .info-box.note {
+              background: color-mix(in srgb, var(--primary) 6%, transparent);
+              border-color: color-mix(in srgb, var(--primary) 30%, transparent);
+            }
+
+            .info-box.warning {
+              background: color-mix(in srgb, var(--warn) 8%, transparent);
+              border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+            }
+
+            .info-box.tip {
+              background: color-mix(in srgb, var(--ok) 8%, transparent);
+              border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+            }
+
+            /* The box's lead-in label carries its hue. */
+            .info-box.note > strong:first-child { color: var(--primary); }
+            .info-box.warning > strong:first-child { color: var(--warn); }
+            .info-box.tip > strong:first-child { color: var(--ok); }
+
+            /* Section list */
+            ul.section-list {
+              list-style: none;
+              padding: 0;
+            }
+
+            ul.section-list li {
+              margin-bottom: 0.5rem;
+              padding: 0.75rem 1rem;
+              background: var(--bg-subtle);
+              border-radius: var(--radius-sm);
+              border: 1px solid var(--border-subtle);
+              transition: border-color var(--transition);
+            }
+
+            ul.section-list li:hover {
+              border-color: var(--border);
+            }
+
+            ul.section-list li a {
+              font-weight: 500;
+              color: var(--primary);
+            }
+
+            /* Navigation pagination */
+            nav.pagination {
+              margin: 1.5rem 0;
+            }
+
+            nav.pagination .pagination-list {
+              list-style: none;
+              display: flex;
+              gap: 0.5rem;
+              flex-wrap: wrap;
+              align-items: center;
+            }
+
+            nav.pagination a {
+              display: inline-block;
+              padding: 0.25rem 0.55rem;
+              border-radius: var(--radius-sm);
+              border: 1px solid var(--border-subtle);
+              color: var(--text-secondary);
+              text-decoration: none;
+            }
+
+            nav.pagination a:hover {
+              color: var(--primary);
+              border-color: var(--primary);
+            }
+
+            .pagination-current span {
+              display: inline-block;
+              padding: 0.25rem 0.55rem;
+              border-radius: var(--radius-sm);
+              border: 1px solid var(--primary);
+              background: color-mix(in srgb, var(--primary) 8%, transparent);
+              color: var(--primary);
+            }
+
+            .pagination-disabled span {
+              display: inline-block;
+              padding: 0.25rem 0.55rem;
+              border-radius: var(--radius-sm);
+              border: 1px solid var(--border-subtle);
+              color: var(--text-muted);
+              opacity: 0.5;
+            }
+
+            /* Footer as colophon: a centered spark over a serif italic
+               imprint line, like the last page of a well-set book. */
+            .docs-footer {
+              margin-top: var(--space-8);
+              padding-bottom: var(--space-5);
+              text-align: center;
+              color: var(--text-muted);
+              font-size: 0.8rem;
+            }
+
+            .docs-footer::before {
+              content: "";
+              display: block;
+              width: 7px;
+              height: 7px;
+              margin: 0 auto var(--space-4);
+              border-radius: 1px;
+              transform: rotate(45deg);
+              background: var(--spark);
+            }
+
+            .docs-footer p { font-family: var(--font-serif); font-style: italic; margin: 0; }
+            .docs-footer a { color: inherit; text-decoration: none; transition: color var(--transition); }
+            .docs-footer a:hover { color: var(--primary); }
+
+            /* Search trigger button */
+            .search-trigger {
+              display: flex;
+              align-items: center;
+              gap: 0.4rem;
+              padding: 0.3rem 0.6rem;
+              border: 1px solid var(--border);
+              border-radius: var(--radius-sm);
+              background: var(--bg);
+              color: var(--text-secondary);
+              font-size: 0.8rem;
+              cursor: pointer;
+              transition: all var(--transition);
+              font-family: inherit;
+            }
+
+            .search-trigger:hover {
+              border-color: var(--text-muted);
+              color: var(--text);
+            }
+
+            .search-trigger kbd {
+              font-size: 0.65rem;
+              padding: 0.1rem 0.35rem;
+              border: 1px solid var(--border);
+              border-radius: 3px;
+              background: var(--bg-raised);
+              box-shadow: 0 1px 0 var(--border);
+              color: var(--text-muted);
+              font-family: inherit;
+              line-height: 1.4;
+            }
+
+            /* Search overlay */
+            .search-overlay {
+              display: none;
+              position: fixed;
+              inset: 0;
+              background: var(--scrim);
+              backdrop-filter: blur(4px);
+              -webkit-backdrop-filter: blur(4px);
+              z-index: 200;
+              justify-content: center;
+              padding-top: 12vh;
+            }
+
+            .search-overlay.active {
+              display: flex;
+            }
+
+            .search-modal {
+              width: 560px;
+              max-width: 90vw;
+              max-height: 70vh;
+              background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+              backdrop-filter: saturate(180%) blur(24px);
+              -webkit-backdrop-filter: saturate(180%) blur(24px);
+              border: 1px solid var(--border-subtle);
+              border-radius: var(--radius);
+              box-shadow: var(--shadow-lg);
+              display: flex;
+              flex-direction: column;
+              overflow: hidden;
+              align-self: flex-start;
+            }
+            @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .search-modal { background: var(--bg-raised); } }
+
+            /* The palette settles into place when it opens. */
+            @media (prefers-reduced-motion: no-preference) {
+              .search-overlay.active { transition: opacity 0.15s var(--ease-out); }
+              .search-overlay.active .search-modal { transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out); }
+              @starting-style {
+                .search-overlay.active { opacity: 0; }
+                .search-overlay.active .search-modal { opacity: 0; transform: translateY(-8px) scale(0.985); }
+              }
+            }
+
+            .search-input-wrap {
+              display: flex;
+              align-items: center;
+              gap: 0.6rem;
+              padding: 0.75rem 1rem;
+              border-bottom: 1px solid var(--border-subtle);
+            }
+
+            .search-input-wrap svg {
+              flex-shrink: 0;
+              color: var(--text-muted);
+            }
+
+            :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+            .search-input-wrap:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+            .skip-link { position: absolute; top: -100px; left: 0; background: var(--primary); color: var(--bg); padding: 0.5rem 1rem; z-index: 1000; }
+            .skip-link:focus { top: 0; }
+            .search-input-wrap input {
+              flex: 1;
+              border: none;
+              outline: none;
+              font-size: 1rem;
+              font-family: inherit;
+              color: var(--text);
+              background: transparent;
+            }
+
+            .search-input-wrap input::placeholder {
+              color: var(--text-muted);
+            }
+
+            .search-input-wrap kbd {
+              font-size: 0.65rem;
+              padding: 0.15rem 0.4rem;
+              border: 1px solid var(--border);
+              border-radius: 3px;
+              background: var(--bg-raised);
+              box-shadow: 0 1px 0 var(--border);
+              color: var(--text-muted);
+              font-family: inherit;
+              cursor: pointer;
+              line-height: 1.4;
+            }
+
+            .search-results {
+              overflow-y: auto;
+              padding: 0.5rem;
+            }
+
+            .search-result-item {
+              display: block;
+              padding: 0.6rem 0.75rem;
+              border-radius: var(--radius-sm);
+              text-decoration: none;
+              color: var(--text);
+              cursor: pointer;
+              transition: background 0.1s;
+            }
+
+            .search-result-item:hover,
+            .search-result-item.active {
+              background: var(--bg-subtle);
+              text-decoration: none;
+            }
+
+            .search-result-item .search-result-title {
+              font-weight: 500;
+              font-size: 0.9rem;
+              margin-bottom: 0.15rem;
+            }
+
+            .search-result-item .search-result-snippet {
+              font-size: 0.8rem;
+              color: var(--text-secondary);
+              line-height: 1.4;
+              display: -webkit-box;
+              -webkit-line-clamp: 2;
+              -webkit-box-orient: vertical;
+              overflow: hidden;
+            }
+
+            .search-result-item .search-result-snippet mark {
+              background: color-mix(in srgb, var(--primary) 15%, transparent);
+              color: var(--primary-strong);
+              border-radius: 2px;
+              padding: 0 1px;
+            }
+
+            .search-no-results {
+              padding: 2rem 1rem;
+              text-align: center;
+              color: var(--text-muted);
+              font-size: 0.9rem;
+            }
+
+            .search-hint {
+              padding: 0.5rem 0.75rem;
+              display: flex;
+              gap: 1rem;
+              justify-content: center;
+              border-top: 1px solid var(--border-subtle);
+              color: var(--text-muted);
+              font-size: 0.7rem;
+            }
+
+            .search-hint kbd {
+              font-size: 0.65rem;
+              padding: 0 0.3rem;
+              border: 1px solid var(--border);
+              border-radius: 3px;
+              background: var(--bg-raised);
+              box-shadow: 0 1px 0 var(--border);
+              font-family: inherit;
+              line-height: 1.4;
+            }
+
+            /* Search trigger press feedback */
+            .search-trigger:active {
+              transform: scale(0.96);
+            }
+
+            /* Heading anchors — appended by search.js, visible on hover so
+               deep links are one click without cluttering the prose. */
+            .heading-anchor {
+              margin-left: 0.4rem;
+              font-family: var(--font-sans);
+              font-size: 0.8em;
+              font-weight: 400;
+              color: var(--text-muted);
+              text-decoration: none;
+              opacity: 0;
+              transition: opacity var(--transition), color var(--transition);
+            }
+            .docs-main h2:hover .heading-anchor,
+            .docs-main h3:hover .heading-anchor,
+            .heading-anchor:focus-visible { opacity: 1; }
+            .heading-anchor:hover { color: var(--primary); }
+
+            /* Reading-order neighbours — a quiet card pair that warms on hover. */
+            .docs-page-nav {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: var(--space-3);
+              margin-top: var(--space-6);
+              padding-top: var(--space-5);
+              border-top: 1px solid var(--border-subtle);
+            }
+            .page-nav-link {
+              display: flex;
+              flex-direction: column;
+              gap: 0.2rem;
+              padding: var(--space-3) var(--space-4);
+              border: 1px solid var(--border);
+              border-radius: var(--radius-sm);
+              text-decoration: none;
+              transition: border-color var(--transition), background var(--transition);
+            }
+            .page-nav-next { text-align: right; }
+            .page-nav-link:hover { border-color: color-mix(in srgb, var(--primary) 45%, transparent); background: var(--primary-tint); text-decoration: none; }
+            .page-nav-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+            .page-nav-title { font-family: var(--font-serif); font-weight: 700; color: var(--heading); }
+
+            /* Responsive */
+            @media (max-width: 768px) {
+              .docs-sidebar {
+                display: none;
+              }
+              .docs-main {
+                margin-left: 0;
+                padding: 1.5rem 1rem;
+              }
+              .docs-page-nav { grid-template-columns: 1fr; }
+              .page-nav-next { text-align: left; }
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+              *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+            }
+            CSS
         end
 
-        private def search_js_content : String
+        # Inserted into the shared search overlay IIFE (see
+        # `Base#search_js_content`). Indented two spaces to sit inside the
+        # IIFE body.
+        private def docs_heading_anchor_js : String
           <<-JS
-          (function () {
-            var searchData = null;
-            var activeIndex = -1;
-            var overlay = document.getElementById('searchOverlay');
-            var input = document.getElementById('searchInput');
-            var resultsEl = document.getElementById('searchResults');
-
-            function loadSearchData(cb) {
-              if (searchData) return cb(searchData);
-              var base = document.querySelector('link[rel="stylesheet"]').href;
-              var searchUrl = base.substring(0, base.indexOf('/css/')) + '/search.json';
-              fetch(searchUrl)
-                .then(function (r) { return r.json(); })
-                .then(function (data) { searchData = data; cb(data); })
-                .catch(function () { searchData = []; cb([]); });
-            }
-
-            window.openSearch = function () {
-              overlay.classList.add('active');
-              input.value = '';
-              resultsEl.innerHTML = '';
-              activeIndex = -1;
-              input.focus();
-              loadSearchData(function () {});
-            };
-
-            window.closeSearch = function () {
-              overlay.classList.remove('active');
-              activeIndex = -1;
-            };
-
-            document.addEventListener('keydown', function (e) {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-                e.preventDefault();
-                if (overlay.classList.contains('active')) {
-                  closeSearch();
-                } else {
-                  openSearch();
-                }
+              // Hover anchors for headings (ids are generated at build time).
+              var heads = document.querySelectorAll('.docs-main h2[id], .docs-main h3[id]');
+              for (var hi = 0; hi < heads.length; hi++) {
+                var anchor = document.createElement('a');
+                anchor.className = 'heading-anchor';
+                anchor.href = '#' + heads[hi].id;
+                anchor.setAttribute('aria-label', 'Link to this section');
+                anchor.textContent = '#';
+                heads[hi].appendChild(anchor);
               }
-              if (e.key === 'Escape' && overlay.classList.contains('active')) {
-                closeSearch();
-              }
-            });
-
-            function escapeHtml(s) {
-              var d = document.createElement('div');
-              d.textContent = s;
-              return d.innerHTML;
-            }
-
-            function highlightMatch(text, query) {
-              if (!query) return escapeHtml(text);
-              var escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-              var re = new RegExp('(' + escaped + ')', 'gi');
-              return escapeHtml(text).replace(re, '<mark>$1</mark>');
-            }
-
-            function getSnippet(content, query) {
-              var lower = content.toLowerCase();
-              var idx = lower.indexOf(query.toLowerCase());
-              var start = Math.max(0, idx - 60);
-              var end = Math.min(content.length, idx + query.length + 100);
-              var snippet = content.substring(start, end).replace(/\\s+/g, ' ').trim();
-              if (start > 0) snippet = '...' + snippet;
-              if (end < content.length) snippet = snippet + '...';
-              return snippet;
-            }
-
-            function search(query) {
-              if (!searchData || !query.trim()) {
-                resultsEl.innerHTML = '';
-                activeIndex = -1;
-                return;
-              }
-              var q = query.trim().toLowerCase();
-              var results = [];
-              for (var i = 0; i < searchData.length; i++) {
-                var item = searchData[i];
-                var titleIdx = item.title.toLowerCase().indexOf(q);
-                var contentIdx = item.content.toLowerCase().indexOf(q);
-                if (titleIdx !== -1 || contentIdx !== -1) {
-                  var score = titleIdx !== -1 ? 100 - titleIdx : contentIdx;
-                  results.push({ item: item, score: score });
-                }
-              }
-              results.sort(function (a, b) { return b.score - a.score; });
-              results = results.slice(0, 10);
-
-              if (results.length === 0) {
-                resultsEl.innerHTML = '<div class="search-no-results">No results for "' + escapeHtml(query) + '"</div>';
-                activeIndex = -1;
-                return;
-              }
-
-              var html = '';
-              for (var j = 0; j < results.length; j++) {
-                var r = results[j].item;
-                var snippet = getSnippet(r.content, query.trim());
-                html += '<a class="search-result-item" href="' + r.url + '" data-index="' + j + '">'
-                  + '<div class="search-result-title">' + highlightMatch(r.title, query.trim()) + '</div>'
-                  + '<div class="search-result-snippet">' + highlightMatch(snippet, query.trim()) + '</div>'
-                  + '</a>';
-              }
-              html += '<div class="search-hint"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>ESC</kbd> close</span></div>';
-              resultsEl.innerHTML = html;
-              activeIndex = -1;
-            }
-
-            function updateActive() {
-              var items = resultsEl.querySelectorAll('.search-result-item');
-              for (var i = 0; i < items.length; i++) {
-                items[i].classList.toggle('active', i === activeIndex);
-              }
-              if (activeIndex >= 0 && items[activeIndex]) {
-                items[activeIndex].scrollIntoView({ block: 'nearest' });
-              }
-            }
-
-            if (input) {
-              input.addEventListener('input', function () {
-                loadSearchData(function () { search(input.value); });
-              });
-
-              input.addEventListener('keydown', function (e) {
-                var items = resultsEl.querySelectorAll('.search-result-item');
-                var count = items.length;
-                if (e.key === 'ArrowDown') {
-                  e.preventDefault();
-                  activeIndex = (activeIndex + 1) % count;
-                  updateActive();
-                } else if (e.key === 'ArrowUp') {
-                  e.preventDefault();
-                  activeIndex = (activeIndex - 1 + count) % count;
-                  updateActive();
-                } else if (e.key === 'Enter') {
-                  e.preventDefault();
-                  if (activeIndex >= 0 && items[activeIndex]) {
-                    window.location.href = items[activeIndex].href;
-                  } else if (items.length > 0) {
-                    window.location.href = items[0].href;
-                  }
-                }
-              });
-            }
-          })();
-          JS
+            JS
         end
 
         # Docs-specific page template
         # Override footer for docs (Jinja2 syntax)
         protected def footer_template : String
           <<-HTML
-              <div class="docs-footer">
-                <p>Powered by Hwaro</p>
-              </div>
-            </main>
-          </div>
-          {{ highlight_js }}
-          <script src="{{ base_url }}/js/search.js"></script>
-          {{ auto_includes_js }}
-          </body>
-          </html>
-          HTML
-        end
-
-        # Search overlay HTML shared by page and section templates
-        private def search_overlay_html : String
-          <<-HTML
-          <div class="search-overlay" id="searchOverlay" onclick="if(event.target===this)closeSearch()">
-            <div class="search-modal">
-              <div class="search-input-wrap">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                <input type="text" id="searchInput" placeholder="Search documentation..." autocomplete="off">
-                <kbd onclick="closeSearch()">ESC</kbd>
-              </div>
-              <div class="search-results" id="searchResults"></div>
+                <div class="docs-footer">
+                  <p>{{ site.title | e }} · Powered by <a href="https://github.com/hahwul/hwaro">Hwaro</a></p>
+                </div>
+              </main>
             </div>
-          </div>
-          HTML
+            {{ highlight_js }}
+            <script src="{{ base_url }}/js/search.js"></script>
+            #{theme_toggle_script}
+            {{ auto_includes_js }}
+            </body>
+            </html>
+            HTML
         end
 
-        # Header navigation HTML shared by page and section templates
+        # Header navigation HTML shared by every page template via
+        # `partials/nav.html`. `lang_prefix` is applied so the same
+        # navigation works for multilingual sites — without it, the
+        # English logo and section links are hardcoded and a Korean
+        # reader on a translated page is one click away from being
+        # bounced back to `/getting-started/` (English).
         private def docs_nav_html : String
           <<-HTML
-          <header class="docs-header">
-            <a href="{{ base_url }}/" class="logo">{{ site.title }} <span>Documentation</span></a>
-            <nav>
-              <a href="{{ base_url }}/getting-started/">Getting Started</a>
-              <a href="{{ base_url }}/guide/">Guide</a>
-              <a href="{{ base_url }}/reference/">Reference</a>
-            </nav>
-            <div class="header-right">
-              <button class="search-trigger" onclick="openSearch()" title="Search">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                <span>Search</span>
-                <kbd>&#8984;K</kbd>
-              </button>
-            </div>
-          </header>
-          HTML
+            <header class="docs-header">
+              <a href="{{ base_url }}{{ lang_prefix }}/" class="logo">{{ site.title | e }} <span>Documentation</span></a>
+              <nav>
+                <a href="{{ base_url }}{{ lang_prefix }}/getting-started/">Getting Started</a>
+                <a href="{{ base_url }}{{ lang_prefix }}/guide/">Guide</a>
+                <a href="{{ base_url }}{{ lang_prefix }}/reference/">Reference</a>
+              </nav>
+              <div class="header-right">
+                {% if page.translations | length > 0 %}
+                <nav class="lang-switcher" aria-label="Language">
+                  {% for t in page.translations %}
+                  <a href="{{ base_url }}{{ t.url }}" hreflang="{{ t.code }}"{% if t.is_current %} aria-current="true"{% endif %}>{{ t.code | upper }}</a>
+                  {% endfor %}
+                </nav>
+                {% endif %}
+                <button class="search-trigger" onclick="openSearch()" title="Search">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                  <span>Search</span>
+                  <kbd>&#8984;K</kbd>
+                </button>
+                #{theme_toggle_html}
+              </div>
+            </header>
+            HTML
         end
 
         # Sidebar HTML shared by page and section templates
+        # Renders the docs sidebar dynamically by iterating
+        # `site.sections` (gh#523). Previously the sidebar was a
+        # hand-written `<aside>` with three sections × three to four
+        # pages baked in, so any page added via `hwaro new` never
+        # appeared. Now every top-level section under `content/` shows
+        # up automatically with its leaf pages listed underneath.
+        #
+        # Section / page order follows whatever `site.sections` returns
+        # (filesystem / weight-driven). Set `weight = N` in front
+        # matter to reorder.
+        # Pages sort by `weight` (with `path` first as a stable tiebreak),
+        # so each section reads in learning order — Installation before
+        # Configuration — instead of alphabetically.
         private def docs_sidebar_html : String
           <<-HTML
             <aside class="docs-sidebar">
+              {% for sec in site.sections | sort(attribute="path") %}{% if sec.name != "" and sec.language == page_language %}
               <div class="sidebar-section">
-                <div class="sidebar-title">Getting Started</div>
+                <div class="sidebar-title">{{ sec.title | e }}</div>
                 <ul class="sidebar-links">
-                  <li><a href="{{ base_url }}/getting-started/">Overview</a></li>
-                  <li><a href="{{ base_url }}/getting-started/installation/">Installation</a></li>
-                  <li><a href="{{ base_url }}/getting-started/quick-start/">Quick Start</a></li>
-                  <li><a href="{{ base_url }}/getting-started/configuration/">Configuration</a></li>
+                  <li><a href="{{ base_url }}{{ sec.url }}"{% if sec.url | active_path %} class="active" aria-current="page"{% endif %}>Overview</a></li>
+                  {% for p in sec.pages | sort(attribute="path") | sort(attribute="weight") %}{% if not p.is_index %}
+                  <li><a href="{{ base_url }}{{ p.url }}"{% if p.url | active_path %} class="active" aria-current="page"{% endif %}>{{ p.title | e }}</a></li>
+                  {% endif %}{% endfor %}
                 </ul>
               </div>
-              <div class="sidebar-section">
-                <div class="sidebar-title">Guide</div>
-                <ul class="sidebar-links">
-                  <li><a href="{{ base_url }}/guide/">Overview</a></li>
-                  <li><a href="{{ base_url }}/guide/content-management/">Content Management</a></li>
-                  <li><a href="{{ base_url }}/guide/templates/">Templates</a></li>
-                  <li><a href="{{ base_url }}/guide/shortcodes/">Shortcodes</a></li>
-                </ul>
-              </div>
-              <div class="sidebar-section">
-                <div class="sidebar-title">Reference</div>
-                <ul class="sidebar-links">
-                  <li><a href="{{ base_url }}/reference/">Overview</a></li>
-                  <li><a href="{{ base_url }}/reference/cli/">CLI Commands</a></li>
-                  <li><a href="{{ base_url }}/reference/config/">Configuration</a></li>
-                </ul>
-              </div>
+              {% endif %}{% endfor %}
             </aside>
-          HTML
+            HTML
         end
 
-        # Docs-specific page template (Jinja2 syntax)
+        # Docs-specific page template (Jinja2 syntax). All docs templates
+        # share the same chrome (nav, search overlay, sidebar, container
+        # open) via `partials/`, so this template only carries the body —
+        # and `footer.html` closes the container the same way for all of
+        # them. That symmetry is what keeps 404/taxonomy from emitting
+        # dangling `</main></div>` like the previous version did.
         private def docs_page_template : String
           <<-HTML
-          {% include "header.html" %}
-          #{docs_nav_html}
-          #{search_overlay_html}
-          <div class="docs-container">
-          #{docs_sidebar_html}
-            <main class="docs-main">
-              <h1>{{ page.title }}</h1>
-              {{ content }}
-          {% include "footer.html" %}
-          HTML
+            {% include "header.html" %}
+            {% include "partials/nav.html" %}
+            {% include "partials/search.html" %}
+            <div class="docs-container">
+            {% include "partials/sidebar.html" %}
+              <main id="main" class="docs-main">
+                {% if page.title is present %}<h1>{{ page.title | e }}</h1>{% endif %}
+                {% if toc %}<nav class="docs-toc" aria-label="On this page"><p class="docs-toc-title">On this page</p>{{ toc }}</nav>{% endif %}
+                {{ content }}
+
+                {# Reading-order neighbours (page.lower/page.higher). Docs
+                   deliberately cross section boundaries: Quick Start flows
+                   into the Guide the way a book flows into its next chapter. #}
+                {% if page.lower or page.higher %}
+                <nav class="docs-page-nav" aria-label="Pages">
+                  {% if page.lower %}
+                  <a class="page-nav-link page-nav-prev" href="{{ base_url }}{{ page.lower.url }}" rel="prev">
+                    <span class="page-nav-label">Previous</span>
+                    <span class="page-nav-title">{{ page.lower.title | e }}</span>
+                  </a>
+                  {% else %}<span></span>{% endif %}
+                  {% if page.higher %}
+                  <a class="page-nav-link page-nav-next" href="{{ base_url }}{{ page.higher.url }}" rel="next">
+                    <span class="page-nav-label">Next</span>
+                    <span class="page-nav-title">{{ page.higher.title | e }}</span>
+                  </a>
+                  {% endif %}
+                </nav>
+                {% endif %}
+            {% include "footer.html" %}
+            HTML
         end
 
         # Docs-specific section template (Jinja2 syntax)
         private def docs_section_template : String
           <<-HTML
-          {% include "header.html" %}
-          #{docs_nav_html}
-          #{search_overlay_html}
-          <div class="docs-container">
-          #{docs_sidebar_html}
-            <main class="docs-main">
-              <h1>{{ page.title }}</h1>
-              {{ content }}
+            {% include "header.html" %}
+            {% include "partials/nav.html" %}
+            {% include "partials/search.html" %}
+            <div class="docs-container">
+            {% include "partials/sidebar.html" %}
+              <main id="main" class="docs-main">
+                {% if page.title is present %}<h1>{{ page.title | e }}</h1>{% endif %}
+                {{ content }}
 
-              <h2>In This Section</h2>
-              <ul class="section-list">
-                {{ section.list }}
-              </ul>
-              {{ pagination }}
-          {% include "footer.html" %}
-          HTML
+                <h2>In This Section</h2>
+                <ul class="section-list">
+                  {{ section.list }}
+                </ul>
+                {{ pagination }}
+            {% include "footer.html" %}
+            HTML
         end
 
-        # Content files
+        # Docs-specific 404 — wraps the message in the docs-container so
+        # the page actually shows the nav/sidebar and the closing tags
+        # from `footer.html` line up. Previously this used the generic
+        # `not_found_template` which left an unmatched `</main></div>`.
+        private def docs_not_found_template : String
+          <<-HTML
+            {% include "header.html" %}
+            {% include "partials/nav.html" %}
+            {% include "partials/search.html" %}
+            <div class="docs-container">
+            {% include "partials/sidebar.html" %}
+              <main id="main" class="docs-main">
+                <h1>404 Not Found</h1>
+                <p>The page you are looking for does not exist.</p>
+                <p><a href="{{ base_url }}{{ lang_prefix }}/">Return to home</a></p>
+            {% include "footer.html" %}
+            HTML
+        end
+
+        # Docs-specific taxonomy templates — same chrome as page.html so
+        # the footer's closing tags match the body's open tags.
+        private def docs_taxonomy_template : String
+          <<-HTML
+            {% include "header.html" %}
+            {% include "partials/nav.html" %}
+            {% include "partials/search.html" %}
+            <div class="docs-container">
+            {% include "partials/sidebar.html" %}
+              <main id="main" class="docs-main">
+                <h1>{{ page.title | e }}</h1>
+                <p class="taxonomy-desc">Browse all terms in this taxonomy:</p>
+                {{ content }}
+            {% include "footer.html" %}
+            HTML
+        end
+
+        private def docs_taxonomy_term_template : String
+          <<-HTML
+            {% include "header.html" %}
+            {% include "partials/nav.html" %}
+            {% include "partials/search.html" %}
+            <div class="docs-container">
+            {% include "partials/sidebar.html" %}
+              <main id="main" class="docs-main">
+                <h1>{{ page.title | e }}</h1>
+                <p class="taxonomy-desc">Pages tagged with this term:</p>
+                {{ content }}
+            {% include "footer.html" %}
+            HTML
+        end
+
+        # Content files. The landing composes designed blocks (raw HTML
+        # passes through Markdown untouched): section cards for wayfinding,
+        # then a typographic feature grid — no bullet walls.
         private def index_content : String
           <<-CONTENT
-+++
-title = "Documentation"
-+++
+            +++
+            title = "Documentation"
+            description = "Project documentation powered by Hwaro."
+            +++
 
-This documentation site is powered by [Hwaro](https://github.com/hahwul/hwaro), a fast and lightweight static site generator.
+            This documentation site is powered by [Hwaro](https://github.com/hahwul/hwaro), a fast and lightweight static site generator. Three sections, a sidebar, and search come wired up, ready for your own docs.
 
-## Quick Links
+            <div class="link-cards">
+              <a class="link-card" href="/getting-started/"><strong>Getting Started</strong><span>Install, set up, and run your first build.</span></a>
+              <a class="link-card" href="/guide/"><strong>Guide</strong><span>Content, templates, and shortcodes in depth.</span></a>
+              <a class="link-card" href="/reference/"><strong>Reference</strong><span>Every CLI command and configuration key.</span></a>
+            </div>
 
-- **[Getting Started](/getting-started/)** - Installation, setup, and basic usage
-- **[Guide](/guide/)** - In-depth guides on content, templates, and more
-- **[Reference](/reference/)** - CLI commands and configuration options
+            ## Features
 
-## Features
-
-- **Write in Markdown** - Simple, readable content authoring
-- **Jinja2 Templates** - Customizable templates via Crinja engine
-- **Fast Builds** - Powered by Crystal for blazing fast build times
-- **Built-in Search** - Client-side search with keyboard shortcuts
-- **Responsive Layout** - Documentation layout that works on all devices
-- **Syntax Highlighting** - Code blocks with automatic syntax highlighting
-CONTENT
+            <div class="feature-grid">
+              <div class="feature"><strong>Write in Markdown</strong><span>Simple, readable content authoring.</span></div>
+              <div class="feature"><strong>Jinja2 Templates</strong><span>Customizable templates via the Crinja engine.</span></div>
+              <div class="feature"><strong>Fast Builds</strong><span>Powered by Crystal for quick rebuild cycles.</span></div>
+              <div class="feature"><strong>Built-in Search</strong><span>Client-side search with keyboard shortcuts.</span></div>
+              <div class="feature"><strong>Responsive Layout</strong><span>A documentation layout that works on all devices.</span></div>
+              <div class="feature"><strong>Syntax Highlighting</strong><span>Code blocks highlighted at build time.</span></div>
+            </div>
+            CONTENT
         end
 
         private def getting_started_index : String
           <<-CONTENT
-+++
-title = "Getting Started"
-+++
+            +++
+            title = "Getting Started"
+            description = "Install Hwaro, scaffold a project, and run your first build."
+            +++
 
-Welcome to the Getting Started guide. This section will help you set up your first Hwaro documentation site.
+            Welcome to the Getting Started guide. This section will help you set up your first Hwaro documentation site.
 
-## What You'll Learn
+            ## What You'll Learn
 
-1. How to install Hwaro
-2. Creating your first documentation site
-3. Basic configuration options
-4. Building and previewing your site
-CONTENT
+            1. How to install Hwaro
+            2. Creating your first documentation site
+            3. Basic configuration options
+            4. Building and previewing your site
+            CONTENT
         end
 
         private def installation_content : String
           <<-CONTENT
-+++
-title = "Installation"
-+++
+            +++
+            title = "Installation"
+            description = "Install Hwaro on your system."
+            weight = 1
+            +++
 
-Learn how to install Hwaro on your system.
+            Learn how to install Hwaro on your system.
 
-## Prerequisites
+            ## Prerequisites
 
-- [Crystal](https://crystal-lang.org/) 1.0 or later
-- Git (optional, for cloning)
+            - [Crystal](https://crystal-lang.org/) 1.0 or later
+            - Git (optional, for cloning)
 
-## Install from Source
+            ## Install from Source
 
-```bash
-git clone https://github.com/hahwul/hwaro
-cd hwaro
-shards install
-shards build --release
-```
+            ```bash
+            git clone https://github.com/hahwul/hwaro
+            cd hwaro
+            shards install
+            shards build --release
+            ```
 
-## Verify Installation
+            ## Verify Installation
 
-```bash
-./bin/hwaro --version
-```
+            ```bash
+            ./bin/hwaro --version
+            ```
 
-You should see the version number if Hwaro is installed correctly.
+            You should see the version number if Hwaro is installed correctly.
 
-## Next Steps
+            ## Next Steps
 
-Once installed, proceed to the [Quick Start](/getting-started/quick-start.html) guide.
-CONTENT
+            Once installed, proceed to the [Quick Start](/getting-started/quick-start/) guide.
+            CONTENT
         end
 
         private def quick_start_content : String
           <<-CONTENT
-+++
-title = "Quick Start"
-+++
+            +++
+            title = "Quick Start"
+            description = "Get up and running with a new Hwaro docs site in minutes."
+            weight = 2
+            +++
 
-Get up and running with Hwaro in minutes.
+            Get up and running with Hwaro in minutes.
 
-## Create a New Project
+            ## Create a New Project
 
-```bash
-hwaro init my-docs --scaffold docs
-cd my-docs
-```
+            ```bash
+            hwaro init my-docs --scaffold docs
+            cd my-docs
+            ```
 
-## Project Structure
+            ## Project Structure
 
-```
-my-docs/
-├── config.toml          # Site configuration
-├── content/             # Markdown content files
-│   ├── index.md
-│   ├── getting-started/
-│   └── guide/
-├── templates/           # Jinja2 templates
-└── static/              # Static assets
-```
+            ```
+            my-docs/
+            ├── config.toml          # Site configuration
+            ├── content/             # Markdown content files
+            │   ├── index.md
+            │   ├── getting-started/
+            │   └── guide/
+            ├── templates/           # Jinja2 templates
+            └── static/              # Static assets
+            ```
 
-## Build Your Site
+            ## Build Your Site
 
-```bash
-hwaro build
-```
+            ```bash
+            hwaro build
+            ```
 
-The generated site will be in the `public/` directory.
+            The generated site will be in the `public/` directory.
 
-## Preview Locally
+            ## Preview Locally
 
-```bash
-hwaro serve
-```
+            ```bash
+            hwaro serve
+            ```
 
-Visit `http://localhost:3000` to see your site.
+            Visit `http://localhost:3000` to see your site.
 
-## Next Steps
+            ## Next Steps
 
-- Read about [Configuration](/getting-started/configuration.html)
-- Learn about [Content Management](/guide/content-management.html)
-CONTENT
+            - Read about [Configuration](/getting-started/configuration/)
+            - Learn about [Content Management](/guide/content-management/)
+            CONTENT
         end
 
         private def configuration_content : String
           <<-CONTENT
-+++
-title = "Configuration"
-+++
+            +++
+            title = "Configuration"
+            description = "Configure your Hwaro site via config.toml."
+            weight = 3
+            +++
 
-Hwaro is configured through a `config.toml` file in your project root.
+            Hwaro is configured through a `config.toml` file in your project root.
 
-## Basic Configuration
+            ## Basic Configuration
 
-```toml
-title = "My Documentation"
-description = "Project documentation"
-base_url = "https://docs.example.com"
-```
+            ```toml
+            title = "My Documentation"
+            description = "Project documentation"
+            base_url = "https://docs.example.com"
+            ```
 
-## Search Configuration
+            ## Search Configuration
 
-```toml
-[search]
-enabled = true
-format = "fuse_json"
-fields = ["title", "content"]
-```
+            ```toml
+            [search]
+            enabled = true
+            format = "fuse_json"
+            fields = ["title", "content"]
+            ```
 
-## SEO Configuration
+            ## SEO Configuration
 
-```toml
-[sitemap]
-enabled = true
+            ```toml
+            [sitemap]
+            enabled = true
 
-[robots]
-enabled = true
-```
+            [robots]
+            enabled = true
+            ```
 
-## Full Reference
+            ## Full Reference
 
-See the [Configuration Reference](/reference/config.html) for all available options.
-CONTENT
+            See the [Configuration Reference](/reference/config/) for all available options.
+            CONTENT
         end
 
         private def guide_index : String
           <<-CONTENT
-+++
-title = "Guide"
-+++
+            +++
+            title = "Guide"
+            description = "In-depth guides on content, templates, and shortcodes."
+            +++
 
-This section contains in-depth guides for using Hwaro effectively.
+            This section contains in-depth guides for using Hwaro effectively.
 
-## Topics
+            ## Topics
 
-Learn about the core concepts and features of Hwaro:
+            Learn about the core concepts and features of Hwaro:
 
-- **Content Management** - Organize and write your documentation
-- **Templates** - Customize the look and feel of your site
-- **Shortcodes** - Add reusable components to your content
-CONTENT
+            - **Content Management** - Organize and write your documentation
+            - **Templates** - Customize the look and feel of your site
+            - **Shortcodes** - Add reusable components to your content
+            CONTENT
         end
 
         private def content_management_content : String
           <<-CONTENT
-+++
-title = "Content Management"
-+++
+            +++
+            title = "Content Management"
+            description = "How to organize, author, and front-matter your content."
+            weight = 1
+            +++
 
-Learn how to organize and write content in Hwaro.
+            Learn how to organize and write content in Hwaro.
 
-## Content Directory
+            ## Content Directory
 
-All content files live in the `content/` directory:
+            All content files live in the `content/` directory:
 
-```
-content/
-├── index.md              # Homepage
-├── getting-started/      # Section
-│   ├── _index.md         # Section index
-│   ├── installation.md   # Page
-│   └── quick-start.md    # Page
-└── guide/
-    └── ...
-```
+            ```
+            content/
+            ├── index.md              # Homepage
+            ├── getting-started/      # Section
+            │   ├── _index.md         # Section index
+            │   ├── installation.md   # Page
+            │   └── quick-start.md    # Page
+            └── guide/
+                └── ...
+            ```
 
-## Front Matter
+            ## Front Matter
 
-Each content file starts with front matter in TOML format:
+            Each content file starts with front matter in TOML format:
 
-```markdown
-+++
-title = "Page Title"
-date = "2024-01-01"
-description = "Page description for SEO"
-+++
+            ```markdown
+            +++
+            title = "Page Title"
+            date = "#{Time.utc.to_s("%Y-%m-%d")}"
+            description = "Page description for SEO"
+            +++
 
-# Your Content Here
-```
+            # Your Content Here
+            ```
 
-## Sections
+            ## Sections
 
-Sections are directories containing related content. Each section should have an `_index.md` file.
+            Sections are directories containing related content. Each section should have an `_index.md` file.
 
-## Links
+            ## Links
 
-Link to other pages using relative paths:
+            Link to other pages using relative paths:
 
-```markdown
-[Installation](/getting-started/installation.html)
-```
+            ```markdown
+            [Installation](/getting-started/installation/)
+            ```
 
-## Images
+            ## Images
 
-Place images in `static/` and reference them:
+            Place images in `static/` and reference them:
 
-```markdown
-![Diagram](/images/diagram.png)
-```
-CONTENT
+            ```markdown
+            ![Diagram](/images/diagram.png)
+            ```
+            CONTENT
         end
 
         private def templates_content : String
           <<-CONTENT
-+++
-title = "Templates"
-+++
+            +++
+            title = "Templates"
+            description = "Customize your site's look with Crinja (Jinja2) templates."
+            weight = 2
+            +++
 
-Hwaro uses Jinja2-compatible templates (via Crinja) for rendering pages.
+            Hwaro uses Jinja2-compatible templates (via Crinja) for rendering pages.
 
-## Template Directory
+            ## Template Directory
 
-Templates are stored in `templates/`:
+            Templates are stored in `templates/`:
 
-```
-templates/
-├── base.html       # Base template with common structure
-├── page.html       # Regular pages
-├── section.html    # Section indexes
-├── partials/       # Partial templates
-│   └── nav.html
-└── shortcodes/     # Shortcode templates
-```
+            ```
+            templates/
+            ├── base.html       # Base template with common structure
+            ├── page.html       # Regular pages
+            ├── section.html    # Section indexes
+            ├── partials/       # Partial templates
+            │   └── nav.html
+            └── shortcodes/     # Shortcode templates
+            ```
 
-## Available Variables
+            ## Available Variables
 
-In templates, you have access to:
+            In templates, you have access to:
 
-| Flat Variable | Object Access | Description |
-|---------------|---------------|-------------|
-| `page_title` | `page.title` | Current page title |
-| `site_title` | `site.title` | Site title from config |
-| `content` | — | Rendered page content |
-| `base_url` | `site.base_url` | Site base URL |
+            | Flat Variable | Object Access | Description |
+            |---------------|---------------|-------------|
+            | `page_title` | `page.title` | Current page title |
+            | `site_title` | `site.title` | Site title from config |
+            | `content` | - | Rendered page content |
+            | `base_url` | `site.base_url` | Site base URL |
 
-## Template Inheritance
+            ## Template Inheritance
 
-Extend base templates:
+            Extend base templates:
 
-```jinja
-{% extends "base.html" %}
-{% block content %}{{ content }}{% endblock %}
-```
+            ```jinja
+            {% extends "base.html" %}
+            {% block content %}{{ content }}{% endblock %}
+            ```
 
-## Including Partials
+            ## Including Partials
 
-Include other templates:
+            Include other templates:
 
-```jinja
-{% include "partials/nav.html" %}
-```
+            ```jinja
+            {% include "partials/nav.html" %}
+            ```
 
-## Customization
+            ## Customization
 
-Modify templates to change the site layout, add navigation, or include custom scripts.
-CONTENT
+            Modify templates to change the site layout, add navigation, or include custom scripts.
+            CONTENT
         end
 
         private def shortcodes_content : String
           <<-CONTENT
-+++
-title = "Shortcodes"
-+++
+            +++
+            title = "Shortcodes"
+            description = "Reusable template snippets you can embed in Markdown."
+            weight = 3
+            +++
 
-Shortcodes are reusable content snippets you can embed in your Markdown.
+            Shortcodes are reusable content snippets you can embed in your Markdown.
 
-## Using Shortcodes
+            ## Using Shortcodes
 
-In your Markdown content:
+            Inline and block forms are supported. **Named closers are recommended** for clarity:
 
-```jinja
-{{ alert(type="info", message="This is an info alert") }}
-```
+            Inline:
+            ```jinja
+            {{ alert(type="info", body="This is an info alert") }}
+            ```
 
-## Built-in Shortcodes
+            Block:
+            ```jinja
+            {% alert(type="warning", title="Caution") %}
+            Be careful with this!
+            {% end %}
 
-### Alert
+            {% alert(type="tip") %}Named closer recommended{% endalert %}
+            ```
 
-Display an alert box:
+            ## Built-in Shortcodes
 
-```jinja
-{{ alert(type="warning", message="Be careful!") }}
-```
+            ### Alert / Callout
 
-Types: `info`, `warning`, `tip`, `note`
+            Display an alert box. Works in both inline and block forms.
 
-## Creating Custom Shortcodes
+            ```jinja
+            {{ alert(type="warning", body="Be careful!") }}
+            {% alert(type="tip") %}A helpful tip here.{% end %}
+            ```
 
-1. Create a template in `templates/shortcodes/`:
+            Types: `info`, `warning`, `tip`, `note`, etc. (depends on your shortcode template).
 
-```jinja
-{# templates/shortcodes/highlight.html #}
-<mark class="highlight">{{ text }}</mark>
-```
+            ## Creating Custom Shortcodes
 
-2. Use it in your content:
+            1. Create a template in `templates/shortcodes/`:
 
-```jinja
-{{ highlight(text="Important text here") }}
-```
+            ```jinja
+            {# templates/shortcodes/highlight.html #}
+            <mark class="highlight">{{ text }}</mark>
+            ```
 
-## Advanced Example
+            2. Use it in your content:
 
-```jinja
-{# templates/shortcodes/alert.html #}
-{% if type and message %}
-<div class="alert alert-{{ type }}">
-  {{ message | safe }}
-</div>
-{% endif %}
-```
+            ```jinja
+            {{ highlight(text="Important text here") }}
+            ```
 
-## Best Practices
+            ## Advanced Example
 
-- Keep shortcodes simple and focused
-- Document your custom shortcodes
-- Use semantic HTML in shortcode templates
-- Use the `safe` filter for HTML content
-CONTENT
+            ```jinja
+            {# templates/shortcodes/alert.html #}
+            {% if type and body %}
+            <div class="alert alert-{{ type }}">
+              {{ body | safe }}
+            </div>
+            {% endif %}
+            ```
+
+            ## Best Practices
+
+            - Keep shortcodes simple and focused
+            - Document your custom shortcodes
+            - Use semantic HTML in shortcode templates
+            - Use the `safe` filter for HTML content
+            CONTENT
         end
 
         private def reference_index : String
           <<-CONTENT
-+++
-title = "Reference"
-+++
+            +++
+            title = "Reference"
+            description = "CLI commands and configuration reference."
+            +++
 
-Technical reference documentation for Hwaro.
+            Technical reference documentation for Hwaro.
 
-## Contents
+            ## Contents
 
-- **CLI Commands** - All available command-line commands
-- **Configuration** - Complete configuration options reference
-CONTENT
+            - **CLI Commands** - All available command-line commands
+            - **Configuration** - Complete configuration options reference
+            CONTENT
         end
 
         private def cli_reference_content : String
           <<-CONTENT
-+++
-title = "CLI Commands"
-+++
+            +++
+            title = "CLI Commands"
+            description = "Complete reference for every hwaro subcommand."
+            weight = 1
+            +++
 
-Reference for all Hwaro command-line commands.
+            Reference for all Hwaro command-line commands.
 
-## hwaro init
+            ## hwaro init
 
-Initialize a new Hwaro project.
+            Initialize a new Hwaro project.
 
-```bash
-hwaro init [path] [options]
-```
+            ```bash
+            hwaro init [path] [options]
+            ```
 
-**Options:**
+            **Options:**
 
-| Option | Description |
-|--------|-------------|
-| `--scaffold TYPE` | Scaffold type: simple, blog, blog-dark, docs, docs-dark (default: simple) |
-| `--force` | Overwrite existing files |
-| `--skip-sample-content` | Don't create sample content |
+            | Option | Description |
+            |--------|-------------|
+            | `--scaffold TYPE` | Scaffold type: simple, bare, blog, docs, book (default: simple) |
+            | `--force` | Overwrite existing files |
+            | `--skip-sample-content` | Don't create sample content |
 
-**Examples:**
+            **Examples:**
 
-```bash
-hwaro init my-site
-hwaro init my-blog --scaffold blog
-hwaro init my-blog --scaffold blog-dark
-hwaro init my-docs --scaffold docs --force
-hwaro init my-docs --scaffold docs-dark
-```
+            ```bash
+            hwaro init my-site
+            hwaro init my-blog --scaffold blog
+            hwaro init my-docs --scaffold docs --force
+            hwaro init my-book --scaffold book
+            ```
 
-## hwaro build
+            ## hwaro build
 
-Build the static site.
+            Build the static site.
 
-```bash
-hwaro build [options]
-```
+            ```bash
+            hwaro build [options]
+            ```
 
-**Options:**
+            **Options:**
 
-| Option | Description |
-|--------|-------------|
-| `--config FILE` | Use a custom config file |
-| `--output DIR` | Output directory (default: public) |
+            | Option | Description |
+            |--------|-------------|
+            | `--config FILE` | Use a custom config file |
+            | `--output DIR` | Output directory (default: public) |
 
-## hwaro serve
+            ## hwaro serve
 
-Start a development server.
+            Start a development server.
 
-```bash
-hwaro serve [options]
-```
+            ```bash
+            hwaro serve [options]
+            ```
 
-**Options:**
+            **Options:**
 
-| Option | Description |
-|--------|-------------|
-| `--port PORT` | Server port (default: 3000) |
-| `--host HOST` | Server host (default: localhost) |
+            | Option | Description |
+            |--------|-------------|
+            | `--port PORT` | Server port (default: 3000) |
+            | `--host HOST` | Server host (default: localhost) |
 
-## hwaro new
+            ## hwaro new
 
-Create a new content file.
+            Create a new content file.
 
-```bash
-hwaro new [path]
-```
+            ```bash
+            hwaro new [path]
+            ```
 
-Creates a new Markdown file with front matter template.
-CONTENT
+            Creates a new Markdown file with front matter template.
+            CONTENT
         end
 
         private def config_reference_content : String
           <<-CONTENT
-+++
-title = "Configuration Reference"
-+++
+            +++
+            title = "Configuration Reference"
+            description = "Every option you can set in config.toml."
+            weight = 2
+            +++
 
-Complete reference for `config.toml` options.
+            Complete reference for `config.toml` options.
 
-## Site Settings
+            ## Site Settings
 
-```toml
-title = "Site Title"
-description = "Site description"
-base_url = "https://example.com"
-```
+            ```toml
+            title = "Site Title"
+            description = "Site description"
+            base_url = "https://example.com"
+            ```
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `title` | string | Site title |
-| `description` | string | Site description |
-| `base_url` | string | Production URL |
+            | Key | Type | Description |
+            |-----|------|-------------|
+            | `title` | string | Site title |
+            | `description` | string | Site description |
+            | `base_url` | string | Production URL |
 
-## Search
+            ## Search
 
-```toml
-[search]
-enabled = true
-format = "fuse_json"
-fields = ["title", "content"]
-filename = "search.json"
-```
+            ```toml
+            [search]
+            enabled = true
+            format = "fuse_json"
+            fields = ["title", "content"]
+            filename = "search.json"
+            ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | false | Enable search index |
-| `format` | string | "fuse_json" | Index format |
-| `fields` | array | ["title"] | Fields to index |
+            | Key | Type | Default | Description |
+            |-----|------|---------|-------------|
+            | `enabled` | bool | false | Enable search index |
+            | `format` | string | "fuse_json" | Index format |
+            | `fields` | array | ["title"] | Fields to index |
 
-## Sitemap
+            ## Sitemap
 
-```toml
-[sitemap]
-enabled = true
-filename = "sitemap.xml"
-changefreq = "weekly"
-priority = 0.5
-```
+            ```toml
+            [sitemap]
+            enabled = true
+            filename = "sitemap.xml"
+            changefreq = "weekly"
+            priority = 0.5
+            ```
 
-## RSS/Atom Feeds
+            ## RSS/Atom Feeds
 
-```toml
-[feeds]
-enabled = true
-type = "rss"
-limit = 10
-sections = ["posts"]
-```
+            ```toml
+            [feeds]
+            enabled = true
+            type = "rss"
+            limit = 10
+            sections = ["posts"]
+            ```
 
-## Taxonomies
+            ## Taxonomies
 
-```toml
-[[taxonomies]]
-name = "tags"
-feed = true
+            ```toml
+            [[taxonomies]]
+            name = "tags"
+            feed = true
 
-[[taxonomies]]
-name = "categories"
-paginate_by = 10
-```
-CONTENT
+            [[taxonomies]]
+            name = "categories"
+            paginate_by = 10
+            ```
+            CONTENT
         end
       end
     end

@@ -1,12 +1,16 @@
 # Frontmatter Converter Service
 #
 # This service provides functionality to convert frontmatter between
-# YAML and TOML formats in content files.
+# YAML, TOML, and JSON formats in content files.
 
 require "json"
 require "yaml"
 require "toml"
+require "./content_lister"
+require "../utils/frontmatter_scanner"
+require "../utils/frontmatter_writer"
 require "../utils/logger"
+require "../utils/text_utils"
 
 module Hwaro
   module Services
@@ -14,6 +18,7 @@ module Hwaro
     enum FrontmatterFormat
       YAML
       TOML
+      JSON
       Unknown
     end
 
@@ -42,6 +47,15 @@ module Hwaro
       YAML_DELIMITER = "---"
       TOML_DELIMITER = "+++"
 
+      # Frontmatter splitters. The closing-delimiter clause matches trailing
+      # horizontal whitespace and exactly one newline (or end of file) — *not*
+      # `\s*$\n?`, which would silently swallow a blank line between the
+      # delimiter and the body. The body capture keeps any blank line as a
+      # leading `\n`, so round-tripping TOML↔YAML preserves the author's
+      # original spacing (regression: blank line was lost).
+      YAML_FRONTMATTER_RE = /\A---\s*\n(.*?\n?)^---[ \t]*(?:\r?\n|\z)(.*)\z/m
+      TOML_FRONTMATTER_RE = /\A\+\+\+\s*\n(.*?\n?)^\+\+\+[ \t]*(?:\r?\n|\z)(.*)\z/m
+
       private enum ConversionStatus
         Converted
         Skipped
@@ -65,15 +79,32 @@ module Hwaro
         convert_files(FrontmatterFormat::TOML)
       end
 
+      # Convert all content files to JSON format
+      def convert_to_json : ConversionResult
+        convert_files(FrontmatterFormat::JSON)
+      end
+
       # Detect the frontmatter format of a file
       def detect_format(content : String) : FrontmatterFormat
         if content.starts_with?("#{TOML_DELIMITER}\n") || content.starts_with?("#{TOML_DELIMITER}\r\n")
           FrontmatterFormat::TOML
         elsif content.starts_with?("#{YAML_DELIMITER}\n") || content.starts_with?("#{YAML_DELIMITER}\r\n")
           FrontmatterFormat::YAML
+        elsif content.starts_with?('{') && json_frontmatter_object?(content)
+          FrontmatterFormat::JSON
         else
           FrontmatterFormat::Unknown
         end
+      end
+
+      # A body that merely *starts* with `{` (e.g. a `{{< shortcode >}}` line)
+      # can balance braces and fool the scanner; only claim JSON when the
+      # leading block actually parses as a JSON object.
+      private def json_frontmatter_object?(content : String) : Bool
+        return false unless end_idx = Utils::FrontmatterScanner.find_json_end(content)
+        JSON.parse(content.byte_slice(0, end_idx)).as_h? ? true : false
+      rescue JSON::ParseException
+        false
       end
 
       # Convert a single file's frontmatter
@@ -83,25 +114,47 @@ module Hwaro
       end
 
       private def convert_file_with_status(file_path : String, target_format : FrontmatterFormat, log_skipped : Bool = true) : ConversionStatus
-        content = File.read(file_path)
+        # Strip a BOM before detection so a BOM'd file isn't misread as
+        # "no frontmatter" and skipped. The rewrite below drops the BOM too.
+        content = Utils::TextUtils.strip_bom(File.read(file_path))
         current_format = detect_format(content)
 
         # Skip if already in target format or unknown format
         if current_format == target_format
-          Logger.info "  Skipped (already #{target_format}): #{file_path}" if log_skipped
+          Logger.item("skipped (already #{target_format}): #{file_path}", glyph: :bullet) if log_skipped
           return ConversionStatus::Skipped
         end
 
         if current_format == FrontmatterFormat::Unknown
-          Logger.warn "  Skipped (no frontmatter): #{file_path}" if log_skipped
+          Logger.item("skipped (no frontmatter): #{file_path}", glyph: :warn) if log_skipped
           return ConversionStatus::Skipped
+        end
+
+        # A leading `---`/`+++` pair whose inside isn't a mapping (a horizontal
+        # rule followed by prose, a stray list, an unclosed delimiter) is body
+        # text, not frontmatter. Converting it used to REPLACE the block with
+        # empty frontmatter, silently deleting the author's content — skip
+        # such files instead of writing anything.
+        unless frontmatter_mapping?(content, current_format)
+          Logger.item("skipped (leading #{format_label(current_format)} block is not frontmatter): #{file_path}", glyph: :warn) if log_skipped
+          return ConversionStatus::Skipped
+        end
+
+        # The command already prints a blanket "comments are not preserved"
+        # notice, but that fires on every run and says nothing about which
+        # files are actually affected. Name the casualties so an author with
+        # hundreds of files knows exactly what this in-place rewrite cost —
+        # hwaro's own scaffolds ship commented frontmatter, so this is easy
+        # to hit and easy to miss in a large `git diff`.
+        if dropped = dropped_comment_count(content, current_format)
+          Logger.warn "#{file_path}: dropping #{dropped} frontmatter comment line(s)."
         end
 
         converted_content = convert_content(content, current_format, target_format)
 
         if converted_content
-          File.write(file_path, converted_content)
-          Logger.success "  Converted: #{file_path}"
+          write_in_place(file_path, converted_content)
+          Logger.item(file_path, glyph: :ok)
           ConversionStatus::Converted
         else
           Logger.error "  Failed to convert: #{file_path}"
@@ -124,9 +177,7 @@ module Hwaro
         skipped = 0
         errors = 0
 
-        format_name = target_format == FrontmatterFormat::YAML ? "YAML" : "TOML"
-        Logger.info "Converting frontmatter to #{format_name} format..."
-        Logger.info ""
+        format_name = format_label(target_format)
 
         find_content_files.each do |file_path|
           status = convert_file_with_status(file_path, target_format, log_skipped: false)
@@ -141,15 +192,16 @@ module Hwaro
           end
         end
 
-        Logger.info ""
-        Logger.info "Conversion complete:"
-        Logger.info "  Converted: #{converted}"
-        Logger.info "  Skipped: #{skipped}"
-        Logger.info "  Errors: #{errors}" if errors > 0
+        summary = "#{converted} files · #{skipped} skipped"
+        summary += " · #{errors} errors" if errors > 0
+        Logger.info "" if Logger.color_enabled?
+        Logger.outcome("converted", summary, glyph: errors > 0 ? :err : :result)
 
         ConversionResult.new(
           success: errors == 0,
-          message: "Converted #{converted} files to #{format_name}",
+          # On failure `message` is what the CLI surfaces as the error, so it
+          # has to describe the failure — not the (partial) success.
+          message: errors > 0 ? "#{errors} file(s) could not be converted to #{format_name}" : "Converted #{converted} files to #{format_name}",
           converted_count: converted,
           skipped_count: skipped,
           error_count: errors
@@ -159,12 +211,16 @@ module Hwaro
       private def find_content_files : Array(String)
         files = [] of String
 
+        # Unfollowable symlinks are dropped here (see `ContentWalk`). There is
+        # no frontmatter to rewrite in a link that resolves to nothing, and
+        # counting one as a conversion *error* made `hwaro tool convert` report
+        # failure — and exit non-zero — on a tree `hwaro build` publishes fine.
         Dir.glob(File.join(@content_dir, "**", "*.md")) do |file|
-          files << file
+          files << file if ContentWalk.readable_file?(file)
         end
 
         Dir.glob(File.join(@content_dir, "**", "*.markdown")) do |file|
-          files << file
+          files << file if ContentWalk.readable_file?(file)
         end
 
         files.sort
@@ -176,14 +232,100 @@ module Hwaro
           yaml_to_toml(content)
         when {FrontmatterFormat::TOML, FrontmatterFormat::YAML}
           toml_to_yaml(content)
-        else
-          nil
+        when {FrontmatterFormat::YAML, FrontmatterFormat::JSON}
+          yaml_to_json(content)
+        when {FrontmatterFormat::JSON, FrontmatterFormat::YAML}
+          json_to_yaml(content)
+        when {FrontmatterFormat::TOML, FrontmatterFormat::JSON}
+          toml_to_json(content)
+        when {FrontmatterFormat::JSON, FrontmatterFormat::TOML}
+          json_to_toml(content)
         end
+      end
+
+      # True when the file's leading delimiter block both closes properly and
+      # parses as a key/value mapping. Parse *errors* return true so they
+      # surface as Failed (with a message) in the convert path rather than
+      # being silently skipped here.
+      private def frontmatter_mapping?(content : String, format : FrontmatterFormat) : Bool
+        case format
+        when FrontmatterFormat::YAML
+          return false unless match = content.match(YAML_FRONTMATTER_RE)
+          begin
+            YAML.parse(match[1]).as_h? ? true : false
+          rescue YAML::ParseException
+            true
+          end
+        when FrontmatterFormat::TOML
+          # TOML.parse always yields a table; just require a closing delimiter.
+          content.matches?(TOML_FRONTMATTER_RE)
+        else
+          # JSON detection already validated an object in detect_format.
+          true
+        end
+      end
+
+      # Replace a content file atomically (temp file + rename) so an
+      # interrupt or full disk mid-conversion can't truncate the original.
+      # rename(2) only needs directory permission, so check the file itself
+      # first — a read-only file must fail instead of being silently replaced
+      # — and carry its permissions onto the replacement.
+      private def write_in_place(file_path : String, content : String) : Nil
+        unless File::Info.writable?(file_path)
+          raise File::Error.new("File not writable", file: file_path)
+        end
+
+        permissions = File.info(file_path).permissions
+        tmp_path = "#{file_path}.hwaro-convert.tmp"
+        File.write(tmp_path, content)
+        File.chmod(tmp_path, permissions)
+        File.rename(tmp_path, file_path)
+      rescue ex
+        File.delete(tmp_path) if tmp_path && File.exists?(tmp_path)
+        raise ex
+      end
+
+      # Number of whole-line comments in the source frontmatter block, or nil
+      # when there are none. Only full-line `#` comments count: a trailing `#`
+      # can legally live inside a quoted value, and this drives a warning, not
+      # a decision, so a conservative under-count beats false alarms. JSON has
+      # no comment syntax, so it is never scanned.
+      private def dropped_comment_count(content : String, from : FrontmatterFormat) : Int32?
+        block = case from
+                when FrontmatterFormat::TOML then content.match(TOML_FRONTMATTER_RE).try(&.[1])
+                when FrontmatterFormat::YAML then content.match(YAML_FRONTMATTER_RE).try(&.[1])
+                end
+        return unless block
+
+        count = block.each_line.count(&.lstrip.starts_with?('#'))
+        count > 0 ? count : nil
+      end
+
+      private def format_label(fmt : FrontmatterFormat) : String
+        case fmt
+        when FrontmatterFormat::YAML then "YAML"
+        when FrontmatterFormat::TOML then "TOML"
+        when FrontmatterFormat::JSON then "JSON"
+        else                              "Unknown"
+        end
+      end
+
+      # Split JSON-frontmatter content into (json_string, body). Returns nil if
+      # the file does not start with a balanced JSON object.
+      private def split_json_frontmatter(content : String) : {String, String}?
+        end_idx = Utils::FrontmatterScanner.find_json_end(content)
+        return unless end_idx
+
+        # find_json_end returns a BYTE offset; slice on bytes so multibyte
+        # JSON frontmatter isn't corrupted/truncated mid-codepoint.
+        json_str = content.byte_slice(0, end_idx)
+        body = content.byte_slice(end_idx).lchop("\r\n").lchop("\n")
+        {json_str, body}
       end
 
       private def yaml_to_toml(content : String) : String?
         # Extract YAML frontmatter
-        if match = content.match(/\A---\s*\n(.*?\n?)^---\s*$\n?(.*)\z/m)
+        if match = content.match(YAML_FRONTMATTER_RE)
           yaml_str = match[1]
           body = match[2]
 
@@ -196,14 +338,12 @@ module Hwaro
             Logger.debug "YAML parse error: #{ex.message}"
             nil
           end
-        else
-          nil
         end
       end
 
       private def toml_to_yaml(content : String) : String?
         # Extract TOML frontmatter
-        if match = content.match(/\A\+\+\+\s*\n(.*?\n?)^\+\+\+\s*$\n?(.*)\z/m)
+        if match = content.match(TOML_FRONTMATTER_RE)
           toml_str = match[1]
           body = match[2]
 
@@ -216,118 +356,196 @@ module Hwaro
             Logger.debug "TOML parse error: #{ex.message}"
             nil
           end
-        else
+        end
+      end
+
+      private def yaml_to_json(content : String) : String?
+        if match = content.match(YAML_FRONTMATTER_RE)
+          yaml_str = match[1]
+          body = match[2]
+          begin
+            yaml_data = YAML.parse(yaml_str)
+            json_str = yaml_to_json_string(yaml_data)
+            "#{json_str}\n#{body}"
+          rescue ex
+            Logger.debug "YAML parse error: #{ex.message}"
+            nil
+          end
+        end
+      end
+
+      private def toml_to_json(content : String) : String?
+        if match = content.match(TOML_FRONTMATTER_RE)
+          toml_str = match[1]
+          body = match[2]
+          begin
+            toml_data = TOML.parse(toml_str)
+            json_str = toml_to_json_string(toml_data)
+            "#{json_str}\n#{body}"
+          rescue ex
+            Logger.debug "TOML parse error: #{ex.message}"
+            nil
+          end
+        end
+      end
+
+      private def json_to_yaml(content : String) : String?
+        return unless parts = split_json_frontmatter(content)
+        json_str, body = parts
+        begin
+          json_data = JSON.parse(json_str)
+          yaml_body = convert_json_to_yaml_string(json_data)
+          "#{YAML_DELIMITER}\n#{yaml_body}#{YAML_DELIMITER}\n#{body}"
+        rescue ex
+          Logger.debug "JSON parse error: #{ex.message}"
           nil
         end
       end
 
-      private def convert_yaml_to_toml_string(yaml : YAML::Any, indent : Int32 = 0) : String
-        TomlBuilder.new.build(yaml)
+      private def json_to_toml(content : String) : String?
+        return unless parts = split_json_frontmatter(content)
+        json_str, body = parts
+        begin
+          json_data = JSON.parse(json_str)
+          # Reuse the YAML→TOML builder by going through YAML::Any.
+          yaml_any = json_to_yaml_any(json_data)
+          toml_body = Utils::FrontmatterWriter::TomlBuilder.new.build(yaml_any)
+          "#{TOML_DELIMITER}\n#{toml_body}#{TOML_DELIMITER}\n#{body}"
+        rescue ex
+          Logger.debug "JSON parse error: #{ex.message}"
+          nil
+        end
       end
 
-      private class TomlBuilder
-        def initialize
-          @output = String::Builder.new
+      # Pretty-print a YAML::Any tree as a JSON object (2-space indent).
+      private def yaml_to_json_string(yaml : YAML::Any) : String
+        return "{}" unless yaml.as_h?
+        yaml_any_to_json_any(yaml).to_pretty_json
+      end
+
+      # Pretty-print a TOML::Table as a JSON object (2-space indent).
+      private def toml_to_json_string(toml : TOML::Table) : String
+        root = JSON::Any.new({} of String => JSON::Any)
+        hash = root.as_h
+        toml.each do |key, value|
+          hash[key] = toml_any_to_json_any(value)
         end
+        root.to_pretty_json
+      end
 
-        def build(yaml : YAML::Any) : String
-          return "" unless yaml.as_h?
-          process_table(yaml, [] of String, true)
-          @output.to_s
+      # Serialize a frontmatter date/time value without corrupting the calendar day.
+      #
+      # Frontmatter dates are commonly written as TOML/YAML *local dates* such as
+      # `2026-05-20`, which parse to midnight in the local time zone. Rendering
+      # those through `to_rfc3339` (always UTC) rolls the day back in any
+      # positive-offset zone — e.g. in KST `2026-05-20` becomes
+      # `2026-05-19T15:00:00Z`, silently shifting the post's date on a format
+      # round-trip. When the value carries no time-of-day we emit a bare
+      # `YYYY-MM-DD` date and keep the day; genuine timestamps round-trip as RFC 3339.
+      def self.serialize_time(time : Time) : String
+        Utils::FrontmatterWriter.serialize_time(time)
+      end
+
+      # `depth` guards the cyclic-YAML case (a self-referencing anchor); see
+      # `Utils::Nesting`. Every caller already rescues and returns nil, so the
+      # conversion is skipped rather than crashing `hwaro tool convert`.
+      private def yaml_any_to_json_any(yaml : YAML::Any, depth : Int32 = 0) : JSON::Any
+        Utils::Nesting.check!(depth)
+        raw = yaml.raw
+        case raw
+        when Bool    then JSON::Any.new(raw)
+        when Int32   then JSON::Any.new(raw.to_i64)
+        when Int64   then JSON::Any.new(raw)
+        when Float32 then JSON::Any.new(raw.to_f64)
+        when Float64 then JSON::Any.new(raw)
+        when String  then JSON::Any.new(raw)
+        when Time    then JSON::Any.new(FrontmatterConverter.serialize_time(raw))
+        when Nil     then JSON::Any.new(nil)
+        when Array
+          arr = yaml.as_a.map { |v| yaml_any_to_json_any(v, depth + 1) }
+          JSON::Any.new(arr)
+        when Hash
+          hash = {} of String => JSON::Any
+          yaml.as_h.each do |k, v|
+            key_str = k.as_s? || k.to_s
+            hash[key_str] = yaml_any_to_json_any(v, depth + 1)
+          end
+          JSON::Any.new(hash)
+        else
+          JSON::Any.new(yaml.to_s)
         end
+      end
 
-        private def process_table(yaml : YAML::Any, path : Array(String), print_header : Bool)
-          return unless yaml.as_h?
-
-          simple_values = {} of String => YAML::Any
-          tables = {} of String => YAML::Any
-          array_tables = {} of String => YAML::Any
-
-          yaml.as_h.each do |key, value|
-            key_str = key.as_s? || key.to_s
-
-            if value.as_h?
-              tables[key_str] = value
-            elsif is_array_of_tables?(value)
-              array_tables[key_str] = value
-            else
-              simple_values[key_str] = value
+      private def toml_any_to_json_any(value : TOML::Any, depth : Int32 = 0) : JSON::Any
+        Utils::Nesting.check!(depth)
+        raw = value.raw
+        case raw
+        when Bool    then JSON::Any.new(raw)
+        when Int64   then JSON::Any.new(raw)
+        when Float64 then JSON::Any.new(raw)
+        when String  then JSON::Any.new(raw)
+        when Time    then JSON::Any.new(FrontmatterConverter.serialize_time(raw))
+        when Array
+          arr = raw.map do |item|
+            item.is_a?(TOML::Any) ? toml_any_to_json_any(item, depth + 1) : JSON::Any.new(item.to_s)
+          end
+          JSON::Any.new(arr)
+        when Hash
+          if raw.is_a?(Hash(String, TOML::Any))
+            hash = {} of String => JSON::Any
+            raw.each do |k, v|
+              hash[k] = toml_any_to_json_any(v, depth + 1)
             end
-          end
-
-          if !simple_values.empty? && print_header && !path.empty?
-            @output << "\n" unless @output.empty?
-            @output << "[" << format_path(path) << "]\n"
-          end
-
-          simple_values.each do |k, v|
-            @output << format_key(k) << " = " << to_toml_value(v) << "\n"
-          end
-
-          tables.each do |k, v|
-            process_table(v, path + [k], true)
-          end
-
-          array_tables.each do |k, v|
-            v.as_a.each do |item|
-              new_path = path + [k]
-              @output << "\n" unless @output.empty?
-              @output << "[[" << format_path(new_path) << "]]\n"
-              process_table(item, new_path, false)
-            end
-          end
-        end
-
-        private def is_array_of_tables?(value : YAML::Any) : Bool
-          return false unless value.as_a?
-          return false if value.as_a.empty?
-          value.as_a.all? { |v| v.as_h? }
-        end
-
-        private def format_path(path : Array(String)) : String
-          path.map { |k| format_key(k) }.join(".")
-        end
-
-        private def format_key(key : String) : String
-          if key =~ /^[A-Za-z0-9_-]+$/
-            key
+            JSON::Any.new(hash)
           else
-            "\"#{escape_toml_string(key)}\""
+            JSON::Any.new(raw.to_s)
+          end
+        else
+          JSON::Any.new(value.to_s)
+        end
+      end
+
+      # Convert JSON::Any to YAML::Any so the existing TomlBuilder can consume it.
+      private def json_to_yaml_any(json : JSON::Any, depth : Int32 = 0) : YAML::Any
+        Utils::Nesting.check!(depth)
+        raw = json.raw
+        case raw
+        when Bool    then YAML::Any.new(raw)
+        when Int64   then YAML::Any.new(raw)
+        when Float64 then YAML::Any.new(raw)
+        when String  then YAML::Any.new(raw)
+        when Nil     then YAML::Any.new(nil)
+        when Array
+          arr = json.as_a.map { |v| json_to_yaml_any(v, depth + 1) }
+          YAML::Any.new(arr)
+        when Hash
+          hash = {} of YAML::Any => YAML::Any
+          json.as_h.each do |k, v|
+            hash[YAML::Any.new(k)] = json_to_yaml_any(v, depth + 1)
+          end
+          YAML::Any.new(hash)
+        else
+          YAML::Any.new(json.to_s)
+        end
+      end
+
+      # Produce the body of a YAML block (without the `---` fences) for a JSON
+      # document by routing through the existing YAML converter.
+      private def convert_json_to_yaml_string(json : JSON::Any) : String
+        yaml_any = json_to_yaml_any(json)
+        # Build a hash like the TOML path does so we get identical formatting.
+        hash = {} of String => YAML::Any
+        if h = yaml_any.as_h?
+          h.each do |k, v|
+            key_str = k.as_s? || k.to_s
+            hash[key_str] = v
           end
         end
+        hash.to_yaml.lchop("---\n")
+      end
 
-        private def to_toml_value(value : YAML::Any) : String
-          raw = value.raw
-
-          case raw
-          when Bool
-            raw.to_s
-          when Int32, Int64
-            raw.to_s
-          when Float32, Float64
-            raw.to_s
-          when Time
-            raw.to_rfc3339
-          when Array
-            items = value.as_a.map { |v| to_toml_value(v) }
-            "[#{items.join(", ")}]"
-          when String
-            "\"#{escape_toml_string(raw)}\""
-          when Nil
-            "\"\""
-          else
-            "\"#{escape_toml_string(value.to_s)}\""
-          end
-        end
-
-        private def escape_toml_string(str : String) : String
-          str
-            .gsub("\\", "\\\\")
-            .gsub("\"", "\\\"")
-            .gsub("\n", "\\n")
-            .gsub("\t", "\\t")
-            .gsub("\r", "\\r")
-        end
+      private def convert_yaml_to_toml_string(yaml : YAML::Any, indent : Int32 = 0) : String
+        Utils::FrontmatterWriter::TomlBuilder.new.build(yaml)
       end
 
       private def convert_toml_to_yaml_string(toml : TOML::Table) : String
@@ -346,41 +564,7 @@ module Hwaro
       end
 
       private def toml_value_to_yaml(value : TOML::Any) : YAML::Any
-        raw = value.raw
-
-        case raw
-        when String
-          YAML::Any.new(raw)
-        when Int64
-          YAML::Any.new(raw)
-        when Float64
-          YAML::Any.new(raw)
-        when Bool
-          YAML::Any.new(raw)
-        when Time
-          YAML::Any.new(raw.to_rfc3339)
-        when Array
-          arr = raw.map { |item|
-            if item.is_a?(TOML::Any)
-              toml_value_to_yaml(item)
-            else
-              YAML::Any.new(item.to_s)
-            end
-          }
-          YAML::Any.new(arr)
-        when Hash
-          if raw.is_a?(Hash(String, TOML::Any))
-            hash = {} of YAML::Any => YAML::Any
-            raw.each do |k, v|
-              hash[YAML::Any.new(k)] = toml_value_to_yaml(v)
-            end
-            YAML::Any.new(hash)
-          else
-            YAML::Any.new(raw.to_s)
-          end
-        else
-          YAML::Any.new(raw.to_s)
-        end
+        Utils::FrontmatterWriter.toml_to_yaml_any(value)
       end
     end
   end

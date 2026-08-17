@@ -1,4 +1,10 @@
+# Sidebar structure for the docs.
+#
+# KEEP IN SYNC WITH FRONT-MATTER WEIGHTS: prev/next navigation and section
+# card grids follow page `weight` (sections sort_by = "weight"), so when you
+# reorder or add links here, mirror the order in the pages' front matter.
 - title: Start
+  section: start
   items:
     - title: Overview
       url: /start/
@@ -13,6 +19,7 @@
     - title: Tools & Completion
       url: /start/tools/
 - title: Writing
+  section: writing
   items:
     - title: Overview
       url: /writing/
@@ -27,54 +34,112 @@
     - title: Archetypes
       url: /writing/archetypes/
 - title: Templates
+  section: templates
   items:
     - title: Overview
       url: /templates/
-    - title: Data Model
-      url: /templates/data-model/
     - title: Syntax
       url: /templates/syntax/
+    - title: Data Model
+      url: /templates/data-model/
     - title: Functions
       url: /templates/functions/
     - title: Filters
       url: /templates/filters/
+    - title: Render Hooks
+      url: /templates/render-hooks/
 - title: Features
+  section: features
   items:
     - title: Overview
       url: /features/
-    - title: SEO
-      url: /features/seo/
-    - title: Search
-      url: /features/search/
-    - title: Syntax Highlighting
-      url: /features/syntax-highlighting/
-    - title: Pagination
-      url: /features/pagination/
-    - title: Multilingual
-      url: /features/multilingual/
-    - title: Auto Includes
-      url: /features/auto-includes/
-    - title: Content Files
-      url: /features/content-files/
-    - title: Image Processing
-      url: /features/image-processing/
-    - title: Build Hooks
-      url: /features/build-hooks/
-    - title: Incremental Build
-      url: /features/incremental-build/
-    - title: Streaming Build
-      url: /features/streaming-build/
-    - title: Asset Pipeline
-      url: /features/asset-pipeline/
-    - title: LLMs.txt
-      url: /features/llms-txt/
+    - title: SEO & Discovery
+      items:
+        - title: SEO
+          url: /features/seo/
+        - title: Structured Data
+          url: /features/structured-data/
+        - title: Auto OG Images
+          url: /features/og-images/
+        - title: LLMs.txt
+          url: /features/llms-txt/
+    - title: Content
+      items:
+        - title: Search
+          url: /features/search/
+        - title: Pagination
+          url: /features/pagination/
+        - title: Syntax Highlighting
+          url: /features/syntax-highlighting/
+        - title: Markdown Extensions
+          url: /features/markdown-extensions/
+        - title: Series
+          url: /features/series/
+        - title: Related Posts
+          url: /features/related-posts/
+        - title: Menus
+          url: /features/menus/
+        - title: Output Formats
+          url: /features/output-formats/
+    - title: Build & Performance
+      items:
+        - title: Incremental Build
+          url: /features/incremental-build/
+        - title: Streaming Build
+          url: /features/streaming-build/
+        - title: Build Hooks
+          url: /features/build-hooks/
+        - title: Asset Pipeline
+          url: /features/asset-pipeline/
+        - title: Cache Busting
+          url: /features/cache-busting/
+    - title: Files & Environment
+      items:
+        - title: Environment Variables
+          url: /features/env-variables/
+        - title: Env-Specific Config
+          url: /features/env-config/
+        - title: Auto Includes
+          url: /features/auto-includes/
+        - title: Content Files
+          url: /features/content-files/
+    - title: Platform
+      items:
+        - title: Multilingual
+          url: /features/multilingual/
+        - title: Image Processing
+          url: /features/image-processing/
+        - title: PWA
+          url: /features/pwa/
+        - title: AMP
+          url: /features/amp/
+        - title: Deployment
+          url: /features/deployment/
 - title: Deploy
+  section: deploy
   items:
     - title: Overview
       url: /deploy/
+    - title: Configuration
+      url: /deploy/config/
     - title: GitHub Pages
       url: /deploy/github-pages/
     - title: GitLab CI
       url: /deploy/gitlab-ci/
+    - title: Netlify
+      url: /deploy/netlify/
+    - title: Vercel
+      url: /deploy/vercel/
+    - title: Cloudflare Pages
+      url: /deploy/cloudflare-pages/
+    - title: Codeberg Pages
+      url: /deploy/codeberg-pages/
     - title: Docker
       url: /deploy/docker/
+- title: Integrations
+  section: integrations
+  items:
+    - title: Overview
+      url: /integrations/
+    - title: Agent Skills
+      url: /integrations/skills/

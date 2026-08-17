@@ -7,15 +7,15 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       order = [] of String
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "low") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "low") do |_|
         order << "low"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 50, name: "mid") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 50, name: "mid") do |_|
         order << "mid"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "high") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "high") do |_|
         order << "high"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -29,15 +29,15 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       order = [] of String
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "first") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "first") do |_|
         order << "first"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "second") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "second") do |_|
         order << "second"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "third") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 10, name: "third") do |_|
         order << "third"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -54,16 +54,16 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       second_ran = false
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "skipper") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "skipper") do |_|
         Hwaro::Core::Lifecycle::HookResult::Skip
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-skip") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-skip") do |_|
         second_ran = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
       result = manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, ctx)
-      result.should eq(Hwaro::Core::Lifecycle::HookResult::Skip)
+      result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
       second_ran.should be_false
     end
   end
@@ -74,10 +74,10 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       second_ran = false
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "aborter") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "aborter") do |_|
         Hwaro::Core::Lifecycle::HookResult::Abort
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-abort") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-abort") do |_|
         second_ran = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -93,9 +93,8 @@ describe Hwaro::Core::Lifecycle::Manager do
       manager = Hwaro::Core::Lifecycle::Manager.new
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "raiser") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "raiser") do |_|
         raise "something went wrong"
-        Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
       result = manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, ctx)
@@ -107,17 +106,31 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       second_ran = false
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "raiser") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "raiser") do |_|
         raise "boom"
-        Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-raise") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 1, name: "after-raise") do |_|
         second_ran = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
       manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, ctx)
       second_ran.should be_false
+    end
+
+    it "re-raises a HwaroError unchanged instead of downgrading to Abort" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
+
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "classified-raiser") do |_|
+        raise Hwaro::HwaroError.new(Hwaro::Errors::HWARO_E_CONFIG, "bad config")
+      end
+
+      error = expect_raises(Hwaro::HwaroError) do
+        manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, ctx)
+      end
+      error.code.should eq(Hwaro::Errors::HWARO_E_CONFIG)
+      error.exit_code.should eq(Hwaro::Errors::EXIT_CONFIG)
     end
   end
 
@@ -136,8 +149,8 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx.set("marker", "hello")
 
       received_value = ""
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "ctx-reader") do |ctx|
-        received_value = ctx.get_string("marker")
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "ctx-reader") do |hook_ctx|
+        received_value = hook_ctx.get_string("marker")
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -152,11 +165,11 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       order = [] of String
 
-      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "before") do |ctx|
+      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "before") do |_|
         order << "before"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |ctx|
+      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |_|
         order << "after"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -169,12 +182,12 @@ describe Hwaro::Core::Lifecycle::Manager do
       order.should eq(["before", "action", "after"])
     end
 
-    it "skips action when before hook returns Skip" do
+    it "runs the action when a before hook returns Skip (only remaining hooks are skipped)" do
       manager = Hwaro::Core::Lifecycle::Manager.new
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       action_ran = false
 
-      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "skipper") do |ctx|
+      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "skipper") do |_|
         Hwaro::Core::Lifecycle::HookResult::Skip
       end
 
@@ -182,8 +195,8 @@ describe Hwaro::Core::Lifecycle::Manager do
         action_ran = true
       end
 
-      result.should eq(Hwaro::Core::Lifecycle::HookResult::Skip)
-      action_ran.should be_false
+      result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
+      action_ran.should be_true
     end
 
     it "skips action and after hooks when before hook returns Abort" do
@@ -192,10 +205,10 @@ describe Hwaro::Core::Lifecycle::Manager do
       action_ran = false
       after_ran = false
 
-      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "aborter") do |ctx|
+      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "aborter") do |_|
         Hwaro::Core::Lifecycle::HookResult::Abort
       end
-      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |ctx|
+      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |_|
         after_ran = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -214,7 +227,7 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       after_ran = false
 
-      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |ctx|
+      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after") do |_|
         after_ran = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -224,6 +237,51 @@ describe Hwaro::Core::Lifecycle::Manager do
       end
 
       result.should eq(Hwaro::Core::Lifecycle::HookResult::Abort)
+      after_ran.should be_false
+    end
+
+    it "classifies an IO::Error from the action as HWARO_E_IO instead of Abort" do
+      # Returning Abort here erased the exception type, and the CLI turned the
+      # resulting `false` into HWARO_E_INTERNAL / exit 70 — the code reserved
+      # for hwaro bugs — for ordinary filesystem trouble, with the path and
+      # errno reaching only a stderr log line, never the --json payload.
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
+      after_ran = false
+
+      manager.after(Hwaro::Core::Lifecycle::Phase::Write, name: "after") do |_|
+        after_ran = true
+        Hwaro::Core::Lifecycle::HookResult::Continue
+      end
+
+      error = expect_raises(Hwaro::HwaroError) do
+        manager.run_phase(Hwaro::Core::Lifecycle::Phase::Write, ctx) do
+          # Same shape Dir.mkdir raises when a plain file squats on the name.
+          raise File::Error.new("Unable to create directory: 'public': File exists", file: "public")
+        end
+      end
+      error.code.should eq(Hwaro::Errors::HWARO_E_IO)
+      error.exit_code.should eq(6)
+      (error.message || "").should contain("public")
+      after_ran.should be_false
+    end
+
+    it "re-raises a HwaroError from the action and does not run after hooks" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
+      after_ran = false
+
+      manager.after(Hwaro::Core::Lifecycle::Phase::ParseContent, name: "after") do |_|
+        after_ran = true
+        Hwaro::Core::Lifecycle::HookResult::Continue
+      end
+
+      error = expect_raises(Hwaro::HwaroError) do
+        manager.run_phase(Hwaro::Core::Lifecycle::Phase::ParseContent, ctx) do
+          raise Hwaro::HwaroError.new(Hwaro::Errors::HWARO_E_CONTENT, "boom")
+        end
+      end
+      error.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
       after_ran.should be_false
     end
 
@@ -262,7 +320,7 @@ describe Hwaro::Core::Lifecycle::Manager do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
       phases_executed = [] of String
 
-      manager.before(Hwaro::Core::Lifecycle::Phase::Transform, name: "aborter") do |ctx|
+      manager.before(Hwaro::Core::Lifecycle::Phase::Transform, name: "aborter") do |_|
         Hwaro::Core::Lifecycle::HookResult::Abort
       end
 
@@ -297,10 +355,10 @@ describe Hwaro::Core::Lifecycle::Manager do
   describe "introspection" do
     it "#hooks_at returns registered hooks at a point" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "hook1") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "hook1") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "hook2") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "hook2") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -316,7 +374,7 @@ describe Hwaro::Core::Lifecycle::Manager do
 
     it "#has_hooks? returns true when hooks exist" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "test") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "test") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -326,13 +384,13 @@ describe Hwaro::Core::Lifecycle::Manager do
 
     it "#hook_count returns total count across all points" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeWrite, name: "h3") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeWrite, name: "h3") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -341,10 +399,10 @@ describe Hwaro::Core::Lifecycle::Manager do
 
     it "#clear removes all hooks" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -356,10 +414,10 @@ describe Hwaro::Core::Lifecycle::Manager do
 
     it "#clear_point removes hooks only at the specified point" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "h1") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::AfterRender, name: "h2") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
@@ -380,6 +438,127 @@ describe Hwaro::Core::Lifecycle::Manager do
       manager.has_hooks?(Hwaro::Core::Lifecycle::HookPoint::BeforeRender).should be_true
       manager.hook_count.should eq(1)
     end
+
+    it "returns self so registrations can be chained" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      manager.register(TestHookable.new).should be(manager)
+    end
+
+    it "registers multiple Hookables additively" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      manager.register(TestHookable.new)
+      manager.register(TestHookable.new)
+      manager.hook_count.should eq(2)
+    end
+  end
+
+  describe "fluent registration" do
+    it "returns self from #on for chaining" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      result = manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "x") do |_ctx|
+        Hwaro::Core::Lifecycle::HookResult::Continue
+      end
+      result.should be(manager)
+    end
+  end
+
+  describe "#register_hook (explicit handler)" do
+    it "registers a HookHandler directly" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      handler = Hwaro::Core::Lifecycle::HookHandler.new do |_ctx|
+        Hwaro::Core::Lifecycle::HookResult::Continue
+      end
+      manager.register_hook(
+        Hwaro::Core::Lifecycle::HookPoint::BeforeRender,
+        handler,
+        priority: 7,
+        name: "explicit",
+      )
+
+      hooks = manager.hooks_at(Hwaro::Core::Lifecycle::HookPoint::BeforeRender)
+      hooks.size.should eq(1)
+      hooks.first.priority.should eq(7)
+      hooks.first.name.should eq("explicit")
+    end
+
+    it "re-sorts the hook list by priority after each registration" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      h1 = Hwaro::Core::Lifecycle::HookHandler.new { |_| Hwaro::Core::Lifecycle::HookResult::Continue }
+      h2 = Hwaro::Core::Lifecycle::HookHandler.new { |_| Hwaro::Core::Lifecycle::HookResult::Continue }
+      h3 = Hwaro::Core::Lifecycle::HookHandler.new { |_| Hwaro::Core::Lifecycle::HookResult::Continue }
+
+      point = Hwaro::Core::Lifecycle::HookPoint::BeforeRender
+      manager.register_hook(point, h1, priority: 1, name: "low")
+      manager.register_hook(point, h2, priority: 100, name: "high")
+      manager.register_hook(point, h3, priority: 50, name: "mid")
+
+      manager.hooks_at(point).map(&.name).should eq(["high", "mid", "low"])
+    end
+  end
+
+  describe "Manager.new(debug: true)" do
+    it "emits debug log lines for each fired hook without altering its result" do
+      # Capture and restore the global Logger.io / level so this test does
+      # not pollute other specs that read from spec_helper's IO::Memory.
+      previous_io = Hwaro::Logger.io
+      previous_level = Hwaro::Logger.level
+      sink = IO::Memory.new
+      Hwaro::Logger.io = sink
+      # Manager#trigger uses Logger.debug — bump the level so it isn't
+      # filtered (default is Info).
+      Hwaro::Logger.level = Hwaro::Logger::Level::Debug
+
+      begin
+        manager = Hwaro::Core::Lifecycle::Manager.new(debug: true)
+        ctx = Hwaro::Core::Lifecycle::BuildContext.new(Hwaro::Config::Options::BuildOptions.new)
+
+        manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "debug-target") do |_ctx|
+          Hwaro::Core::Lifecycle::HookResult::Continue
+        end
+
+        result = manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, ctx)
+        result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
+        sink.to_s.should contain("debug-target")
+      ensure
+        Hwaro::Logger.io = previous_io
+        Hwaro::Logger.level = previous_level
+      end
+    end
+  end
+
+  describe "#dump_hooks" do
+    it "does not raise when there are no hooks registered" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      manager.dump_hooks
+    end
+
+    it "does not raise when hooks are present" do
+      manager = Hwaro::Core::Lifecycle::Manager.new
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, priority: 5, name: "h") do |_|
+        Hwaro::Core::Lifecycle::HookResult::Continue
+      end
+      manager.dump_hooks
+    end
+  end
+
+  describe ".default class property" do
+    it "lazily creates a singleton Manager instance" do
+      a = Hwaro::Core::Lifecycle.default
+      b = Hwaro::Core::Lifecycle.default
+      a.should be(b)
+    end
+
+    it "allows overriding the default with a fresh Manager" do
+      # class_property's getter returns Manager? even though the block
+      # guarantees non-nil; not_nil! is needed for the setter signature.
+      original = Hwaro::Core::Lifecycle.default
+      replacement = Hwaro::Core::Lifecycle::Manager.new
+      Hwaro::Core::Lifecycle.default = replacement
+      Hwaro::Core::Lifecycle.default.should be(replacement)
+    ensure
+      # Restore the original singleton so other specs aren't affected
+      Hwaro::Core::Lifecycle.default = original.not_nil!
+    end
   end
 end
 
@@ -388,7 +567,7 @@ class TestHookable
   include Hwaro::Core::Lifecycle::Hookable
 
   def register_hooks(manager : Hwaro::Core::Lifecycle::Manager)
-    manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "test-hookable") do |ctx|
+    manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeRender, name: "test-hookable") do |_|
       Hwaro::Core::Lifecycle::HookResult::Continue
     end
   end

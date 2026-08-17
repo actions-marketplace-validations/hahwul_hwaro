@@ -20,14 +20,49 @@ module Hwaro
         private def generate_og_images(ctx : Core::Lifecycle::BuildContext)
           site = ctx.site
           return unless site
+          if ctx.options.skip_og_image
+            Logger.debug "  Skipping OG image generation (--skip-og-image)"
+            return
+          end
           return unless site.config.og.auto_image.enabled
 
-          Content::Seo::OgImage.generate(
-            ctx.all_pages,
+          ai = site.config.og.auto_image
+
+          # Lazy mode: skip automatic bulk generation during `hwaro serve`.
+          # OG images are generated on first request instead (much faster
+          # initial dev server startup on large sites) — but pages must still
+          # ADVERTISE their og:image URL, or every page ships without the
+          # meta tag for the whole session. Assign the predicted URLs without
+          # rendering; the dev server's OgLazyImageHandler creates the files
+          # on demand.
+          if ai.lazy_generate && ctx.options.serve_mode
+            lazy_pages = ctx.priority_pages || ctx.all_pages
+            assigned = Content::Seo::OgImage.assign_lazy_urls(lazy_pages, site.config)
+            Logger.debug "  Skipping OG image generation (lazy_generate enabled in serve mode); assigned #{assigned} on-demand URL(s)"
+            return
+          end
+
+          # When --fast-start is active, only generate images for the
+          # priority subset on the cold pass. The deferred render pass
+          # re-runs this hook for the rest. PNG OG generation is the
+          # single largest cost on big sites — rendering 700+ PNGs
+          # eats ~20s on a 1k-page site and is what made fast-start
+          # indistinguishable from a normal cold start.
+          pages = ctx.priority_pages || ctx.all_pages
+
+          start = ctx.profiler ? Time.instant : nil
+          stats = Content::Seo::OgImage.generate(
+            pages,
             site.config,
             ctx.output_dir,
             ctx.options.verbose,
+            partial: ctx.partial_render,
+            parallel: ctx.options.parallel,
           )
+          if (p = ctx.profiler) && start
+            elapsed = (Time.instant - start).total_milliseconds
+            p.record_asset_generation("og_image:generate", stats[:generated], stats[:skipped], elapsed)
+          end
         end
       end
     end

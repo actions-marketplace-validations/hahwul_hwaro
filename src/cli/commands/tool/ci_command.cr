@@ -1,6 +1,7 @@
 require "option_parser"
 require "../../metadata"
 require "../../../utils/logger"
+require "../../../utils/file_safe"
 require "../../../services/ci_config"
 
 module Hwaro
@@ -46,6 +47,8 @@ module Hwaro
           end
 
           def run(args : Array(String))
+            Logger.warn "DEPRECATED: 'tool ci' is deprecated. Use 'tool platform github-pages' instead."
+            Logger.warn ""
             provider : String? = nil
             output_file : String? = nil
             stdout_mode = false
@@ -66,7 +69,7 @@ module Hwaro
                 exit
               end
               parser.unknown_args do |unknown|
-                provider = unknown.first? if unknown.any?
+                provider = unknown.first? if unknown.present?
               end
             end
 
@@ -98,9 +101,9 @@ module Hwaro
               end
 
               dir = File.dirname(filename)
-              FileUtils.mkdir_p(dir) unless Dir.exists?(dir)
+              Hwaro::Utils::FileSafe.mkdir_p(dir) unless Dir.exists?(dir)
               File.write(filename, content)
-              Logger.success "Generated #{filename}"
+              Logger.outcome("created", filename)
             end
           end
         end

@@ -1,7 +1,7 @@
 +++
 title = "Syntax"
 description = "Jinja2-compatible template syntax reference"
-weight = 2
+weight = 1
 toc = true
 +++
 
@@ -163,7 +163,7 @@ Evaluate conditions:
 {% endif %}
 ```
 
-See [Filters](/templates/filters/) for all available tests.
+Tests are not filters, but they are documented on the same page — see [Filters › Tests](/templates/filters/#tests).
 
 ## Whitespace Control
 

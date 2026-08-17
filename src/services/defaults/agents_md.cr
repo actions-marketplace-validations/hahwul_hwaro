@@ -2,228 +2,344 @@ module Hwaro
   module Services
     module Defaults
       class AgentsMd
+        def self.remote_content : String
+          <<-CONTENT
+            # AGENTS.md - AI Agent Instructions for Hwaro Site
+
+            This document provides instructions for AI agents working on this Hwaro-generated website.
+
+            ## Project Overview
+
+            This is a static website built with [Hwaro](https://github.com/hahwul/hwaro), a fast and lightweight static site generator written in Crystal.
+
+            ## Essential Commands
+
+            | Command | Description |
+            |---------|-------------|
+            | `hwaro build` | Build the site to `public/` directory |
+            | `hwaro serve` | Start development server with live reload |
+            | `hwaro new <path>` | Create new content from archetype |
+            | `hwaro deploy` | Deploy the site (requires configuration) |
+            | `hwaro build --drafts` | Include draft content |
+            | `hwaro serve -p 8080` | Serve on custom port (default: 3000) |
+            | `hwaro build --base-url "https://example.com"` | Set base URL for production |
+
+            ## Directory Structure
+
+            ```
+            .
+            ├── config.toml          # Site configuration
+            ├── content/             # Markdown content files
+            │   ├── index.md         # Homepage (single file, no underscore)
+            │   ├── about.md         # Standalone page
+            │   └── <section>/       # Section directory (posts/, guide/, chapter-1/, …)
+            │       ├── _index.md    # Section landing page (underscore-prefixed)
+            │       └── *.md         # Pages within the section
+            ├── templates/           # Jinja2 templates (Crinja)
+            │   ├── header.html      # Shared <head> + <body> open
+            │   ├── footer.html      # Shared <body>/<html> close
+            │   ├── page.html        # Page template
+            │   ├── section.html     # Section listing template
+            │   ├── 404.html         # Not-found page
+            │   ├── partials/        # Reusable fragments (nav, search, sidebar)
+            │   └── shortcodes/      # Shortcode templates
+            ├── static/              # Static assets (copied as-is)
+            └── archetypes/          # Content templates for `hwaro new`
+            ```
+
+            ## Notes for AI Agents
+
+            1. **Front matter** can be TOML (`+++`), YAML (`---`), or JSON (`{...}` at file start). Pick one per file and keep delimiters matched.
+            2. **Rendered content** is `{{ content }}` in templates (already-safe HTML — no extra `| safe` needed).
+            3. **Custom metadata** is `page.extra.field`, not `page.params.field`.
+            4. **Always preview** with `hwaro serve` before committing.
+            5. **Validate front matter syntax** (TOML, YAML, or JSON) and `config.toml` after edits.
+            6. **Use `{{ base_url }}` prefix** for URLs in templates.
+            7. **Escape user content** with `{{ value | e }}` (or `| escape`) in templates.
+
+            ## Full Reference
+
+            For detailed documentation on content, templates, configuration, and more:
+
+            - [Hwaro Documentation](https://hwaro.hahwul.com)
+            - [Configuration Guide](https://hwaro.hahwul.com/start/config/)
+            - [Full LLM Reference](https://hwaro.hahwul.com/llms-full.txt) — comprehensive reference optimized for AI agents
+
+            To generate the full embedded AGENTS.md locally, run:
+            ```
+            hwaro tool agents-md --local --write
+            ```
+
+            ## Site-Specific Instructions
+
+            <!-- Add your site-specific rules and conventions below -->
+            CONTENT
+        end
+
         def self.content : String
           <<-CONTENT
-          # AGENTS.md - AI Agent Instructions for Hwaro Site
+            # AGENTS.md - AI Agent Instructions for Hwaro Site
 
-          This document provides instructions for AI agents working on this Hwaro-generated website.
+            This document provides instructions for AI agents working on this Hwaro-generated website.
 
-          ## Project Overview
+            ## Project Overview
 
-          This is a static website built with [Hwaro](https://github.com/hahwul/hwaro), a fast and lightweight static site generator written in Crystal.
+            This is a static website built with [Hwaro](https://github.com/hahwul/hwaro), a fast and lightweight static site generator written in Crystal.
 
-          ## Hwaro Usage
+            ## Essential Commands
 
-          ### Installation
+            | Command | Description |
+            |---------|-------------|
+            | `hwaro build` | Build the site to `public/` directory |
+            | `hwaro serve` | Start development server with live reload |
+            | `hwaro new <path>` | Create new content from archetype |
+            | `hwaro deploy` | Deploy the site (requires configuration) |
+            | `hwaro build --drafts` | Include draft content |
+            | `hwaro serve -p 8080` | Serve on custom port (default: 3000) |
+            | `hwaro build --base-url "https://example.com"` | Set base URL for production |
 
-          **Homebrew:**
-          ```bash
-          brew tap hahwul/hwaro
-          brew install hwaro
-          ```
+            ## Directory Structure
 
-          **From Source (Crystal):**
-          ```bash
-          git clone https://github.com/hahwul/hwaro.git
-          cd hwaro
-          shards install
-          shards build --release --no-debug --production
-          # Binary: ./bin/hwaro
-          ```
+            ```
+            .
+            ├── config.toml             # Site configuration
+            ├── content/                # Markdown content files
+            │   ├── index.md            # Homepage (single file, no underscore)
+            │   ├── about.md            # Standalone page
+            │   └── <section>/          # Section directory (posts/, guide/, chapter-1/, …)
+            │       ├── _index.md       # Section landing page (underscore-prefixed)
+            │       └── *.md            # Pages within the section
+            ├── templates/              # Jinja2 templates (Crinja)
+            │   ├── header.html         # Shared <head> + <body> open
+            │   ├── footer.html         # Shared <body>/<html> close
+            │   ├── page.html           # Page template
+            │   ├── section.html        # Section listing template
+            │   ├── taxonomy.html       # Taxonomy index (e.g. /tags/)
+            │   ├── taxonomy_term.html  # Single taxonomy term (e.g. /tags/foo/)
+            │   ├── 404.html            # Error page
+            │   ├── partials/           # Reusable fragments (nav, search, sidebar)
+            │   └── shortcodes/         # Shortcode templates
+            ├── static/                 # Static assets (copied as-is)
+            └── archetypes/             # Content templates for `hwaro new`
+            ```
 
-          ### Essential Commands
+            ## Content
 
-          | Command | Description |
-          |---------|-------------|
-          | `hwaro init [DIR]` | Initialize a new site |
-          | `hwaro build` | Build the site to `public/` directory |
-          | `hwaro serve` | Start development server with live reload |
-          | `hwaro version` | Show version information |
-          | `hwaro deploy` | Deploy the site (requires configuration) |
+            ### Pages
 
-          ### Build & Serve Options
+            Create `.md` files in `content/`. Front matter can use TOML (`+++`), YAML (`---`), or JSON (`{...}` at file start) — TOML is the default.
 
-          - **Drafts:** `hwaro build --drafts` / `hwaro serve --drafts` (Include content with `draft = true`)
-          - **Port:** `hwaro serve -p 8080` (Default: 3000)
-          - **Open:** `hwaro serve --open` (Open browser automatically)
-          - **Base URL:** `hwaro build --base-url "https://example.com"`
+            ```toml
+            +++
+            title = "Page Title"
+            date = "2024-01-15"
+            description = "SEO description"
+            draft = false
+            tags = ["tag1", "tag2"]
+            image = "/images/cover.png"
+            weight = 0
+            toc = true
+            authors = ["Author"]
+            template = "page"
 
-          ## Directory Structure
+            [extra]
+            custom_field = "value"
+            +++
 
-          ```
-          .
-          ├── config.toml          # Site configuration
-          ├── content/             # Markdown content files
-          │   ├── _index.md        # Homepage content
-          │   ├── about.md         # About page
-          │   └── blog/            # Blog section
-          │       ├── _index.md    # Blog listing page
-          │       └── *.md         # Individual blog posts
-          ├── templates/           # Jinja2 templates (.html, .j2)
-          │   ├── header.html      # Site header partial
-          │   ├── footer.html      # Site footer partial
-          │   ├── page.html        # Default page template
-          │   ├── section.html     # Section listing template
-          │   └── 404.html         # Not found page
-          └── static/              # Static assets (copied as-is)
-          ```
+            Markdown content here.
+            ```
 
-          ## Content Management
+            | Field | Type | Description |
+            |-------|------|-------------|
+            | title | string | Page title (required) |
+            | date | string | Publication date (YYYY-MM-DD) |
+            | description | string | SEO description |
+            | draft | bool | Exclude from production builds |
+            | tags | array | Tag taxonomy terms |
+            | image | string | Featured image for social sharing |
+            | weight | int | Sort order (lower = first) |
+            | toc | bool | Enable table of contents |
+            | template | string | Custom template name |
+            | slug | string | Custom URL slug |
+            | aliases | array | Redirect URLs to this page |
+            | authors | array | Author names |
+            | taxonomies | table | Taxonomy terms by name (access via `page.taxonomies.<name>`) |
+            | extra | table | Custom metadata (access via `page.extra`) |
 
-          ### Creating New Pages
+            ### Sections
 
-          Create a new `.md` file in the `content/` directory.
+            A directory with `_index.md` groups related content.
 
-          **Example Front Matter (TOML):**
-          ```toml
-          +++
-          title = "Page Title"
-          date = "2024-01-01"
-          draft = false
-          tags = ["tag1", "tag2"]
-          +++
+            ```toml
+            +++
+            title = "Blog"
+            sort_by = "date"
+            paginate = 10
+            +++
+            ```
 
-          Your markdown content here.
-          ```
+            | Field | Type | Description |
+            |-------|------|-------------|
+            | sort_by | string | Sort by: `date`, `weight`, `title` |
+            | paginate | int | Pages per page |
+            | transparent | bool | Pass pages to parent section |
+            | generate_feeds | bool | Generate RSS feed for this section |
+            | page_template | string | Default template for child pages |
 
-          ### Creating Sections
+            ### Internal Links
 
-          1. Create a directory under `content/` (e.g., `content/projects/`)
-          2. Add `_index.md` for the section listing page
-          3. Add individual `.md` files for section items
+            Use `@/` to link to content by source path:
+            ```markdown
+            [Read the post](@/blog/my-post.md)
+            [Blog section](@/blog/_index.md)
+            ```
 
-          **Section `_index.md` Example:**
-          ```toml
-          +++
-          title = "Projects"
-          paginate = 10
-          pagination_enabled = true
-          sort_by = "date"   # "date" | "title" | "weight"
-          reverse = false
-          +++
-          ```
+            ### Content Summary
 
-          ### Front Matter Fields
+            Use `<!-- more -->` to define a summary for listings:
+            ```markdown
+            This appears in listings.
 
-          | Field       | Type     | Description                              |
-          |-------------|----------|------------------------------------------|
-          | title       | string   | Page title (required)                    |
-          | date        | string   | Publication date (YYYY-MM-DD)            |
-          | draft       | boolean  | If true, excluded from production build  |
-          | description | string   | Page description for SEO                 |
-          | image       | string   | Featured image URL for social sharing    |
-          | tags        | array    | List of tags                             |
-          | categories  | array    | List of categories                       |
-          | template    | string   | Custom template name (without extension) |
-          | weight      | integer  | Sort order (lower = first)               |
-          | slug        | string   | Custom URL slug                          |
-          | aliases     | array    | URL redirects to this page               |
+            <!-- more -->
 
-          ### Markdown Features
+            Full content continues here.
+            ```
 
-          - **Standard Markdown:** Headers, lists, code blocks, etc.
-          - **Tables:** Supported.
-          - **Footnotes:** Supported.
-          - **Raw HTML:** Supported (unless `safe = true` in config).
+            ## Templates
 
-          ## Template Development
+            ### Template Selection
 
-          ### Template Location
+            | Content | Template |
+            |---------|----------|
+            | `content/index.md` | `index.html` or `page.html` |
+            | `content/about.md` | `page.html` |
+            | `content/blog/_index.md` | `section.html` |
+            | `content/blog/post.md` | `page.html` |
+            | Taxonomy listing | `taxonomy.html` |
+            | Taxonomy term | `taxonomy_term.html` |
 
-          All templates are in the `templates/` directory using Jinja2 syntax (powered by Crinja).
+            ### Key Variables
 
-          ### Key Variables
+            **In page.html:**
+            ```jinja
+            {{ page.title }}          {# Page title #}
+            {{ page.date }}           {# Publication date #}
+            {{ page.url }}            {# Relative URL #}
+            {{ page.description }}    {# SEO description #}
+            {{ page.image }}          {# Featured image #}
+            {{ page.reading_time }}   {# Reading time in minutes #}
+            {{ page.word_count }}     {# Word count #}
+            {{ page.extra.field }}    {# Custom front matter #}
+            {{ content }}             {# Rendered HTML content (already safe) #}
+            {{ toc }}                 {# Table of contents HTML #}
+            ```
 
-          #### Global Objects
-          - `site`: Site configuration and metadata (`site.title`, `site.base_url`).
-          - `page`: Current page object (available in page templates).
-          - `section`: Current section object (available in section templates).
+            **In section.html:**
+            ```jinja
+            {{ section.title }}
+            {{ section.pages }}       {# Array of pages #}
+            {{ section.pages_count }}
+            {{ section.subsections }} {# Child sections #}
+            ```
 
-          #### Page Variables
-          Variables can be accessed via the `page` object:
-          - `{{ page.title }}` - Page title
-          - `{{ page.content }}` - Rendered content
-          - `{{ page.date }}` - Date object
-          - `{{ page.url }}` - Relative URL (e.g., `/blog/post/`)
-          - `{{ page.permalink }}` - Absolute URL
-          - `{{ page.section }}` - Section name
-          - `{{ page.params.custom_field }}` - Access extra front matter fields
+            **Global:**
+            ```jinja
+            {{ site.title }}
+            {{ site.description }}
+            {{ base_url }}
+            {{ current_year }}
+            ```
 
-          ### Common Jinja2 Syntax
+            **SEO (pre-rendered HTML):**
+            ```jinja
+            {{ og_all_tags | safe }}       {# OpenGraph + Twitter meta tags #}
+            {{ canonical_tag | safe }}     {# Canonical link #}
+            {{ jsonld | safe }}            {# JSON-LD structured data #}
+            {{ highlight_tags | safe }}    {# Syntax highlighting CSS + JS #}
+            {{ auto_includes | safe }}     {# Auto-included CSS + JS #}
+            ```
 
-          - **Output:** `{{ variable }}`
-          - **Logic:** `{% if condition %}...{% endif %}`
-          - **Loops:** `{% for item in items %}...{% endfor %}`
-          - **Comments:** `{# comment #}`
-          - **Filters:** `{{ value | filter }}`
+            ### Navigation
 
-          ### Template Inheritance
+            ```jinja
+            {# Previous/Next page #}
+            {% if page.lower %}<a href="{{ page.lower.url }}">← {{ page.lower.title }}</a>{% endif %}
+            {% if page.higher %}<a href="{{ page.higher.url }}">{{ page.higher.title }} →</a>{% endif %}
 
-          **Base Template (`templates/base.html`):**
-          ```jinja
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>{% block title %}{{ site.title }}{% endblock %}</title>
-          </head>
-          <body>
-            {% block content %}{% endblock %}
-          </body>
-          </html>
-          ```
+            {# Breadcrumbs #}
+            {% for ancestor in page.ancestors %}
+              <a href="{{ ancestor.url }}">{{ ancestor.title }}</a> /
+            {% endfor %}
+            ```
 
-          **Child Template (`templates/page.html`):**
-          ```jinja
-          {% extends "base.html" %}
+            ### Shortcodes
 
-          {% block title %}{{ page.title }} - {{ site.title }}{% endblock %}
+            Reusable components in `templates/shortcodes/`. Use in markdown:
+            ```markdown
+            {{ youtube(id="dQw4w9WgXcQ") }}
+            {% alert(type="warning") %}Warning text{% endalert %}
+            ```
 
-          {% block content %}
-            <article>
-              <h1>{{ page.title }}</h1>
-              {{ content }}
-            </article>
-          {% endblock %}
-          ```
+            ### Common Filters
 
-          ### Partials
+            | Filter | Description |
+            |--------|-------------|
+            | `safe` | Output raw HTML |
+            | `escape` | Escape HTML entities |
+            | `default(value="fallback")` | Default value if nil |
+            | `truncate(length=100)` | Truncate string |
+            | `slugify` | Convert to URL slug |
+            | `strip_html` | Remove HTML tags |
+            | `markdownify` | Render markdown to HTML |
+            | `date(format="%Y-%m-%d")` | Format date |
+            | `upper` / `lower` | Case conversion |
+            | `join(", ")` | Join array |
 
-          Include reusable components:
-          ```jinja
-          {% include "header.html" %}
-          {% include "footer.html" %}
-          ```
+            ## Configuration
 
-          ### Custom Filters
+            Key `config.toml` sections:
 
-          - `{{ date | date("%Y-%m-%d") }}` - Format date
-          - `{{ text | truncate_words(50) }}` - Truncate text
-          - `{{ text | slugify }}` - Convert to slug
-          - `{{ url | absolute_url }}` - Make URL absolute
-          - `{{ url | relative_url }}` - Prefix with base_url
-          - `{{ html | strip_html }}` - Remove HTML tags
-          - `{{ markdown | markdownify }}` - Render markdown
+            ```toml
+            title = "My Site"
+            base_url = "https://example.com"
 
-          ## Styling & Assets
+            [highlight]
+            enabled = true
+            theme = "github-dark"
 
-          ### CSS Location
-          - Place CSS files in `static/css/`.
-          - Reference in templates: `<link rel="stylesheet" href="{{ base_url }}/css/style.css">`.
+            [search]
+            enabled = true
 
-          ### Static Files
-          - Any file in `static/` is copied to the root of the output directory.
-          - Example: `static/robots.txt` -> `public/robots.txt`.
+            [sitemap]
+            enabled = true
 
-          ## Notes for AI Agents
+            [feeds]
+            enabled = true
 
-          1. **Always preserve front matter** when editing content files.
-          2. **Use `hwaro serve`** to preview changes.
-          3. **Check `config.toml`** for site-wide settings (e.g., markdown safety, pagination).
-          4. **Template Syntax:** Use standard Jinja2 syntax.
-          5. **Validate TOML syntax** in config.toml after edits.
-          6. **Keep URLs relative** using `{{ base_url }}` prefix where appropriate, or `page.url`.
-          7. **Escape user content** with `{{ value | escape }}` when needed.
-          CONTENT
+            [og]
+            default_image = "/images/og.png"
+            twitter_card = "summary_large_image"
+
+            [[taxonomies]]
+            name = "tags"
+            ```
+
+            See [Hwaro Documentation](https://hwaro.hahwul.com/start/config/) for the full configuration reference.
+
+            ## Notes for AI Agents
+
+            1. **Front matter** can be TOML (`+++`), YAML (`---`), or JSON (`{...}` at file start). Pick one per file and keep delimiters matched.
+            2. **Rendered content** is `{{ content }}` in templates (already-safe HTML — no extra `| safe` needed), not `{{ page.content }}`.
+            3. **Custom metadata** is `page.extra.field`, not `page.params.field`.
+            4. **Always preview** with `hwaro serve` before committing.
+            5. **Validate front matter syntax** (TOML, YAML, or JSON) and `config.toml` after edits.
+            6. **Use `{{ base_url }}` prefix** for URLs in templates.
+            7. **Escape user content** with `{{ value | e }}` (or `| escape`) in templates.
+
+            ## Site-Specific Instructions
+
+            <!-- Add your site-specific rules and conventions below -->
+            CONTENT
         end
       end
     end

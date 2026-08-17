@@ -41,11 +41,10 @@ module Hwaro
                   if default_entries = lang_hash[default_val]?
                     if val = default_entries.as_h[key_val]?
                       result = val.to_s
-                      found = true
                     end
                   end
                 end
-              rescue
+              rescue Exception
                 # No translations available
               end
 
@@ -54,7 +53,14 @@ module Hwaro
 
             # Pluralize filter: {{ count | pluralize("item", "items") }}
             env.filters["pluralize"] = Crinja.filter({singular: "", plural: ""}) do
-              count = target.as_number.to_i rescue 0
+              # Keep the count as a number (don't .to_i): truncating 1.9 → 1
+              # would wrongly pick the singular form. Grammatically only an
+              # exact count of 1 is singular.
+              count = begin
+                target.as_number
+              rescue Exception
+                0
+              end
               singular = arguments["singular"].to_s
               plural = arguments["plural"].to_s
               count == 1 ? singular : plural

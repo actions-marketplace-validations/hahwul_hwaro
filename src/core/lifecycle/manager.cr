@@ -63,7 +63,13 @@ module Hwaro
         # Hook Execution API
         # ========================================
 
-        # Trigger all hooks at a specific point
+        # Trigger all hooks at a specific point.
+        #
+        # `Skip` is scoped to the CURRENT hook point (see HookResult's doc:
+        # "skip remaining hooks in current phase"): the remaining hooks at
+        # this point don't run, but the result is Continue so the phase body
+        # and subsequent phases proceed. Only `Abort` (or a raised
+        # HwaroError) terminates the build.
         def trigger(point : HookPoint, context : BuildContext) : HookResult
           hooks = @hooks[point]
           return HookResult::Continue if hooks.empty?
@@ -72,16 +78,30 @@ module Hwaro
             Logger.debug "  → Hook: #{hook.name} @ #{point}" if @debug
 
             begin
+              # Lightweight per-hook timing when --profile is enabled (#561)
+              start = if (p = context.profiler) && p.enabled?
+                        Time.instant
+                      end
+
               result = hook.handler.call(context)
+
+              if start && (p = context.profiler)
+                elapsed = (Time.instant - start).total_milliseconds
+                p.record_hook(hook.name, elapsed)
+              end
 
               case result
               when HookResult::Skip
-                Logger.info "  ⏭ Phase skipped by hook: #{hook.name}" if @debug
-                return result
+                Logger.info "  ⏭ Remaining hooks at #{point} skipped by hook: #{hook.name}" if @debug
+                return HookResult::Continue
               when HookResult::Abort
                 Logger.error "  ✖ Build aborted by hook: #{hook.name}"
                 return result
               end
+            rescue ex : Hwaro::HwaroError
+              # Classified errors propagate unchanged so the CLI can surface
+              # them with their documented exit code / JSON payload.
+              raise ex
             rescue ex
               Logger.error "  Hook '#{hook.name}' failed at #{point}: #{ex.message}"
               Logger.debug "  Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
@@ -93,7 +113,7 @@ module Hwaro
         end
 
         # Execute a phase with before/after hooks
-        def run_phase(phase : Phase, context : BuildContext, &action) : HookResult
+        def run_phase(phase : Phase, context : BuildContext, &) : HookResult
           before_point, after_point = Lifecycle.hook_points_for(phase)
 
           Logger.debug "Phase: #{phase}" if @debug
@@ -105,6 +125,26 @@ module Hwaro
           # Phase action
           begin
             yield
+          rescue ex : Hwaro::HwaroError
+            # Classified phase-action errors propagate to the CLI so exit
+            # code + JSON payload stay stable; don't downgrade to Abort.
+            raise ex
+          rescue ex : IO::Error
+            # Ordinary filesystem trouble — a plain file squatting on the
+            # output directory name, a permission denial, a name the
+            # filesystem rejects, a full disk — is an environment problem,
+            # not a hwaro bug. Swallowing the exception TYPE here (returning
+            # Abort) made the CLI report every one of them as
+            # HWARO_E_INTERNAL / exit 70, the code documented as
+            # "unrecoverable bug or unexpected state", and dropped the only
+            # useful detail (which path, which errno) from the --json
+            # payload. Re-raise classified so it exits 6 with the real
+            # message; genuine internal faults still fall through to Abort.
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_IO,
+              message: "Phase #{phase} failed: #{ex.message}",
+              cause: ex,
+            )
           rescue ex
             Logger.error "Phase #{phase} failed: #{ex.message}"
             Logger.debug "  Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
@@ -135,7 +175,7 @@ module Hwaro
         end
 
         def has_hooks?(point : HookPoint) : Bool
-          @hooks[point].any?
+          @hooks[point].present?
         end
 
         def hook_count : Int32

@@ -7,6 +7,8 @@ toc = true
 
 Archetypes are content templates that define default front matter and content structure for new pages. When you create content with `hwaro new`, archetypes provide consistent starting points.
 
+`hwaro init` ships a starter `archetypes/default.md` (and scaffold-specific archetypes like `posts.md` for the blog scaffold) so `hwaro new` picks up front matter (TOML by default, with YAML and JSON also supported) with a `description` field out of the box. Edit or extend them to match your site's conventions.
+
 ## Overview
 
 Archetypes live in the `archetypes/` directory at your project root:
@@ -32,22 +34,24 @@ An archetype is a Markdown file with front matter and optional content. Use plac
 | Placeholder | Description |
 |-------------|-------------|
 | `{{ title }}` | Content title (from `-t` flag or filename) |
-| `{{ date }}` | Current date and time |
-| `{{ draft }}` | Draft status (`true` for drafts/ directory) |
+| `{{ date }}` | Current local date as `YYYY-MM-DD`, or the `--date` value verbatim |
+| `{{ tags }}` | Tags from `--tags` as a TOML array (`[]` if none) |
+| `{{ draft }}` | `true` if `--draft` is passed, or the target path contains a `drafts` directory; `false` otherwise |
+| `{{ description }}` | Description collected by the interactive `hwaro new` wizard; empty string when none is given |
 
 ### Example Archetype
 
 Create `archetypes/posts.md`:
 
 ```markdown
----
-title: "{{ title }}"
-date: {{ date }}
-draft: false
-author: "Your Name"
-tags: []
-categories: []
----
++++
+title = "{{ title }}"
+date = {{ date }}
+draft = false
+authors = ["Your Name"]
+tags = []
+categories = []
++++
 
 # {{ title }}
 
@@ -95,7 +99,40 @@ If no specific archetype matches, uses `archetypes/default.md`.
 
 ### 5. Built-in Template
 
-If no archetypes exist, uses the built-in default template.
+If no archetypes exist, uses the built-in default template. The format and
+default fields of that template are controlled by `[content.new]` in
+`config.toml`:
+
+```toml
+[content.new]
+front_matter_format = "toml"         # "toml" (default), "yaml", or "json"
+default_fields = ["description"]      # extra keys to scaffold with empty values
+bundle = false                        # true: scaffold foo/index.md instead of foo.md
+```
+
+Fields that overlap with the built-ins (`title`, `date`, `draft`, `tags`)
+are ignored so they aren't duplicated with empty values.
+
+### Leaf-bundle (directory) layout
+
+When you plan to add multilingual siblings (`index.ko.md`) or colocated
+images next to a page, you want the directory-per-page layout:
+
+```
+content/abcd/
+└── index.md
+```
+
+Pick the layout per invocation, per archetype, or per site:
+
+- **CLI:** `hwaro new posts/hello.md --bundle` (or `--no-bundle` to force
+  the single-file form).
+- **Archetype:** put `<!-- hwaro: bundle -->` as the first line of the
+  archetype so any `hwaro new` using it defaults to bundle mode. The
+  directive is stripped from the generated content.
+- **Config:** `bundle = true` under `[content.new]` sets the house style.
+
+Priority is CLI > archetype > config > single-file (the default).
 
 ## Usage Examples
 
@@ -130,16 +167,16 @@ hwaro new tools/develop/my-tool.md
 ### Blog Posts (`archetypes/posts.md`)
 
 ```markdown
----
-title: "{{ title }}"
-date: {{ date }}
-draft: false
-author: ""
-tags: []
-categories: []
-description: ""
-image: ""
----
++++
+title = "{{ title }}"
+date = {{ date }}
+draft = false
+authors = []
+tags = []
+categories = []
+description = "{{ description }}"
+image = ""
++++
 
 # {{ title }}
 
@@ -151,12 +188,12 @@ Introduction paragraph.
 ### Documentation (`archetypes/docs.md`)
 
 ```markdown
----
-title: "{{ title }}"
-date: {{ date }}
-weight: 10
-toc: true
----
++++
+title = "{{ title }}"
+date = {{ date }}
+weight = 10
+toc = true
++++
 
 Brief description of this documentation page.
 
@@ -170,18 +207,29 @@ Brief description of this documentation page.
 ### Default (`archetypes/default.md`)
 
 ```markdown
----
-title: "{{ title }}"
-date: {{ date }}
-draft: {{ draft }}
----
++++
+title = "{{ title }}"
+date = "{{ date }}"
+draft = {{ draft }}
+description = "{{ description }}"
+tags = {{ tags }}
++++
 
 # {{ title }}
 ```
+
+This mirrors the `archetypes/default.md` that `hwaro init` ships. The
+`{{ description }}` placeholder substitutes to an empty string for the flag
+form and to the value you type in the interactive `hwaro new` wizard.
 
 ## Tips
 
 - **Consistent metadata**: Define all commonly used front matter fields in archetypes
 - **Section-specific**: Create archetypes for each content section with relevant defaults
 - **Nested organization**: Use subdirectories in `archetypes/` to match your content structure
-- **Draft handling**: The `{{ draft }}` placeholder is `true` when creating in `drafts/` directory
+- **Draft handling**: `{{ draft }}` is `true` when `--draft` is passed, when you enable the draft toggle in the interactive wizard, or when the target path contains a `drafts/` segment
+
+## See Also
+
+- [Pages](/writing/pages/) — Front matter fields reference
+- [CLI](/start/cli/) — The `hwaro new` command

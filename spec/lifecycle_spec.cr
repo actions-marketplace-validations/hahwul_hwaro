@@ -31,7 +31,7 @@ describe Hwaro::Core::Lifecycle do
 
     it "can register hooks at specific points" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
       manager.hook_count.should eq(1)
@@ -40,10 +40,10 @@ describe Hwaro::Core::Lifecycle do
 
     it "can register hooks using before/after helpers" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "before-render") do |ctx|
+      manager.before(Hwaro::Core::Lifecycle::Phase::Render, name: "before-render") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
-      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after-render") do |ctx|
+      manager.after(Hwaro::Core::Lifecycle::Phase::Render, name: "after-render") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
       manager.hook_count.should eq(2)
@@ -55,7 +55,7 @@ describe Hwaro::Core::Lifecycle do
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
 
       triggered = false
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |_|
         triggered = true
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -72,12 +72,12 @@ describe Hwaro::Core::Lifecycle do
 
       order = [] of String
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 10, name: "low") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 10, name: "low") do |_|
         order << "low"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "high") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, priority: 100, name: "high") do |_|
         order << "high"
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
@@ -88,7 +88,7 @@ describe Hwaro::Core::Lifecycle do
 
     it "can clear hooks" do
       manager = Hwaro::Core::Lifecycle::Manager.new
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "test") do |_|
         Hwaro::Core::Lifecycle::HookResult::Continue
       end
       manager.hook_count.should eq(1)
@@ -101,12 +101,14 @@ describe Hwaro::Core::Lifecycle do
       options = Hwaro::Config::Options::BuildOptions.new
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "skipper") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "skipper") do |_|
         Hwaro::Core::Lifecycle::HookResult::Skip
       end
 
+      # Skip only suppresses the remaining hooks at this hook point; the
+      # phase sequence continues, so trigger reports Continue.
       result = manager.trigger(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, ctx)
-      result.should eq(Hwaro::Core::Lifecycle::HookResult::Skip)
+      result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
     end
 
     it "handles HookResult::Abort" do
@@ -114,7 +116,7 @@ describe Hwaro::Core::Lifecycle do
       options = Hwaro::Config::Options::BuildOptions.new
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
 
-      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "aborter") do |ctx|
+      manager.on(Hwaro::Core::Lifecycle::HookPoint::BeforeInitialize, name: "aborter") do |_|
         Hwaro::Core::Lifecycle::HookResult::Abort
       end
 
@@ -166,7 +168,7 @@ describe Hwaro::Core::Lifecycle do
 
       ctx.get_string("key").should eq("value")
       ctx.get_int("count").should eq(42)
-      ctx.get_bool("enabled").should eq(true)
+      ctx.get_bool("enabled").should be_true
       ctx.get_string("missing", "default").should eq("default")
     end
   end

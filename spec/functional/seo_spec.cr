@@ -10,13 +10,13 @@ require "./support/build_helper"
 describe "SEO: llms.txt generation" do
   it "generates llms.txt with instructions" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [llms]
-    enabled = true
-    instructions = "This is a test site about Crystal programming."
-    TOML
+      [llms]
+      enabled = true
+      instructions = "This is a test site about Crystal programming."
+      TOML
 
     build_site(
       config,
@@ -31,14 +31,14 @@ describe "SEO: llms.txt generation" do
 
   it "generates llms-full.txt with page content" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [llms]
-    enabled = true
-    instructions = "Test instructions"
-    full_enabled = true
-    TOML
+      [llms]
+      enabled = true
+      instructions = "Test instructions"
+      full_enabled = true
+      TOML
 
     build_site(
       config,
@@ -59,12 +59,12 @@ describe "SEO: llms.txt generation" do
 
   it "does not generate llms.txt when disabled" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [llms]
-    enabled = false
-    TOML
+      [llms]
+      enabled = false
+      TOML
 
     build_site(
       config,
@@ -79,15 +79,15 @@ end
 describe "SEO: Atom feed generation" do
   it "generates Atom feed" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
-    description = "A test site"
+      title = "Test"
+      base_url = "http://localhost"
+      description = "A test site"
 
-    [feeds]
-    enabled = true
-    type = "atom"
-    filename = "atom.xml"
-    TOML
+      [feeds]
+      enabled = true
+      type = "atom"
+      filename = "atom.xml"
+      TOML
 
     build_site(
       config,
@@ -111,26 +111,26 @@ end
 describe "SEO: Multiple features simultaneously" do
   it "generates sitemap, robots, feed, and llms.txt together" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
-    description = "Multi-SEO test"
+      title = "Test"
+      base_url = "http://localhost"
+      description = "Multi-SEO test"
 
-    [sitemap]
-    enabled = true
+      [sitemap]
+      enabled = true
 
-    [robots]
-    enabled = true
+      [robots]
+      enabled = true
 
-    [feeds]
-    enabled = true
-    type = "rss"
-    filename = "rss.xml"
+      [feeds]
+      enabled = true
+      type = "rss"
+      filename = "rss.xml"
 
-    [llms]
-    enabled = true
-    instructions = "Multi SEO"
-    full_enabled = true
-    TOML
+      [llms]
+      enabled = true
+      instructions = "Multi SEO"
+      full_enabled = true
+      TOML
 
     build_site(
       config,
@@ -169,14 +169,14 @@ end
 describe "SEO: Sitemap with custom configuration" do
   it "generates sitemap with configured changefreq and priority" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [sitemap]
-    enabled = true
-    changefreq = "daily"
-    priority = 0.8
-    TOML
+      [sitemap]
+      enabled = true
+      changefreq = "daily"
+      priority = 0.8
+      TOML
 
     build_site(
       config,
@@ -200,13 +200,13 @@ describe "SEO: Sitemap with custom configuration" do
 
   it "excludes configured paths from sitemap" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [sitemap]
-    enabled = true
-    exclude = ["/secret/"]
-    TOML
+      [sitemap]
+      enabled = true
+      exclude = ["/secret/"]
+      TOML
 
     build_site(
       config,
@@ -221,26 +221,54 @@ describe "SEO: Sitemap with custom configuration" do
       sitemap.should_not contain("/secret/")
     end
   end
+
+  # A `#` in a content filename is legal on disk but ends the path component
+  # of a URL: the page was written to `public/posts/a#b/index.html` while the
+  # sitemap advertised `http://localhost/posts/a#b/`, which every crawler
+  # reads as `/posts/a` plus a fragment — a 404 published as canonical.
+  it "percent-encodes a fragment delimiter in the sitemap <loc>" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [sitemap]
+      enabled = true
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/a#b.md" => "---\ntitle: Hash\n---\nHash body",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.exists?("public/posts/a#b/index.html").should be_true
+
+      sitemap = File.read("public/sitemap.xml")
+      sitemap.should contain("<loc>http://localhost/posts/a%23b/</loc>")
+      sitemap.should_not contain("<loc>http://localhost/posts/a#b/</loc>")
+    end
+  end
 end
 
 describe "SEO: Robots.txt with custom rules" do
   it "generates robots.txt with multiple user-agent rules" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [robots]
-    enabled = true
+      [robots]
+      enabled = true
 
-    [[robots.rules]]
-    user_agent = "*"
-    allow = ["/"]
-    disallow = ["/private/", "/admin/"]
+      [[robots.rules]]
+      user_agent = "*"
+      allow = ["/"]
+      disallow = ["/private/", "/admin/"]
 
-    [[robots.rules]]
-    user_agent = "Googlebot"
-    allow = ["/"]
-    TOML
+      [[robots.rules]]
+      user_agent = "Googlebot"
+      allow = ["/"]
+      TOML
 
     build_site(
       config,
@@ -257,13 +285,13 @@ end
 describe "SEO: Search index with different formats" do
   it "generates search index with content field" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [search]
-    enabled = true
-    fields = ["title", "url", "content"]
-    TOML
+      [search]
+      enabled = true
+      fields = ["title", "url", "content"]
+      TOML
 
     build_site(
       config,
@@ -283,13 +311,13 @@ describe "SEO: Search index with different formats" do
 
   it "excludes pages with in_search_index: false" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [search]
-    enabled = true
-    fields = ["title", "url"]
-    TOML
+      [search]
+      enabled = true
+      fields = ["title", "url"]
+      TOML
 
     build_site(
       config,
@@ -309,15 +337,15 @@ end
 describe "SEO: Atom feed with multiple posts" do
   it "generates Atom feed with correct entry structure" do
     config = <<-TOML
-    title = "Test Site"
-    base_url = "http://localhost"
-    description = "A test site"
+      title = "Test Site"
+      base_url = "http://localhost"
+      description = "A test site"
 
-    [feeds]
-    enabled = true
-    type = "atom"
-    filename = "atom.xml"
-    TOML
+      [feeds]
+      enabled = true
+      type = "atom"
+      filename = "atom.xml"
+      TOML
 
     build_site(
       config,
@@ -345,15 +373,15 @@ end
 describe "SEO: RSS feed content verification" do
   it "generates RSS with proper channel and item structure" do
     config = <<-TOML
-    title = "My Site"
-    base_url = "http://localhost"
-    description = "Site description"
+      title = "My Site"
+      base_url = "http://localhost"
+      description = "Site description"
 
-    [feeds]
-    enabled = true
-    type = "rss"
-    filename = "feed.xml"
-    TOML
+      [feeds]
+      enabled = true
+      type = "rss"
+      filename = "feed.xml"
+      TOML
 
     build_site(
       config,
@@ -379,13 +407,13 @@ end
 describe "SEO: llms.txt content structure" do
   it "includes page titles and URLs in llms.txt" do
     config = <<-TOML
-    title = "My Site"
-    base_url = "http://localhost"
+      title = "My Site"
+      base_url = "http://localhost"
 
-    [llms]
-    enabled = true
-    instructions = "This is My Site."
-    TOML
+      [llms]
+      enabled = true
+      instructions = "This is My Site."
+      TOML
 
     build_site(
       config,
@@ -402,6 +430,104 @@ describe "SEO: llms.txt content structure" do
       llms = File.read("public/llms.txt")
       llms.should contain("My Site")
       llms.should contain("This is My Site.")
+    end
+  end
+end
+
+describe "SEO: JSON-LD by page type" do
+  it "emits WebSite for the homepage (not an Article with an empty headline) and Article for titled pages" do
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+      description = "A site about things"
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        # Homepage with an empty title, exactly like the default scaffold.
+        "index.md"       => "+++\ntitle = \"\"\n+++\nWelcome",
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        "blog/post.md"   => "---\ntitle: My Post\ndate: 2026-01-01\n---\nBody",
+      },
+      template_files: {
+        "page.html"    => "{{ jsonld }}",
+        "section.html" => "{{ jsonld }}",
+      },
+    ) do
+      home = File.read("public/index.html")
+      home.should contain(%("@type":"WebSite"))
+      # The homepage must not be an Article, and must never carry an empty headline.
+      home.should_not contain(%("@type":"Article"))
+      home.should_not contain(%("headline":""))
+
+      # A normal titled page still gets a proper Article with a real headline.
+      post = File.read("public/blog/post/index.html")
+      post.should contain(%("@type":"Article"))
+      post.should contain(%("headline":"My Post"))
+    end
+  end
+end
+
+describe "SEO: Custom feed templates" do
+  it "renders the feed through templates/rss.xml.jinja for all feed surfaces" do
+    config = <<-TOML
+      title = "Test Site"
+      base_url = "http://localhost"
+
+      [feeds]
+      enabled = true
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\ngenerate_feeds: true\n---\n",
+        "blog/post.md"   => "---\ntitle: My Post\ndate: 2026-03-05\n---\nBody",
+      },
+      template_files: {
+        "page.html"     => "{{ content }}",
+        "section.html"  => "{{ content }}",
+        "rss.xml.jinja" => "OVERRIDE kind={{ feed.kind }} first={{ pages[0].title | xml_escape }}",
+      },
+    ) do
+      File.read("public/rss.xml").should eq("OVERRIDE kind=main first=My Post")
+      File.read("public/blog/rss.xml").should eq("OVERRIDE kind=section first=My Post")
+    end
+  end
+
+  # Staleness regression: with --cache and zero re-rendered pages, the
+  # Generate phase used to skip feeds entirely. A feed-template-only edit
+  # between two warm builds must still refresh rss.xml.
+  it "regenerates the feed on a warm cache build after a template-only edit" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", <<-TOML)
+          title = "Test Site"
+          base_url = "http://localhost"
+
+          [feeds]
+          enabled = true
+          TOML
+        FileUtils.mkdir_p("content")
+        File.write("content/post.md", "---\ntitle: Post\ndate: 2026-03-05\n---\nBody")
+        FileUtils.mkdir_p("templates")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("templates/rss.xml.jinja", "FEED-V1")
+
+        # Cold build (no hooks: exercises the Generate phase's default
+        # skip-if-unchanged path, which the hook-based CLI flow bypasses).
+        builder1 = Hwaro::Core::Build::Builder.new
+        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        File.read("public/rss.xml").should eq("FEED-V1")
+
+        # Template-only edit, then a warm build in a fresh process: every
+        # page is a cache hit (0 rendered), but the feed must not skip.
+        File.write("templates/rss.xml.jinja", "FEED-V2")
+        builder2 = Hwaro::Core::Build::Builder.new
+        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        File.read("public/rss.xml").should eq("FEED-V2")
+      end
     end
   end
 end

@@ -67,12 +67,12 @@ describe "Build Integration: URL generation" do
 
   it "applies permalink remapping from config" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [permalinks]
-    "old/posts" = "posts"
-    TOML
+      [permalinks]
+      "old/posts" = "posts"
+      TOML
 
     build_site(
       config,
@@ -89,6 +89,47 @@ describe "Build Integration: URL generation" do
       body = File.read("public/posts/a/index.html")
       body.should contain("Body A")
     end
+  end
+
+  it "a dateless draft or headless page under a date-token pattern does not abort the build" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [permalinks]
+      "posts" = "/:year/:slug/"
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "posts/wip.md"    => "---\ntitle: WIP\ndraft: true\n---\nDraft, no date",
+        "posts/data.md"   => "---\ntitle: Data\nrender: false\n---\nHeadless, no date",
+        "posts/public.md" => "---\ntitle: Public\ndate: 2026-03-05\n---\nDated",
+      },
+      template_files: {"page.html" => "{{ content }}", "section.html" => "{{ content }}"},
+    ) do
+      File.exists?("public/2026/public/index.html").should be_true
+    end
+  end
+
+  it "a dateless PUBLISHED page under a date-token pattern still fails the build" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [permalinks]
+      "posts" = "/:year/:slug/"
+      TOML
+
+    ex = expect_raises(Hwaro::HwaroError, /requires a date, but the page has none/) do
+      build_site(
+        config,
+        content_files: {"posts/undated.md" => "---\ntitle: Undated\n---\nNo date"},
+        template_files: {"page.html" => "{{ content }}"},
+      ) { }
+    end
+    ex.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
   end
 end
 
@@ -261,9 +302,10 @@ describe "Build Integration: Prev/Next navigation" do
         "page.html"    => "LOWER={% if page.lower %}{{ page.lower.title }}{% else %}NONE{% endif %}|HIGHER={% if page.higher %}{{ page.higher.title }}{% else %}NONE{% endif %}",
       },
     ) do
-      # With sort_by=title order: AAA, BBB, CCC
+      # With sort_by=title order: Blog (section index), AAA, BBB, CCC
+      # Cross-section flat navigation: section index is included
       a_html = File.read("public/blog/a/index.html")
-      a_html.should contain("LOWER=NONE")
+      a_html.should contain("LOWER=Blog")
       a_html.should contain("HIGHER=BBB")
 
       b_html = File.read("public/blog/b/index.html")
@@ -283,13 +325,13 @@ end
 describe "Build Integration: Pagination" do
   it "produces paginated output directories" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [pagination]
-    enabled = true
-    per_page = 2
-    TOML
+      [pagination]
+      enabled = true
+      per_page = 2
+      TOML
 
     build_site(
       config,
@@ -361,6 +403,22 @@ describe "Build Integration: Redirects" do
     end
   end
 
+  it "does not write redirect_to output outside output_dir" do
+    # Regression for #549: previously, a content file whose frontmatter
+    # `path` traversed upward could cause the redirect writer to drop
+    # index.html outside output_dir (a sibling of `public/`).
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "evil.md" => "---\ntitle: PoC\npath: \"../escape-poc-549\"\nredirect_to: /\n---\n",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      Dir.exists?("escape-poc-549").should be_false
+      File.exists?("escape-poc-549/index.html").should be_false
+    end
+  end
+
   it "generates alias redirect pages" do
     build_site(
       BASIC_CONFIG,
@@ -382,6 +440,78 @@ describe "Build Integration: Redirects" do
       File.exists?("public/old-url/index.html").should be_true
       alias2 = File.read("public/old-url/index.html")
       alias2.should contain("url=/new-page/")
+    end
+  end
+
+  it "writes .html aliases to that exact path instead of appending index.html" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "new-page.md" => "---\ntitle: New Page\naliases:\n  - /promo.html\n  - /docs/guide.html\n---\nNew content",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      # Alias is written as a file at that exact path...
+      File.file?("public/promo.html").should be_true
+      File.read("public/promo.html").should contain("url=/new-page/")
+      File.file?("public/docs/guide.html").should be_true
+
+      # ...not a directory `promo.html/` with an index.html inside it
+      # (the previous behaviour blindly appended /index.html).
+      Dir.exists?("public/promo.html").should be_false
+      File.exists?("public/promo.html/index.html").should be_false
+    end
+  end
+
+  # Regression: aliases were prefixed with base_path but `redirect_to` was not,
+  # so on a project-pages deployment a redirect page sent readers to the domain
+  # root (a 404) instead of the intended page under the subpath.
+  it "prefixes redirect_to with base_url's path for subpath deployments" do
+    build_site(
+      "title = \"T\"\nbase_url = \"https://example.com/myblog\"\n",
+      content_files: {
+        "old-page.md"           => "---\ntitle: Old\nredirect_to: /new-page/\n---\n",
+        "old-section/_index.md" => "---\ntitle: Old Section\nredirect_to: /new-section/\n---\n",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "section.html" => "{{ content }}",
+      },
+    ) do
+      File.read("public/old-page/index.html").should contain("url=/myblog/new-page/")
+      File.read("public/old-section/index.html").should contain("url=/myblog/new-section/")
+    end
+  end
+
+  # An off-site `redirect_to` is left alone — base_path only applies to
+  # root-relative, site-internal targets.
+  it "leaves an external redirect_to untouched under a subpath deployment" do
+    build_site(
+      "title = \"T\"\nbase_url = \"https://example.com/myblog\"\n",
+      content_files: {
+        "ext.md"      => "---\ntitle: Ext\nredirect_to: https://example.org/x\n---\n",
+        "protorel.md" => "---\ntitle: Proto\nredirect_to: \"//cdn.example.org/x\"\n---\n",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.read("public/ext/index.html").should contain("url=https://example.org/x")
+      File.read("public/protorel/index.html").should contain("url=//cdn.example.org/x")
+    end
+  end
+
+  it "prefixes alias redirects with base_url's path for subpath deployments" do
+    # GitHub/GitLab project pages serve the site under a subpath. The alias
+    # redirect must include that prefix or it 404s (it previously emitted a
+    # bare `/posts/.../` that resolved against the domain root).
+    build_site(
+      "title = \"T\"\nbase_url = \"https://example.com/myblog\"\n",
+      content_files: {
+        "posts/new.md" => "---\ntitle: New\naliases:\n  - /old/\n  - /legacy.html\n---\nNew",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.read("public/old/index.html").should contain("url=/myblog/posts/new/")
+      File.read("public/legacy.html").should contain("url=/myblog/posts/new/")
     end
   end
 end
@@ -571,12 +701,12 @@ end
 describe "Build Integration: Taxonomy pages" do
   it "generates taxonomy index and term pages" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [[taxonomies]]
-    name = "tags"
-    TOML
+      [[taxonomies]]
+      name = "tags"
+      TOML
 
     build_site(
       config,
@@ -605,6 +735,53 @@ describe "Build Integration: Taxonomy pages" do
       File.exists?("public/tags/web/index.html").should be_true
     end
   end
+
+  it "honors taxonomy sort_by/reverse/terms_sort_by in templates and written pages" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [[taxonomies]]
+      name = "tags"
+      sort_by = "title"
+      terms_sort_by = "count"
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "blog/_index.md" => "---\ntitle: Blog\n---\n",
+        # Date order (Zulu newest) deliberately disagrees with title order.
+        "blog/post1.md" => "---\ntitle: Zulu\ndate: 2024-06-01\ntags:\n  - crystal\n  - web\n---\nZ",
+        "blog/post2.md" => "---\ntitle: Alpha\ndate: 2024-01-01\ntags:\n  - crystal\n---\nA",
+      },
+      template_files: {
+        "page.html"          => "{{ content }}",
+        "section.html"       => "{{ content }}",
+        "taxonomy.html"      => "{{ content }}",
+        "taxonomy_term.html" => <<-JINJA,
+          {{ content }}
+          {% set tax = get_taxonomy(kind=taxonomy_name) %}
+          ITEMS:{% for term in tax.items %}[{{ term.name }}]{% endfor %}
+          {% for term in tax.items if term.name == taxonomy_term %}
+          PAGES:{% for p in term.pages %}[{{ p.title }}]{% endfor %}
+          {% endfor %}
+          JINJA
+      },
+    ) do
+      # Term page listing honors sort_by = "title" (Alpha before Zulu).
+      crystal_html = File.read("public/tags/crystal/index.html")
+      crystal_html.index!("Alpha").should be < crystal_html.index!("Zulu")
+      # get_taxonomy term.pages order matches.
+      crystal_html.should contain("PAGES:[Alpha][Zulu]")
+      # get_taxonomy items honor terms_sort_by = "count": crystal (2) first.
+      crystal_html.should contain("ITEMS:[crystal][web]")
+
+      # Index terms list is count-ordered too.
+      idx = File.read("public/tags/index.html")
+      idx.index!(">crystal<").should be < idx.index!(">web<")
+    end
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -613,12 +790,12 @@ end
 describe "Build Integration: SEO files" do
   it "generates sitemap.xml" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [sitemap]
-    enabled = true
-    TOML
+      [sitemap]
+      enabled = true
+      TOML
 
     build_site(
       config,
@@ -634,12 +811,12 @@ describe "Build Integration: SEO files" do
 
   it "generates robots.txt" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [robots]
-    enabled = true
-    TOML
+      [robots]
+      enabled = true
+      TOML
 
     build_site(
       config,
@@ -654,15 +831,15 @@ describe "Build Integration: SEO files" do
 
   it "generates RSS feed" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
-    description = "A test site"
+      title = "Test"
+      base_url = "http://localhost"
+      description = "A test site"
 
-    [feeds]
-    enabled = true
-    type = "rss"
-    filename = "rss.xml"
-    TOML
+      [feeds]
+      enabled = true
+      type = "rss"
+      filename = "rss.xml"
+      TOML
 
     build_site(
       config,
@@ -689,13 +866,13 @@ end
 describe "Build Integration: Search index" do
   it "generates search.json" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [search]
-    enabled = true
-    fields = ["title", "url"]
-    TOML
+      [search]
+      enabled = true
+      fields = ["title", "url"]
+      TOML
 
     build_site(
       config,
@@ -719,14 +896,14 @@ end
 describe "Build Integration: OG tags" do
   it "renders og_tags and twitter_tags in template" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [og]
-    default_image = "/img/default.png"
-    twitter_card = "summary_large_image"
-    twitter_site = "@testsite"
-    TOML
+      [og]
+      default_image = "/img/default.png"
+      twitter_card = "summary_large_image"
+      twitter_site = "@testsite"
+      TOML
 
     build_site(
       config,
@@ -893,13 +1070,13 @@ end
 describe "Build Integration: Auto includes" do
   it "generates CSS/JS link/script tags for auto_includes" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [auto_includes]
-    enabled = true
-    dirs = ["assets/css", "assets/js"]
-    TOML
+      [auto_includes]
+      enabled = true
+      dirs = ["assets/css", "assets/js"]
+      TOML
 
     build_site(
       config,
@@ -923,15 +1100,15 @@ end
 # 25. Highlight tags
 # ---------------------------------------------------------------------------
 describe "Build Integration: Highlight tags" do
-  it "renders highlight CSS/JS tags when highlight is enabled" do
+  it "renders the highlight theme CSS tag and no JS in the default server mode" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [highlight]
-    enabled = true
-    theme = "github-dark"
-    TOML
+      [highlight]
+      enabled = true
+      theme = "github-dark"
+      TOML
 
     build_site(
       config,
@@ -941,6 +1118,29 @@ describe "Build Integration: Highlight tags" do
       html = File.read("public/index.html")
       html.should contain("highlight")
       html.should contain("github-dark")
+      html.should_not contain("hljs.highlightAll()")
+    end
+  end
+
+  it "renders highlight CSS and JS tags in client mode" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [highlight]
+      enabled = true
+      mode = "client"
+      theme = "github-dark"
+      TOML
+
+    build_site(
+      config,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nHome"},
+      template_files: {"page.html" => "{{ highlight_css }}{{ highlight_js }}{{ content }}"},
+    ) do
+      html = File.read("public/index.html")
+      html.should contain("github-dark")
+      html.should contain("hljs.highlightAll()")
     end
   end
 end
@@ -1004,12 +1204,12 @@ end
 describe "Build Integration: in_sitemap exclusion" do
   it "excludes pages with in_sitemap: false from sitemap" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [sitemap]
-    enabled = true
-    TOML
+      [sitemap]
+      enabled = true
+      TOML
 
     build_site(
       config,
@@ -1171,13 +1371,35 @@ describe "Build Integration: Sort by weight" do
       section_html.should contain("Advanced,")
 
       # Verify ordering via lower/higher navigation
+      # Cross-section flat navigation: section index (Docs) comes before Intro
       intro_html = File.read("public/docs/intro/index.html")
-      intro_html.should contain("LOWER=NONE")
+      intro_html.should contain("LOWER=Docs")
       intro_html.should contain("HIGHER=Basics")
 
       basics_html = File.read("public/docs/basics/index.html")
       basics_html.should contain("LOWER=Intro")
       basics_html.should contain("HIGHER=Advanced")
+    end
+  end
+
+  it "returns the same sorted order from get_section().pages as section.pages" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "index.md"         => "---\ntitle: Home\ntemplate: home\n---\n",
+        "docs/_index.md"   => "---\ntitle: Docs\nsort_by: weight\n---\n",
+        "docs/intro.md"    => "---\ntitle: Intro\nweight: 1\n---\nIntro",
+        "docs/advanced.md" => "---\ntitle: Advanced\nweight: 3\n---\nAdvanced",
+        "docs/basics.md"   => "---\ntitle: Basics\nweight: 2\n---\nBasics",
+      },
+      template_files: {
+        "page.html"    => "{{ content }}",
+        "home.html"    => "{% for p in get_section(\"docs\").pages %}{{ p.title }},{% endfor %}",
+        "section.html" => "{% for p in section.pages %}{{ p.title }},{% endfor %}",
+      },
+    ) do
+      home_html = File.read("public/index.html")
+      home_html.should contain("Intro,Basics,Advanced,")
     end
   end
 end
@@ -1280,6 +1502,61 @@ describe "Build Integration: Summary via page_summary variable" do
     ) do
       html = File.read("public/post/index.html")
       html.should contain("SUMMARY=Fallback summary")
+    end
+  end
+
+  # Summaries render through the same sub-pipeline as the body — shortcodes,
+  # markdown extensions, and internal links must not diverge between the
+  # article and its list-page/feed summary.
+  it "expands shortcodes in the summary instead of leaking literal syntax" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => %(---\ntitle: Post\n---\nIntro {{ badge(label="new") }} text.\n\n<!-- more -->\n\nBody.),
+      },
+      template_files: {
+        "page.html"             => "SUMMARY={{ page_summary }}|{{ content }}",
+        "shortcodes/badge.html" => %(<span class="badge">{{ label }}</span>),
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain(%(SUMMARY=))
+      html.should contain(%(<span class="badge">new</span>))
+      html.should_not contain("{{ badge")
+    end
+  end
+
+  it "renders markdown-extension syntax (tables) in the summary like the body" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md" => "---\ntitle: Post\n---\n| a | b |\n|---|---|\n| 1 | 2 |\n\n<!-- more -->\n\nBody.",
+      },
+      template_files: {
+        "page.html" => "SUMMARY[{{ page_summary }}]|{{ content }}",
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      summary_part = html.split("|").first
+      summary_part.should contain("<table")
+    end
+  end
+
+  it "resolves internal @/ links inside the summary" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "post.md"  => "---\ntitle: Post\n---\nSee [other](@/other.md) first.\n\n<!-- more -->\n\nBody.",
+        "other.md" => "---\ntitle: Other\n---\nOther body.",
+      },
+      template_files: {
+        "page.html" => "SUMMARY={{ page_summary }}|{{ content }}",
+      },
+    ) do
+      html = File.read("public/post/index.html")
+      html.should contain(%(SUMMARY=))
+      html.should contain(%(href="/other/"))
+      html.should_not contain("@/other.md")
     end
   end
 end
@@ -1461,12 +1738,12 @@ end
 describe "Build Integration: Emoji" do
   it "converts emoji shortcodes when enabled" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [markdown]
-    emoji = true
-    TOML
+      [markdown]
+      emoji = true
+      TOML
 
     build_site(
       config,
@@ -1487,12 +1764,12 @@ end
 describe "Build Integration: Lazy loading" do
   it "adds loading=lazy to images when enabled" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [markdown]
-    lazy_loading = true
-    TOML
+      [markdown]
+      lazy_loading = true
+      TOML
 
     build_site(
       config,
@@ -1512,12 +1789,12 @@ end
 describe "Build Integration: Safe mode" do
   it "strips raw HTML when safe mode is enabled" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [markdown]
-    safe = true
-    TOML
+      [markdown]
+      safe = true
+      TOML
 
     build_site(
       config,
@@ -1613,15 +1890,15 @@ end
 describe "Build Integration: Multiple taxonomies" do
   it "generates pages for multiple taxonomy types" do
     config = <<-TOML
-    title = "Test"
-    base_url = "http://localhost"
+      title = "Test"
+      base_url = "http://localhost"
 
-    [[taxonomies]]
-    name = "tags"
+      [[taxonomies]]
+      name = "tags"
 
-    [[taxonomies]]
-    name = "categories"
-    TOML
+      [[taxonomies]]
+      name = "categories"
+      TOML
 
     build_site(
       config,
@@ -1832,6 +2109,32 @@ describe "Build Integration: Static file nested directories" do
       File.exists?("public/assets/images/logo.png").should be_true
       File.exists?("public/assets/fonts/custom.woff2").should be_true
       File.read("public/assets/css/main.css").should eq("body{}")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# 56. Root-level page bundles are not the homepage
+# ---------------------------------------------------------------------------
+describe "Build Integration: root-level page bundle template" do
+  it "renders content/about/index.md with page.html, not the homepage template" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "index.md"       => "---\ntitle: Home\n---\nHome body",
+        "about/index.md" => "---\ntitle: About\n---\nAbout body",
+      },
+      template_files: {
+        "index.html" => "HOME|{{ content }}",
+        "page.html"  => "PAGE|{{ page.title }}|{{ content }}",
+      },
+    ) do
+      File.read("public/index.html").should contain("HOME|")
+
+      about = File.read("public/about/index.html")
+      about.should contain("PAGE|About|")
+      about.should contain("About body")
+      about.should_not contain("HOME|")
     end
   end
 end

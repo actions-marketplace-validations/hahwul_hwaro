@@ -3,6 +3,7 @@ title = "Tools & Completion"
 description = "Utility tools for content management and shell completion"
 weight = 5
 toc = true
+sort_by = "weight"
 +++
 
 Hwaro includes utility tools for content management and shell completion scripts for a better CLI experience.
@@ -16,9 +17,16 @@ The `hwaro tool` command provides utility subcommands for working with content f
 | [convert](/start/tools/convert/) | Convert frontmatter between YAML and TOML formats |
 | [list](/start/tools/list/) | List content files by status |
 | [check-links](/start/tools/check-links/) | Check for dead links in content files |
-| [doctor](/start/tools/doctor/) | Diagnose config and content issues |
+| [stats](/start/tools/stats/) | Show content statistics |
+| [validate](/start/tools/validate/) | Validate content frontmatter and markup |
+| [unused-assets](/start/tools/unused-assets/) | Find unreferenced static files |
+| [doctor](/start/tools/doctor/) | Diagnose config, template, and structure issues |
 | [platform](/start/tools/platform/) | Generate hosting platform config files |
-| [ci](/start/tools/ci/) | Generate CI/CD workflow files |
+| [import](/start/tools/import/) | Import content from various platforms |
+| [export](/start/tools/export/) | Export content to other platforms |
+| [agents-md](/start/tools/agents-md/) | Generate or update AGENTS.md file |
+
+> **Deprecated:** [ci](/start/tools/ci/) is hidden from help and superseded by [platform](/start/tools/platform/) (e.g. `hwaro tool platform github-pages`).
 
 ---
 
@@ -83,7 +91,7 @@ hwaro completion fish > ~/.config/fish/completions/hwaro.fish
 The completion scripts provide tab completion for:
 
 - **Commands**: `hwaro <TAB>` → `init`, `build`, `serve`, `new`, `deploy`, `tool`, `completion`
-- **Subcommands**: `hwaro tool <TAB>` → `convert`, `list`, `check-links`
+- **Subcommands**: `hwaro tool <TAB>` → `convert`, `list`, `stats`, `validate`, `export`, etc.
 - **Flags**: `hwaro build <TAB>` → `--output`, `--drafts`, `--minify`, etc.
 - **Positional arguments**: `hwaro completion <TAB>` → `bash`, `zsh`, `fish`
 - **Positional choices**: `hwaro tool convert <TAB>` → `to-yaml`, `to-toml`

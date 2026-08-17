@@ -28,12 +28,12 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "title": "Hello",
-        "count": 42,
-        "active": true
-      }
-      JSON
+        {
+          "title": "Hello",
+          "count": 42,
+          "active": true
+        }
+        JSON
 
       result = processor.process(input, context)
       result.content.should eq(%q({"title":"Hello","count":42,"active":true}))
@@ -45,13 +45,13 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "person": {
-          "name": "Alice",
-          "age": 30
+        {
+          "person": {
+            "name": "Alice",
+            "age": 30
+          }
         }
-      }
-      JSON
+        JSON
 
       result = processor.process(input, context)
       result.content.should eq(%q({"person":{"name":"Alice","age":30}}))
@@ -62,14 +62,14 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "tags": [
-          "crystal",
-          "programming",
-          "test"
-        ]
-      }
-      JSON
+        {
+          "tags": [
+            "crystal",
+            "programming",
+            "test"
+          ]
+        }
+        JSON
 
       result = processor.process(input, context)
       result.content.should eq(%q({"tags":["crystal","programming","test"]}))
@@ -80,11 +80,11 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      [
-        { "id": 1, "name": "first" },
-        { "id": 2, "name": "second" }
-      ]
-      JSON
+        [
+          { "id": 1, "name": "first" },
+          { "id": 2, "name": "second" }
+        ]
+        JSON
 
       result = processor.process(input, context)
       result.content.should eq(%q([{"id":1,"name":"first"},{"id":2,"name":"second"}]))
@@ -126,16 +126,38 @@ describe Hwaro::Content::Processors::Json do
       result.error.should_not be_nil
     end
 
+    it "round-trips a max-Int64 integer losslessly" do
+      processor = Hwaro::Content::Processors::Json.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = %q({"n":9223372036854775807})
+      result = processor.process(input, context)
+      result.error.should be_nil
+      result.content.should eq(input)
+    end
+
+    it "reports an error for an integer larger than Int64 (pinned parser limit)" do
+      # Crystal's JSON parser cannot represent integers beyond Int64, so a
+      # valid-but-huge literal currently fails to minify rather than being
+      # preserved. Pin this so a future numeric-preserving fix is deliberate.
+      processor = Hwaro::Content::Processors::Json.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = %q({"n": 123456789012345678901234567890})
+      result = processor.process(input, context)
+      result.error.should_not be_nil
+    end
+
     it "handles JSON with special characters in strings" do
       processor = Hwaro::Content::Processors::Json.new
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "message": "He said \\"hello\\"",
-        "path": "C:\\\\Users\\\\test"
-      }
-      JSON
+        {
+          "message": "He said \\"hello\\"",
+          "path": "C:\\\\Users\\\\test"
+        }
+        JSON
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -147,11 +169,11 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "name": "Test",
-        "value": null
-      }
-      JSON
+        {
+          "name": "Test",
+          "value": null
+        }
+        JSON
 
       result = processor.process(input, context)
       result.content.should eq(%q({"name":"Test","value":null}))
@@ -162,13 +184,13 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "integer": 42,
-        "float": 3.14,
-        "negative": -10,
-        "zero": 0
-      }
-      JSON
+        {
+          "integer": 42,
+          "float": 3.14,
+          "negative": -10,
+          "zero": 0
+        }
+        JSON
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -182,16 +204,16 @@ describe Hwaro::Content::Processors::Json do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-JSON
-      {
-        "level1": {
-          "level2": {
-            "level3": {
-              "value": "deep"
+        {
+          "level1": {
+            "level2": {
+              "level3": {
+                "value": "deep"
+              }
             }
           }
         }
-      }
-      JSON
+        JSON
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -252,13 +274,13 @@ describe Hwaro::Content::Processors::Xml do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <root>
-        <item>
-          <title>Hello</title>
-        </item>
-      </root>
-      XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <root>
+          <item>
+            <title>Hello</title>
+          </item>
+        </root>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -305,17 +327,61 @@ describe Hwaro::Content::Processors::Xml do
       result.content.should eq(input)
     end
 
+    it "preserves whitespace and newlines inside a CDATA section" do
+      # CDATA is raw character data (RSS <content:encoded>, embedded scripts,
+      # pre-formatted code) — its internal whitespace must not be collapsed.
+      processor = Hwaro::Content::Processors::Xml.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = "<root>\n  <![CDATA[ keep   these    spaces\n  and newline ]]>\n</root>"
+      result = processor.process(input, context)
+      result.content.should contain("<![CDATA[ keep   these    spaces\n  and newline ]]>")
+    end
+
+    it "does not collapse cross-line whitespace between tag-like text inside CDATA (A15)" do
+      # The `>\s*\n\s*<` collapse is for markup between tags; inside CDATA
+      # those bytes are character data and must survive byte-exact.
+      processor = Hwaro::Content::Processors::Xml.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = "<root><d><![CDATA[</a>\n<em>]]></d></root>"
+      result = processor.process(input, context)
+      result.error.should be_nil
+      result.content.should contain("<![CDATA[</a>\n<em>]]>")
+    end
+
+    it "preserves a CDATA section byte-exact while still minifying surrounding markup" do
+      processor = Hwaro::Content::Processors::Xml.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = "<root>\n  <d><![CDATA[pre >\n< post]]></d>\n</root>"
+      result = processor.process(input, context)
+      result.error.should be_nil
+      result.content.should contain("<![CDATA[pre >\n< post]]>")
+      result.content.should contain("<root><d>")
+      result.content.should contain("</d></root>")
+    end
+
+    it "preserves whitespace and newlines inside an XML comment" do
+      processor = Hwaro::Content::Processors::Xml.new
+      context = Hwaro::Content::Processors::ProcessorContext.new
+
+      input = "<root>\n  <!-- keep   these    spaces\n  and newline -->\n</root>"
+      result = processor.process(input, context)
+      result.content.should contain("<!-- keep   these    spaces\n  and newline -->")
+    end
+
     it "minifies XML with attributes" do
       processor = Hwaro::Content::Processors::Xml.new
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-        <url>
-          <loc>https://example.com/</loc>
-        </url>
-      </urlset>
-      XML
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://example.com/</loc>
+          </url>
+        </urlset>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -328,11 +394,11 @@ describe Hwaro::Content::Processors::Xml do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <root>
-        <empty/>
-        <also-empty />
-      </root>
-      XML
+        <root>
+          <empty/>
+          <also-empty />
+        </root>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -354,18 +420,18 @@ describe Hwaro::Content::Processors::Xml do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <rss version="2.0">
-        <channel>
-          <title>Test Feed</title>
-          <link>https://example.com</link>
-          <item>
-            <title>Post 1</title>
-            <link>https://example.com/post1/</link>
-          </item>
-        </channel>
-      </rss>
-      XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+          <channel>
+            <title>Test Feed</title>
+            <link>https://example.com</link>
+            <item>
+              <title>Post 1</title>
+              <link>https://example.com/post1/</link>
+            </item>
+          </channel>
+        </rss>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -379,21 +445,21 @@ describe Hwaro::Content::Processors::Xml do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-        <url>
-          <loc>https://example.com/</loc>
-          <lastmod>2024-01-01</lastmod>
-          <changefreq>weekly</changefreq>
-          <priority>1.0</priority>
-        </url>
-        <url>
-          <loc>https://example.com/about/</loc>
-          <changefreq>monthly</changefreq>
-          <priority>0.8</priority>
-        </url>
-      </urlset>
-      XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://example.com/</loc>
+            <lastmod>2024-01-01</lastmod>
+            <changefreq>weekly</changefreq>
+            <priority>1.0</priority>
+          </url>
+          <url>
+            <loc>https://example.com/about/</loc>
+            <changefreq>monthly</changefreq>
+            <priority>0.8</priority>
+          </url>
+        </urlset>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil
@@ -425,17 +491,17 @@ describe Hwaro::Content::Processors::Xml do
       context = Hwaro::Content::Processors::ProcessorContext.new
 
       input = <<-XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <feed xmlns="http://www.w3.org/2005/Atom">
-        <title>Test Feed</title>
-        <link href="https://example.com" />
-        <entry>
-          <title>Entry 1</title>
-          <link href="https://example.com/entry1/" />
-          <content type="html">Some content</content>
-        </entry>
-      </feed>
-      XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>Test Feed</title>
+          <link href="https://example.com" />
+          <entry>
+            <title>Entry 1</title>
+            <link href="https://example.com/entry1/" />
+            <content type="html">Some content</content>
+          </entry>
+        </feed>
+        XML
 
       result = processor.process(input, context)
       result.error.should be_nil

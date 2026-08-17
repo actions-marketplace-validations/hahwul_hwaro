@@ -6,10 +6,69 @@
 require "json"
 require "yaml"
 require "toml"
+require "../utils/date_utils"
+require "../utils/frontmatter_scanner"
 require "../utils/logger"
+require "../utils/text_utils"
 
 module Hwaro
   module Services
+    # Filesystem guard shared by the content-walking tool services (`tool
+    # list` / `tool stats` here, plus `tool convert`, `tool validate` and
+    # `tool unused-assets`). It lives beside the lister because that is the
+    # walker the other services already build on.
+    #
+    # `Dir.glob` reports a symlink as an ordinary path, so a self-referential
+    # link (`ln -s loop.md content/loop.md`), a mutually-pointing pair, or a
+    # dangling link all come back looking like a normal file. Resolving one
+    # fails with ELOOP/ENOENT, and `File.info?` — hence `File.directory?` —
+    # RAISES `File::Error` on ELOOP, because it only swallows ENOENT/ENOTDIR.
+    # `hwaro build` adopted an lstat-first guard for exactly this tree (see
+    # `core/build/phases/read_content.cr`), but the tool commands still walked
+    # it blind: `tool unused-assets` died with a raw filesystem error, and the
+    # others turned every bad link into a read failure they reported as the
+    # author's problem. Skip such entries the way the build does.
+    #
+    # Unlike the build this guard judges READABILITY only, never containment:
+    # the build refuses a link resolving outside the project because it would
+    # publish the target, whereas these commands merely read, and they take an
+    # arbitrary `--content-dir` that need not sit under `Dir.current` — testing
+    # containment against that root would skip every file the user asked about.
+    module ContentWalk
+      extend self
+
+      # True when `path` is a regular file that can actually be opened.
+      #
+      # Anything that simply is not a file (a directory, or a FIFO/socket
+      # whose `File.read` would block forever) is skipped without comment — it
+      # was never content. A symlink we cannot follow is named in a single
+      # warning instead, matching `Phases::Initialize#static_target_info`, so
+      # a file missing from a listing or a validate summary is never silent.
+      def readable_file?(path : String) : Bool
+        # lstat never follows, so a cycle is an ordinary symlink entry here
+        # instead of an ELOOP failure. For the common (non-symlink) case it is
+        # also the only stat the walk needs.
+        lstat = File.info?(path, follow_symlinks: false)
+        return false if lstat.nil?
+        return lstat.file? unless lstat.symlink?
+
+        target = begin
+          File.info?(path, follow_symlinks: true)
+        rescue ex : File::Error
+          Logger.warn "Skipping unresolvable symlink: #{path}"
+          Logger.debug "Symlink stat failed: #{ex.message}"
+          return false
+        end
+
+        if target.nil?
+          Logger.warn "Skipping dangling symlink: #{path}"
+          return false
+        end
+
+        target.file?
+      end
+    end
+
     # Filter type for listing content
     enum ContentFilter
       All
@@ -25,7 +84,7 @@ module Hwaro
       property title : String
       property draft : Bool
 
-      @[JSON::Field(converter: Hwaro::Services::ContentInfo::TimeConverter)]
+      @[JSON::Field(converter: Hwaro::Services::ContentInfo::TimeConverter, emit_null: true)]
       property date : Time?
 
       def initialize(
@@ -56,6 +115,15 @@ module Hwaro
     class ContentLister
       YAML_DELIMITER = "---"
       TOML_DELIMITER = "+++"
+
+      # Column header labels — also used as the minimum column width so the
+      # header row never glues two adjacent labels together when the data
+      # values are shorter than the label itself (see column-width clamp in
+      # `#display`). Keep these and the header `String.build` block in sync.
+      HEADER_STATUS = "Status"
+      HEADER_DATE   = "Date"
+      HEADER_TITLE  = "Title"
+      HEADER_PATH   = "Path"
 
       # Content directory path
       @content_dir : String
@@ -104,8 +172,8 @@ module Hwaro
 
         # Sort by date (newest first), then by path
         contents.sort_by! do |info|
-          {info.date.try(&.to_unix) || 0_i64, info.path}
-        end.reverse!
+          {-(info.date.try(&.to_unix) || 0_i64), info.path}
+        end
 
         contents
       end
@@ -115,84 +183,88 @@ module Hwaro
         contents = list_content(filter)
 
         filter_name = case filter
-                      when ContentFilter::All       then "All"
-                      when ContentFilter::Drafts    then "Drafts"
-                      when ContentFilter::Published then "Published"
-                      else                               "Unknown"
+                      when ContentFilter::Drafts    then "drafts"
+                      when ContentFilter::Published then "published"
+                      else                               "all"
                       end
 
-        Logger.info "Listing #{filter_name.downcase} content in '#{@content_dir}'..."
-        Logger.info ""
+        Logger.heading("list", "#{filter_name} · #{@content_dir}")
 
         if contents.empty?
-          Logger.info "  No content found."
+          Logger.outcome("listed", "no content found", :info)
           return
         end
 
-        # Calculate column widths
-        max_path_width = [contents.map(&.path.size).max, 40].min
-        max_title_width = [contents.map(&.title.size).max, 30].min
+        Logger.info ""
 
-        # Print header
-        header = String.build do |str|
-          str << "  "
-          str << "Status".ljust(10)
-          str << "Date".ljust(12)
-          str << "Title".ljust(max_title_width + 2)
-          str << "Path"
+        # Titles come from semi-trusted front matter, so strip control bytes
+        # before they reach the terminal (a raw ANSI escape could repaint the
+        # console, and it throws the column widths off either way).
+        cells = contents.map do |info|
+          {Utils::TextUtils.strip_control(info.title), Utils::TextUtils.strip_control(info.path)}
         end
-        Logger.info header
-        Logger.info "  " + "-" * (10 + 12 + max_title_width + 2 + max_path_width)
 
-        # Print each content item
-        contents.each do |info|
-          status = info.draft ? "draft" : "published"
-          status_display = info.draft ? "[draft]" : "[pub]"
-          date_display = info.date.try(&.to_s("%Y-%m-%d")) || "-"
-          title_display = truncate(info.title, max_title_width)
-          path_display = truncate(info.path, max_path_width)
+        # Cap long cells so the table stays scannable; the header labels are
+        # the minimum column widths (Logger::Table aligns to the widest cell).
+        # Measured in terminal columns to match both `truncate` below and the
+        # table's own padding.
+        max_title_width = [[cells.max_of { |title, _| Utils::TextUtils.display_width(title) }, 30].min, HEADER_TITLE.size].max
+        max_path_width = [[cells.max_of { |_, path| Utils::TextUtils.display_width(path) }, 40].min, HEADER_PATH.size].max
 
-          line = String.build do |str|
-            str << "  "
-            str << status_display.ljust(10)
-            str << date_display.ljust(12)
-            str << title_display.ljust(max_title_width + 2)
-            str << path_display
-          end
-          Logger.info line
+        table = Logger::Table.new([HEADER_STATUS, HEADER_DATE, HEADER_TITLE, HEADER_PATH])
+        contents.each_with_index do |info, index|
+          status = info.draft ? "[draft]" : "[pub]"
+          status_role = info.draft ? Logger::Role::Warn : Logger::Role::Dim
+          title, path = cells[index]
+          table.row(
+            [
+              status,
+              info.date.try(&.to_s("%Y-%m-%d")) || "-",
+              truncate(title, max_title_width),
+              truncate(path, max_path_width),
+            ],
+            [status_role, Logger::Role::Dim, Logger::Role::Plain, Logger::Role::Dim]
+          )
         end
+        table.emit
 
         Logger.info ""
-        Logger.info "Total: #{contents.size} file(s)"
+        Logger.outcome("listed", "#{contents.size} #{contents.size == 1 ? "file" : "files"}")
       end
 
       private def find_content_files : Array(String)
         files = [] of String
 
+        # Unfollowable symlinks are dropped here (see `ContentWalk`) so one
+        # bad link cannot turn a listing into a wall of "Failed to read
+        # content file" warnings for files the build itself skips. `tool
+        # stats` walks through this method too, so both stay consistent.
         Dir.glob(File.join(@content_dir, "**", "*.md")) do |file|
-          files << file
+          files << file if ContentWalk.readable_file?(file)
         end
 
         Dir.glob(File.join(@content_dir, "**", "*.markdown")) do |file|
-          files << file
+          files << file if ContentWalk.readable_file?(file)
         end
 
         files.sort
       end
 
       private def parse_content_info(file_path : String) : ContentInfo?
-        content = File.read(file_path)
+        # Match the build's frontmatter reader: a BOM'd file would otherwise
+        # list as "Untitled" with no date while it builds correctly.
+        content = Utils::TextUtils.strip_bom(File.read(file_path))
 
         title = "Untitled"
         draft = false
         date : Time? = nil
 
         # Try TOML Front Matter (+++)
-        if match = content.match(/\A\+\+\+\s*\n(.*?\n?)^\+\+\+\s*$\n?/m)
+        if match = content.match(Utils::FrontmatterScanner::TOML_FRONTMATTER_RE)
           begin
             toml_fm = TOML.parse(match[1])
-            title = toml_fm["title"]?.try(&.as_s) || title
-            draft = toml_fm["draft"]?.try(&.as_bool) || false
+            title = toml_fm["title"]?.try(&.as_s?) || title
+            draft = toml_fm["draft"]?.try(&.as_bool?) || false
             # TOML parser may return Time directly or String
             if date_val = toml_fm["date"]?
               raw = date_val.raw
@@ -206,7 +278,7 @@ module Hwaro
             Logger.debug "TOML front matter parsing failed for #{file_path}: #{ex.message}"
           end
           # Try YAML Front Matter (---)
-        elsif match = content.match(/\A---\s*\n(.*?\n?)^---\s*$\n?/m)
+        elsif match = content.match(Utils::FrontmatterScanner::YAML_FRONTMATTER_RE)
           begin
             yaml_fm = YAML.parse(match[1])
             if yaml_fm.as_h?
@@ -224,6 +296,22 @@ module Hwaro
           rescue ex
             Logger.debug "YAML front matter parsing failed for #{file_path}: #{ex.message}"
           end
+          # Try JSON Front Matter (balanced {...} at file start)
+        elsif content.starts_with?('{') && (end_idx = Utils::FrontmatterScanner.find_json_end(content))
+          begin
+            # find_json_end returns a BYTE offset; byte_slice keeps multibyte
+            # JSON frontmatter intact so title/date aren't silently lost.
+            json_fm = JSON.parse(content.byte_slice(0, end_idx))
+            if json_fm.as_h?
+              title = json_fm["title"]?.try(&.as_s?) || title
+              draft = json_fm["draft"]?.try(&.as_bool?) || false
+              if str_val = json_fm["date"]?.try(&.as_s?)
+                date = parse_time(str_val)
+              end
+            end
+          rescue ex
+            Logger.debug "JSON front matter parsing failed for #{file_path}: #{ex.message}"
+          end
         end
 
         ContentInfo.new(
@@ -238,36 +326,27 @@ module Hwaro
       end
 
       private def parse_time(time_str : String?) : Time?
-        return nil unless time_str
-
-        formats = [
-          "%Y-%m-%d %H:%M:%S",
-          "%Y-%m-%dT%H:%M:%S",
-          "%Y-%m-%d",
-        ]
-
-        formats.each do |fmt|
-          begin
-            return Time.parse(time_str, fmt, Time::Location::UTC)
-          rescue
-            next
-          end
-        end
-
-        # Try ISO 8601 parsing as last resort
-        begin
-          return Time.parse_rfc3339(time_str)
-        rescue
-          nil
-        end
+        return unless time_str
+        Utils::DateUtils.parse_lenient(time_str)
       end
 
+      # Cap a cell at `max_length` terminal COLUMNS. Measuring in codepoints
+      # while the table pads by display width let a 30-codepoint CJK title
+      # claim a 60-column column, undoing the alignment fix one step earlier.
       private def truncate(str : String, max_length : Int32) : String
-        if str.size > max_length
-          str[0, max_length - 3] + "..."
-        else
-          str
+        return str if Utils::TextUtils.display_width(str) <= max_length
+
+        budget = max_length - 3
+        kept = String.build do |io|
+          used = 0
+          str.each_char do |c|
+            w = Utils::TextUtils.display_width(c.to_s)
+            break if used + w > budget
+            io << c
+            used += w
+          end
         end
+        "#{kept}..."
       end
     end
   end

@@ -15,6 +15,7 @@ describe Hwaro::CLI::Commands::BuildCommand do
       options.drafts.should be_false
       options.minify.should be_false
       options.parallel.should be_true
+      options.workers.should eq(0)
       options.cache.should be_false
       options.highlight.should be_true
       options.verbose.should be_false
@@ -42,6 +43,23 @@ describe Hwaro::CLI::Commands::BuildCommand do
       result, _ = cmd.parse_options(["--base-url", "https://example.com"])
       options, _ = result
       options.base_url.should eq("https://example.com")
+    end
+
+    it "rejects an invalid --base-url with HWARO_E_USAGE" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.parse_options(["--base-url", "not a valid url"])
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      err.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+    end
+
+    it "rejects a --base-url without a scheme" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      err = expect_raises(Hwaro::HwaroError) do
+        cmd.parse_options(["--base-url", "example.com"])
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
     end
 
     it "parses boolean flags" do
@@ -80,6 +98,72 @@ describe Hwaro::CLI::Commands::BuildCommand do
 
       options.parallel.should be_false
       options.highlight.should be_false
+    end
+
+    it "parses --jobs into the worker count" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      result, _ = cmd.parse_options(["--jobs", "2"])
+      options, _ = result
+      options.workers.should eq(2)
+    end
+
+    it "warns that --jobs is ignored when combined with --no-parallel" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      log = with_captured_log do
+        result, _ = cmd.parse_options(["--no-parallel", "--jobs", "4"])
+        options, _ = result
+        options.parallel.should be_false
+        options.workers.should eq(4)
+      end
+      log.should contain("--jobs")
+      log.should contain("--no-parallel")
+    end
+
+    it "does not warn about --jobs when parallel rendering is enabled" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      log = with_captured_log do
+        cmd.parse_options(["--jobs", "4"])
+      end
+      log.should_not contain("--no-parallel")
+    end
+
+    it "raises HwaroError(HWARO_E_USAGE) when --jobs is not a positive integer" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+
+      ["0", "-1", "abc", ""].each do |bad|
+        err = expect_raises(Hwaro::HwaroError) do
+          cmd.parse_options(["--jobs", bad])
+        end
+        err.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+      end
+    end
+
+    it "defaults skip_og_image to false" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      result, _ = cmd.parse_options([] of String)
+      options, _ = result
+      options.skip_og_image.should be_false
+    end
+
+    it "parses --skip-og-image flag" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      result, _ = cmd.parse_options(["--skip-og-image"])
+      options, _ = result
+      options.skip_og_image.should be_true
+    end
+
+    it "defaults skip_image_processing to false" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      result, _ = cmd.parse_options([] of String)
+      options, _ = result
+      options.skip_image_processing.should be_false
+    end
+
+    it "parses --skip-image-processing flag" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      result, _ = cmd.parse_options(["--skip-image-processing"])
+      options, _ = result
+      options.skip_image_processing.should be_true
     end
 
     it "parses mixed flags" do
@@ -160,6 +244,24 @@ describe Hwaro::CLI::Commands::BuildCommand do
       ensure
         ENV.delete("HWARO_MEMORYLIMIT")
       end
+    end
+
+    it "defaults json flag to false" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      _, _, json_output = cmd.parse_options([] of String)
+      json_output.should be_false
+    end
+
+    it "parses --json flag" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      _, _, json_output = cmd.parse_options(["--json"])
+      json_output.should be_true
+    end
+
+    it "parses -j short json flag" do
+      cmd = Hwaro::CLI::Commands::BuildCommand.new
+      _, _, json_output = cmd.parse_options(["-j"])
+      json_output.should be_true
     end
 
     it "CLI --memory-limit overrides HWARO_MEMORYLIMIT env var" do

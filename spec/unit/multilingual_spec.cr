@@ -19,9 +19,51 @@ describe Hwaro::Content::Multilingual do
     Hwaro::Content::Multilingual.link_translations!([en, ko], config)
 
     en.translations.map(&.code).should eq(["en", "ko"])
-    en.translations.find(&.is_current).not_nil!.code.should eq("en")
-    ko.translations.find(&.is_current).not_nil!.code.should eq("ko")
+    en.translations.find!(&.is_current).code.should eq("en")
+    ko.translations.find!(&.is_current).code.should eq("ko")
     ko.translations.map(&.url).should eq(["/about/", "/ko/about/"])
+  end
+
+  it "links translation variants on .markdown pages" do
+    config = Hwaro::Models::Config.new
+    config.default_language = "en"
+    config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+    en = Hwaro::Models::Page.new("about.markdown")
+    en.title = "About"
+    en.url = "/about/"
+
+    ko = Hwaro::Models::Page.new("about.ko.markdown")
+    ko.title = "소개"
+    ko.url = "/ko/about/"
+    ko.language = "ko"
+
+    Hwaro::Content::Multilingual.link_translations!([en, ko], config)
+
+    en.translations.map(&.code).should eq(["en", "ko"])
+    ko.translations.map(&.code).should eq(["en", "ko"])
+    ko.translations.map(&.url).should eq(["/about/", "/ko/about/"])
+  end
+
+  # Regression for https://github.com/hahwul/hwaro/issues/486
+  # `link_translations!` used to populate `page.translations` with a
+  # single self-entry for pages that have no actual cross-language
+  # variants. The canonical guard from docs/templates/data-model.md —
+  # `{% if page.translations %}<nav class="lang-switcher">…</nav>{% endif %}` —
+  # therefore always rendered an empty (or current-only) switcher on
+  # single-language pages.
+  it "leaves page.translations empty when no cross-language variant exists" do
+    config = Hwaro::Models::Config.new
+    config.default_language = "en"
+    config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+    only_en = Hwaro::Models::Page.new("solo.md")
+    only_en.title = "Solo"
+    only_en.url = "/solo/"
+
+    Hwaro::Content::Multilingual.link_translations!([only_en], config)
+
+    only_en.translations.should be_empty
   end
 
   it "builds /<lang>/ prefixed URLs for nested index.<lang>.md files" do
@@ -32,29 +74,29 @@ describe Hwaro::Content::Multilingual do
       Dir.cd(temp_dir) do
         Dir.mkdir_p("content/about")
         File.write("content/about/index.md", <<-MD)
-        +++
-        title = "About"
-        +++
+          +++
+          title = "About"
+          +++
 
-        # About
-        MD
+          # About
+          MD
         File.write("content/about/index.ko.md", <<-MD)
-        +++
-        title = "소개"
-        +++
+          +++
+          title = "소개"
+          +++
 
-        # 소개
-        MD
+          # 소개
+          MD
 
         File.write("config.toml", <<-TOML)
-        title = "Test"
-        base_url = "http://localhost:3000"
-        default_language = "en"
+          title = "Test"
+          base_url = "http://localhost:3000"
+          default_language = "en"
 
-        [languages.ko]
-        language_name = "한국어"
-        weight = 2
-        TOML
+          [languages.ko]
+          language_name = "한국어"
+          weight = 2
+          TOML
 
         builder = Hwaro::Core::Build::Builder.new
         builder.run(output_dir: "public", drafts: false, minify: false, parallel: false, cache: false, highlight: true, verbose: false, profile: false)

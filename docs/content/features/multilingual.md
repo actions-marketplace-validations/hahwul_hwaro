@@ -1,7 +1,7 @@
 +++
 title = "Multilingual"
 description = "Build multilingual sites with translation linking and hreflang tags"
-weight = 5
+weight = 22
 toc = true
 +++
 
@@ -36,7 +36,7 @@ weight = 3
 | language_name | string | — | Human-readable language name |
 | weight | int | 0 | Sort order (lower = first) |
 | generate_feed | bool | true | Generate RSS/Atom feed for this language |
-| build_search_index | bool | false | Include in search index |
+| build_search_index | bool | true | Include in search index |
 | taxonomies | array | [] | Taxonomies for this language |
 
 ## Content Structure
@@ -360,15 +360,16 @@ language_name = "日本語"
 generate_feed = false   # No /ja/rss.xml will be generated
 ```
 
-Language feeds share the same `sections`, `limit`, and `truncate` settings from the global `[feeds]` config:
+Language feeds share the same `sections`, `limit`, `truncate`, and `full_content` settings from the global `[feeds]` config:
 
 ```toml
 [feeds]
 enabled = true
-type = "rss"       # or "atom"
+type = "rss"           # or "atom"
 limit = 20
 truncate = 0
-sections = []      # empty = all sections
+full_content = true    # false = description/summary only
+sections = []          # empty = all sections
 default_language_only = true
 ```
 

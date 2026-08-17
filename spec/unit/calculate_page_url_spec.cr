@@ -8,6 +8,10 @@ module Hwaro::Core::Build
       calculate_page_url(page)
     end
 
+    def test_raise_on_permalink_errors(pages : Array(Models::Page))
+      raise_on_permalink_errors!(pages)
+    end
+
     def test_set_config(config : Models::Config)
       @config = config
     end
@@ -264,6 +268,185 @@ describe Hwaro::Core::Build::Builder do
         builder.test_calculate_page_url(page)
 
         page.url.should eq("/archive/2023/wip/")
+      end
+
+      it "maps a flat file under an empty-target source to root" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"pages" => ""}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("pages/about.md")
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/about/")
+      end
+
+      it "maps a nested subdirectory under an empty-target source to root without doubling slashes" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"pages" => ""}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("pages/contact/info.md")
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/contact/info/")
+      end
+
+      it "maps a nested section index under an empty-target source to root without doubling slashes" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"pages" => ""}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("pages/contact/_index.md")
+        page.is_index = true
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/contact/")
+      end
+    end
+
+    # -----------------------------------------------------------------------
+    # Token patterns (Hugo-style [permalinks] values)
+    # -----------------------------------------------------------------------
+    describe "token patterns" do
+      it "expands date tokens with zero padding" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:month/:day/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/hello.md")
+        page.date = Time.utc(2026, 3, 5)
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/2026/03/05/hello/")
+      end
+
+      it "uses the front-matter slug for :slug" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/long-name.md")
+        page.date = Time.utc(2026, 3, 5)
+        page.slug = "short"
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/2026/short/")
+      end
+
+      it "slugifies the title for :title and expands :section and :filename" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":section/:title/:filename"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/tech/my-file.md")
+        page.title = "Hello World"
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/posts/tech/hello-world/my-file/")
+      end
+
+      it "matches subdirectories under the rule source" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/tech/x.md")
+        page.date = Time.utc(2025, 12, 31)
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/2025/x/")
+      end
+
+      it "prefixes the language before the pattern output" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.default_language = "en"
+        config.permalinks = {"posts" => ":year/:month/:day/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/x.ko.md")
+        page.language = "ko"
+        page.date = Time.utc(2026, 3, 5)
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/ko/2026/03/05/x/")
+      end
+
+      it "custom_path takes priority over a pattern rule" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/x.md")
+        page.date = Time.utc(2026, 3, 5)
+        page.custom_path = "/pinned/"
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/pinned/")
+      end
+
+      it "skips pattern rules for index pages" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/_index.md")
+        page.is_index = true
+        builder.test_calculate_page_url(page)
+
+        page.url.should eq("/posts/")
+      end
+
+      it "defers the dateless-page error: fallback URL at parse, raise only for publishing pages" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        # The parse fan-out runs before cascades/draft filtering, so URL
+        # calculation must not abort the build — it parks the error and
+        # falls back to the directory URL.
+        page = Hwaro::Models::Page.new("posts/undated.md")
+        builder.test_calculate_page_url(page)
+        page.url.should eq("/posts/undated/")
+        page.permalink_error.not_nil!.should contain("requires a date, but the page has none")
+
+        # A page that publishes still fails the build, classified.
+        ex = expect_raises(Hwaro::HwaroError, /requires a date, but the page has none/) do
+          builder.test_raise_on_permalink_errors([page])
+        end
+        ex.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
+
+        # A headless page never publishes the URL — no error.
+        page.render = false
+        builder.test_raise_on_permalink_errors([page])
+      end
+
+      it "clears a stale permalink error once the page gains a date" do
+        builder = Hwaro::Core::Build::Builder.new
+        config = Hwaro::Models::Config.new
+        config.permalinks = {"posts" => ":year/:slug"}
+        builder.test_set_config(config)
+
+        page = Hwaro::Models::Page.new("posts/undated.md")
+        builder.test_calculate_page_url(page)
+        page.permalink_error.should_not be_nil
+
+        page.date = Time.utc(2026, 3, 5)
+        builder.test_calculate_page_url(page)
+        page.permalink_error.should be_nil
+        page.url.should eq("/2026/undated/")
+        builder.test_raise_on_permalink_errors([page])
       end
     end
 

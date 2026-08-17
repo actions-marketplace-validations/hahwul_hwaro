@@ -66,8 +66,24 @@ Generate RSS feeds for your site and sections.
 ```toml
 [feeds]
 enabled = true
-limit = 20
+type = "rss"              # "rss" or "atom"
+limit = 20                # Maximum number of items
+truncate = 0              # Truncate to N characters (0 = no truncation)
+full_content = true       # true = full HTML body, false = description/summary only
+filename = ""             # Leave empty for default (rss.xml or atom.xml)
+sections = []             # Limit to specific sections, e.g., ["posts"]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Enable feed generation |
+| `type` | `"rss"` | Feed format: `"rss"` or `"atom"` |
+| `limit` | `10` | Maximum number of items in feed |
+| `truncate` | `0` | Truncate content to N characters (0 = full content) |
+| `full_content` | `true` | `true` = full HTML in feed, `false` = use front matter `description` or auto-generated summary |
+| `filename` | `""` | Custom filename (empty = `rss.xml` or `atom.xml`) |
+| `sections` | `[]` | Limit feed to specific sections |
+| `default_language_only` | `true` | Multilingual: main feed includes default language only |
 
 ### Section Feeds
 
@@ -118,7 +134,87 @@ language_name = "日本語"
 generate_feed = false   # No /ja/rss.xml will be generated
 ```
 
-Language feeds share the same `sections`, `limit`, and `truncate` settings from `[feeds]` config. RSS language feeds include a `<language>` tag, and Atom feeds include an `xml:lang` attribute. The feed title includes the language name (e.g., `"My Site (한국어)"`).
+Language feeds share the same `sections`, `limit`, `truncate`, and `full_content` settings from `[feeds]` config. RSS language feeds include a `<language>` tag, and Atom feeds include an `xml:lang` attribute. The feed title includes the language name (e.g., `"My Site (한국어)"`).
+
+### Custom Feed Templates
+
+To take full control of the feed markup, create a template named after the feed output:
+
+| Feed type | Template file | Loaded as key |
+|-----------|---------------|---------------|
+| RSS | `templates/rss.xml.jinja` | `rss.xml` |
+| Atom | `templates/atom.xml.jinja` | `atom.xml` |
+
+Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`) — only the final extension is stripped, so `rss.xml.jinja` loads under the key `rss.xml`. Whatever the extension, the file is always rendered as **Jinja** (an `.ecr` file is picked up too, but ECR `<%= %>` tags pass through as literal text — use Jinja syntax). The template file itself is the opt-in: when it's absent, Hwaro emits its built-in feed exactly as before, and deleting the template falls back to the built-in output. The override applies to **all four feed kinds** — the main feed, per-section feeds, per-language feeds, and per-taxonomy-term feeds — and a custom `[feeds] filename` still controls the output path.
+
+`{% include %}` works inside feed templates, and a broken template fails the build with a template error naming the file.
+
+#### Context variables
+
+`feed` — metadata about the feed being rendered:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `feed.type` | string | `"rss"` or `"atom"` (follows `[feeds] type`) |
+| `feed.kind` | string | `"main"`, `"section"`, `"language"`, or `"taxonomy"` |
+| `feed.title` | string | Feed title (site title, `Site - Section`, `Site (한국어)`, …) |
+| `feed.description` | string | Site description |
+| `feed.url` | string | Absolute, percent-encoded self URL of this feed file |
+| `feed.home_url` | string | Canonical HTML URL the feed represents (site root, section page, or language home) |
+| `feed.base_url` | string | `base_url` without a trailing slash |
+| `feed.language` | string? | Language code for per-language feeds, else none |
+| `feed.updated` | time | Newest entry date (deterministic; epoch when no entry has a date) |
+| `feed.updated_rfc3339` | string | `feed.updated` as RFC 3339 (Atom `<updated>`) |
+| `feed.updated_rfc822` | string | `feed.updated` as RFC 822 (RSS `<lastBuildDate>`/`<pubDate>` style) |
+| `feed.author` | string | Site title (falls back to the feed title) |
+| `feed.section_url` | string? | Section URL — section feeds only |
+| `feed.taxonomy` / `feed.term` | string? | Taxonomy name and term — taxonomy feeds only |
+
+`pages` — the sorted, limit-applied entry list. Each entry:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `title` | string | Page title (site title when the page title is empty) |
+| `url` | string | Absolute, percent-encoded page URL |
+| `date` / `updated` | time? | Raw front-matter dates (usable with the `date` filter) |
+| `date_rfc822` | string? | Preformatted RFC 822 date; none for dateless pages |
+| `updated_rfc3339` | string | RFC 3339 timestamp from `updated`/`date` (epoch fallback) |
+| `description` | string? | Front-matter description |
+| `summary` | string | Plain-text summary (description → `<!-- more -->` summary → excerpt) |
+| `content` | string | Body honoring `full_content`/`truncate` (plain text when truncating) |
+| `content_html` | string | Full HTML body with links absolutized for out-of-context readers |
+| `content_is_html` | bool | Whether `content` is HTML (`false` under `truncate`/`full_content = false`) |
+| `authors` | array | Front-matter authors |
+| `categories` | array | Taxonomy terms — `tags` first, then other taxonomies, deduplicated |
+| `section` | string | Page section path |
+| `language` | string? | Page language code |
+
+#### Example
+
+Values are **not** pre-escaped — applying `xml_escape` (or emitting CDATA) is the template author's job:
+
+```jinja
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>{{ feed.title | xml_escape }}</title>
+    <link>{{ feed.home_url | xml_escape }}</link>
+    <description>{{ feed.description | xml_escape }}</description>
+    {% if feed.language %}<language>{{ feed.language | xml_escape }}</language>{% endif %}
+    <atom:link href="{{ feed.url | xml_escape }}" rel="self" type="application/rss+xml" />
+    {% for p in pages %}
+    <item>
+      <title>{{ p.title | xml_escape }}</title>
+      <link>{{ p.url | xml_escape }}</link>
+      <guid>{{ p.url | xml_escape }}</guid>
+      <description>{{ p.summary | xml_escape }}</description>
+      {% if p.date_rfc822 %}<pubDate>{{ p.date_rfc822 }}</pubDate>{% endif %}
+      {% for term in p.categories %}<category>{{ term | xml_escape }}</category>{% endfor %}
+    </item>
+    {% endfor %}
+  </channel>
+</rss>
+```
 
 ### Template Links
 
@@ -147,6 +243,25 @@ Control search engine crawling.
 enabled = true
 ```
 
+With custom rules:
+
+```toml
+[robots]
+enabled = true
+rules = [
+  { user_agent = "*", disallow = ["/admin", "/private"] },
+  { user_agent = "GPTBot", disallow = ["/"] }
+]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| enabled | bool | true | Generate `robots.txt` |
+| filename | string | "robots.txt" | Output filename |
+| rules | array | [] | List of user-agent rules with `allow` and `disallow` paths |
+
+When no rules are configured, Hwaro generates a default allow-all rule. If a rule has both `allow` and `disallow` empty, an explicit `Allow: /` is added to prevent ambiguous behavior.
+
 ### Output
 
 ```
@@ -161,33 +276,14 @@ Sitemap: https://example.com/sitemap.xml
 
 Generate instruction files for AI/LLM crawlers following the [llms.txt standard](https://llmstxt.org/).
 
-### Configuration
-
 ```toml
 [llms]
 enabled = true
-filename = "llms.txt"
 instructions = "This site's content is provided under the MIT license."
 full_enabled = true
-full_filename = "llms-full.txt"
 ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Generate `llms.txt` |
-| filename | string | "llms.txt" | Output filename |
-| instructions | string | "" | Instructions for LLM crawlers |
-| full_enabled | bool | false | Generate full content version |
-| full_filename | string | "llms-full.txt" | Full version filename |
-
-### Output
-
-- `/llms.txt` — Instructions text only
-- `/llms-full.txt` — Full site content with metadata (title, URL, source path per page)
-
-The full version includes all rendered pages sorted by URL, separated by `---` delimiters.
-
-See [LLMs.txt](/features/llms-txt/) for detailed documentation.
+See [LLMs.txt](/features/llms-txt/) for full configuration and output details.
 
 ---
 
@@ -207,7 +303,7 @@ fb_app_id = "your_fb_app_id"
 | Key | Description |
 |-----|-------------|
 | default_image | Fallback image when page has none |
-| type | OpenGraph type (website, article) |
+| type | OpenGraph type for content pages (default: `"article"`; listing pages always emit `"website"`) |
 | fb_app_id | Facebook App ID (optional) |
 
 ### Page-Level Override
@@ -289,17 +385,7 @@ Or include both OG and Twitter:
 
 ## JSON-LD Structured Data
 
-Hwaro generates [JSON-LD](https://json-ld.org/) structured data for search engines.
-
-### Template Variables
-
-| Variable | Description |
-|----------|-------------|
-| jsonld | Both Article and BreadcrumbList JSON-LD |
-| jsonld_article | Article JSON-LD only |
-| jsonld_breadcrumb | BreadcrumbList JSON-LD only |
-
-### Template Usage
+Hwaro automatically generates Article and BreadcrumbList JSON-LD for every page.
 
 ```jinja
 <head>
@@ -307,79 +393,66 @@ Hwaro generates [JSON-LD](https://json-ld.org/) structured data for search engin
 </head>
 ```
 
-Or include specific types:
-
-```jinja
-<head>
-  {{ jsonld_article | safe }}
-  {{ jsonld_breadcrumb | safe }}
-</head>
-```
-
-### Article Output
-
-```html
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "Article",
-  "headline": "My Article",
-  "url": "https://example.com/blog/my-article/",
-  "datePublished": "2024-01-15T00:00:00+00:00",
-  "dateModified": "2024-02-01T00:00:00+00:00",
-  "description": "Article description",
-  "author": {
-    "@type": "Person",
-    "name": "Author Name"
-  }
-}
-</script>
-```
-
-### BreadcrumbList Output
-
-```html
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "BreadcrumbList",
-  "itemListElement": [
-    {"@type": "ListItem", "position": 1, "name": "My Site", "item": "https://example.com/"},
-    {"@type": "ListItem", "position": 2, "name": "Blog", "item": "https://example.com/blog/"},
-    {"@type": "ListItem", "position": 3, "name": "My Article"}
-  ]
-}
-</script>
-```
-
-### Fields Included
-
-The Article JSON-LD includes the following fields when available:
-
-| Field | Source |
-|-------|--------|
-| headline | `page.title` |
-| url | `page.permalink` or computed from `base_url` |
-| datePublished | `page.date` |
-| dateModified | `page.updated` |
-| description | `page.description` |
-| image | `page.image` |
-| author | First entry from `page.authors` |
+Additional schema types (FAQ, HowTo, WebSite, Organization) are also available. See [Structured Data](/features/structured-data/) for all types, configuration, and output examples.
 
 ---
 
 ## Template Variables
+
+### Pre-rendered HTML
+
+These variables output ready-to-use HTML tags:
 
 | Variable | Description |
 |----------|-------------|
 | og_tags | OpenGraph meta tags |
 | twitter_tags | Twitter Card meta tags |
 | og_all_tags | Both OG and Twitter tags |
+| canonical_tag | Canonical link tag |
+| hreflang_tags | Hreflang alternate link tags |
 | jsonld | Article + BreadcrumbList JSON-LD |
 | jsonld_article | Article JSON-LD only |
 | jsonld_breadcrumb | BreadcrumbList JSON-LD only |
 | page_description | Page description (fallback: site) |
 | page_image | Page image (fallback: og.default_image) |
+
+### Structured SEO Object
+
+The `seo` object provides individual field access for building custom meta tags:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| seo.canonical_url | String | Full canonical URL |
+| seo.og_type | String | OpenGraph type (default: "article") |
+| seo.og_image | String | Resolved absolute image URL |
+| seo.twitter_card | String | Twitter card type |
+| seo.twitter_site | String | Twitter site handle |
+| seo.twitter_creator | String | Twitter creator handle |
+| seo.fb_app_id | String | Facebook App ID |
+| seo.hreflang | Array | Language translation links |
+
+```jinja
+<head>
+  <link rel="canonical" href="{{ seo.canonical_url }}">
+  <meta property="og:title" content="{{ page.title }}">
+  <meta property="og:type" content="{{ seo.og_type }}">
+  <meta property="og:url" content="{{ seo.canonical_url }}">
+  {% if page.description %}
+  <meta property="og:description" content="{{ page.description }}">
+  {% endif %}
+  {% if seo.og_image %}
+  <meta property="og:image" content="{{ seo.og_image }}">
+  {% endif %}
+  {% if seo.fb_app_id %}
+  <meta property="fb:app_id" content="{{ seo.fb_app_id }}">
+  {% endif %}
+  <meta name="twitter:card" content="{{ seo.twitter_card }}">
+  <meta name="twitter:title" content="{{ page.title }}">
+  {% if seo.twitter_site %}
+  <meta name="twitter:site" content="{{ seo.twitter_site }}">
+  {% endif %}
+</head>
+```
 
 ---
 

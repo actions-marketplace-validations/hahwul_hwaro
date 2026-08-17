@@ -7,8 +7,9 @@ describe "Site Variables Integration" do
       FileUtils.mkdir_p(File.join(tmp_dir, "content/blog"))
       FileUtils.mkdir_p(File.join(tmp_dir, "templates"))
 
-      # Config
-      File.write(File.join(tmp_dir, "config.yml"), "title: Test Site\nbase_url: http://example.com")
+      # Config — Models::Config.load now raises HwaroError(HWARO_E_CONFIG)
+      # when config.toml is missing, so provide a minimal one.
+      File.write(File.join(tmp_dir, "config.toml"), %(title = "Test Site"\nbase_url = "http://example.com"))
 
       # Content
       File.write(File.join(tmp_dir, "content/index.md"), "---\ntitle: Home\n---\nHello")
@@ -18,11 +19,11 @@ describe "Site Variables Integration" do
       # Template
       # We check lengths. We assume filters 'length' works (it's standard Jinja).
       template = <<-HTML
-      Pages: {{ site.pages | length }}
-      Sections: {{ site.sections | length }}
-      Taxonomies: {{ site.taxonomies | length }}
-      Tags: {{ site.taxonomies.tags.items | length }}
-      HTML
+        Pages: {{ site.pages | length }}
+        Sections: {{ site.sections | length }}
+        Taxonomies: {{ site.taxonomies | length }}
+        Tags: {{ site.taxonomies.tags.items | length }}
+        HTML
       File.write(File.join(tmp_dir, "templates/page.html"), template)
 
       # Run Build
@@ -55,9 +56,9 @@ describe "Site Variables Integration" do
       File.write(File.join(tmp_dir, "content/index.md"), "---\ntitle: Home\n---\nHello")
 
       template = <<-HTML
-      SITE_TITLE={{ site_title }}
-      BASE_URL={{ base_url }}
-      HTML
+        SITE_TITLE={{ site_title }}
+        BASE_URL={{ base_url }}
+        HTML
       File.write(File.join(tmp_dir, "templates/page.html"), template)
 
       Dir.cd(tmp_dir) do

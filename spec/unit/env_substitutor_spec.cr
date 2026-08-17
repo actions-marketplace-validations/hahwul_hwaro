@@ -85,7 +85,7 @@ describe Hwaro::Utils::EnvSubstitutor do
 
     it "deduplicates missing variable names" do
       ENV.delete("HWARO_DUP")
-      result, missing = Hwaro::Utils::EnvSubstitutor.substitute("${HWARO_DUP} and ${HWARO_DUP}")
+      _, missing = Hwaro::Utils::EnvSubstitutor.substitute("${HWARO_DUP} and ${HWARO_DUP}")
       missing.size.should eq(1)
       missing.should eq(["HWARO_DUP"])
     end
@@ -116,6 +116,56 @@ describe Hwaro::Utils::EnvSubstitutor do
       missing.should be_empty
     ensure
       ENV.delete("HWARO_EMPTY_BARE")
+    end
+
+    it "allows balanced braces in default value" do
+      result, missing = Hwaro::Utils::EnvSubstitutor.substitute("${HWARO_UNSET_JSON:-{\"key\": 1}}")
+      result.should eq("{\"key\": 1}")
+      missing.should be_empty
+    end
+  end
+
+  describe ".substitute_with_warnings" do
+    it "returns the substituted string" do
+      ENV["HWARO_WARN_OK"] = "value"
+      Hwaro::Utils::EnvSubstitutor.substitute_with_warnings("k = ${HWARO_WARN_OK}").should eq("k = value")
+    ensure
+      ENV.delete("HWARO_WARN_OK")
+    end
+
+    it "leaves unresolved vars as-is and logs a warning per missing var" do
+      ENV.delete("HWARO_WARN_MISSING")
+      prev_io = Hwaro::Logger.io
+      buffer = IO::Memory.new
+      Hwaro::Logger.io = buffer
+      begin
+        result = Hwaro::Utils::EnvSubstitutor.substitute_with_warnings(
+          "a=${HWARO_WARN_MISSING} b=${HWARO_WARN_MISSING}",
+          source: "test-source",
+        )
+        result.should eq("a=${HWARO_WARN_MISSING} b=${HWARO_WARN_MISSING}")
+        log_text = buffer.to_s
+        log_text.should contain("HWARO_WARN_MISSING")
+        log_text.should contain("test-source")
+        # deduplicated to one warning
+        log_text.scan("HWARO_WARN_MISSING").size.should eq(1)
+      ensure
+        Hwaro::Logger.io = prev_io
+      end
+    end
+
+    it "emits no warnings when every variable resolves" do
+      ENV["HWARO_WARN_SET"] = "x"
+      prev_io = Hwaro::Logger.io
+      buffer = IO::Memory.new
+      Hwaro::Logger.io = buffer
+      begin
+        Hwaro::Utils::EnvSubstitutor.substitute_with_warnings("${HWARO_WARN_SET}").should eq("x")
+        buffer.to_s.should be_empty
+      ensure
+        Hwaro::Logger.io = prev_io
+        ENV.delete("HWARO_WARN_SET")
+      end
     end
   end
 end

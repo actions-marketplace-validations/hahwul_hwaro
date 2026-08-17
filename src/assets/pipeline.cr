@@ -8,7 +8,10 @@ require "file_utils"
 require "../utils/css_minifier"
 require "../utils/js_minifier"
 require "../utils/logger"
+require "../utils/output_guard"
+require "../utils/path_utils"
 require "../models/config"
+require "./sass_compiler"
 
 module Hwaro
   module Assets
@@ -17,7 +20,11 @@ module Hwaro
       # e.g. "main.css" => "/assets/main.a1b2c3d4.css"
       getter manifest : Hash(String, String)
 
-      def initialize(@config : Models::AssetsConfig, @base_url : String)
+      # `sass_enabled` mirrors `[sass].enabled`: `.scss` bundle entries
+      # compile through the built-in compiler only when the feature is on;
+      # otherwise they concatenate verbatim (pre-Sass behavior, and the
+      # escape hatch for sources outside the supported subset).
+      def initialize(@config : Models::AssetsConfig, @base_url : String, @sass_enabled : Bool = false)
         @manifest = {} of String => String
       end
 
@@ -25,7 +32,17 @@ module Hwaro
         return unless @config.enabled
 
         assets_output = File.join(output_dir, @config.output_dir)
-        FileUtils.mkdir_p(assets_output)
+        # `[assets] output_dir` is joined onto the build output directory and,
+        # unchanged, becomes the manifest URL every page links. A traversing
+        # value ("../../oops") published the fingerprinted bundles above the
+        # site root — public/ ended up with no CSS at all and every page linked
+        # a 404. The source side is already validated in process_bundle; this is
+        # the missing check on the destination side.
+        unless Utils::OutputGuard.within_output_dir?(assets_output, output_dir)
+          Logger.warn "Asset pipeline: output_dir '#{@config.output_dir}' escapes the output directory; skipping asset processing."
+          return
+        end
+        Hwaro::Utils::FileSafe.mkdir_p(assets_output)
 
         @config.bundles.each do |bundle|
           process_bundle(bundle, assets_output)
@@ -48,14 +65,34 @@ module Hwaro
               Logger.warn "Asset pipeline: source file not found: #{source}"
               next
             end
+            # Symlink targets outside the configured source_dir must not be
+            # read into a published bundle. Bound against source_dir (not
+            # Dir.current) so mktmpdir-based tests and custom source roots
+            # still work while still rejecting /etc-style escapes.
+            unless Utils::PathUtils.resolves_within?(source, source_dir_real)
+              Logger.warn "Asset pipeline: source outside source directory (symlink?): #{file}"
+              next
+            end
             io << "\n" if i > 0
-            io << File.read(source)
+            content = File.read(source)
+            # `.scss` bundle entries compile before concatenation when the
+            # built-in Sass feature is on; verbatim otherwise.
+            if @sass_enabled && file.ends_with?(".scss")
+              content = SassCompiler.compile_source(content, source)
+            end
+            io << content
           end
         end
 
         if contents.empty?
           Logger.warn "Asset pipeline: bundle '#{bundle.name}' produced empty output"
           return
+        end
+
+        # A `.scss`-named bundle would publish with a non-CSS extension and
+        # skip the extension-keyed minifier — almost certainly a mistake.
+        if bundle.name.ends_with?(".scss")
+          Logger.warn "Asset pipeline: bundle '#{bundle.name}' keeps the .scss extension in output — name the bundle '#{bundle.name.sub(/\.scss\z/, ".css")}' to serve it as CSS."
         end
 
         # Minify if enabled
@@ -72,7 +109,14 @@ module Hwaro
 
         # Write the bundle
         output_path = File.join(assets_output, output_name)
-        FileUtils.mkdir_p(File.dirname(output_path))
+        # A bundle `name` may legitimately carry a subdirectory ("vendor/x.css"),
+        # so it is joined rather than basenamed — which means it can also carry
+        # "..". Bound it to the asset output directory before writing.
+        unless Utils::OutputGuard.within_output_dir?(output_path, assets_output)
+          Logger.warn "Asset pipeline: bundle '#{bundle.name}' resolves outside the asset output directory; skipping."
+          return
+        end
+        Hwaro::Utils::FileSafe.mkdir_p(File.dirname(output_path))
         File.write(output_path, contents)
 
         # Record in manifest

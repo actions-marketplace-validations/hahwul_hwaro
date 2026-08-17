@@ -1,28 +1,46 @@
 require "../models/page"
+require "./discovery_pages"
 require "../models/config"
 require "../utils/logger"
 require "../utils/text_utils"
 require "./processors/markdown"
+require "html"
 require "json"
+require "uri"
 
 module Hwaro
   module Content
     class Search
-      def self.generate(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false)
+      def self.generate(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false, skip_if_unchanged : Bool = false)
         return unless config.search.enabled
 
-        # Filter out draft pages and pages with in_search_index = false
-        search_pages = pages.reject { |p| p.draft || !p.in_search_index }
-
-        # Filter out excluded paths
-        unless config.search.exclude.empty?
-          excluded_paths = config.search.exclude.map do |path|
-            path.starts_with?('/') ? path : "/#{path}"
+        if skip_if_unchanged
+          search_path = File.join(output_dir, File.basename(config.search.filename))
+          if File.exists?(search_path)
+            Logger.debug "  Search index unchanged (cache hit), skipping."
+            return
           end
+        end
 
+        # Filter out drafts, pages opted out of the index, `render = false`
+        # pages, and auto-generated pages (e.g. taxonomy index/term listings).
+        # The `render` check keeps the index in lockstep with the pages that
+        # actually emit HTML; the `generated` check mirrors llms.cr so
+        # navigational listing pages don't pollute search results. Both match
+        # the guards sitemap.cr / feeds.cr / llms.cr already apply.
+        search_pages = pages.reject { |p| !p.search_index_eligible? }
+
+        search_pages = DiscoveryPages.dedupe_by_url(search_pages)
+        DiscoveryPages.reject_excluded!(search_pages, config.search.exclude)
+
+        # Multilingual: honor each language's `build_search_index` toggle so a
+        # language opted out is excluded from the index. Pages without an
+        # explicit language fall back to the default language.
+        if config.multilingual?
+          default_lang = config.default_language
           search_pages.reject! do |page|
-            page_url = page.url.starts_with?('/') ? page.url : "/#{page.url}"
-            excluded_paths.any? { |excluded| page_url == excluded || page_url.starts_with?(excluded.ends_with?("/") ? excluded : excluded + "/") }
+            lang_config = config.language(page.language || default_lang)
+            lang_config ? !lang_config.build_search_index : false
           end
         end
 
@@ -53,9 +71,9 @@ module Hwaro
         # Write search file
         filename = File.basename(config.search.filename)
         search_path = File.join(output_dir, filename)
-        File.write(search_path, content)
+        Hwaro::Utils::FileSafe.atomic_write(search_path, content)
         Logger.action :create, search_path if verbose
-        Logger.info "  Generated search index with #{search_pages.size} pages."
+        Logger.info "  Generated search index with #{search_pages.size} pages." if verbose
       end
 
       private def self.build_search_data(pages : Array(Models::Page), config : Models::Config) : Array(Hash(String, String | Array(String)))
@@ -63,30 +81,52 @@ module Hwaro
         fields = config.search.fields.map(&.downcase)
         cjk = config.search.tokenize_cjk
 
+        # Extract base path from base_url for subpath deployments. Use the
+        # memoized Config helper rather than re-parsing: it also rescues a
+        # malformed base_url (a bare `URI.parse` raised out of the generator
+        # and aborted the build) and normalizes a "/" path to "".
+        base_path = config.base_path
+
         pages.map do |page|
           data = {} of String => String | Array(String)
 
           fields.each do |field|
             case field
             when "title"
-              title = page.title
+              # The root index commonly has an empty title; fall back to the
+              # site title so the search entry isn't blank (mirrors llms.cr/feeds).
+              # Store the title verbatim: it is plain frontmatter text, and
+              # stripping "tags" from it destroyed titles like `Using <canvas>`.
+              # XSS safety is the renderer's job — every bundled search UI
+              # escapes via escapeHtml() before innerHTML (like feeds escape
+              # via escape_xml), so defense belongs there, not in the data.
+              title = page.title.empty? ? config.title : page.title
               data["title"] = cjk ? Utils::TextUtils.tokenize_cjk(title) : title
             when "content"
               # Convert markdown to plain text
-              # Optimization: Reuse rendered content if available
+              # Optimization: Reuse rendered content if available. The
+              # fallback passes the site's markdown options so cache-hit
+              # pages index the same text a rendered page produces
+              # (safe-mode HTML stripping, emoji, extensions).
               if !page.content.empty?
                 html_content = page.content
               else
-                html_content, _ = Processor::Markdown.render(page.raw_content)
+                md = config.markdown
+                hooks = Content::Processors::RenderHooks.fallback_context(page, config)
+                html_content = Processor::Markdown.render_body_cached(page.raw_content, safe: md.safe, emoji: md.emoji, lazy_loading: md.lazy_loading, markdown_config: md,
+                  hooks: hooks, hooks_key: "#{page.url}:#{page.language}")
               end
 
-              # Strip HTML tags to get plain text
-              text_content = Utils::TextUtils.strip_html(html_content)
+              # Strip HTML tags AND decode entities so the index stores
+              # actual characters (`print("hi")`) rather than the HTML-
+              # escaped form (`print(&quot;hi&quot;)`). Client-side
+              # search libraries match on the raw stored string.
+              text_content = HTML.unescape(Utils::TextUtils.strip_html(html_content))
               data["content"] = cjk ? Utils::TextUtils.tokenize_cjk(text_content) : text_content
             when "tags"
               data["tags"] = page.tags
             when "url"
-              data["url"] = page.url
+              data["url"] = base_path + page.url
             when "section"
               data["section"] = page.section
             when "description"
@@ -96,7 +136,11 @@ module Hwaro
           end
 
           # Always include URL even if not in fields list
-          data["url"] = page.url unless data.has_key?("url")
+          data["url"] = base_path + page.url unless data.has_key?("url")
+
+          # Always include the page language so the client can scope results
+          # to the current language (mirrors per-language feeds).
+          data["lang"] = page.language || config.default_language
 
           data
         end

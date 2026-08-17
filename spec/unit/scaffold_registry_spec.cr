@@ -9,6 +9,12 @@ describe Hwaro::Services::Scaffolds::Registry do
       scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::Simple)
     end
 
+    it "returns Bare scaffold" do
+      scaffold = Hwaro::Services::Scaffolds::Registry.get(Hwaro::Config::Options::ScaffoldType::Bare)
+      scaffold.should_not be_nil
+      scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::Bare)
+    end
+
     it "returns Blog scaffold" do
       scaffold = Hwaro::Services::Scaffolds::Registry.get(Hwaro::Config::Options::ScaffoldType::Blog)
       scaffold.should_not be_nil
@@ -21,26 +27,20 @@ describe Hwaro::Services::Scaffolds::Registry do
       scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::Docs)
     end
 
-    it "returns BlogDark scaffold" do
-      scaffold = Hwaro::Services::Scaffolds::Registry.get(Hwaro::Config::Options::ScaffoldType::BlogDark)
+    it "returns Book scaffold" do
+      scaffold = Hwaro::Services::Scaffolds::Registry.get(Hwaro::Config::Options::ScaffoldType::Book)
       scaffold.should_not be_nil
-      scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::BlogDark)
-    end
-
-    it "returns DocsDark scaffold" do
-      scaffold = Hwaro::Services::Scaffolds::Registry.get(Hwaro::Config::Options::ScaffoldType::DocsDark)
-      scaffold.should_not be_nil
-      scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::DocsDark)
+      scaffold.type.should eq(Hwaro::Config::Options::ScaffoldType::Book)
     end
   end
 
   describe ".has?" do
     it "returns true for registered types" do
       Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::Simple).should be_true
+      Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::Bare).should be_true
       Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::Blog).should be_true
       Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::Docs).should be_true
-      Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::BlogDark).should be_true
-      Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::DocsDark).should be_true
+      Hwaro::Services::Scaffolds::Registry.has?(Hwaro::Config::Options::ScaffoldType::Book).should be_true
     end
   end
 
@@ -64,10 +64,10 @@ describe Hwaro::Services::Scaffolds::Registry do
     it "includes all scaffold type names" do
       names = Hwaro::Services::Scaffolds::Registry.list.map(&.[0])
       names.should contain("simple")
+      names.should contain("bare")
       names.should contain("blog")
       names.should contain("docs")
-      names.should contain("blog-dark")
-      names.should contain("docs-dark")
+      names.should contain("book")
     end
   end
 

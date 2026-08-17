@@ -10,6 +10,7 @@ require "json"
 require "option_parser"
 require "../../metadata"
 require "../../../services/content_lister"
+require "../../../utils/errors"
 require "../../../utils/logger"
 
 module Hwaro
@@ -51,25 +52,32 @@ module Hwaro
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
               parser.unknown_args do |unknown|
-                filter = unknown.first? if unknown.any?
+                filter = unknown.first? if unknown.present?
               end
             end
 
+            Runner.enable_json_mode! if json_output
+
+            supported = POSITIONAL_CHOICES.join(", ")
+
             unless filter
-              Logger.error "Missing filter argument. Use 'all', 'drafts', or 'published'"
-              Logger.info ""
-              Logger.info "Usage: hwaro tool list <all|drafts|published> [options]"
-              Logger.info ""
-              Logger.info "Filters:"
-              Logger.info "  all        List all content files"
-              Logger.info "  drafts     List only draft content files"
-              Logger.info "  published  List only published content files"
-              Logger.info ""
-              Logger.info "Examples:"
-              Logger.info "  hwaro tool list all"
-              Logger.info "  hwaro tool list drafts"
-              Logger.info "  hwaro tool list published --content-dir=posts"
-              exit(1)
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_USAGE,
+                message: "missing <filter> argument",
+                hint: "Usage: hwaro tool list <all|drafts|published> — supported: #{supported}.",
+              )
+            end
+
+            # A missing content directory is a failure, not an empty listing:
+            # the command used to print "not found" on stderr, `[]` on stdout
+            # and still exit 0, so a script could not tell "no content" from
+            # "wrong directory". Matches `tool validate` / `tool check-links`.
+            unless Dir.exists?(content_dir)
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_CONTENT,
+                message: "Content directory '#{content_dir}' does not exist",
+                hint: "Create it or pass --content-dir DIR to point at your content root.",
+              )
             end
 
             lister = Services::ContentLister.new(content_dir)
@@ -82,9 +90,11 @@ module Hwaro
                              when "published", "pub"
                                Services::ContentFilter::Published
                              else
-                               Logger.error "Unknown filter: #{filter}"
-                               Logger.info "Use 'all', 'drafts', or 'published'"
-                               exit(1)
+                               raise Hwaro::HwaroError.new(
+                                 code: Hwaro::Errors::HWARO_E_USAGE,
+                                 message: "unknown filter: #{filter}",
+                                 hint: "Supported: #{supported}.",
+                               )
                              end
 
             if json_output

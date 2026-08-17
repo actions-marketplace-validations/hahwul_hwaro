@@ -1,358 +1,586 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ page.language }}" data-theme="dark">
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <meta name="description" content="{{ page.description }}" />
         <title>
-            {{ site.title }} - Fast & Lightweight Static Site Generator
+            {{ site.title }} - {{ "landing.title_tag" | t }}
         </title>
         {{ og_all_tags }}
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-        <link
-            href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap"
-            rel="stylesheet"
-        />
+        {{ canonical_tag }}
+        {{ hreflang_tags }}
+        <link rel="icon" type="image/png" href="/icons/favicon-96x96.png" sizes="96x96" />
+        <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg" />
+        <link rel="shortcut icon" href="/icons/favicon.ico" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
+        <link rel="manifest" href="/icons/site.webmanifest" />
+        <link rel="preload" href="/fonts/GeistVF.woff2" as="font" type="font/woff2" crossorigin>
+        <link rel="preload" href="/fonts/GeistMonoVF.woff2" as="font" type="font/woff2" crossorigin>
+        <link rel="preload" href="/images/landing/cover.jpg" as="image" fetchpriority="high">
         {{ auto_includes_css }}
+        <!-- Progressive enhancement: scroll reveals only apply with JS, so a
+             no-JS visitor sees every section at full opacity. -->
+        <script>
+            document.documentElement.classList.add("js");
+        </script>
     </head>
-    <body>
+    <body class="landing-body">
         <header class="landing-header">
             <a href="{{ base_url }}/" class="logo">
-                <img src="/hwaro-wide.webp" style="height: 50px" />
+                <img src="/hwaro-wide.webp" alt="Hwaro" />
             </a>
             <nav>
-                <a href="{{ base_url }}/start/cli/">CLI</a>
-                <a href="https://examples.hwaro.hahwul.com">Examples</a>
-                <a
-                    href="https://github.com/hahwul/hwaro"
-                    class="github-link"
-                    target="_blank"
-                    rel="noopener"
-                >
-                    <svg viewBox="0 0 24 24">
-                        <path
-                            d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"
-                        />
+                <a href="{{ base_url }}{{ lang_prefix }}/start/">{{ "nav.docs" | t }}</a>
+                <a href="https://examples.hwaro.hahwul.com" target="_blank" rel="noopener">{{ "nav.examples" | t }}</a>
+                {% if page.translations %}
+                <details class="lang-switch">
+                    <summary class="lang-switch-btn" aria-label="{{ "header.language_aria" | t }}">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M1.5 8h13M8 1.5c1.7 1.8 2.6 4.1 2.6 6.5s-.9 4.7-2.6 6.5M8 1.5C6.3 3.3 5.4 5.6 5.4 8s.9 4.7 2.6 6.5"/></svg>
+                        <span class="lang-switch-code">{{ page.language | upper }}</span>
+                        <svg class="lang-switch-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                    </summary>
+                    <ul class="lang-switch-menu">
+                        {% for tr in page.translations %}
+                        <li><a href="{{ base_url }}{{ tr.url }}" lang="{{ tr.code }}" hreflang="{{ tr.code }}"{% if tr.is_current %} class="current" aria-current="true"{% endif %}>{% if tr.code == "ko" %}한국어{% else %}English{% endif %}</a></li>
+                        {% endfor %}
+                    </ul>
+                </details>
+                {% endif %}
+                <a href="https://github.com/hahwul/hwaro" class="github-link" target="_blank" rel="noopener" aria-label="Hwaro on GitHub">
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
                     </svg>
-                    GitHub
                 </a>
             </nav>
         </header>
 
-        <main>
+        <main class="landing">
+            <!-- ============================================================
+                 HERO - immersive: brazier art + embers behind centered copy
+                 ============================================================ -->
             <section class="hero">
-                <div class="hero-badge">
-                    <span>Static Site Generator</span>
+                <div class="hero-bg" aria-hidden="true">
+                    <canvas id="ember-canvas"></canvas>
                 </div>
-                <h1>
-                    Fast by default.<br /><span class="highlight"
-                        >Yours by design.</span
-                    >
-                </h1>
-                <p>
-                    No themes, no lock-in. <br />
-                    Your content, your structure, your speed.
-                </p>
-                <div class="hero-buttons">
-                    <a href="{{ base_url }}/start/" class="btn btn-primary">
-                        <svg viewBox="0 0 24 24">
-                            <path
-                                d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74 0-3.86-3.14-7-7-7z"
-                            />
-                        </svg>
-                        Quick Start
-                    </a>
-                    <a
-                        href="https://github.com/hahwul/hwaro"
-                        class="btn btn-secondary"
-                        target="_blank"
-                        rel="noopener"
-                    >
-                        <svg viewBox="0 0 24 24">
-                            <path
-                                d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"
-                            />
-                        </svg>
-                        View on GitHub
-                    </a>
+                <div class="hero-content">
+                    <h1>
+                        {{ "landing.hero_title_1" | t }}<br />
+                        <span class="highlight">{{ "landing.hero_title_2" | t }}</span>
+                    </h1>
+                    <p class="hero-sub">
+                        {{ "landing.hero_sub" | t }}
+                    </p>
+                    <div class="hero-actions">
+                        <a href="{{ base_url }}{{ lang_prefix }}/start/" class="btn btn-primary">{{ "landing.get_started" | t }}</a>
+                        <button type="button" class="hero-install" id="hero-install" data-command="brew install hahwul/hwaro/hwaro">
+                            <code>$ brew install hahwul/hwaro/hwaro</code>
+                            <svg class="copy-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                            <svg class="check-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12.5l5 5 11-11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            <span class="visually-hidden">{{ "landing.copy_install" | t }}</span>
+                        </button>
+                    </div>
                 </div>
             </section>
 
-            <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 200 200"
-                width="400px"
-                height="100%"
-                style="display: block; margin: 0 auto"
-            >
-                <defs>
-                    <filter
-                        id="fire-wobble"
-                        x="-20%"
-                        y="-20%"
-                        width="140%"
-                        height="140%"
-                    >
-                        <feTurbulence
-                            type="fractalNoise"
-                            baseFrequency="0.04 0.08"
-                            numOctaves="2"
-                            result="noise"
+            <!-- ============================================================
+                 SPEED - the measured build, replayed in real time
+                 ============================================================ -->
+            <section class="speed reveal" id="speed">
+                <div class="lp-wrap">
+                    <div class="speed-header">
+                        <h2>{{ "landing.speed_title" | t }}</h2>
+                        <p>
+                            {% if page.language == "ko" %}
+                            공개 <a href="https://hahwul.github.io/ssg-benchmark/" target="_blank" rel="noopener">SSG 벤치마크</a>의
+                            minimal 워크로드(순수 마크다운 → HTML) 기준 콜드 빌드 중앙값입니다.
+                            {% else %}
+                            Median cold build on the open
+                            <a href="https://hahwul.github.io/ssg-benchmark/" target="_blank" rel="noopener">SSG benchmark</a>,
+                            minimal workload: pure markdown to HTML.
+                            {% endif %}
+                        </p>
+                    </div>
+
+                    <div class="speed-stage">
+                        <p class="speed-figure" aria-hidden="true">
+                            <span class="speed-number">0.00</span><span class="speed-unit">s</span>
+                        </p>
+                        <div
+                            class="speed-track"
+                            role="img"
+                            aria-label="{{ "landing.speed_aria" | t }}"
                         >
-                            <animate
-                                attributeName="baseFrequency"
-                                values="0.04 0.08; 0.05 0.12; 0.04 0.08"
-                                dur="2.5s"
-                                repeatCount="indefinite"
-                            />
-                        </feTurbulence>
-                        <feDisplacementMap
-                            in="SourceGraphic"
-                            in2="noise"
-                            scale="2.5"
-                            xChannelSelector="R"
-                            yChannelSelector="G"
-                        />
-                    </filter>
-
-                    <style>
-                        /* 붉은 영역이 숨을 쉬듯 커졌다 작아지는 펄스 애니메이션 */
-                        .fire-pulse {
-                            transform-origin: center 144px; /* 화살창 바닥을 기준으로 스케일링 */
-                            animation: pulse 1.5s infinite alternate ease-in-out;
-                        }
-                        @keyframes pulse {
-                            0% {
-                                transform: scaleY(1);
-                                opacity: 0.92;
-                            }
-                            100% {
-                                transform: scaleY(1.03);
-                                opacity: 1;
-                            }
-                        }
-
-                        /* 불티(Sparks) 애니메이션 */
-                        .spark {
-                            animation-timing-function: ease-in;
-                            animation-iteration-count: infinite;
-                        }
-                        .spark-1 {
-                            animation-name: flyUp1;
-                            animation-duration: 2s;
-                        }
-                        .spark-2 {
-                            animation-name: flyUp2;
-                            animation-duration: 2.5s;
-                            animation-delay: 0.5s;
-                        }
-                        .spark-3 {
-                            animation-name: flyUp3;
-                            animation-duration: 1.8s;
-                            animation-delay: 1.2s;
-                        }
-
-                        @keyframes flyUp1 {
-                            0% {
-                                transform: translateY(0);
-                                opacity: 0;
-                            }
-                            50% {
-                                opacity: 0.8;
-                            }
-                            100% {
-                                transform: translateY(-40px);
-                                opacity: 0;
-                            }
-                        }
-                        @keyframes flyUp2 {
-                            0% {
-                                transform: translateY(0);
-                                opacity: 0;
-                            }
-                            50% {
-                                opacity: 1;
-                            }
-                            100% {
-                                transform: translateY(-50px);
-                                opacity: 0;
-                            }
-                        }
-                        @keyframes flyUp3 {
-                            0% {
-                                transform: translateY(0);
-                                opacity: 0;
-                            }
-                            50% {
-                                opacity: 0.9;
-                            }
-                            100% {
-                                transform: translateY(-45px);
-                                opacity: 0;
-                            }
-                        }
-                    </style>
-                </defs>
-
-                <rect x="48" y="34" width="104" height="10" fill="#7A7B7E" />
-                <path
-                    d="M 28 150 L 28 54 L 172 54 L 172 150 L 154 150 L 154 72 L 46 72 L 46 150 Z"
-                    fill="#7A7B7E"
-                />
-                <rect x="28" y="160" width="144" height="10" fill="#7A7B7E" />
-
-                <g class="fire-pulse" filter="url(#fire-wobble)">
-                    <rect
-                        x="50"
-                        y="76"
-                        width="100"
-                        height="68"
-                        fill="#ED1C24"
-                    />
-                    <path
-                        d="M 50 76 L 150 76 L 150 84 L 58 84 L 58 144 L 50 144 Z"
-                        fill="#BE1622"
-                    />
-                </g>
-
-                <g>
-                    <circle
-                        cx="70"
-                        cy="130"
-                        r="1.5"
-                        fill="#FFD54F"
-                        class="spark spark-1"
-                        opacity="0"
-                    />
-                    <circle
-                        cx="100"
-                        cy="135"
-                        r="2"
-                        fill="#FFA000"
-                        class="spark spark-2"
-                        opacity="0"
-                    />
-                    <circle
-                        cx="130"
-                        cy="125"
-                        r="1.5"
-                        fill="#FFD54F"
-                        class="spark spark-3"
-                        opacity="0"
-                    />
-                </g>
-
-                <rect x="50" y="124" width="100" height="8" fill="#FFFFFF" />
-                <path
-                    d="M50 124 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12"
-                    fill="#FFFFFF"
-                />
-                <path
-                    d="M56 132 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12 h6 v12 h5.75 v-12"
-                    fill="#FFFFFF"
-                />
-            </svg>
-
-            <section class="features">
-                <div class="features-header">
-                    <h2>Features</h2>
-                </div>
-                <div class="features-grid">
-                    <div class="feature-card">
-                        <h3>blazing_fast</h3>
-                        <p>
-                            Built with Crystal for incredible performance.
-                            Parallel processing and smart caching make builds
-                            lightning quick.
-                        </p>
-                    </div>
-                    <div class="feature-card">
-                        <h3>markdown_first</h3>
-                        <p>
-                            Write content in Markdown with TOML front matter.
-                            Syntax highlighting included out of the box.
-                        </p>
-                    </div>
-                    <div class="feature-card">
-                        <h3>flexible_templates</h3>
-                        <p>
-                            Customizable Jinja2 templates with includes,
-                            inheritance, and full control over your site's
-                            design.
-                        </p>
-                    </div>
-                    <div class="feature-card">
-                        <h3>built_in_seo</h3>
-                        <p>
-                            Automatic sitemap, robots.txt, RSS/Atom feeds, and
-                            OpenGraph meta tags generation.
-                        </p>
-                    </div>
-                    <div class="feature-card">
-                        <h3>taxonomies</h3>
-                        <p>
-                            Organize content with tags, categories, and custom
-                            taxonomies. Automatic index page generation.
-                        </p>
-                    </div>
-                    <div class="feature-card">
-                        <h3>extensible</h3>
-                        <p>
-                            Lifecycle hooks, custom processors, and build hooks
-                            for complete customization.
-                        </p>
-                    </div>
-                </div>
-            </section>
-
-            <section class="code-section">
-                <div class="code-block">
-                    <div class="code-header">
-                        <div class="code-dots">
-                            <span class="code-dot red"></span>
-                            <span class="code-dot yellow"></span>
-                            <span class="code-dot green"></span>
+                            <span class="speed-fill"></span>
                         </div>
-                        <span>terminal</span>
+                        <p class="speed-caption">
+                            <span>{{ "landing.speed_caption" | t }}</span>
+                            <button type="button" class="speed-replay">&#8635; {{ "landing.replay" | t }}</button>
+                        </p>
                     </div>
-                    <div class="code-content">
-                        <pre><span class="comment"># Create a new project</span>
-<span class="prompt">$</span> <span class="command">hwaro init my-site --scaffold docs</span>
 
-<span class="comment"># Start development server</span>
-<span class="prompt">$</span> <span class="command">cd my-site && hwaro serve</span>
+                    <ul class="speed-modes">
+                        <li>
+                            <span class="mode-name">minimal</span>
+                            <span class="mode-desc">{{ "landing.mode_minimal" | t }}</span>
+                            <span class="mode-time">0.44s</span>
+                        </li>
+                        <li>
+                            <span class="mode-name">blog</span>
+                            <span class="mode-desc">{{ "landing.mode_blog" | t }}</span>
+                            <span class="mode-time">0.59s</span>
+                        </li>
+                        <li>
+                            <span class="mode-name">heavy</span>
+                            <span class="mode-desc">{{ "landing.mode_heavy" | t }}</span>
+                            <span class="mode-time">1.50s</span>
+                        </li>
+                    </ul>
+                </div>
+            </section>
 
-<span class="comment"># Build for production</span>
-<span class="prompt">$</span> <span class="command">hwaro build --minify</span></pre>
+            <!-- ============================================================
+                 FEATURES - bento, six cells, no holes
+                 ============================================================ -->
+            <section class="bento reveal" id="features">
+                <div class="lp-wrap">
+                    <div class="section-header">
+                        <h2>{{ "landing.features_title" | t }}</h2>
+                        <p>{{ "landing.features_sub" | t }}</p>
+                    </div>
+                    <div class="bento-grid">
+                        <article class="bento-cell cell-seo">
+                            <h3>built_in_seo</h3>
+                            <p>
+                                {{ "landing.seo_desc" | t }}
+                            </p>
+                            <div class="og-fan" aria-hidden="true">
+                                {% set fan = resize_image(path="/images/og-style-examples/style-terminal.png", width=640) %}
+                                <img src="{{ fan.url }}" alt="" width="640" height="336" loading="lazy" decoding="async" />
+                                {% set fan = resize_image(path="/images/og-style-examples/style-bauhaus.png", width=640) %}
+                                <img src="{{ fan.url }}" alt="" width="640" height="336" loading="lazy" decoding="async" />
+                                {% set fan = resize_image(path="/images/og-style-examples/style-editorial.png", width=640) %}
+                                <img src="{{ fan.url }}" alt="" width="640" height="336" loading="lazy" decoding="async" />
+                            </div>
+                        </article>
+                        <article class="bento-cell cell-fast">
+                            <h3>blazing_fast</h3>
+                            <p>
+                                {{ "landing.fast_desc" | t }}
+                            </p>
+                        </article>
+                        <article class="bento-cell cell-markdown">
+                            <h3>markdown_first</h3>
+                            <p>{{ "landing.markdown_desc" | t }}</p>
+                            <pre aria-hidden="true"><code class="hljs"><span class="hljs-section">+++</span>
+<span class="hljs-attr">title</span> = <span class="hljs-string">"Hello"</span>
+<span class="hljs-attr">tags</span> = [<span class="hljs-string">"crystal"</span>]
+<span class="hljs-attr">toc</span> = <span class="hljs-literal">true</span>
+<span class="hljs-section">+++</span></code></pre>
+                        </article>
+                        <article class="bento-cell cell-templates">
+                            <h3>flexible_templates</h3>
+                            <p>
+                                {{ "landing.templates_desc" | t }}
+                            </p>
+                        </article>
+                        <article class="bento-cell cell-taxonomies">
+                            <h3>taxonomies</h3>
+                            <p>
+                                {{ "landing.taxonomies_desc" | t }}
+                            </p>
+                        </article>
+                        <article class="bento-cell cell-extensible">
+                            <h3>extensible</h3>
+                            <p>
+                                {{ "landing.extensible_desc" | t }}
+                            </p>
+                        </article>
                     </div>
                 </div>
             </section>
-        </main>
 
-        <footer class="landing-footer">
-            <p>
-                Built with ❤️ using
-                <a
-                    href="https://crystal-lang.org"
-                    target="_blank"
-                    rel="noopener"
-                    >Crystal</a
-                >
-                ·
-                <a
-                    href="https://github.com/hahwul/hwaro"
-                    target="_blank"
-                    rel="noopener"
-                    >GitHub</a
-                >
-            </p>
-            <p>
-                <a href="https://www.hahwul.com" target="_blank" rel="noopener"
-                    ><img src="/images/hahwul.webp" class="hahwul-img"
-                /></a>
-            </p>
-        </footer>
+            <!-- ============================================================
+                 SCAFFOLDS - five starting points, scroll-snap rail
+                 ============================================================ -->
+            <section class="scaffolds reveal" id="scaffolds">
+                <div class="lp-wrap">
+                    <div class="section-header">
+                        <h2>{{ "landing.scaffolds_title" | t }}</h2>
+                        <p>
+                            {{ "landing.scaffolds_sub" | t }}
+                        </p>
+                    </div>
+                </div>
+                <div class="scaffold-rail" tabindex="0">
+                    {% set scaffolds = [
+                        ["docs", "landing.scaffold_docs" | t],
+                        ["blog", "landing.scaffold_blog" | t],
+                        ["book", "landing.scaffold_book" | t],
+                        ["simple", "landing.scaffold_simple" | t],
+                        ["bare", "landing.scaffold_bare" | t]
+                    ] %}
+                    {% for s in scaffolds %}
+                    {% set shot = resize_image(path="/images/scaffolds/scaffold-" ~ s[0] ~ ".png", width=640) %}
+                    <figure class="scaffold-card">
+                        <img
+                            src="{{ shot.url }}"
+                            alt="The {{ s[0] }} scaffold rendered in a browser"
+                            width="640"
+                            height="400"
+                            loading="lazy"
+                            decoding="async"
+                            style="background-color: {{ shot.dominant_color }}"
+                        />
+                        <figcaption>
+                            <code>hwaro init my-site --scaffold {{ s[0] }}</code>
+                            <span>{{ s[1] }}</span>
+                        </figcaption>
+                    </figure>
+                    {% endfor %}
+                </div>
+            </section>
+
+            <!-- ============================================================
+                 OG STYLES - one slow marquee of real build output
+                 ============================================================ -->
+            <section class="ogband reveal" id="og-styles">
+                <div class="lp-wrap">
+                    <div class="section-header">
+                        <h2>{{ "landing.og_title" | t }}</h2>
+                        <p>
+                            {% if page.language == "ko" %}
+                            브라우저나 외부 서비스 없이 모든 페이지에 Open Graph
+                            이미지가 만들어집니다. 19가지 스타일은
+                            <a href="{{ base_url }}/ko/features/og-images/">자동 OG 이미지</a>
+                            문서에서 확인할 수 있습니다.
+                            {% else %}
+                            Every page gets an Open Graph image without a
+                            browser or an external service.
+                            <a href="{{ base_url }}/features/og-images/">Auto OG Images</a>
+                            covers all nineteen styles.
+                            {% endif %}
+                        </p>
+                    </div>
+                </div>
+                {% set og_styles = ["terminal", "minimal", "gradient", "brutalist", "bauhaus", "editorial", "halftone", "grid", "dots", "waves", "diagonal", "split", "framed", "hero", "monument", "artistic", "band", "surreal", "default"] %}
+                <div class="og-marquee" aria-label="{{ "landing.og_aria" | t }}">
+                    <div class="og-track">
+                        {% for s in og_styles %}
+                        {% set card = resize_image(path="/images/og-style-examples/style-" ~ s ~ ".png", width=640) %}
+                        <img src="{{ card.url }}" alt="OG image style: {{ s }}" width="640" height="336" loading="lazy" decoding="async" style="background-color: {{ card.dominant_color }}" />
+                        {% endfor %}
+                        {% for s in og_styles %}
+                        {% set card = resize_image(path="/images/og-style-examples/style-" ~ s ~ ".png", width=640) %}
+                        <img src="{{ card.url }}" alt="" aria-hidden="true" width="640" height="336" loading="lazy" decoding="async" style="background-color: {{ card.dominant_color }}" />
+                        {% endfor %}
+                    </div>
+                </div>
+            </section>
+
+            <!-- ============================================================
+                 SHOWCASE - real sites from the examples gallery
+                 ============================================================ -->
+            <section class="showcase reveal" id="showcase">
+                <div class="lp-wrap">
+                    <div class="section-header">
+                        <h2>{{ "landing.showcase_title" | t }}</h2>
+                        <p>
+                            {% if page.language == "ko" %}
+                            <a href="https://examples.hwaro.hahwul.com" target="_blank" rel="noopener">예제 갤러리</a>의
+                            사이트들. 전부 실제 빌드 결과물입니다.
+                            {% else %}
+                            Sites from the
+                            <a href="https://examples.hwaro.hahwul.com" target="_blank" rel="noopener">examples gallery</a>,
+                            each one a real build.
+                            {% endif %}
+                        </p>
+                    </div>
+                    <div class="showcase-grid">
+                        {% set examples = [
+                            ["seoulnight", "landing"],
+                            ["burin", "portfolio"],
+                            ["jasper", "docs"],
+                            ["gloaming", "blog"],
+                            ["starship", "wiki"],
+                            ["dansaekhwa", "gallery"]
+                        ] %}
+                        {% for ex in examples %}
+                        <a
+                            href="https://hahwul.github.io/hwaro-examples/{{ ex[0] }}/"
+                            class="showcase-card"
+                            target="_blank"
+                            rel="noopener"
+                        >
+                            <span class="showcase-preview">
+                                <img
+                                    src="https://examples.hwaro.hahwul.com/screenshots/{{ ex[0] }}.png"
+                                    alt="Screenshot of the {{ ex[0] }} example site"
+                                    loading="lazy"
+                                    decoding="async"
+                                />
+                            </span>
+                            <span class="showcase-info">
+                                <span class="showcase-name">{{ ex[0] }}</span>
+                                <span class="showcase-tag">{{ ex[1] }}</span>
+                            </span>
+                        </a>
+                        {% endfor %}
+                    </div>
+                </div>
+            </section>
+
+            <!-- ============================================================
+                 CLOSER - install and go
+                 ============================================================ -->
+            <section class="get-started reveal" id="install-hwaro">
+                <div class="lp-wrap">
+                    <h2>{{ "landing.closer_title" | t }}</h2>
+                    <p>{{ "landing.closer_sub" | t }}</p>
+                    <div class="install" id="install">
+                        <div class="install-tabs" role="tablist" aria-label="{{ "landing.install_method" | t }}">
+                            <button type="button" role="tab" aria-selected="true" data-command="brew install hahwul/hwaro/hwaro">Homebrew</button>
+                            <button type="button" role="tab" aria-selected="false" data-command="sudo snap install hwaro">Snap</button>
+                            <button type="button" role="tab" aria-selected="false" data-command="yay -S hwaro">AUR</button>
+                            <button type="button" role="tab" aria-selected="false" data-command="nix profile install github:hahwul/hwaro">Nix</button>
+                        </div>
+                        <div class="install-cmd">
+                            <code id="install-command">brew install hahwul/hwaro/hwaro</code>
+                            <button type="button" class="install-copy" id="install-copy" aria-label="{{ "landing.copy_command" | t }}">
+                                <svg class="copy-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                                <svg class="check-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12.5l5 5 11-11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </button>
+                        </div>
+                        <p class="install-more">
+                            <a href="{{ base_url }}{{ lang_prefix }}/start/installation/">{{ "landing.install_more" | t }} &rarr;</a>
+                        </p>
+                    </div>
+                    <a href="{{ base_url }}{{ lang_prefix }}/start/" class="btn btn-primary">{{ "landing.get_started" | t }}</a>
+                </div>
+            </section>
+
+            <div class="lp-wrap">
+                {% include "site-footer.html" %}
+            </div>
+        </main>
         {{ auto_includes_js }}
+        <script>
+        // Ember particles rising from the hero art. Skipped entirely under
+        // prefers-reduced-motion; rAF pauses on hidden tabs by itself.
+        (function() {
+            var reduce = window.matchMedia &&
+                window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            var canvas = document.getElementById('ember-canvas');
+            if (!canvas || reduce) return;
+            var ctx = canvas.getContext('2d');
+            var host = canvas.parentElement;
+            var embers = [];
+            var MAX = 40;
+
+            function resize() {
+                canvas.width = host.offsetWidth;
+                canvas.height = host.offsetHeight;
+            }
+            resize();
+            window.addEventListener('resize', resize);
+
+            function Ember() {
+                this.reset();
+                this.y = Math.random() * canvas.height;
+            }
+
+            Ember.prototype.reset = function() {
+                this.x = Math.random() * canvas.width;
+                this.y = canvas.height + 4;
+                this.r = Math.random() * 2.2 + 0.8;
+                this.vx = (Math.random() - 0.5) * 0.6;
+                this.vy = -(Math.random() * 1.2 + 0.4);
+                this.life = 1;
+                this.decay = Math.random() * 0.008 + 0.003;
+                this.drift = Math.random() * 0.3 + 0.1;
+                this.wobble = Math.random() * Math.PI * 2;
+                var hue = Math.random();
+                if (hue < 0.5) {
+                    this.color = [255, 160 + Math.random() * 60 | 0, 30 + Math.random() * 30 | 0];
+                } else if (hue < 0.8) {
+                    this.color = [255, 80 + Math.random() * 60 | 0, 20 + Math.random() * 20 | 0];
+                } else {
+                    this.color = [255, 220 + Math.random() * 35 | 0, 80 + Math.random() * 60 | 0];
+                }
+            };
+
+            Ember.prototype.update = function() {
+                this.wobble += 0.04;
+                this.x += this.vx + Math.sin(this.wobble) * this.drift;
+                this.y += this.vy;
+                this.life -= this.decay;
+                if (this.life <= 0 || this.y < -10 || this.x < -10 || this.x > canvas.width + 10) {
+                    this.reset();
+                }
+            };
+
+            Ember.prototype.draw = function(ctx) {
+                var a = this.life * 0.65;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.r * this.life, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(' + this.color[0] + ',' + this.color[1] + ',' + this.color[2] + ',' + a + ')';
+                ctx.shadowColor = 'rgba(' + this.color[0] + ',' + this.color[1] + ',' + this.color[2] + ',' + (a * 0.5) + ')';
+                ctx.shadowBlur = this.r * 5;
+                ctx.fill();
+            };
+
+            for (var i = 0; i < MAX; i++) {
+                embers.push(new Ember());
+            }
+
+            function loop() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                for (var i = 0; i < embers.length; i++) {
+                    embers[i].update();
+                    embers[i].draw(ctx);
+                }
+                ctx.shadowBlur = 0;
+                ctx.shadowColor = 'transparent';
+                requestAnimationFrame(loop);
+            }
+            loop();
+        })();
+        </script>
+        <script>
+        // Install tabs + clipboard, shared by the hero one-liner and the
+        // closer's tabbed picker.
+        (function() {
+            function copyText(text, onDone) {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(onDone, function() {});
+                } else {
+                    var ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.setAttribute('readonly', '');
+                    ta.style.position = 'absolute';
+                    ta.style.left = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { document.execCommand('copy'); onDone(); } catch (e) {}
+                    document.body.removeChild(ta);
+                }
+            }
+
+            function flash(el) {
+                el.classList.add('is-copied');
+                clearTimeout(el._copyTimer);
+                el._copyTimer = setTimeout(function() {
+                    el.classList.remove('is-copied');
+                }, 1600);
+            }
+
+            var heroInstall = document.getElementById('hero-install');
+            if (heroInstall) {
+                heroInstall.addEventListener('click', function() {
+                    copyText(heroInstall.getAttribute('data-command'), function() {
+                        flash(heroInstall);
+                    });
+                });
+            }
+
+            var install = document.getElementById('install');
+            if (!install) return;
+            var tabs = install.querySelectorAll('[role="tab"]');
+            var cmdEl = document.getElementById('install-command');
+            var copyBtn = document.getElementById('install-copy');
+
+            for (var i = 0; i < tabs.length; i++) {
+                tabs[i].addEventListener('click', function() {
+                    for (var j = 0; j < tabs.length; j++) {
+                        tabs[j].setAttribute('aria-selected', 'false');
+                    }
+                    this.setAttribute('aria-selected', 'true');
+                    cmdEl.textContent = this.getAttribute('data-command');
+                });
+            }
+
+            copyBtn.addEventListener('click', function() {
+                copyText(cmdEl.textContent.trim(), function() {
+                    flash(copyBtn);
+                });
+            });
+        })();
+        </script>
+        <script>
+        // Scroll reveals + the benchmark chart replayed in real time.
+        // Honors prefers-reduced-motion.
+        (function() {
+            var reduce = window.matchMedia &&
+                window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+            // The speed stage replays the actual measured build: the bar
+            // fills in exactly MS milliseconds (the median 1,000-page minimal
+            // build) while the counter tracks real elapsed time.
+            function runSpeed(section) {
+                var MS = 443;
+                var fill = section.querySelector('.speed-fill');
+                var num = section.querySelector('.speed-number');
+                var stage = section.querySelector('.speed-stage');
+                if (!fill || !num || !stage) return;
+                var running = false;
+
+                function play() {
+                    if (running) return;
+                    if (reduce) {
+                        num.textContent = (MS / 1000).toFixed(2);
+                        fill.style.transform = 'scaleX(1)';
+                        stage.classList.add('is-done');
+                        return;
+                    }
+                    running = true;
+                    stage.classList.remove('is-done');
+                    fill.style.transition = 'none';
+                    fill.style.transform = 'scaleX(0)';
+                    void fill.offsetWidth; /* flush the reset */
+                    fill.style.transition = 'transform ' + MS + 'ms linear';
+                    fill.style.transform = 'scaleX(1)';
+                    var t0 = null;
+                    function step(ts) {
+                        if (t0 === null) t0 = ts;
+                        var p = Math.min((ts - t0) / MS, 1);
+                        num.textContent = ((MS * p) / 1000).toFixed(2);
+                        if (p < 1) {
+                            requestAnimationFrame(step);
+                        } else {
+                            stage.classList.add('is-done');
+                            running = false;
+                        }
+                    }
+                    requestAnimationFrame(step);
+                }
+
+                var replay = section.querySelector('.speed-replay');
+                if (replay) replay.addEventListener('click', play);
+                play();
+            }
+
+            var reveals = document.querySelectorAll('.reveal');
+
+            function show(el) {
+                el.classList.add('is-visible');
+                if (el.classList.contains('speed')) runSpeed(el);
+            }
+
+            if (reduce || !('IntersectionObserver' in window)) {
+                for (var i = 0; i < reveals.length; i++) show(reveals[i]);
+                return;
+            }
+
+            var io = new IntersectionObserver(function(entries) {
+                entries.forEach(function(e) {
+                    if (!e.isIntersecting) return;
+                    show(e.target);
+                    io.unobserve(e.target);
+                });
+            }, { threshold: 0.15, rootMargin: '0px 0px -8% 0px' });
+
+            for (var j = 0; j < reveals.length; j++) io.observe(reveals[j]);
+        })();
+        </script>
     </body>
 </html>

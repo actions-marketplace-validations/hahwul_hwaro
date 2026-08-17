@@ -28,14 +28,21 @@ module Hwaro
           @@manifest_mutex.synchronize { @@manifest }
         end
 
+        # Replace the class-level manifest (serve-mode SCSS/asset recompile).
+        # Full builds go through process_assets; this keeps fingerprint paths
+        # in sync when only static files changed.
+        def self.replace_manifest(manifest : Hash(String, String))
+          @@manifest_mutex.synchronize { @@manifest = manifest }
+        end
+
         private def process_assets(ctx : Core::Lifecycle::BuildContext)
           config = ctx.config
           return unless config && config.assets.enabled
 
-          pipeline = Assets::Pipeline.new(config.assets, config.base_url)
+          pipeline = Assets::Pipeline.new(config.assets, config.base_url, config.sass.enabled)
           pipeline.process(ctx.output_dir)
 
-          @@manifest_mutex.synchronize { @@manifest = pipeline.manifest }
+          AssetHooks.replace_manifest(pipeline.manifest)
 
           if pipeline.manifest.size > 0
             Logger.info "  Assets: #{pipeline.manifest.size} bundle(s) processed."

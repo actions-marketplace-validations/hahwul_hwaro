@@ -1,6 +1,7 @@
 require "json"
 require "../../models/config"
 require "../../models/page"
+require "../processors/internal_link_resolver"
 
 module Hwaro
   module Content
@@ -8,18 +9,41 @@ module Hwaro
       module JsonLd
         extend self
 
+        # Join `path` onto `base` as a root-relative absolute URL.
+        private def abs_path(base : String, path : String) : String
+          "#{base}#{path.starts_with?("/") ? path : "/#{path}"}"
+        end
+
+        # Like abs_path, but leaves a value that already carries its own origin
+        # (any `scheme:` URL, or a protocol-relative `//host/…`) untouched.
+        private def abs_or_external(base : String, value : String) : String
+          Processors::InternalLinkResolver.has_own_origin?(value) ? value : abs_path(base, value)
+        end
+
         # Generate Article JSON-LD for a page
-        def article(page : Models::Page, config : Models::Config) : String
+        def article(page : Models::Page, config : Models::Config, site : Models::Site? = nil) : String
           base = config.base_url_stripped
-          url = page.permalink || "#{base}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+          url = page.permalink || abs_path(base, page.url)
 
           date_published = page.date.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z"))
           updated_str = page.updated.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z"))
           desc = page.description
           image_url = if image = page.image
-                        image.starts_with?("http") ? image : "#{base}#{image.starts_with?("/") ? image : "/#{image}"}"
+                        abs_or_external(base, image)
                       end
+          # Prefer the resolved display name from site.authors (data/authors
+          # enrichment) so the schema.org author matches the visible author name
+          # used on /authors/ pages, not the raw frontmatter id. Falls back to the
+          # raw value when no data entry (or no site) is available.
           author_name = page.authors.first?
+          if (raw_id = author_name) && (s = site)
+            if author = s.authors[raw_id.strip.downcase]?
+              author_raw = author.raw
+              if author_raw.is_a?(Hash) && (name_val = author_raw["name"]?)
+                author_name = name_val.to_s
+              end
+            end
+          end
 
           json = JSON.build do |j|
             j.object do
@@ -53,23 +77,54 @@ module Hwaro
           wrap_script(json)
         end
 
+        # Generate CollectionPage JSON-LD for listing pages (section indexes,
+        # taxonomy index/term pages, author term pages). These are collections,
+        # not articles, so they use schema.org CollectionPage with a `name`
+        # instead of Article/`headline`, keeping JSON-LD consistent with the
+        # og:type="website" emitted on the same page (gh#522 follow-up).
+        def collection_page(page : Models::Page, config : Models::Config, url_override : String? = nil) : String
+          base = config.base_url_stripped
+          url = if u = url_override
+                  abs_path(base, u)
+                else
+                  page.permalink || abs_path(base, page.url)
+                end
+
+          json = JSON.build do |j|
+            j.object do
+              j.field "@context", "https://schema.org"
+              j.field "@type", "CollectionPage"
+              j.field "name", page.title
+              j.field "url", url
+              if (d = page.description) && !d.empty?
+                j.field "description", d
+              end
+            end
+          end
+
+          wrap_script(json)
+        end
+
         # Generate BreadcrumbList JSON-LD from page ancestors
         def breadcrumb(page : Models::Page, config : Models::Config) : String
           base = config.base_url_stripped
 
           items = [] of Hash(String, String | Int32)
 
-          # Home
+          # Home — language-prefixed so a non-default-language page's Home crumb
+          # points at the localized homepage (/ko/, /ja/) rather than the
+          # default-language root, matching the localized ancestor crumbs below.
+          lang_prefix = (l = page.language) && l != config.default_language && config.multilingual? ? "/#{l}" : ""
           items << {
             "@type"    => "ListItem",
             "position" => 1,
             "name"     => config.title,
-            "item"     => "#{base}/",
+            "item"     => "#{base}#{lang_prefix}/",
           }
 
           # Ancestors
           page.ancestors.each_with_index do |ancestor, idx|
-            ancestor_url = "#{base}#{ancestor.url.starts_with?("/") ? ancestor.url : "/#{ancestor.url}"}"
+            ancestor_url = abs_path(base, ancestor.url)
             items << {
               "@type"    => "ListItem",
               "position" => idx + 2,
@@ -85,16 +140,16 @@ module Hwaro
             "name"     => page.title,
           }
 
-          json = JSON.build do |json|
-            json.object do
-              json.field "@context", "https://schema.org"
-              json.field "@type", "BreadcrumbList"
-              json.field "itemListElement" do
-                json.array do
+          json = JSON.build do |j|
+            j.object do
+              j.field "@context", "https://schema.org"
+              j.field "@type", "BreadcrumbList"
+              j.field "itemListElement" do
+                j.array do
                   items.each do |item|
-                    json.object do
+                    j.object do
                       item.each do |k, v|
-                        json.field k, v
+                        j.field k, v
                       end
                     end
                   end
@@ -153,7 +208,7 @@ module Hwaro
           return "" if steps.empty?
 
           base = config.base_url_stripped
-          url = "#{base}#{page.url}"
+          url = abs_path(base, page.url)
 
           json = JSON.build do |j|
             j.object do
@@ -231,10 +286,10 @@ module Hwaro
               j.field "@type", "Person"
               j.field "name", name
               if u = url
-                j.field "url", u.starts_with?("http") ? u : "#{base}#{u.starts_with?("/") ? u : "/#{u}"}"
+                j.field "url", abs_or_external(base, u)
               end
               if img = image
-                j.field "image", img.starts_with?("http") ? img : "#{base}#{img.starts_with?("/") ? img : "/#{img}"}"
+                j.field "image", abs_or_external(base, img)
               end
             end
           end
@@ -257,7 +312,7 @@ module Hwaro
                 j.field "description", config.description
               end
               if logo_url = logo
-                j.field "logo", logo_url.starts_with?("http") ? logo_url : "#{base}#{logo_url.starts_with?("/") ? logo_url : "/#{logo_url}"}"
+                j.field "logo", abs_or_external(base, logo_url)
               end
             end
           end
@@ -292,7 +347,45 @@ module Hwaro
         end
 
         private def wrap_script(json : String) : String
-          %(<script type="application/ld+json">#{json.gsub("</", "<\\/")}</script>)
+          %(<script type="application/ld+json">#{escape_for_script(json)}</script>)
+        end
+
+        # Escape HTML-significant characters as `\uXXXX` so JSON can never
+        # break out of the surrounding `<script>` element. `<` etc. are
+        # valid JSON escapes that decode back to the original characters in
+        # any JSON parser, so the structured data stays intact. This mirrors
+        # Go's `encoding/json` HTML escaping and defends against both
+        # `</script>` injection and the "script data double escape" trap a
+        # bare `<!--<script` would otherwise spring (gh: dogfooding find).
+        private def escape_for_script(json : String) : String
+          # U+2028/U+2029 are valid in JSON strings but are JS line terminators;
+          # escaping them (as Go's encoding/json does) keeps the JSON-LD payload
+          # parseable by stricter/older consumers embedding it in inline script.
+          json.gsub('<', "\\u003c").gsub('>', "\\u003e").gsub('&', "\\u0026")
+            .gsub('\u2028', "\\u2028").gsub('\u2029', "\\u2029")
+        end
+
+        # Coerce a `page.extra[key]` value to `Array(String)` regardless of whether
+        # the parser produced `Array(String)` (all-strings case) or `Array(ExtraValue)`
+        # (mixed case). Non-string elements are filtered out.
+        private def extra_string_array(page : Models::Page, key : String) : Array(String)?
+          case raw = page.extra[key]?
+          when Array(String)
+            raw
+          when Array
+            raw.compact_map { |v| v.as?(String) }
+          end
+        end
+
+        # Read an array-of-tables `extra` value. A TOML `[[extra.faq]]` block (or
+        # equivalent JSON/YAML array of objects) parses to Array(ExtraValue) whose
+        # elements are Hash(String, ExtraValue); the flat-string helper above
+        # discards those. Returns nil when the value isn't a non-empty hash array.
+        private def extra_hash_array(page : Models::Page, key : String) : Array(Hash(String, Models::ExtraValue))?
+          raw = page.extra[key]?
+          return unless raw.is_a?(Array)
+          out = raw.compact_map { |v| v.as?(Hash(String, Models::ExtraValue)) }
+          out.empty? ? nil : out
         end
 
         private def extract_faq_items(page : Models::Page) : Array(NamedTuple(question: String, answer: String))
@@ -300,24 +393,30 @@ module Hwaro
 
           # Parse from page content: look for ## Q: ... / A: ... pattern
           # or from extra["faq"] if available as string pairs
-          if faq_raw = page.extra["faq"]?
-            case faq_raw
-            when Array(String)
-              # Pairs: ["Q1", "A1", "Q2", "A2"]
-              faq_raw.each_slice(2) do |pair|
-                if pair.size == 2
-                  items << {question: pair[0], answer: pair[1]}
-                end
+          if faq_pairs = extra_string_array(page, "faq")
+            # Pairs: ["Q1", "A1", "Q2", "A2"]
+            faq_pairs.each_slice(2) do |pair|
+              if pair.size == 2
+                items << {question: pair[0], answer: pair[1]}
               end
             end
           end
 
           # Also check faq_questions / faq_answers parallel arrays
-          if questions = page.extra["faq_questions"]?.try(&.as?(Array(String)))
-            if answers = page.extra["faq_answers"]?.try(&.as?(Array(String)))
+          if questions = extra_string_array(page, "faq_questions")
+            if answers = extra_string_array(page, "faq_answers")
               questions.zip(answers).each do |q, a|
                 items << {question: q, answer: a}
               end
+            end
+          end
+
+          # Table-array form documented above: [[extra.faq]] with question/answer.
+          if hash_items = extra_hash_array(page, "faq")
+            hash_items.each do |h|
+              q = h["question"]?.try(&.as?(String))
+              a = h["answer"]?.try(&.as?(String))
+              items << {question: q, answer: a} if q && a
             end
           end
 
@@ -327,24 +426,30 @@ module Hwaro
         private def extract_howto_steps(page : Models::Page) : Array(NamedTuple(name: String, text: String))
           steps = [] of NamedTuple(name: String, text: String)
 
-          if steps_raw = page.extra["howto_steps"]?
-            case steps_raw
-            when Array(String)
-              # Pairs: ["Step Name", "Step Text", ...]
-              steps_raw.each_slice(2) do |pair|
-                if pair.size == 2
-                  steps << {name: pair[0], text: pair[1]}
-                end
+          if steps_pairs = extra_string_array(page, "howto_steps")
+            # Pairs: ["Step Name", "Step Text", ...]
+            steps_pairs.each_slice(2) do |pair|
+              if pair.size == 2
+                steps << {name: pair[0], text: pair[1]}
               end
             end
           end
 
           # Also check howto_names / howto_texts parallel arrays
-          if names = page.extra["howto_names"]?.try(&.as?(Array(String)))
-            if texts = page.extra["howto_texts"]?.try(&.as?(Array(String)))
+          if names = extra_string_array(page, "howto_names")
+            if texts = extra_string_array(page, "howto_texts")
               names.zip(texts).each do |n, t|
                 steps << {name: n, text: t}
               end
+            end
+          end
+
+          # Table-array form documented above: [[extra.howto_steps]] name/text.
+          if hash_steps = extra_hash_array(page, "howto_steps")
+            hash_steps.each do |h|
+              n = h["name"]?.try(&.as?(String))
+              t = h["text"]?.try(&.as?(String))
+              steps << {name: n, text: t} if n && t
             end
           end
 

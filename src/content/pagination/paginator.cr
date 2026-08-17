@@ -119,7 +119,6 @@ module Hwaro
             has_next = page_num < total_pages
 
             # Generate URLs using section's paginate_path
-            current_url = page_url(base_url, page_num, paginate_path)
             prev_url = has_prev ? page_url(base_url, page_num - 1, paginate_path) : nil
             next_url = has_next ? page_url(base_url, page_num + 1, paginate_path) : nil
             first_url = page_url(base_url, 1, paginate_path)
@@ -150,8 +149,10 @@ module Hwaro
 
         # Check if pagination is enabled for a section
         private def pagination_enabled_for_section?(section : Models::Section) : Bool
-          # Section-level override takes precedence
-          if enabled = section.pagination_enabled
+          # Section-level override takes precedence. Distinguish an explicit
+          # `false` (disable) from `nil` (no override) — `if enabled = false`
+          # would treat a deliberate disable like "not set" and fall through.
+          unless (enabled = section.pagination_enabled).nil?
             return enabled
           end
 

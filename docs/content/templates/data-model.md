@@ -1,11 +1,11 @@
 +++
 title = "Data Model"
 description = "Site, Section, and Page data types available in templates"
-weight = 1
+weight = 2
 toc = true
 +++
 
-Hwaro's template system centers on three core types: **Site**, **Section**, and **Page**. Understanding their hierarchy is essential for building templates.
+Hwaro's template system centers on three core types: **Site**, **Section**, and **Page**. This page is a **template-side reference** — all properties and variables you can use when building templates. For how to write content and set front matter fields, see [Writing](/writing/).
 
 ## Hierarchy
 
@@ -46,6 +46,7 @@ The root container. Configured in `config.toml`.
 | site.taxonomies | Object | All taxonomy groups and terms |
 | site.data | Object | Data loaded from `data/` directory |
 | site.authors | Object | Aggregated author data |
+| site.menus | Object | Named menus for the **default language** (see [Menus](#menus)) |
 
 ### Flat Aliases
 
@@ -65,7 +66,11 @@ Hwaro allows you to store auxiliary data in the `data/` directory. Files ending 
 data/
 ├── authors.yml
 ├── products.json
-└── config.toml
+├── config.toml
+└── users/
+    ├── alice.yml
+    ├── bob.yml
+    └── cho.yml
 ```
 
 #### Accessing Data
@@ -89,6 +94,26 @@ Can be accessed in templates:
   <p>{{ product.price }}</p>
 {% endfor %}
 ```
+
+#### Subdirectories
+
+Subdirectories under `data/` become nested maps. Each file becomes a child keyed by its filename (without extension), and the parent directory itself is iterable.
+
+Given the layout above, `data/users/alice.yml`, `data/users/bob.yml`, and `data/users/cho.yml` are exposed as:
+
+- `site.data.users.alice`, `site.data.users.bob`, `site.data.users.cho` — individual file contents
+- `site.data.users` — a map you can iterate to list every user
+
+```jinja
+{% for name, user in site.data.users %}
+  <h3>{{ name }}</h3>
+  <p>{{ user.bio }}</p>
+{% endfor %}
+```
+
+Directories nest arbitrarily: `data/users/admins/root.yml` → `site.data.users.admins.root`.
+
+**Conflicts.** If a directory and a file share the same stem (e.g. `data/users.yml` alongside `data/users/`), the **directory wins** and the file is ignored. Hwaro emits a warning during the build so the shadowed file is not silently dropped.
 
 ### Site Authors
 
@@ -183,8 +208,8 @@ For the current section URL in `section.html`, use `page.url`.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| sort_by | String? | "date" | Sort by: date, weight, title |
-| reverse | Bool? | false | Reverse sort order |
+| sort_by | String? | "date" | Sort by: date (newest first), weight (lowest first), title (A→Z) |
+| reverse | Bool? | false | Flip the natural sort order — see [Writing › Sections › Sort direction](/writing/sections/#sort-direction) |
 | paginate | Int? | — | Pages per page |
 | transparent | Bool | false | Pass pages to parent |
 | generate_feeds | Bool | false | Generate RSS feed |
@@ -222,6 +247,19 @@ For simple listings, use the pre-rendered HTML:
 <ul>{{ section_list | safe }}</ul>
 ```
 
+For custom markup, iterate `section.pages` directly:
+
+```jinja
+<ul>
+{% for p in section.pages %}
+  <li>
+    <a href="{{ p.url }}">{{ p.title }}</a>
+    {% if p.date %}<time>{{ p.date }}</time>{% endif %}
+  </li>
+{% endfor %}
+</ul>
+```
+
 ---
 
 ## Page
@@ -252,6 +290,7 @@ Rendered HTML content is available as the top-level `content` variable.
 | page.weight | Int | Sort weight |
 | page.image | String? | Featured image path |
 | page.authors | Array<String> | Author names |
+| page.taxonomies | Object | This page's taxonomy terms (`page.taxonomies.tags`, `page.taxonomies.<name>`) |
 | page.extra | Object | Custom front matter fields |
 
 ### Computed Properties
@@ -260,8 +299,12 @@ Rendered HTML content is available as the top-level `content` variable.
 |----------|------|-------------|
 | page.word_count | Int | Word count |
 | page.reading_time | Int | Reading time (minutes) |
-| page.summary | String? | Content before <!-- more --> |
+| page.summary | String? | Rendered HTML for the chunk before `<!-- more -->`, falling back to `page.description` when no marker is present. Use with `\| safe` to embed (e.g. `{{ page.summary \| safe }}`); for `<meta name="description">` use `page.description` directly. |
 | page.assets | Array<String> | Static files in page bundle |
+| page.series | String | Series name from front matter (empty if none) |
+| page.series_index | Int | 1-based position within the series (requires `[series]` enabled) |
+| page.series_pages | Array<Page> | All pages in the same series, sorted by `series_weight` |
+| page.related_posts | Array<Page> | Pages sharing taxonomy terms (requires `[related]` enabled) |
 
 ### Boolean Flags
 
@@ -278,8 +321,8 @@ Rendered HTML content is available as the top-level `content` variable.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| page.lower | Page? | Previous page in section |
-| page.higher | Page? | Next page in section |
+| page.lower | Page? | Previous page in reading order |
+| page.higher | Page? | Next page in reading order |
 | page.ancestors | Array<Page> | Parent section chain |
 | page.translations | Array<TranslationLink> | Language variants |
 
@@ -316,6 +359,8 @@ Rendered HTML content is available as the top-level `content` variable.
 ## Navigation Objects
 
 ### page.lower / page.higher
+
+Navigation follows the flat reading order across the entire site, similar to mdBook or Docusaurus. Pages are ordered depth-first through the section tree: **section index → section pages → subsections (recursive)**. Within each section, pages are sorted by the section's `sort_by` setting (weight, date, or title).
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -405,6 +450,11 @@ pros = ["Fast", "Reliable"]
 </ul>
 ```
 
+A top-level `outputs = ["json"]` in front matter is likewise an ordinary
+unknown key that lands in `page.extra.outputs` — it overrides the
+`[outputs]` config default for that one page/section. See
+[Output Formats](/features/output-formats/).
+
 ---
 
 ### Time Variables
@@ -423,6 +473,8 @@ pros = ["Fast", "Reliable"]
 
 ### SEO Variables
 
+**Pre-rendered HTML** (backward compatible):
+
 | Variable | Description |
 |----------|-------------|
 | og_tags | OpenGraph meta tags |
@@ -430,12 +482,48 @@ pros = ["Fast", "Reliable"]
 | og_all_tags | Both OG and Twitter tags |
 | canonical_tag | Canonical link tag |
 | hreflang_tags | Hreflang alternate link tags (multilingual) |
+| pagination_seo_links | `<link rel="prev/next">` tags |
 
 ```jinja
 <head>
   {{ og_all_tags | safe }}
   {{ canonical_tag | safe }}
   {{ hreflang_tags | safe }}
+  {{ pagination_seo_links | safe }}
+</head>
+```
+
+**Structured data** for custom meta tag markup:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| seo.canonical_url | String | Full canonical URL (base_url + page URL) |
+| seo.og_type | String | OpenGraph type (default: "article") |
+| seo.og_image | String | Resolved absolute image URL |
+| seo.twitter_card | String | Twitter card type (default: "summary_large_image") |
+| seo.twitter_site | String | Twitter site handle |
+| seo.twitter_creator | String | Twitter creator handle |
+| seo.fb_app_id | String | Facebook App ID |
+| seo.hreflang | Array | Same as `page.translations` |
+
+Page title, description, URL, and image are available as `page.title`, `page.description`, `page.url`, `page.image`. The `seo` object provides computed values specific to SEO (resolved URLs, config values).
+
+```jinja
+<head>
+  <link rel="canonical" href="{{ seo.canonical_url }}">
+  <meta property="og:title" content="{{ page.title }}">
+  <meta property="og:type" content="{{ seo.og_type }}">
+  <meta property="og:url" content="{{ seo.canonical_url }}">
+  {% if page.description %}
+  <meta property="og:description" content="{{ page.description }}">
+  {% endif %}
+  {% if seo.og_image %}
+  <meta property="og:image" content="{{ seo.og_image }}">
+  {% endif %}
+  <meta name="twitter:card" content="{{ seo.twitter_card }}">
+  {% if seo.twitter_site %}
+  <meta name="twitter:site" content="{{ seo.twitter_site }}">
+  {% endif %}
 </head>
 ```
 
@@ -443,14 +531,16 @@ pros = ["Fast", "Reliable"]
 
 ### Asset Variables
 
+Pre-rendered `<link>` and `<script>` tags for convenience. These are generated from your `config.toml` settings.
+
 | Variable | Description |
 |----------|-------------|
-| highlight_css | Syntax highlighting CSS |
-| highlight_js | Syntax highlighting JS |
-| highlight_tags | Both CSS and JS |
-| auto_includes_css | Auto-included CSS |
-| auto_includes_js | Auto-included JS |
-| auto_includes | All auto-includes |
+| highlight_css | Syntax highlighting CSS `<link>` tag |
+| highlight_js | Syntax highlighting JS `<script>` tag |
+| highlight_tags | Both CSS and JS tags |
+| auto_includes_css | Auto-included CSS `<link>` tags |
+| auto_includes_js | Auto-included JS `<script>` tags |
+| auto_includes | All auto-include tags |
 
 ```jinja
 <head>
@@ -468,18 +558,83 @@ pros = ["Fast", "Reliable"]
 
 ### Table of Contents
 
+Only available when `toc = true` in front matter.
+
+**Pre-rendered HTML** (backward compatible):
+
 | Variable | Type | Description |
 |----------|------|-------------|
 | toc | String | Generated TOC HTML |
 | toc_obj.html | String | Same TOC HTML in object form |
-
-Only available when `toc = true` in front matter:
 
 ```jinja
 {% if page.toc %}
 <aside class="toc">
   {{ toc | safe }}
 </aside>
+{% endif %}
+```
+
+**Structured data** for custom TOC markup:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| toc_obj.headers | Array | Structured TOC header objects |
+| toc_obj.headers[].level | Int | Heading level (2-6) |
+| toc_obj.headers[].id | String | Anchor ID |
+| toc_obj.headers[].title | String | Heading text |
+| toc_obj.headers[].permalink | String | Full anchor permalink |
+| toc_obj.headers[].children | Array | Nested child headers (same structure) |
+
+```jinja
+{% if page.toc %}
+<nav class="toc">
+  <ul>
+  {% for h in toc_obj.headers %}
+    <li>
+      <a href="{{ h.permalink }}">{{ h.title }}</a>
+      {% if h.children %}
+      <ul>
+        {% for child in h.children %}
+        <li><a href="{{ child.permalink }}">{{ child.title }}</a></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+</nav>
+{% endif %}
+```
+
+---
+
+### Paginator
+
+Available in section and taxonomy term templates when pagination is enabled (`paginate` in [section front matter](/writing/sections/#front-matter), `paginate_by` for taxonomies). Page 1 lives at the section URL; later pages at `{url}/{paginate_path}/{n}/`.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| paginator.paginate_by | Int | Items per page |
+| paginator.base_url | String | Pager base URL (`{url}/{paginate_path}/`) |
+| paginator.number_pagers | Int | Total number of pages |
+| paginator.first | String | First page URL |
+| paginator.last | String | Last page URL |
+| paginator.previous | String? | Previous page URL (nil on first page) |
+| paginator.next | String? | Next page URL (nil on last page) |
+| paginator.pages | Array<Page> | Pages on the current pager |
+| paginator.current_index | Int | Current page number (1-based) |
+| paginator.total_pages | Int | Same as `number_pagers` |
+
+A `pagination_obj` variant exposes the same data as `previous_url`, `next_url`, `first_url`, `last_url`, `current_page`, `total_pages`, `total_items`, `per_page`, `has_previous`, `has_next`, and `html` (the pre-rendered nav, also available as the flat `pagination` variable).
+
+```jinja
+{% if paginator is defined and paginator.number_pagers > 1 %}
+<nav>
+  {% if paginator.previous %}<a href="{{ paginator.previous }}">Prev</a>{% endif %}
+  <span>{{ paginator.current_index }} / {{ paginator.number_pagers }}</span>
+  {% if paginator.next %}<a href="{{ paginator.next }}">Next</a>{% endif %}
+</nav>
 {% endif %}
 ```
 
@@ -492,9 +647,37 @@ Available in taxonomy templates:
 | Variable | Type | Description |
 |----------|------|-------------|
 | taxonomy_name | String | Taxonomy name (e.g., "tags") |
-| taxonomy_term | String | Current term name |
-| taxonomy_terms | Array | All terms (in taxonomy.html) |
-| taxonomy_pages | Array<Page> | Pages for term |
+| taxonomy_term | String | Current term name (empty on the index page) |
+| content | String | Pre-rendered listing HTML (terms or pages) |
+
+For custom listings, use `get_taxonomy()` — see [Taxonomies](/writing/taxonomies/).
+
+---
+
+## Menus
+
+`site.menus` exposes the **default language's** named menus (config `[[menus.*]]` + front-matter `menus`/`menu` registrations). Inside a template, prefer `get_menu(name="...")` over `site.menus.<name>` — it resolves against the **current page's** language instead, falling back to the default language:
+
+```jinja
+{% for item in get_menu(name="main") %}
+<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name }}</a>
+{% endfor %}
+```
+
+### Entry Properties
+
+| Property | Type | Description |
+|----------|------|--------------|
+| name | String | Display label |
+| url | String | Bare root-relative path, or untouched external URL — comparable to `page.url` |
+| href | String | `url` with the site's `base_path` applied (internal) or unchanged (external) — use this in `<a href>` |
+| identifier | String | Unique key within the menu |
+| weight | Int | Sort order |
+| external | Bool | `true` for `http://`, `https://`, or `//` URLs |
+| children | Array\<Entry\> | Nested entries whose `parent` matches this entry's `identifier` |
+| page | Page? | The registering page's data (front-matter-registered entries only; nil for config-only entries and for entries registered on a section) |
+
+See [Menus](/features/menus/) for the full config/front-matter reference, hierarchy, and per-language behavior.
 
 ---
 
@@ -525,90 +708,6 @@ Available in taxonomy templates:
 
 {# Default value #}
 {{ page.description | default(value=site.description) }}
-```
-
----
-
-## Example Templates
-
-### page.html
-
-```jinja
-{% extends "base.html" %}
-
-{% block content %}
-<article>
-  <h1>{{ page.title }}</h1>
-  
-  <div class="meta">
-    <time>{{ page.date }}</time>
-    {% if page.authors %}
-    <span>by {{ page.authors | join(", ") }}</span>
-    {% endif %}
-    <span>{{ page.reading_time }} min read</span>
-  </div>
-  
-  {% if page.toc %}
-  <nav class="toc">{{ toc | safe }}</nav>
-  {% endif %}
-  
-  <div class="content">
-    {{ content | safe }}
-  </div>
-  
-  {% if page.lower or page.higher %}
-  <nav class="post-nav">
-    {% if page.lower %}
-    <a href="{{ page.lower.url }}">← {{ page.lower.title }}</a>
-    {% endif %}
-    {% if page.higher %}
-    <a href="{{ page.higher.url }}">{{ page.higher.title }} →</a>
-    {% endif %}
-  </nav>
-  {% endif %}
-</article>
-{% endblock %}
-```
-
-### section.html
-
-```jinja
-{% extends "base.html" %}
-
-{% block content %}
-<section>
-  <h1>{{ section.title }}</h1>
-  {% if section.description %}
-  <p class="lead">{{ section.description }}</p>
-  {% endif %}
-  
-  {{ content | safe }}
-  
-  <h2>Articles ({{ section.pages_count }})</h2>
-  <ul class="article-list">
-  {% for p in section.pages %}
-    <li>
-      <a href="{{ p.url }}">{{ p.title }}</a>
-      {% if p.date %}<time>{{ p.date }}</time>{% endif %}
-    </li>
-  {% endfor %}
-  </ul>
-  
-  {% if section.subsections %}
-  <h2>Categories</h2>
-  <ul>
-  {% for sub in section.subsections %}
-    <li>
-      <a href="{{ sub.url }}">{{ sub.title }}</a>
-      ({{ sub.pages_count }})
-    </li>
-  {% endfor %}
-  </ul>
-  {% endif %}
-  
-  {{ pagination | safe }}
-</section>
-{% endblock %}
 ```
 
 ---

@@ -12,6 +12,17 @@ def capture_logger_output(&) : String
   output
 end
 
+# IO::Memory that pretends to be a TTY — used by progress-bar tests so
+# they exercise the animated path. Plain IO::Memory reports tty? = false,
+# which matches the new `Logger.progress` non-TTY fallback (no per-step
+# output), so without this helper the bar-shape assertions would fail
+# even though the code is correct.
+class TtyMemory < IO::Memory
+  def tty?
+    true
+  end
+end
+
 describe Hwaro::Logger do
   describe ".level" do
     it "defaults to Info level" do
@@ -233,7 +244,7 @@ describe Hwaro::Logger do
 
   describe ".progress" do
     it "outputs progress bar" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(5, 10, "Building: ")
       output = io.to_s
@@ -245,7 +256,7 @@ describe Hwaro::Logger do
     end
 
     it "shows 100% on completion" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(10, 10, "Done: ")
       output = io.to_s
@@ -256,7 +267,7 @@ describe Hwaro::Logger do
     end
 
     it "outputs nothing when total is 0" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(0, 0)
       output = io.to_s
@@ -266,7 +277,7 @@ describe Hwaro::Logger do
     end
 
     it "outputs nothing when total is negative" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(0, -1)
       output = io.to_s
@@ -276,7 +287,7 @@ describe Hwaro::Logger do
     end
 
     it "shows partial progress" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(1, 4)
       output = io.to_s
@@ -287,7 +298,7 @@ describe Hwaro::Logger do
     end
 
     it "contains block characters for progress bar" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(5, 10)
       output = io.to_s
@@ -298,7 +309,7 @@ describe Hwaro::Logger do
     end
 
     it "works without prefix" do
-      io = IO::Memory.new
+      io = TtyMemory.new
       Hwaro::Logger.io = io
       Hwaro::Logger.progress(3, 10)
       output = io.to_s
@@ -306,6 +317,156 @@ describe Hwaro::Logger do
       output.should contain("3/10")
       # Restore
       Hwaro::Logger.io = IO::Memory.new
+    end
+
+    # When output isn't a TTY (pipes, CI logs, agent capture, files),
+    # the animated `\r`-overwriting bar would concatenate into one
+    # 60-line smear because `\r` doesn't return to column 0 there.
+    # Suppress per-step output and emit only the final completion line.
+    it "suppresses per-step output in non-TTY mode" do
+      io = IO::Memory.new
+      Hwaro::Logger.io = io
+      Hwaro::Logger.progress(5, 10, "Building: ")
+      output = io.to_s
+      output.should be_empty
+      Hwaro::Logger.io = IO::Memory.new
+    end
+
+    it "emits a final summary line on completion in non-TTY mode" do
+      io = IO::Memory.new
+      Hwaro::Logger.io = io
+      Hwaro::Logger.progress(10, 10, "Copying ")
+      output = io.to_s
+      output.should contain("Copying done (10/10)")
+      output.should_not contain("\r")
+      output.should_not contain("█")
+      Hwaro::Logger.io = IO::Memory.new
+    end
+  end
+
+  describe ".color_enabled?" do
+    it "returns false when NO_COLOR env var is set to a non-empty value" do
+      original_override = Hwaro::Logger.color_enabled? # snapshot pre-change
+      Hwaro::Logger.color_enabled = nil                # restore auto-detect
+      original = ENV["NO_COLOR"]?
+      ENV["NO_COLOR"] = "1"
+      Hwaro::Logger.color_enabled?.should be_false
+      if orig = original
+        ENV["NO_COLOR"] = orig
+      else
+        ENV.delete("NO_COLOR")
+      end
+      # Restore previous explicit state (tests tail each other).
+      Hwaro::Logger.color_enabled = original_override
+    end
+
+    it "returns false when NO_COLOR is set but empty (auto-detect fallback)" do
+      # Per spec https://no-color.org, NO_COLOR only disables color when
+      # non-empty. With an empty value we fall through to the TTY check.
+      original_override = Hwaro::Logger.color_enabled?
+      Hwaro::Logger.color_enabled = nil
+      original = ENV["NO_COLOR"]?
+      ENV["NO_COLOR"] = ""
+      # In test runs STDOUT is usually not a TTY, so this is still false.
+      Hwaro::Logger.color_enabled?.should eq(STDOUT.tty?)
+      if orig = original
+        ENV["NO_COLOR"] = orig
+      else
+        ENV.delete("NO_COLOR")
+      end
+      Hwaro::Logger.color_enabled = original_override
+    end
+
+    it "honors explicit override via color_enabled=" do
+      original = ENV["NO_COLOR"]?
+      ENV["NO_COLOR"] = "1"
+      Hwaro::Logger.color_enabled = true
+      Hwaro::Logger.color_enabled?.should be_true
+      Hwaro::Logger.color_enabled = false
+      Hwaro::Logger.color_enabled?.should be_false
+      # Restore auto-detect
+      Hwaro::Logger.color_enabled = nil
+      if orig = original
+        ENV["NO_COLOR"] = orig
+      else
+        ENV.delete("NO_COLOR")
+      end
+    end
+
+    it "suppresses ANSI escape sequences in emitted output when disabled" do
+      Hwaro::Logger.color_enabled = false
+      output = capture_logger_output { Hwaro::Logger.success("done") }
+      output.should contain("done")
+      output.should_not contain("\e[")
+      output = capture_logger_output { Hwaro::Logger.error("boom") }
+      output.should contain("boom")
+      output.should_not contain("\e[")
+      output = capture_logger_output { Hwaro::Logger.warn("careful") }
+      output.should contain("careful")
+      output.should_not contain("\e[")
+      output = capture_logger_output { Hwaro::Logger.action("Creating", "file") }
+      output.should contain("Creating")
+      output.should contain("file")
+      output.should_not contain("\e[")
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "emits ANSI escape sequences when enabled (and the colorize lib is active)" do
+      # The `colorize` shard strips ANSI when writing to non-TTY targets, so
+      # we explicitly re-enable it for this assertion and restore afterwards.
+      original = Colorize.enabled?
+      Colorize.enabled = true
+      Hwaro::Logger.color_enabled = true
+      output = capture_logger_output { Hwaro::Logger.success("done") }
+      output.should contain("\e[")
+      Hwaro::Logger.color_enabled = nil
+      Colorize.enabled = original
+    end
+  end
+
+  describe ".quiet=" do
+    it "suppresses info output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.info("should be silent") }
+      output.should_not contain("should be silent")
+      Hwaro::Logger.quiet = false
+    end
+
+    it "suppresses success output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.success("hidden success") }
+      output.should_not contain("hidden success")
+      Hwaro::Logger.quiet = false
+    end
+
+    it "suppresses action output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.action("Creating", "file.md") }
+      output.should_not contain("Creating")
+      output.should_not contain("file.md")
+      Hwaro::Logger.quiet = false
+    end
+
+    it "suppresses progress output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.progress(5, 10, "Building: ") }
+      output.should_not contain("Building:")
+      output.should_not contain("50.0%")
+      Hwaro::Logger.quiet = false
+    end
+
+    it "still emits warn output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.warn("important warning") }
+      output.should contain("important warning")
+      Hwaro::Logger.quiet = false
+    end
+
+    it "still emits error output" do
+      Hwaro::Logger.quiet = true
+      output = capture_logger_output { Hwaro::Logger.error("fatal thing") }
+      output.should contain("fatal thing")
+      Hwaro::Logger.quiet = false
     end
   end
 
@@ -324,6 +485,280 @@ describe Hwaro::Logger do
 
     it "has four levels total" do
       Hwaro::Logger::Level.values.size.should eq(4)
+    end
+  end
+
+  describe ".dur" do
+    it "formats sub-second values as whole ms" do
+      Hwaro::Logger.dur(0.0).should eq("0ms")
+      Hwaro::Logger.dur(999.4).should eq("999ms")
+    end
+
+    it "formats values >= 1s as seconds with two decimals" do
+      Hwaro::Logger.dur(1000.0).should eq("1.00s")
+      Hwaro::Logger.dur(1180.5).should eq("1.18s")
+    end
+  end
+
+  describe ".paint / .glyph fallbacks" do
+    it "returns raw text and ASCII glyphs when color is disabled" do
+      Hwaro::Logger.color_enabled = false
+      Hwaro::Logger.paint("x", Hwaro::Logger::Role::Accent).should eq("x")
+      Hwaro::Logger.glyph(:result).should eq("*")
+      Hwaro::Logger.glyph(:ok).should eq("[ok]")
+      Hwaro::Logger.glyph(:watch).should eq("~")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "uses unicode glyphs when color is enabled" do
+      Hwaro::Logger.color_enabled = true
+      Hwaro::Logger.glyph(:result).should contain("✦")
+      Hwaro::Logger.glyph(:prompt).should contain("◇")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe Hwaro::Logger::Receipt do
+    it "renders an escape-free plain summary, flattening · to , and skipping empty rows" do
+      r = Hwaro::Logger::Receipt.new("build")
+      r.row("read", "44 content files")
+      r.row("parse", "42 pages", emphasis: "2 skipped")
+      r.row("render", "42 pages · 0 cached")
+      r.row("write", "") # empty → skipped
+      r.outcome("built", "42 content pages", :result, 1180.5)
+
+      out = r.render_plain
+      out.should contain("hwaro: build")
+      out.should contain("read: 44 content files")
+      out.should contain("parse: 42 pages, 2 skipped")
+      out.should contain("render: 42 pages, 0 cached")
+      out.should_not contain("write:")
+      out.should contain("built: 42 content pages in 1.18s")
+      out.should_not contain("\e[")
+    end
+
+    it "renders wordmark heading, blank-line rhythm, and a spark outcome on tty" do
+      Hwaro::Logger.color_enabled = true
+      r = Hwaro::Logger::Receipt.new("build")
+      r.row("read", "x")
+      r.row("generate", "y")
+      r.outcome("built", "z")
+      tty = r.render_tty
+      lines = tty.lines
+      lines.first.should contain("hwaro")
+      lines.first.should contain("build")
+      lines[1].should eq("")
+      lines[-2].should eq("")
+      lines.last.should contain("✦")
+      lines.last.should contain("built")
+      tty.should_not contain("─")
+      tty.should_not contain("●")
+      tty.should_not contain("▴")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe ".outcome" do
+    it "prints a plain `verb: value` line when color is off" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.outcome("created", "content/x.md") }
+      out.should eq("created: content/x.md\n")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "is suppressed in quiet mode" do
+      Hwaro::Logger.quiet = true
+      out = capture_logger_output { Hwaro::Logger.outcome("created", "x") }
+      out.should eq("")
+    ensure
+      Hwaro::Logger.quiet = false
+    end
+
+    it "prints a column-0 spark line with a middot duration on tty" do
+      Hwaro::Logger.color_enabled = true
+      out = capture_logger_output { Hwaro::Logger.outcome("built", "42 pages", ms: 1180.5) }
+      out.should contain("✦")
+      out.should contain("built")
+      out.should contain("42 pages")
+      out.should contain("1.18s")
+      out.should_not start_with(" ") # the spark sits at column 0
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe ".heading" do
+    it "prints `hwaro: kind title` when color is off" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.heading("build", "my-site") }
+      out.should eq("hwaro: build my-site\n")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "prints the wordmark heading followed by a blank line on tty" do
+      Hwaro::Logger.color_enabled = true
+      out = capture_logger_output { Hwaro::Logger.heading("build") }
+      lines = out.lines
+      lines.size.should eq(2)
+      lines.first.should contain("hwaro")
+      lines.first.should contain("build")
+      lines[1].should eq("")
+      out.should_not contain("●")
+      out.should_not contain("─")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe ".item" do
+    it "prints an indented ascii-glyph line when color is off" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.item("posts/a.md is fine", glyph: :ok) }
+      out.should eq("  [ok] posts/a.md is fine\n")
+      out.should_not contain("\e[")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "defaults to the neutral bullet and honors indent" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.item("detail", indent: 6) }
+      out.should eq("      - detail\n")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "uses the unicode glyph when color is on" do
+      Hwaro::Logger.color_enabled = true
+      out = capture_logger_output { Hwaro::Logger.item("bad link", glyph: :err) }
+      out.should contain("✗")
+      out.should contain("bad link")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "is suppressed in quiet mode" do
+      Hwaro::Logger.quiet = true
+      out = capture_logger_output { Hwaro::Logger.item("x") }
+      out.should eq("")
+    ensure
+      Hwaro::Logger.quiet = false
+    end
+  end
+
+  describe ".section" do
+    it "prints `label: annotation` when color is off" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.section("tags", "top 15") }
+      out.should eq("tags: top 15\n")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "prints `label:` without an annotation when color is off" do
+      Hwaro::Logger.color_enabled = false
+      out = capture_logger_output { Hwaro::Logger.section("unused files") }
+      out.should eq("unused files:\n")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "joins label and annotation with a middot on the 2-space grid in tty mode" do
+      Hwaro::Logger.color_enabled = true
+      out = capture_logger_output { Hwaro::Logger.section("tags", "top 15") }
+      out.should start_with("  ")
+      out.should_not start_with("    ")
+      out.should contain("·")
+      out.should contain("top 15")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe ".bar" do
+    it "renders a plain # run when color is off" do
+      Hwaro::Logger.color_enabled = false
+      Hwaro::Logger.bar(5, 10, width: 20).should eq("#" * 10)
+      Hwaro::Logger.bar(10, 10, width: 20).should eq("#" * 20)
+      Hwaro::Logger.bar(0, 10, width: 20).should eq("")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "renders an accent fill on a dim track when color is on" do
+      Hwaro::Logger.color_enabled = true
+      bar = Hwaro::Logger.bar(5, 10, width: 20)
+      bar.should contain("█")
+      bar.should contain("░")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+
+    it "renders an empty bar when max is zero" do
+      Hwaro::Logger.color_enabled = false
+      Hwaro::Logger.bar(3, 0).should eq("")
+    ensure
+      Hwaro::Logger.color_enabled = nil
+    end
+  end
+
+  describe Hwaro::Logger::Table do
+    it "columnizes rows against the widest cell with a two-space gutter" do
+      t = Hwaro::Logger::Table.new(["Status", "Title", "Path"])
+      t.row(["[pub]", "Hello World", "content/posts/hello.md"])
+      t.row(["[draft]", "WIP", "content/wip.md"])
+
+      out = t.render_plain
+      lines = out.split("\n")
+      lines[0].should eq("  Status   Title        Path")
+      lines[1].should eq("  [pub]    Hello World  content/posts/hello.md")
+      lines[2].should eq("  [draft]  WIP          content/wip.md")
+      out.should_not contain("\e[")
+    end
+
+    it "keeps geometry identical in tty mode and paints roles" do
+      original_colorize = Colorize.enabled?
+      Colorize.enabled = true
+      Hwaro::Logger.color_enabled = true
+      t = Hwaro::Logger::Table.new(["Status", "Path"])
+      t.row(["[draft]", "a.md"], [Hwaro::Logger::Role::Warn, Hwaro::Logger::Role::Dim])
+      tty = t.render_tty
+      tty.should contain("\e[")
+      # Stripping escapes must yield the plain geometry.
+      stripped = tty.gsub(/\e\[[0-9;]*m/, "")
+      stripped.should eq(t.render_plain)
+    ensure
+      Hwaro::Logger.color_enabled = nil
+      Colorize.enabled = original_colorize.nil? ? true : original_colorize
+    end
+
+    it "does not emit anything in quiet mode" do
+      Hwaro::Logger.quiet = true
+      io = IO::Memory.new
+      t = Hwaro::Logger::Table.new(["A"])
+      t.row(["1"])
+      t.emit(io)
+      io.to_s.should eq("")
+    ensure
+      Hwaro::Logger.quiet = false
+    end
+  end
+
+  describe "glyph registry additions" do
+    it "provides bullet and arrow with ascii fallbacks" do
+      Hwaro::Logger.color_enabled = false
+      Hwaro::Logger.glyph(:bullet).should eq("-")
+      Hwaro::Logger.glyph(:arrow).should eq("->")
+      Hwaro::Logger.color_enabled = true
+      Hwaro::Logger.glyph(:bullet).should contain("·")
+      Hwaro::Logger.glyph(:arrow).should contain("→")
+    ensure
+      Hwaro::Logger.color_enabled = nil
     end
   end
 end

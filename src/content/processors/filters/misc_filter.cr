@@ -6,10 +6,52 @@ module Hwaro
     module Processors
       module Filters
         module MiscFilters
+          # Recursively serialize a Crinja value tree into a JSON::Builder.
+          # Direct `target.to_json(io)` cannot be used here — Crinja::Value#to_json
+          # opens its own document and raises inside an already-open builder.
+          def self.build_json(json : JSON::Builder, value : Crinja::Value)
+            build_json(json, value.raw)
+          end
+
+          def self.build_json(json : JSON::Builder, raw)
+            case raw
+            when Crinja::Value      then build_json(json, raw.raw)
+            when Crinja::SafeString then json.string(raw.to_s)
+            when Array              then json.array { raw.each { |v| build_json(json, v) } }
+            when Hash               then json.object { raw.each { |k, v| json.field(k.to_s) { build_json(json, v) } } }
+            when String, Int32, Int64, Float64, Bool, Nil
+              raw.to_json(json)
+            else
+              json.string(raw.to_s)
+            end
+          end
+
           def self.register(env : Crinja)
-            # JSON encode filter (escapes </ to prevent script-tag breakout in inline JS)
+            # JSON encode filter (escapes </ to prevent script-tag breakout in inline JS).
+            # Serialize the actual value tree — `target.to_s.to_json` would stringify
+            # the Crinja::Value first and emit broken JSON (e.g. "[Crinja::Value<...>]")
+            # for arrays/hashes/numbers.
             env.filters["jsonify"] = Crinja.filter do
-              target.to_s.to_json.gsub("</", "<\\/")
+              JSON.build { |b| MiscFilters.build_json(b, target) }.gsub("</", "<\\/")
+            end
+
+            # Override Crinja's built-in `tojson`. Crinja wraps its output in
+            # `SafeString.escape`, which HTML-entity-escapes the JSON (`"` ->
+            # `&quot;`, `&` -> `&amp;`) — that is invalid JSON in a standalone
+            # `.json`/output-format file, and also unusable inside a <script>
+            # (browsers don't HTML-decode there). Emit real JSON like `jsonify`
+            # while keeping the documented `tojson` name and its optional
+            # `indent` argument (spaces) working; `</` stays escaped so the
+            # result is still safe to embed in an inline <script>.
+            env.filters["tojson"] = Crinja.filter({indent: nil}) do
+              raw_indent = arguments["indent"].raw
+              # Clamp on the raw Int (Crinja stores it as Int64) BEFORE building
+              # the spaces string: a negative count makes `String#*` raise
+              # ArgumentError (aborting the whole build), and a huge one would
+              # overflow `to_i` or allocate a giant per-level indent. 0..16 is a
+              # sane range for JSON indentation.
+              indent_str = raw_indent.is_a?(Int) ? " " * raw_indent.clamp(0, 16) : ""
+              JSON.build(indent_str) { |b| MiscFilters.build_json(b, target) }.gsub("</", "<\\/")
             end
 
             # Default filter — returns fallback when target is nil/undefined or empty string

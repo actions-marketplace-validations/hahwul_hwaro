@@ -15,6 +15,10 @@ module Hwaro::Core::Build
     it "loads data and aggregates authors" do
       Dir.mktmpdir do |dir|
         Dir.cd(dir) do
+          # Minimal config.toml — Models::Config.load now raises
+          # HwaroError(HWARO_E_CONFIG) when the file is missing.
+          File.write("config.toml", %(title = "Test"))
+
           # Create data directory
           FileUtils.mkdir_p("data")
           File.write("data/authors.yml", <<-YAML
@@ -25,28 +29,28 @@ module Hwaro::Core::Build
             jane-smith:
               name: "Jane Smith"
               role: "Designer"
-          YAML
+            YAML
           )
 
           # Create content directory and pages
           FileUtils.mkdir_p("content")
           File.write("content/post1.md", <<-MARKDOWN
-          ---
-          title: "Post 1"
-          date: 2023-01-01
-          authors: ["john-doe"]
-          ---
-          Content 1
-          MARKDOWN
+            ---
+            title: "Post 1"
+            date: 2023-01-01
+            authors: ["john-doe"]
+            ---
+            Content 1
+            MARKDOWN
           )
           File.write("content/post2.md", <<-MARKDOWN
-          ---
-          title: "Post 2"
-          date: 2023-01-02
-          authors: ["john-doe", "jane-smith"]
-          ---
-          Content 2
-          MARKDOWN
+            ---
+            title: "Post 2"
+            date: 2023-01-02
+            authors: ["john-doe", "jane-smith"]
+            ---
+            Content 2
+            MARKDOWN
           )
 
           # Helper config/options
@@ -79,6 +83,49 @@ module Hwaro::Core::Build
           jane["name"].as_s.should eq("Jane Smith")
           jane["pages"].as_a.size.should eq(1)    # Post 2 only
           jane["role"].as_s.should eq("Designer") # Extra data merged
+        end
+      end
+    end
+
+    # A data/authors.* holding a SCALAR (a note to self, a stray "see
+    # AUTHORS.md") killed the build: `authors_data[id]` resolves an attribute
+    # on a String, which raises Crinja::UndefinedError. The build died with
+    # "alice is undefined. / template: <unknown>" — no error code, no
+    # category, no mention of the data file, and a template blamed where none
+    # was involved. Enrichment is optional metadata, so it must degrade.
+    it "warns and skips enrichment when data/authors.* is not a mapping" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("config.toml", %(title = "Test"))
+
+          FileUtils.mkdir_p("data")
+          File.write("data/authors.yml", "see AUTHORS.md\n")
+
+          FileUtils.mkdir_p("content")
+          File.write("content/post1.md", <<-MARKDOWN
+            ---
+            title: "Post 1"
+            date: 2023-01-01
+            authors: ["alice"]
+            ---
+            Content 1
+            MARKDOWN
+          )
+
+          options = Config::Options::BuildOptions.new(output_dir: "public")
+          builder = Builder.new
+
+          built = false
+          log = with_captured_log { built = builder.run(options) }
+
+          built.should be_true
+          log.should contain("data/authors")
+          log.should contain("author enrichment")
+
+          # The author still comes from the page's own front matter.
+          site = builder.site.not_nil!
+          site.authors.has_key?("alice").should be_true
+          site.authors["alice"]["pages"].as_a.size.should eq(1)
         end
       end
     end

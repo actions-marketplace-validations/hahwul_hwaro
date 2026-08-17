@@ -1,7 +1,7 @@
 +++
 title = "Search"
 description = "Generate a client-side search index with Fuse.js"
-weight = 2
+weight = 5
 +++
 
 Hwaro generates a search index that works with Fuse.js for client-side search.
@@ -23,7 +23,7 @@ exclude = ["/private", "/drafts"]
 |-----|------|---------|-------------|
 | enabled | bool | false | Generate search index |
 | format | string | "fuse_json" | Search index format |
-| fields | array | ["title", "content"] | Fields to include in index |
+| fields | array | ["title", "content"] | Fields to include in index — by default only `title` and `content` (`url` is always added) |
 | filename | string | "search.json" | Output filename |
 | exclude | array | [] | Paths (prefixes) to exclude from search index |
 | tokenize_cjk | bool | false | Enable CJK bigram tokenization |
@@ -46,6 +46,8 @@ When enabled, Hwaro generates `/search.json` (configurable via `filename`):
 ```
 
 ## Fields Indexed
+
+Only fields listed in `fields` are emitted (`url` is always included):
 
 | Field | Description |
 |-------|-------------|
@@ -242,3 +244,8 @@ Add to config as post-build hook:
 [build]
 hooks.post = ["npx pagefind --site public"]
 ```
+
+## See Also
+
+- [Configuration](/start/config/) — Search config reference
+- [Multilingual](/features/multilingual/) — CJK tokenization and i18n search

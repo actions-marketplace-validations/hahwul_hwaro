@@ -286,6 +286,25 @@ describe Hwaro::Services::ContentLister do
     end
   end
 
+  describe "JSON frontmatter parsing" do
+    it "parses title, draft, and date from JSON frontmatter" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "{\"title\": \"JSON Post\", \"draft\": true, \"date\": \"2024-06-15\"}\n\n# body")
+
+        lister = Hwaro::Services::ContentLister.new(content_dir)
+        result = lister.list_content(Hwaro::Services::ContentFilter::All)
+
+        result.size.should eq(1)
+        result.first.title.should eq("JSON Post")
+        result.first.draft.should be_true
+        result.first.date.should_not be_nil
+      end
+    end
+  end
+
   describe "no frontmatter" do
     it "handles files without any frontmatter" do
       Dir.mktmpdir do |dir|
@@ -411,6 +430,42 @@ describe Hwaro::Services::ContentLister do
         lister.display(Hwaro::Services::ContentFilter::Published)
       end
     end
+
+    it "renders the ember heading, an aligned table, and a listed outcome" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+        File.write(File.join(content_dir, "post.md"), "---\ntitle: Test Post\ndraft: false\ndate: 2024-01-15\n---\n\n# Content")
+        File.write(File.join(content_dir, "wip.md"), "---\ntitle: WIP\ndraft: true\ndate: 2024-02-01\n---\n\n# Draft")
+
+        output = with_captured_log do
+          Hwaro::Services::ContentLister.new(content_dir).display(Hwaro::Services::ContentFilter::All)
+        end
+
+        output.should contain("hwaro: list all")
+        output.should contain("Status")
+        output.should contain("[pub]")
+        output.should contain("[draft]")
+        output.should contain("Test Post")
+        output.should contain("2024-01-15")
+        output.should contain("listed: 2 files")
+        output.should_not contain("\e[")
+      end
+    end
+
+    it "reports an empty directory with an info outcome" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+
+        output = with_captured_log do
+          Hwaro::Services::ContentLister.new(content_dir).display(Hwaro::Services::ContentFilter::Drafts)
+        end
+
+        output.should contain("hwaro: list drafts")
+        output.should contain("listed: no content found")
+      end
+    end
   end
 end
 
@@ -449,5 +504,73 @@ describe Hwaro::Services::ContentInfo do
     info.title.should eq("My Post")
     info.draft.should be_true
     info.date.should eq(date)
+  end
+
+  describe "JSON serialization" do
+    it "emits ISO-8601 date and preserves it on round-trip" do
+      date = Time.utc(2024, 3, 14, 9, 26, 53)
+      info = Hwaro::Services::ContentInfo.new(
+        path: "post.md",
+        title: "Pi Day",
+        draft: false,
+        date: date,
+      )
+
+      json = info.to_json
+      json.should contain(%("date":"2024-03-14T09:26:53))
+
+      parsed = Hwaro::Services::ContentInfo.from_json(json)
+      parsed.path.should eq("post.md")
+      parsed.title.should eq("Pi Day")
+      parsed.draft.should be_false
+      parsed.date.should eq(date)
+    end
+
+    it "emits null date when unset and round-trips to nil" do
+      info = Hwaro::Services::ContentInfo.new(path: "no-date.md", title: "t")
+      json = info.to_json
+      json.should contain(%("date":null))
+
+      parsed = Hwaro::Services::ContentInfo.from_json(json)
+      parsed.date.should be_nil
+    end
+  end
+
+  describe "date parsing and sorting regression tests" do
+    it "preserves timezone offset in parse_time (regression)" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "---\ntitle: Offset Post\ndate: 2024-06-15T10:30:00+09:00\n---\n\nBody")
+
+        lister = Hwaro::Services::ContentLister.new(content_dir)
+        result = lister.list_all
+
+        result.size.should eq(1)
+        result.first.date.should_not be_nil
+        result.first.date.not_nil!.to_utc.hour.should eq(1)
+        result.first.date.not_nil!.to_utc.minute.should eq(30)
+      end
+    end
+
+    it "sorts tie-breaker paths ascending (A-Z) (regression)" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "c.md"), "---\ntitle: C\ndate: 2024-01-01\n---\n\nC")
+        File.write(File.join(content_dir, "a.md"), "---\ntitle: A\ndate: 2024-01-01\n---\n\nA")
+        File.write(File.join(content_dir, "b.md"), "---\ntitle: B\ndate: 2024-01-01\n---\n\nB")
+
+        lister = Hwaro::Services::ContentLister.new(content_dir)
+        result = lister.list_all
+
+        result.size.should eq(3)
+        File.basename(result[0].path).should eq("a.md")
+        File.basename(result[1].path).should eq("b.md")
+        File.basename(result[2].path).should eq("c.md")
+      end
+    end
   end
 end

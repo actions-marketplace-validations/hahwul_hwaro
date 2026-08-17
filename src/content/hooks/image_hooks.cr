@@ -21,6 +21,10 @@ module Hwaro
         @@resize_map = {} of String => Hash(Int32, String)
         @@resize_map_mutex = Mutex.new
 
+        # Class-level map: original_url => { "lqip" => data_uri, "dominant_color" => hex }
+        @@lqip_map = {} of String => Hash(String, String)
+        @@lqip_map_mutex = Mutex.new
+
         # Max number of concurrent image processing fibers
         CONCURRENCY = 8
 
@@ -39,6 +43,16 @@ module Hwaro
           @@resize_map_mutex.synchronize { @@resize_map.dup }
         end
 
+        # Read-only access to the resize map for the render phase. The map is
+        # populated once by the BeforeRender `image:resize` hook and is never
+        # mutated during rendering, so render workers can read it directly
+        # instead of paying a full `.dup` of the (potentially large, site-wide)
+        # map per image-bearing page and serializing on the mutex. Concurrent
+        # reads of the unmutated Hash under -Dpreview_mt are safe.
+        def self.resize_map_readonly : Hash(String, Hash(Int32, String))
+          @@resize_map_mutex.synchronize { @@resize_map }
+        end
+
         # Replace the resize map (used by tests)
         def self.set_resize_map(map : Hash(String, Hash(Int32, String)))
           @@resize_map_mutex.synchronize { @@resize_map = map }
@@ -50,10 +64,22 @@ module Hwaro
           end
         end
 
+        def self.lqip_map : Hash(String, Hash(String, String))
+          @@lqip_map_mutex.synchronize { @@lqip_map.dup }
+        end
+
+        def self.set_lqip_map(map : Hash(String, Hash(String, String)))
+          @@lqip_map_mutex.synchronize { @@lqip_map = map }
+        end
+
+        def self.find_lqip(url : String) : Hash(String, String)?
+          @@lqip_map_mutex.synchronize { @@lqip_map[url]?.try(&.dup) }
+        end
+
         def self.find_closest(url : String, width : Int32) : String?
           @@resize_map_mutex.synchronize do
             widths_map = @@resize_map[url]?
-            return nil unless widths_map
+            return unless widths_map
             return widths_map[width] if widths_map.has_key?(width)
 
             # Find the smallest width that is >= requested
@@ -81,25 +107,81 @@ module Hwaro
         private def process_images(ctx : Core::Lifecycle::BuildContext)
           config = ctx.config
           return unless config
+          if ctx.options.skip_image_processing
+            Logger.debug "  Skipping image processing (--skip-image-processing)"
+            return
+          end
           return unless config.image_processing.enabled
           return if config.image_processing.widths.empty?
 
+          start = ctx.profiler ? Time.instant : nil
+
           widths = config.image_processing.widths
           quality = config.image_processing.quality
+          lqip_enabled = config.image_processing.lqip_enabled
+          lqip_width = lqip_enabled ? config.image_processing.lqip_width : 0
+          lqip_quality = config.image_processing.lqip_quality
           output_dir = ctx.output_dir
           resolved_output = File.expand_path(output_dir)
 
           # Phase 1: Collect all image jobs (fast, single-threaded)
+          #
+          # Under `--fast-start`, only collect page-asset jobs for the
+          # priority subset and skip the (potentially thousands of) static
+          # and content-file globs entirely on the cold pass. The deferred
+          # render pass re-invokes this hook with priority_pages cleared so
+          # the full job set runs in the background. The `resize_image()`
+          # template helper falls back to the original URL on a cache miss,
+          # so priority pages render correctly even if their non-asset
+          # image references haven't been resized yet.
+          fast_start_priority = ctx.priority_pages
           jobs = [] of ImageJob
           seen = Set(String).new
-          collect_page_asset_jobs(ctx, output_dir, resolved_output, jobs, seen)
-          collect_content_file_jobs(config, output_dir, resolved_output, jobs, seen) if config.content_files.enabled?
-          collect_static_jobs(output_dir, resolved_output, jobs, seen)
+          collect_page_asset_jobs(ctx, output_dir, resolved_output, jobs, seen, fast_start_priority)
+          if fast_start_priority.nil?
+            collect_content_file_jobs(config, output_dir, resolved_output, jobs, seen) if config.content_files.enabled?
+            collect_static_jobs(config, output_dir, resolved_output, jobs, seen)
+          end
 
           return if jobs.empty?
 
-          # Phase 2: Process in parallel with bounded concurrency
+          # Phase 2: Split jobs into "already fresh" (reuse from previous
+          # rebuild's maps) and "needs work". Snapshot previous maps first
+          # so watch-triggered rebuilds don't re-decode unchanged images.
+          # Without this, adding one image to a serve session re-processes
+          # every image in the project (see issue #389).
+          previous_lqip_map = @@lqip_map_mutex.synchronize { @@lqip_map.dup }
+
           new_map = {} of String => Hash(Int32, String)
+          new_lqip_map = {} of String => Hash(String, String)
+          jobs_to_process = [] of ImageJob
+          reused_count = 0
+
+          jobs.each do |job|
+            reused_widths = self.class.reusable_widths(job.source_path, job.dest_dir, widths)
+            if reused_widths && (!lqip_enabled || previous_lqip_map.has_key?(job.original_url))
+              width_urls = {} of Int32 => String
+              reused_widths.each do |width, filename|
+                width_urls[width] = job.url_prefix + filename
+              end
+              new_map[job.original_url] = width_urls
+              if lqip_enabled && (lqip = previous_lqip_map[job.original_url]?)
+                new_lqip_map[job.original_url] = lqip
+              end
+              reused_count += 1
+            else
+              jobs_to_process << job
+            end
+          end
+
+          if jobs_to_process.empty?
+            @@resize_map_mutex.synchronize { @@resize_map = new_map }
+            @@lqip_map_mutex.synchronize { @@lqip_map = new_lqip_map }
+            Logger.info "  Reused #{reused_count} cached image result(s)." if reused_count > 0
+            return
+          end
+
+          # Phase 3: Process the work set in parallel with bounded concurrency
           map_mutex = Mutex.new
           work_channel = Channel(ImageJob?).new(CONCURRENCY)
           done_channel = Channel(Nil).new
@@ -108,33 +190,127 @@ module Hwaro
           CONCURRENCY.times do
             spawn do
               while job = work_channel.receive?
-                width_map = resize_one(job, widths, quality)
-                unless width_map.empty?
+                begin
+                  width_map, lqip_data = resize_one(job, widths, quality, lqip_width, lqip_quality)
                   map_mutex.synchronize do
-                    new_map[job.original_url] = width_map
+                    new_map[job.original_url] = width_map unless width_map.empty?
+                    new_lqip_map[job.original_url] = lqip_data if lqip_data
                   end
+                rescue ex
+                  # resize_one does file I/O (cp, mkdir_p, image writes) that
+                  # can raise on permissions/disk-full/vanished files. A dead
+                  # worker would stall the bounded work_channel feeder below
+                  # and hang the build, so log and move to the next job.
+                  Logger.warn "  Image resize failed for #{job.source_path}: #{ex.message}"
                 end
               end
+            ensure
+              # Guarantee the done signal even if the loop dies some other
+              # way; the `CONCURRENCY.times { done_channel.receive }` wait
+              # below hangs otherwise.
               done_channel.send(nil)
             end
           end
 
           # Feed jobs
-          jobs.each { |job| work_channel.send(job) }
+          jobs_to_process.each { |job| work_channel.send(job) }
           CONCURRENCY.times { work_channel.send(nil) } # sentinel to stop workers
 
           # Wait for all workers
           CONCURRENCY.times { done_channel.receive }
 
           @@resize_map_mutex.synchronize { @@resize_map = new_map }
-          resized_count = new_map.values.sum(&.size)
+          @@lqip_map_mutex.synchronize { @@lqip_map = new_lqip_map }
+          # Count variants (widths × successful jobs), matching the pre-#389
+          # meaning. Counting source images instead would silently halve/third
+          # the number users see and make the "Generated N" line less useful
+          # for verifying that configured widths actually produced output.
+          resized_count = jobs_to_process.sum { |j| new_map[j.original_url]?.try(&.size) || 0 }
           Logger.success "  Generated #{resized_count} resized image(s)." if resized_count > 0
+          Logger.info "  Reused #{reused_count} cached image result(s)." if reused_count > 0
+          Logger.success "  Generated #{new_lqip_map.size} LQIP placeholder(s)." if new_lqip_map.size > 0
+
+          if (p = ctx.profiler) && start
+            elapsed = (Time.instant - start).total_milliseconds
+            p.record_asset_generation("image:resize", resized_count, reused_count, elapsed)
+          end
         end
 
-        # Resize a single image to all widths (one decode, N encodes)
-        private def resize_one(job : ImageJob, widths : Array(Int32), quality : Int32) : Hash(Int32, String)
-          path_map = Processors::ImageProcessor.resize_multi_widths(
-            job.source_path, job.dest_dir, widths, quality
+        # Returns a `width => filename` map when every expected destination
+        # file already exists on disk with an mtime at least as new as the
+        # source (i.e. decoding/resizing would produce bit-identical output).
+        # Returns nil when any destination is missing, stale, or empty —
+        # caller then processes the image normally. Empty is checked so a
+        # killed serve mid-write doesn't leave a zero-byte file that would
+        # pass an mtime check and get served as a broken image.
+        #
+        # Caller must also verify LQIP cache separately; LQIP can't be
+        # reconstructed from disk bytes.
+        def self.reusable_widths(
+          source_path : String,
+          dest_dir : String,
+          widths : Array(Int32),
+        ) : Hash(Int32, String)?
+          return unless File.exists?(source_path)
+          return unless Dir.exists?(dest_dir)
+          source_mtime = File.info(source_path).modification_time
+
+          ext = File.extname(source_path)
+          basename = File.basename(source_path, ext)
+
+          # resize_and_lqip clamps any requested width larger than the source to
+          # the source's true width (writing a single `_<src_w>w` variant), so a
+          # `_<width>w` file does NOT exist for every configured width. Read the
+          # variants that ARE on disk, then require the set to match exactly
+          # what the CURRENT config would produce — otherwise the config
+          # changed and we reprocess.
+          variant_re = /\A#{Regex.escape(basename)}_(\d+)w#{Regex.escape(ext)}\z/
+          on_disk = {} of Int32 => String
+          Dir.each_child(dest_dir) do |name|
+            if m = variant_re.match(name)
+              # `to_i?`, not `to_i`: the capture is unbounded, so a stray
+              # `hero_9999999999w.png` in the output directory (a copied
+              # static file, a leftover from another tool) overflowed Int32
+              # and raised ArgumentError out of the `image:resize` hook —
+              # aborting every build and rebuild with exit 70 until the file
+              # was found and deleted. A width that doesn't fit Int32 can
+              # never match a configured width, so ignoring it is exactly
+              # right: the image simply gets reprocessed.
+              if width = m[1].to_i?
+                on_disk[width] = name
+              end
+            end
+          end
+          return if on_disk.empty?
+
+          # The clamp ceiling must come from the SOURCE image's intrinsic
+          # width. Inferring it from the largest on-disk variant silently
+          # ignored a newly configured larger width: variants from the old
+          # config "satisfied" the new one after clamping to the stale
+          # inferred ceiling, so e.g. adding 1024 to `widths = [320]` never
+          # generated the 1024 variant on warm builds. The old inference
+          # stays as the fallback for headers we can't read.
+          src_w = Processors::ImageProcessor.dimensions(source_path).try(&.[0]) || on_disk.keys.max
+          expected = widths.map { |w| Math.min(w, src_w) }.uniq!
+          return unless expected.sort == on_disk.keys.sort!
+
+          result = {} of Int32 => String
+          expected.each do |w|
+            filename = on_disk[w]?
+            return unless filename
+            dest_info = File.info(File.join(dest_dir, filename))
+            return if dest_info.modification_time < source_mtime
+            return if dest_info.size == 0
+            result[w] = filename
+          end
+          result
+        end
+
+        # Resize a single image to all widths + generate LQIP (one decode pass)
+        private def resize_one(job : ImageJob, widths : Array(Int32), quality : Int32,
+                               lqip_width : Int32, lqip_quality : Int32) : {Hash(Int32, String), Hash(String, String)?}
+          path_map, lqip_uri, dom_color = Processors::ImageProcessor.resize_and_lqip(
+            job.source_path, job.dest_dir, widths, quality, lqip_width, lqip_quality
           )
 
           width_url_map = {} of Int32 => String
@@ -142,7 +318,12 @@ module Hwaro
             resized_name = File.basename(dest_path)
             width_url_map[width] = job.url_prefix + resized_name
           end
-          width_url_map
+
+          lqip_data = if lqip_uri
+                        {"lqip" => lqip_uri, "dominant_color" => dom_color}
+                      end
+
+          {width_url_map, lqip_data}
         end
 
         # --- Job collection helpers ---
@@ -153,8 +334,10 @@ module Hwaro
           resolved_output : String,
           jobs : Array(ImageJob),
           seen : Set(String),
+          priority_pages : Array(Models::Page)? = nil,
         )
-          ctx.all_pages.each do |page|
+          source = priority_pages || ctx.all_pages
+          source.each do |page|
             next if page.assets.empty?
 
             page_bundle_dir = File.dirname(page.path)
@@ -211,6 +394,7 @@ module Hwaro
         end
 
         private def collect_static_jobs(
+          config : Models::Config,
           output_dir : String,
           resolved_output : String,
           jobs : Array(ImageJob),
@@ -218,12 +402,21 @@ module Hwaro
         )
           return unless Dir.exists?("static")
 
-          Dir.glob(File.join("static", "**", "*")).each do |file|
+          # Match the static copy path: include hidden entries so images under
+          # published dot-dirs (e.g. `static/.well-known/`) get resize variants
+          # too. Excluded cruft is filtered out just below.
+          glob_match = File::MatchOptions.glob_default | File::MatchOptions::DotFiles
+          Dir.glob(File.join("static", "**", "*"), match: glob_match).each do |file|
             next unless File.file?(file)
             next unless Processors::ImageProcessor.image?(file)
             next unless safe_path?(file, "static")
 
             relative = Path[file].relative_to("static").to_s
+            # Don't emit resized variants for files the static copy filters out
+            # (`[static] exclude`), otherwise excluded images would leak into
+            # the output even though their originals are never published.
+            next if config.static.excluded?(relative)
+
             original_url = "/" + relative
             next if seen.includes?(original_url)
             dest_dir = File.join(output_dir, File.dirname(relative))
@@ -237,20 +430,147 @@ module Hwaro
           end
         end
 
+        # --- Serve-time targeted reprocessing (A12) ---
+
+        # The `image:resize` hook only runs on full builds, so modified image
+        # BYTES under serve's :static / :content_files change paths left the
+        # resized variants (and LQIP data) stale — the watcher only re-copied
+        # the original. Re-runs the resize pipeline for exactly the changed
+        # images and folds the results into the class-level maps.
+        #
+        # `pages` (when given) also covers page-bundle assets: an image
+        # inside a page bundle publishes its variants under the owning
+        # page's URL, not its content-relative path.
+        #
+        # Returns the number of variant sets regenerated.
+        def self.reprocess_changed_images(
+          changed_paths : Array(String),
+          config : Models::Config,
+          output_dir : String,
+          pages : Array(Models::Page)? = nil,
+        ) : Int32
+          ip = config.image_processing
+          return 0 unless ip.enabled
+          return 0 if ip.widths.empty?
+
+          resolved_output = File.expand_path(output_dir)
+          count = 0
+          changed_paths.each do |src_path|
+            next unless Processors::ImageProcessor.image?(src_path)
+            next unless File.file?(src_path)
+
+            if src_path.starts_with?("static/")
+              next unless safe_source_path?(src_path, "static")
+              relative = Path[src_path].relative_to("static").to_s
+              next if config.static.excluded?(relative)
+              count += reprocess_published(src_path, relative, config, output_dir, resolved_output)
+            elsif src_path.starts_with?("content/")
+              next unless safe_source_path?(src_path, "content")
+              relative = Path[src_path].relative_to("content").to_s
+              if config.content_files.enabled? && config.content_files.publish?(relative)
+                count += reprocess_published(src_path, relative, config, output_dir, resolved_output)
+              end
+              if bundle_pages = pages
+                count += reprocess_bundle_asset(src_path, relative, config, output_dir, resolved_output, bundle_pages)
+              end
+            end
+          end
+          Logger.outcome("resized", "#{count} image variant set#{count == 1 ? "" : "s"}") if count > 0
+          count
+        end
+
+        # Variants published at the file's own relative path (static/ and
+        # [content.files] images) — mirrors collect_static_jobs /
+        # collect_content_file_jobs URL derivation.
+        private def self.reprocess_published(src_path : String, relative : String, config : Models::Config, output_dir : String, resolved_output : String) : Int32
+          dest_dir = File.join(output_dir, File.dirname(relative))
+          return 0 unless safe_dest_path?(dest_dir, resolved_output)
+
+          dir_part = File.dirname(relative)
+          url_prefix = dir_part == "." ? "/" : "/#{dir_part}/"
+          run_targeted_resize(src_path, dest_dir, "/" + relative, url_prefix, config)
+        end
+
+        # Variants published under the owning page's URL (page-bundle
+        # assets) — mirrors collect_page_asset_jobs.
+        private def self.reprocess_bundle_asset(src_path : String, relative : String, config : Models::Config, output_dir : String, resolved_output : String, pages : Array(Models::Page)) : Int32
+          count = 0
+          pages.each do |page|
+            next if page.assets.empty?
+            next unless page.assets.includes?(relative)
+
+            page_bundle_dir = File.dirname(page.path)
+            url_path = page.url.lchop("/")
+            relative_to_bundle = begin
+              Path[relative].relative_to(page_bundle_dir).to_s
+            rescue ArgumentError
+              next
+            end
+            original_url = "/" + url_path + relative_to_bundle
+            asset_dest_dir = File.join(output_dir, url_path, File.dirname(relative_to_bundle))
+            next unless safe_dest_path?(asset_dest_dir, resolved_output)
+
+            url_prefix = "/" + url_path + File.dirname(relative_to_bundle).rstrip(".") + "/"
+            url_prefix = url_prefix.gsub("//", "/")
+
+            count += run_targeted_resize(src_path, asset_dest_dir, original_url, url_prefix, config)
+          end
+          count
+        end
+
+        # One resize_and_lqip pass for a single image, updating the
+        # class-level maps in place (unlike process_images, which rebuilds
+        # them wholesale — a targeted pass must not drop other entries).
+        private def self.run_targeted_resize(src_path : String, dest_dir : String, original_url : String, url_prefix : String, config : Models::Config) : Int32
+          ip = config.image_processing
+          lqip_width = ip.lqip_enabled ? ip.lqip_width : 0
+          path_map, lqip_uri, dom_color = Processors::ImageProcessor.resize_and_lqip(
+            src_path, dest_dir, ip.widths, ip.quality, lqip_width, ip.lqip_quality
+          )
+          return 0 if path_map.empty?
+
+          width_urls = {} of Int32 => String
+          path_map.each { |width, dest| width_urls[width] = url_prefix + File.basename(dest) }
+          @@resize_map_mutex.synchronize { @@resize_map[original_url] = width_urls }
+          if lqip_uri
+            @@lqip_map_mutex.synchronize { @@lqip_map[original_url] = {"lqip" => lqip_uri, "dominant_color" => dom_color} }
+          end
+          1
+        rescue ex
+          Logger.warn "  Image reprocess failed for #{src_path}: #{ex.message}"
+          0
+        end
+
         # --- Security helpers ---
 
         # Verify that a source path resolves within the expected base directory.
         # Uses File.realpath to resolve symlinks before the boundary check.
-        private def safe_path?(path : String, base : String) : Bool
-          resolved = File.realpath(path) rescue return false
-          resolved_base = File.realpath(base) rescue File.expand_path(base)
+        def self.safe_source_path?(path : String, base : String) : Bool
+          resolved = begin
+            File.realpath(path)
+          rescue File::Error
+            return false
+          end
+          resolved_base = begin
+            File.realpath(base)
+          rescue File::Error
+            File.expand_path(base)
+          end
           resolved == resolved_base || resolved.starts_with?(resolved_base + "/")
         end
 
         # Verify destination directory is within output (dest may not exist yet)
-        private def safe_path_dest?(path : String, resolved_output : String) : Bool
+        def self.safe_dest_path?(path : String, resolved_output : String) : Bool
           resolved = File.expand_path(path)
           resolved == resolved_output || resolved.starts_with?(resolved_output + "/")
+        end
+
+        private def safe_path?(path : String, base : String) : Bool
+          ImageHooks.safe_source_path?(path, base)
+        end
+
+        private def safe_path_dest?(path : String, resolved_output : String) : Bool
+          ImageHooks.safe_dest_path?(path, resolved_output)
         end
       end
     end

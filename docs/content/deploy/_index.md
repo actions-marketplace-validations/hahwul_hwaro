@@ -1,47 +1,11 @@
 +++
 title = "Deploy"
 description = "Build and deploy your site to production"
+weight = 5
+sort_by = "weight"
 +++
 
 Deploy your Hwaro site to any static hosting provider.
-
-## Built-in Deploy Command
-
-Hwaro includes a built-in `hwaro deploy` command for deploying to configured targets:
-
-```bash
-# Deploy to default target
-hwaro deploy
-
-# Deploy to a specific target
-hwaro deploy prod
-
-# Preview changes without deploying
-hwaro deploy --dry-run
-```
-
-Configure deployment targets in `config.toml`:
-
-```toml
-[deployment]
-source_dir = "public"
-
-[[deployment.targets]]
-name = "prod"
-url = "file:///var/www/mysite"
-
-[[deployment.targets]]
-name = "s3"
-url = "s3://my-bucket"
-command = "aws s3 sync {source}/ {url} --delete"
-
-# GitHub Pages via deploy script
-[[deployment.targets]]
-name = "github-pages"
-command = "scripts/deploy-ghpages.sh {source}"
-```
-
-See [CLI Reference](/start/cli/#deploy) for all deploy options and [Configuration](/start/config/#deployment) for target setup.
 
 ## Build for Production
 
@@ -49,37 +13,35 @@ See [CLI Reference](/start/cli/#deploy) for all deploy options and [Configuratio
 hwaro build
 ```
 
-This generates static files in `public/`.
-
-### Optional: Minification
-
-You can optionally minify output files:
+This generates static files in `public/`. You can optionally minify output:
 
 ```bash
 hwaro build --minify
 ```
 
-This performs conservative optimization:
-- **HTML**: Removes comments and trailing whitespace
-- **JSON/XML**: Compacts whitespace for smaller files
+This performs conservative optimization — HTML comments and trailing whitespace are removed, JSON/XML whitespace is compacted. All code blocks and content structure are preserved.
 
-All code blocks and content structure are preserved. See [CLI Reference](/start/cli/#build) for details.
-
-## Hosting Options
-
-Static sites can be deployed anywhere:
-
-- [GitHub Pages](/deploy/github-pages/) — Free hosting from GitHub
-- [Docker](/deploy/docker/) — Containerized deployment
-- [GitLab CI](/deploy/gitlab-ci/) — GitLab Pages via CI/CD
-- [Netlify](/deploy/netlify/) — Drag and drop or Git integration
-- [Vercel](/deploy/vercel/) — Zero-config deployments
-- [Cloudflare Pages](/deploy/cloudflare-pages/) — Fast global CDN
-- **AWS S3 + CloudFront** — Scalable hosting
-- **Any web server** — Nginx, Apache, etc.
+Everything in `static/` is copied into `public/` and deployed — including hidden dot-paths such as `.well-known/security.txt` and `.domains` — identically for cold and `--cache`/incremental builds. Common OS/editor/VCS cruft (`.DS_Store`, `.git/`, …) is filtered out automatically; see [Static Files](/start/config/#static-files) to tune it.
 
 ## General Steps
 
 1. Build the site: `hwaro build`
 2. Upload `public/` directory to your host (or use `hwaro deploy`)
 3. Configure your domain
+
+## Built-in Deploy Command
+
+Hwaro includes `hwaro deploy` for deploying to configured targets:
+
+```bash
+hwaro deploy              # Deploy to the first configured target
+hwaro deploy s3           # Deploy to a specific target by name
+hwaro deploy s3 backup    # Deploy to multiple targets
+hwaro deploy --dry-run    # Preview changes
+```
+
+See [Deploy Configuration](/deploy/config/) for full target setup, matchers, and options.
+
+## Platform Guides
+
+See the platform-specific guides below for step-by-step deployment instructions.

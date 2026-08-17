@@ -5,7 +5,7 @@ weight = 4
 toc = true
 +++
 
-Shortcodes are reusable template snippets you can use in Markdown content.
+Shortcodes are reusable template snippets you can use in Markdown content. Custom shortcodes are Jinja2 templates placed in `templates/shortcodes/` — see [Template Syntax](/templates/syntax/) for the templating language reference.
 
 ## Using Shortcodes
 
@@ -20,6 +20,23 @@ Or explicitly:
 ```markdown
 {%raw%}{{ shortcode("shortcode_name", arg1="value") }}{%endraw%}
 ```
+
+### Block Shortcode Closers
+
+Block shortcodes support two closer styles:
+
+- **Bare closer** (simple):
+  ```jinja
+  {% note %}...{% end %}
+  ```
+
+- **Named closer** (recommended):
+  ```jinja
+  {% note %}...{% endnote %}
+  {% alert(type="info") %}...{% endalert %}
+  ```
+
+**We strongly recommend named closers** (`{% endNAME %}`) for any non-trivial content. They make your Markdown much easier to read and maintain, especially when mixing multiple shortcodes or using deep nesting.
 
 ## Built-in Shortcodes
 
@@ -75,10 +92,14 @@ Embed a GitHub Gist.
 
 Display an alert box. Use as a block shortcode to wrap content.
 
+Both bare and named closers are supported (named closers are recommended for complex pages):
+
 ```markdown
 {%raw%}{% alert(type="warning", title="Caution") %}Be careful with this!{% end %}
-{% callout(type="tip") %}Here is a helpful tip.{% end %}{%endraw%}
+{% alert(type="tip") %}Using named closer also works{% endalert %}{%endraw%}
 ```
+
+(We recommend the named closer style for clarity.)
 
 | Param | Default | Description |
 |-------|---------|-------------|
@@ -343,3 +364,8 @@ templates/shortcodes/
     ├── twitter.html
     └── github.html
 ```
+
+## See Also
+
+- [Template Syntax](/templates/syntax/) — Jinja2 reference for custom shortcodes
+- [Functions](/templates/functions/) — Built-in template functions

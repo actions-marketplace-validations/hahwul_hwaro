@@ -12,7 +12,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: ubuntu-24.04-arm
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: macos-15-intel
+            platform: macos
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Crystal
@@ -32,24 +40,34 @@ jobs:
           else
             echo "ARCH=unknown" >> $GITHUB_ENV
           fi
-      - if: matrix.os == 'ubuntu-latest'
+      - if: matrix.platform == 'linux'
         name: Build binary (Linux)
         run: |
           mkdir -p build
-          # Use Alpine/musl-based Crystal container for proper static binary
-          docker run --rm -v $(pwd):/hwaro -w /hwaro --entrypoint="" 84codes/crystal:latest-alpine sh -c "
+          # Use Alpine/musl-based Crystal container for proper static binary.
+          # Parallelism comes from Crystal's execution contexts, sized in
+          # src/main.cr — the old `-Dpreview_mt` flag is deprecated and its
+          # legacy MT scheduler can spin forever at process exit.
+          docker run --rm -v $(pwd):/hwaro -w /hwaro --entrypoint="" crystallang/crystal:1.21.0-alpine sh -c "
             apk add --no-cache yaml-dev git curl &&
             shards install --release --no-debug --production &&
             mkdir -p build &&
             crystal build src/main.cr -o build/hwaro-${GITHUB_REF_SLUG}-linux-${ARCH} --release --no-debug --static
           "
-      - if: startsWith(matrix.os, 'macos')
-        name: Build binary (macOS)
+      - if: matrix.platform == 'macos'
+        name: Install macOS build dependencies
+        run: brew install openssl@3 pkg-config
+      - if: matrix.platform == 'macos'
+        name: Build and package binary (macOS)
         run: |
           mkdir -p build
-          crystal build src/main.cr \
-            -o build/hwaro-${GITHUB_REF_SLUG}-osx-${ARCH} \
-            --no-debug --release
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig"
+          BIN="build/hwaro-${GITHUB_REF_SLUG}-osx-${ARCH}"
+          crystal build src/main.cr -o "$BIN" --no-debug --release
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh "$BIN" "build/hwaro-${GITHUB_REF_SLUG}-osx-${ARCH}.tar.gz" hwaro
+          rm -f "$BIN"
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:

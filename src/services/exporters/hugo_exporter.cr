@@ -1,0 +1,121 @@
+require "./base"
+
+module Hwaro
+  module Services
+    module Exporters
+      class HugoExporter < Base
+        def run(options : Config::Options::ExportOptions) : ExportResult
+          content_dir = options.content_dir
+          output_dir = options.output_dir
+          include_drafts = options.drafts
+          verbose = options.verbose
+
+          files = scan_content_files(content_dir)
+
+          if files.empty?
+            return ExportResult.new(
+              success: false,
+              message: "No content files found in: #{content_dir}"
+            )
+          end
+
+          exported = 0
+          skipped = 0
+          errors = 0
+
+          files.each do |file_path|
+            result = export_file(file_path, content_dir, output_dir, include_drafts, verbose)
+            case result
+            when :exported then exported += 1
+            when :skipped  then skipped += 1
+            end
+          rescue ex
+            errors += 1
+            Logger.warn "Error exporting #{file_path}: #{ex.message}"
+          end
+
+          ExportResult.new(
+            success: exported > 0 || errors == 0,
+            message: "Exported #{exported} items, skipped #{skipped}, errors #{errors}",
+            exported_count: exported,
+            skipped_count: skipped,
+            error_count: errors
+          )
+        end
+
+        private def export_file(
+          file_path : String,
+          content_dir : String,
+          output_dir : String,
+          include_drafts : Bool,
+          verbose : Bool,
+        ) : Symbol
+          raw = read_content(file_path)
+          fields, body = parse_content(raw)
+
+          # Skip drafts unless requested
+          is_draft = fields["draft"]?.try(&.raw) == true
+          if is_draft && !include_drafts
+            return :skipped
+          end
+
+          # Build Hugo frontmatter (TOML).
+          #
+          # Strategy: walk every parsed frontmatter key and either rename
+          # it to its Hugo equivalent (`updated`→`lastmod`, `image`→`images`,
+          # `expires`→`expiryDate`) or pass it through unchanged — including
+          # nested tables (`[extra]`, `[taxonomies]`) and typed scalars. Hugo
+          # accepts arbitrary keys as page params, so dropping them was a
+          # silent data-loss bug for `categories`, `authors`, and any
+          # custom field the user added (gh#527). Source-iteration order
+          # is preserved so Hugo frontmatter reads similarly to the
+          # original.
+          hugo_fields = {} of String => YAML::Any
+          fields.each do |key, value|
+            next if value.raw.nil?
+            case key
+            when "updated"
+              hugo_fields["lastmod"] = value
+            when "expires"
+              hugo_fields["expiryDate"] = value
+            when "image"
+              if image = value.as_s?
+                hugo_fields["images"] = YAML::Any.new([YAML::Any.new(image)])
+              else
+                hugo_fields["images"] = value
+              end
+            else
+              hugo_fields[key] = value
+            end
+          end
+
+          frontmatter = generate_toml_frontmatter(hugo_fields)
+          body = rewrite_internal_links(body)
+
+          # Preserve directory structure
+          relative = file_path.sub(content_dir, "").lstrip('/')
+          out_path = File.join(output_dir, "content", relative)
+
+          # A refused destination (outside `output_dir`) is reported as
+          # skipped, and its bundle assets are not copied either — there is no
+          # exported post for them to sit next to.
+          return :skipped unless write_file(out_path, "#{frontmatter}\n\n#{body.strip}\n", output_dir, verbose)
+
+          # Leaf bundle (`posts/my-post/index.md`): Hugo reads the bundle's
+          # co-located resources out of this same directory, so carry them
+          # across instead of exporting a post whose images all 404.
+          if File.basename(relative).in?("index.md", "index.markdown") && relative.includes?('/')
+            copy_bundle_assets(File.dirname(file_path), File.dirname(out_path), output_dir, verbose)
+          end
+
+          :exported
+        end
+
+        private def generate_toml_frontmatter(fields : Hash(String, YAML::Any)) : String
+          body = Hwaro::Utils::FrontmatterWriter::TomlBuilder.new.build(fields)
+          "+++\n#{body}+++"
+        end
+      end
+    end
+  end
+end

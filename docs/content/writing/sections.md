@@ -39,15 +39,69 @@ Welcome to my blog.
 | description | string | — | Section description |
 | template | string | "section" | Template to use |
 | page_template | string | — | Default template for pages |
-| sort_by | string | "date" | Sort by: date, weight, title |
-| reverse | bool | false | Reverse sort order |
+| sort_by | string | "date" | Sort by: date, weight, title (see [Sort direction](#sort-direction)) |
+| reverse | bool | false | Flip the natural sort order (see [Sort direction](#sort-direction)) |
 | paginate | int | — | Pages per page |
-| paginate_path | string | "page" | Pagination URL pattern |
+| paginate_path | string | "page" | Path segment for pager URLs (default produces `/blog/page/2/`) |
 | transparent | bool | false | Pass pages to parent |
 | generate_feeds | bool | false | Generate RSS feed |
-| redirect_to | string | — | Redirect URL |
+| redirect_to | string | — | Write an HTML redirect page to this URL instead of rendering the section |
 | draft | bool | false | Exclude from production |
 | weight | int | 0 | Section sort order |
+| cascade | table | — | Defaults inherited by descendants (see [Cascade](#cascade)) |
+
+## Cascade
+
+A section's `[cascade]` table sets front matter defaults for every page and
+section below it. A page's own front matter always wins, and deeper cascades
+override shallower ones. The section declaring the cascade is not affected.
+
+```toml
++++
+title = "Blog"
+
+[cascade]
+template = "post"
+tags = ["blog"]
+
+[cascade.extra]
+banner = "default-banner.png"
++++
+```
+
+Every page under the section now renders with the `post` template, carries the
+`blog` tag, and exposes `page.extra.banner` — unless it sets those fields
+itself. `extra` and `taxonomies` merge per key: the page's own keys win,
+cascaded keys fill the gaps.
+
+Cascadable keys: `template`, `draft`, `render`, `toc`, `insert_anchor_links`,
+`in_sitemap`, `in_search_index`, `tags`, `taxonomies`, `authors`, `extra`.
+URL-affecting keys (`slug`, `path`, `aliases`) cannot cascade and are ignored
+with a warning.
+
+On multilingual sites, a cascade only applies within its own language tree —
+`_index.ko.md` cascades to `.ko` pages, `_index.md` to default-language pages.
+
+## Sort direction
+
+Each `sort_by` value has a different natural direction, chosen to match what authors usually want:
+
+| `sort_by` | Default order | With `reverse = true` |
+|-----------|---------------|------------------------|
+| `date`    | Newest first (descending) | Oldest first |
+| `weight`  | Lowest weight first (ascending) | Highest weight first |
+| `title`   | A → Z (ascending) | Z → A |
+
+`reverse` flips whichever direction is natural for the chosen `sort_by`. For example, a blog index sorted by `date` is newest-first by default; setting `reverse = true` switches it to oldest-first.
+
+```toml
++++
+title = "Blog"
+sort_by = "date"
+# reverse = false (default) → newest first
+# reverse = true            → oldest first
++++
+```
 
 ## Examples
 
@@ -63,6 +117,8 @@ paginate_path = "p"
 ```
 
 Generates: `/blog/`, `/blog/p/2/`, `/blog/p/3/`
+
+With the default `paginate_path = "page"`, the URLs are `/blog/page/2/`, `/blog/page/3/`, … — page 1 always stays at the section URL.
 
 ### Documentation
 
@@ -86,6 +142,28 @@ generate_feeds = true
 ```
 
 Generates `/news/rss.xml`.
+
+## Full Front Matter Reference
+
+All available fields in one block. Copy and remove what you don't need.
+
+```toml
++++
+title = "Section Title"
+description = "Section description"
+template = "section"
+page_template = "custom-page"
+sort_by = "date"
+reverse = false
+paginate = 10
+paginate_path = "page"
+transparent = false
+generate_feeds = true
+redirect_to = ""
+draft = false
+weight = 0
++++
+```
 
 ## Nested Sections
 
@@ -130,7 +208,7 @@ When rendering a section page (`_index.md`), these variables are available:
 | section.redirect_to | String | Redirect target if configured |
 | section_list | String | Same as `section.list` |
 | pagination | String | Pre-rendered pagination HTML |
-| paginator | Object | Structured pagination object |
+| paginator | Object | Structured pagination object — see [Data Model › Paginator](/templates/data-model/#paginator) |
 
 Use `page.url` for the current section URL.
 
@@ -142,17 +220,7 @@ Use `page.url` for the current section URL.
 </ul>
 ```
 
-### `paginator` (custom pagination UI)
-
-```jinja
-{% if paginator is defined and paginator.number_pagers > 1 %}
-<nav>
-  {% if paginator.previous %}<a href="{{ paginator.previous }}">Prev</a>{% endif %}
-  <span>{{ paginator.current_index }} / {{ paginator.number_pagers }}</span>
-  {% if paginator.next %}<a href="{{ paginator.next }}">Next</a>{% endif %}
-</nav>
-{% endif %}
-```
+For building a custom pagination UI with `paginator`, see [Data Model › Paginator](/templates/data-model/#paginator).
 
 ## Transparent Sections
 
@@ -204,3 +272,9 @@ You can access the list of section assets in your templates using `section.asset
 | index.md | Regular page | `/blog/` |
 
 Use `_index.md` when you need to list child pages.
+
+## See Also
+
+- [Pages](/writing/pages/) — Individual content files and front matter
+- [Taxonomies](/writing/taxonomies/) — Classify content by tags and categories
+- [Data Model](/templates/data-model/) — Section properties in templates

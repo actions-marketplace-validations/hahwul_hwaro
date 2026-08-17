@@ -18,28 +18,28 @@ describe Hwaro::Content::Processors::Markdown do
   describe "TOML front matter parsing" do
     it "parses basic TOML fields" do
       raw = <<-MD
-      +++
-      title = "My Post"
-      draft = false
-      +++
-      Content here
-      MD
+        +++
+        title = "My Post"
+        draft = false
+        +++
+        Content here
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("My Post")
-      result[:draft].should eq(false)
+      result[:draft].should be_false
       result[:content].should contain("Content here")
     end
 
     it "parses description and image" do
       raw = <<-MD
-      +++
-      title = "Post"
-      description = "A brief summary"
-      image = "/images/hero.jpg"
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        description = "A brief summary"
+        image = "/images/hero.jpg"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:description].should eq("A brief summary")
@@ -48,25 +48,45 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses tags array" do
       raw = <<-MD
-      +++
-      title = "Post"
-      tags = ["crystal", "programming", "web"]
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        tags = ["crystal", "programming", "web"]
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq(["crystal", "programming", "web"])
     end
 
+    it "strips whitespace from tags and taxonomy terms" do
+      # `"  spaced-tag  "` slugified clean but leaked verbatim into the term
+      # page <h1>/<title> and RSS <title>/<category>, and a padded duplicate
+      # of an existing term split into a second `-2` term page.
+      raw = <<-MD
+        +++
+        title = "Post"
+        tags = ["  spaced-tag  ", "clean"]
+
+        [taxonomies]
+        series = ["  My Series "]
+        +++
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq(["spaced-tag", "clean"])
+      result[:taxonomies]["series"].should eq(["My Series"])
+    end
+
     it "parses aliases array" do
       raw = <<-MD
-      +++
-      title = "Post"
-      aliases = ["/old-url/", "/legacy/page/"]
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        aliases = ["/old-url/", "/legacy/page/"]
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:aliases].should eq(["/old-url/", "/legacy/page/"])
@@ -74,12 +94,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses date field" do
       raw = <<-MD
-      +++
-      title = "Post"
-      date = "2024-06-15"
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        date = "2024-06-15"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should_not be_nil
@@ -87,13 +107,13 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses updated field" do
       raw = <<-MD
-      +++
-      title = "Post"
-      date = "2024-01-01"
-      updated = "2024-06-15"
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        date = "2024-01-01"
+        updated = "2024-06-15"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:updated].should_not be_nil
@@ -101,51 +121,51 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses toc field" do
       raw = <<-MD
-      +++
-      title = "Doc"
-      toc = true
-      +++
-      Body
-      MD
+        +++
+        title = "Doc"
+        toc = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:toc].should eq(true)
+      result[:toc].should be_true
     end
 
     it "parses render = false" do
       raw = <<-MD
-      +++
-      title = "Hidden"
-      render = false
-      +++
-      Body
-      MD
+        +++
+        title = "Hidden"
+        render = false
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:render].should eq(false)
+      result[:render].should be_false
     end
 
     it "parses in_sitemap = false" do
       raw = <<-MD
-      +++
-      title = "NoSitemap"
-      in_sitemap = false
-      +++
-      Body
-      MD
+        +++
+        title = "NoSitemap"
+        in_sitemap = false
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:in_sitemap].should eq(false)
+      result[:in_sitemap].should be_false
     end
 
     it "parses slug field" do
       raw = <<-MD
-      +++
-      title = "Original Title"
-      slug = "custom-slug"
-      +++
-      Body
-      MD
+        +++
+        title = "Original Title"
+        slug = "custom-slug"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:slug].should eq("custom-slug")
@@ -153,12 +173,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses path field (custom path)" do
       raw = <<-MD
-      +++
-      title = "Post"
-      path = "/archive/2024/my-post/"
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        path = "/archive/2024/my-post/"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:custom_path].should eq("/archive/2024/my-post/")
@@ -166,12 +186,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses template field" do
       raw = <<-MD
-      +++
-      title = "Special"
-      template = "landing"
-      +++
-      Body
-      MD
+        +++
+        title = "Special"
+        template = "landing"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:template].should eq("landing")
@@ -179,12 +199,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses redirect_to field" do
       raw = <<-MD
-      +++
-      title = "Redirect"
-      redirect_to = "/new-location/"
-      +++
-      Body
-      MD
+        +++
+        title = "Redirect"
+        redirect_to = "/new-location/"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:redirect_to].should eq("/new-location/")
@@ -192,12 +212,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses weight field" do
       raw = <<-MD
-      +++
-      title = "Weighted"
-      weight = 42
-      +++
-      Body
-      MD
+        +++
+        title = "Weighted"
+        weight = 42
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:weight].should eq(42)
@@ -205,12 +225,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses authors array" do
       raw = <<-MD
-      +++
-      title = "Post"
-      authors = ["alice", "bob"]
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        authors = ["alice", "bob"]
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:authors].should eq(["alice", "bob"])
@@ -218,94 +238,94 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses in_search_index = false" do
       raw = <<-MD
-      +++
-      title = "NoSearch"
-      in_search_index = false
-      +++
-      Body
-      MD
+        +++
+        title = "NoSearch"
+        in_search_index = false
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:in_search_index].should eq(false)
+      result[:in_search_index].should be_false
     end
 
     it "parses insert_anchor_links = true" do
       raw = <<-MD
-      +++
-      title = "Anchored"
-      insert_anchor_links = true
-      +++
-      Body
-      MD
+        +++
+        title = "Anchored"
+        insert_anchor_links = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:insert_anchor_links].should eq(true)
+      result[:insert_anchor_links].should be_true
     end
 
     it "parses transparent = true (section property)" do
       raw = <<-MD
-      +++
-      title = "2024"
-      transparent = true
-      +++
-      Body
-      MD
+        +++
+        title = "2024"
+        transparent = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:transparent].should eq(true)
+      result[:transparent].should be_true
     end
 
     it "parses generate_feeds = true" do
       raw = <<-MD
-      +++
-      title = "Blog"
-      generate_feeds = true
-      +++
-      Body
-      MD
+        +++
+        title = "Blog"
+        generate_feeds = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:generate_feeds].should eq(true)
+      result[:generate_feeds].should be_true
     end
 
     it "parses paginate and pagination_enabled" do
       raw = <<-MD
-      +++
-      title = "Section"
-      paginate = 10
-      pagination_enabled = true
-      +++
-      Body
-      MD
+        +++
+        title = "Section"
+        paginate = 10
+        pagination_enabled = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:paginate].should eq(10)
-      result[:pagination_enabled].should eq(true)
+      result[:pagination_enabled].should be_true
     end
 
     it "parses sort_by and reverse" do
       raw = <<-MD
-      +++
-      title = "Section"
-      sort_by = "weight"
-      reverse = true
-      +++
-      Body
-      MD
+        +++
+        title = "Section"
+        sort_by = "weight"
+        reverse = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:sort_by].should eq("weight")
-      result[:reverse].should eq(true)
+      result[:reverse].should be_true
     end
 
     it "parses page_template field" do
       raw = <<-MD
-      +++
-      title = "Section"
-      page_template = "blog_post"
-      +++
-      Body
-      MD
+        +++
+        title = "Section"
+        page_template = "blog_post"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:page_template].should eq("blog_post")
@@ -313,12 +333,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses paginate_path field" do
       raw = <<-MD
-      +++
-      title = "Section"
-      paginate_path = "p"
-      +++
-      Body
-      MD
+        +++
+        title = "Section"
+        paginate_path = "p"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:paginate_path].should eq("p")
@@ -326,33 +346,33 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "extracts extra fields from [extra] table" do
       raw = <<-MD
-      +++
-      title = "Post"
+        +++
+        title = "Post"
 
-      [extra]
-      custom_field = "hello"
-      custom_bool = true
-      custom_int = 99
-      +++
-      Body
-      MD
+        [extra]
+        custom_field = "hello"
+        custom_bool = true
+        custom_int = 99
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:extra].has_key?("extra").should be_true
-      extra = result[:extra]["extra"]
-      # The extra should contain "custom_field" within the nested structure
-      # Since [extra] is parsed as a TOML subtable, it becomes extra["extra"]
+      result[:extra].has_key?("extra").should be_false
+      result[:extra]["custom_field"].should eq("hello")
+      result[:extra]["custom_bool"].should be_true
+      result[:extra]["custom_int"].should eq(99_i64)
     end
 
     it "extracts top-level extra fields not in known keys" do
       raw = <<-MD
-      +++
-      title = "Post"
-      my_custom_key = "custom_value"
-      another_key = true
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        my_custom_key = "custom_value"
+        another_key = true
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:extra].has_key?("my_custom_key").should be_true
@@ -361,13 +381,13 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "extracts taxonomies from front matter" do
       raw = <<-MD
-      +++
-      title = "Post"
-      tags = ["crystal", "web"]
-      categories = ["tech", "programming"]
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        tags = ["crystal", "web"]
+        categories = ["tech", "programming"]
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:taxonomies].has_key?("tags").should be_true
@@ -378,13 +398,13 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "returns front_matter_keys" do
       raw = <<-MD
-      +++
-      title = "Post"
-      draft = false
-      tags = ["a"]
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        draft = false
+        tags = ["a"]
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:front_matter_keys].should contain("title")
@@ -399,28 +419,28 @@ describe Hwaro::Content::Processors::Markdown do
   describe "YAML front matter parsing" do
     it "parses basic YAML fields" do
       raw = <<-MD
-      ---
-      title: My Post
-      draft: false
-      ---
-      Content here
-      MD
+        ---
+        title: My Post
+        draft: false
+        ---
+        Content here
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("My Post")
-      result[:draft].should eq(false)
+      result[:draft].should be_false
       result[:content].should contain("Content here")
     end
 
     it "parses description and image" do
       raw = <<-MD
-      ---
-      title: Post
-      description: A brief summary
-      image: /images/hero.jpg
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        description: A brief summary
+        image: /images/hero.jpg
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:description].should eq("A brief summary")
@@ -429,15 +449,15 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses tags array" do
       raw = <<-MD
-      ---
-      title: Post
-      tags:
-        - crystal
-        - programming
-        - web
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        tags:
+          - crystal
+          - programming
+          - web
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq(["crystal", "programming", "web"])
@@ -445,12 +465,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses inline tags array" do
       raw = <<-MD
-      ---
-      title: Post
-      tags: [crystal, web]
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        tags: [crystal, web]
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq(["crystal", "web"])
@@ -458,14 +478,14 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses aliases array" do
       raw = <<-MD
-      ---
-      title: Post
-      aliases:
-        - /old-url/
-        - /legacy/page/
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        aliases:
+          - /old-url/
+          - /legacy/page/
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:aliases].should eq(["/old-url/", "/legacy/page/"])
@@ -473,51 +493,72 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses date field" do
       raw = <<-MD
-      ---
-      title: Post
-      date: "2024-06-15"
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        date: "2024-06-15"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should_not be_nil
     end
 
-    it "parses toc field" do
+    it "parses UNQUOTED date/updated/expires (YAML native timestamps)" do
+      # Unquoted YAML dates resolve to native Time nodes; the old `.as_s?` read
+      # returned nil and silently dropped them, breaking sort/feeds/sitemap.
       raw = <<-MD
-      ---
-      title: Doc
-      toc: true
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        date: 2024-03-15
+        updated: 2024-04-01
+        expires: 2025-01-01
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:toc].should eq(true)
+      result[:date].should_not be_nil
+      result[:updated].should_not be_nil
+      result[:expires].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+      result[:date].not_nil!.month.should eq(3)
+    end
+
+    it "parses toc field" do
+      raw = <<-MD
+        ---
+        title: Doc
+        toc: true
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:toc].should be_true
     end
 
     it "parses render: false" do
       raw = <<-MD
-      ---
-      title: Hidden
-      render: false
-      ---
-      Body
-      MD
+        ---
+        title: Hidden
+        render: false
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:render].should eq(false)
+      result[:render].should be_false
     end
 
     it "parses slug field" do
       raw = <<-MD
-      ---
-      title: Original
-      slug: custom-slug
-      ---
-      Body
-      MD
+        ---
+        title: Original
+        slug: custom-slug
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:slug].should eq("custom-slug")
@@ -525,12 +566,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses redirect_to field" do
       raw = <<-MD
-      ---
-      title: Redirect
-      redirect_to: /new-location/
-      ---
-      Body
-      MD
+        ---
+        title: Redirect
+        redirect_to: /new-location/
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:redirect_to].should eq("/new-location/")
@@ -538,12 +579,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses weight field" do
       raw = <<-MD
-      ---
-      title: Weighted
-      weight: 42
-      ---
-      Body
-      MD
+        ---
+        title: Weighted
+        weight: 42
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:weight].should eq(42)
@@ -551,14 +592,14 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses authors array" do
       raw = <<-MD
-      ---
-      title: Post
-      authors:
-        - alice
-        - bob
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        authors:
+          - alice
+          - bob
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:authors].should eq(["alice", "bob"])
@@ -566,58 +607,58 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses transparent and generate_feeds" do
       raw = <<-MD
-      ---
-      title: Section
-      transparent: true
-      generate_feeds: true
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        transparent: true
+        generate_feeds: true
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:transparent].should eq(true)
-      result[:generate_feeds].should eq(true)
+      result[:transparent].should be_true
+      result[:generate_feeds].should be_true
     end
 
     it "parses paginate and pagination_enabled" do
       raw = <<-MD
-      ---
-      title: Section
-      paginate: 5
-      pagination_enabled: true
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        paginate: 5
+        pagination_enabled: true
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:paginate].should eq(5)
-      result[:pagination_enabled].should eq(true)
+      result[:pagination_enabled].should be_true
     end
 
     it "parses sort_by and reverse" do
       raw = <<-MD
-      ---
-      title: Section
-      sort_by: title
-      reverse: true
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        sort_by: title
+        reverse: true
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:sort_by].should eq("title")
-      result[:reverse].should eq(true)
+      result[:reverse].should be_true
     end
 
     it "extracts YAML extra fields not in known keys" do
       raw = <<-MD
-      ---
-      title: Post
-      my_custom_key: custom_value
-      another_key: true
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        my_custom_key: custom_value
+        another_key: true
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:extra].has_key?("my_custom_key").should be_true
@@ -626,16 +667,16 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "extracts taxonomies from YAML front matter" do
       raw = <<-MD
-      ---
-      title: Post
-      tags:
-        - crystal
-        - web
-      categories:
-        - tech
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        tags:
+          - crystal
+          - web
+        categories:
+          - tech
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:taxonomies].has_key?("tags").should be_true
@@ -646,16 +687,158 @@ describe Hwaro::Content::Processors::Markdown do
   end
 
   # ---------------------------------------------------------------------------
+  # JSON front matter ({...} balanced at file start)
+  # ---------------------------------------------------------------------------
+  describe "JSON front matter parsing" do
+    it "parses basic JSON fields" do
+      raw = <<-MD
+        {
+          "title": "My JSON Post",
+          "draft": false
+        }
+
+        Content here
+        MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("My JSON Post")
+      result[:draft].should be_false
+      result[:content].should contain("Content here")
+    end
+
+    it "parses description and image" do
+      raw = <<-MD
+        {"title": "Post", "description": "A brief summary", "image": "/images/hero.jpg"}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:description].should eq("A brief summary")
+      result[:image].should eq("/images/hero.jpg")
+    end
+
+    it "parses tags array" do
+      raw = <<-MD
+        {"title": "Tagged", "tags": ["crystal", "web"]}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:tags].should eq(["crystal", "web"])
+      result[:taxonomies].has_key?("tags").should be_true
+      result[:taxonomies]["tags"].should eq(["crystal", "web"])
+    end
+
+    it "parses integer and boolean fields" do
+      raw = <<-MD
+        {"title": "P", "weight": 5, "toc": true, "draft": true}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:weight].should eq(5)
+      result[:toc].should be_true
+      result[:draft].should be_true
+    end
+
+    it "parses date as ISO string" do
+      raw = <<-MD
+        {"title": "Dated", "date": "2024-01-15"}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+    end
+
+    it "captures unknown keys into extra" do
+      raw = <<-MD
+        {"title": "P", "custom_field": "hello", "rating": 4}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:extra]["custom_field"].should eq("hello")
+      result[:extra]["rating"].should eq(4_i64)
+    end
+
+    it "handles nested braces inside string values" do
+      raw = <<-MD
+        {"title": "Tricky {nested}", "description": "a } b { c"}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:title].should eq("Tricky {nested}")
+      result[:description].should eq("a } b { c")
+    end
+
+    it "handles escaped quotes inside strings" do
+      raw = %({"title": "She said \\"hi\\"", "description": "x"}\n\nBody\n)
+
+      result = processor.parse(raw)
+      result[:title].should eq(%(She said "hi"))
+    end
+
+    it "leaves content untouched when file does not start with {" do
+      # Leading whitespace means the { is not at byte 0, so this is not a JSON
+      # frontmatter block — parser should fall through to the no-frontmatter path.
+      raw = " {\"not\": \"frontmatter\"}\n\nBody\n"
+
+      result = processor.parse(raw)
+      result[:title].should eq("Untitled")
+      result[:content].should contain("Body")
+    end
+
+    it "extracts non-taxonomy-keyword arrays into taxonomies" do
+      raw = <<-MD
+        {"title": "P", "tags": ["a"], "categories": ["tech"]}
+
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:taxonomies]["tags"].should eq(["a"])
+      result[:taxonomies]["categories"].should eq(["tech"])
+    end
+
+    it "raises HwaroError for unbalanced JSON when a file_path is provided" do
+      raw = %({"title": "Never closes\n\nbody\n)
+
+      expect_raises(Hwaro::HwaroError, /unbalanced braces/) do
+        processor.parse(raw, "content/broken.md")
+      end
+    end
+
+    it "silently ignores unbalanced JSON when no file_path is provided (library use)" do
+      # Without a file_path the parser has no caller context to raise against,
+      # so we keep the historic graceful-nil behaviour and treat the file as
+      # having no front matter.
+      raw = %({"title": "Never closes\n\nbody\n)
+
+      result = processor.parse(raw)
+      result[:title].should eq("Untitled")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Default values (no front matter or missing fields)
   # ---------------------------------------------------------------------------
   describe "default values" do
     it "uses 'Untitled' when title is missing" do
       raw = <<-MD
-      ---
-      draft: false
-      ---
-      Body
-      MD
+        ---
+        draft: false
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("Untitled")
@@ -663,59 +846,59 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults draft to false" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:draft].should eq(false)
+      result[:draft].should be_false
     end
 
     it "defaults render to true" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:render].should eq(true)
+      result[:render].should be_true
     end
 
     it "defaults in_sitemap to true" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:in_sitemap].should eq(true)
+      result[:in_sitemap].should be_true
     end
 
     it "defaults toc to false" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:toc].should eq(false)
+      result[:toc].should be_false
     end
 
     it "defaults weight to 0" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:weight].should eq(0)
@@ -723,35 +906,48 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults in_search_index to true" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:in_search_index].should eq(true)
+      result[:in_search_index].should be_true
     end
 
-    it "defaults insert_anchor_links to false" do
+    it "defaults insert_anchor_links to nil (site config decides)" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:insert_anchor_links].should eq(false)
+      result[:insert_anchor_links].should be_nil
+    end
+
+    it "parses an explicit insert_anchor_links override" do
+      raw = <<-MD
+        ---
+        title: Post
+        insert_anchor_links: false
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:insert_anchor_links].should be_false
     end
 
     it "defaults paginate_path to 'page'" do
       raw = <<-MD
-      ---
-      title: Section
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:paginate_path].should eq("page")
@@ -759,11 +955,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults tags to empty array" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq([] of String)
@@ -771,11 +967,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults aliases to empty array" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:aliases].should eq([] of String)
@@ -783,11 +979,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults authors to empty array" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:authors].should eq([] of String)
@@ -795,11 +991,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults extra to empty hash" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:extra].empty?.should be_true
@@ -807,11 +1003,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults description to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:description].should be_nil
@@ -819,11 +1015,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults image to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:image].should be_nil
@@ -831,11 +1027,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults date to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should be_nil
@@ -843,11 +1039,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults slug to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:slug].should be_nil
@@ -855,11 +1051,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults custom_path to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:custom_path].should be_nil
@@ -867,11 +1063,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults redirect_to to nil" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:redirect_to].should be_nil
@@ -879,35 +1075,35 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults transparent to false" do
       raw = <<-MD
-      ---
-      title: Section
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:transparent].should eq(false)
+      result[:transparent].should be_false
     end
 
     it "defaults generate_feeds to false" do
       raw = <<-MD
-      ---
-      title: Section
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
-      result[:generate_feeds].should eq(false)
+      result[:generate_feeds].should be_false
     end
 
     it "defaults paginate to nil" do
       raw = <<-MD
-      ---
-      title: Section
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:paginate].should be_nil
@@ -915,11 +1111,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "defaults pagination_enabled to nil" do
       raw = <<-MD
-      ---
-      title: Section
-      ---
-      Body
-      MD
+        ---
+        title: Section
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:pagination_enabled].should be_nil
@@ -935,7 +1131,7 @@ describe Hwaro::Content::Processors::Markdown do
 
       result = processor.parse(raw)
       result[:title].should eq("Untitled")
-      result[:draft].should eq(false)
+      result[:draft].should be_false
       result[:content].should contain("# Hello World")
       result[:content].should contain("Just content, no front matter.")
     end
@@ -956,40 +1152,69 @@ describe Hwaro::Content::Processors::Markdown do
   # Malformed front matter recovery
   # ---------------------------------------------------------------------------
   describe "malformed front matter" do
-    it "recovers from invalid TOML and returns defaults" do
+    it "raises HWARO_E_CONTENT for invalid TOML when a file path is given" do
       raw = <<-MD
-      +++
-      title = "Valid"
-      invalid_syntax :::
-      +++
-      Body content
-      MD
+        +++
+        title = "Valid"
+        invalid_syntax :::
+        +++
+        Body content
+        MD
 
-      result = processor.parse(raw, "test.md")
-      # Should not crash; falls back to defaults for fields it can't parse
-      result[:content].should contain("Body content")
+      err = expect_raises(Hwaro::HwaroError) do
+        processor.parse(raw, "test.md")
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
+      err.exit_code.should eq(5)
+      (err.message || "").should contain("test.md")
     end
 
-    it "recovers from invalid YAML and returns defaults" do
+    it "raises HWARO_E_CONTENT for invalid YAML when a file path is given" do
       raw = <<-MD
-      ---
-      title: Valid
-      invalid: [unterminated
-      ---
-      Body content
-      MD
+        ---
+        title: Valid
+        invalid: [unterminated
+        ---
+        Body content
+        MD
 
-      result = processor.parse(raw, "test.md")
-      # Should not crash; falls back to defaults
+      err = expect_raises(Hwaro::HwaroError) do
+        processor.parse(raw, "test.md")
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
+      err.exit_code.should eq(5)
+      (err.message || "").should contain("test.md")
+    end
+
+    it "falls back to defaults when no file path is given (library use)" do
+      raw_toml = <<-MD
+        +++
+        title = "Valid"
+        invalid_syntax :::
+        +++
+        Body content
+        MD
+      result = processor.parse(raw_toml)
+      # Library-style invocation preserves the previous graceful behaviour
+      result[:content].should contain("Body content")
+
+      raw_yaml = <<-MD
+        ---
+        title: Valid
+        invalid: [unterminated
+        ---
+        Body content
+        MD
+      result = processor.parse(raw_yaml)
       result[:content].should contain("Body content")
     end
 
     it "handles TOML front matter with empty body" do
       raw = <<-MD
-      +++
-      title = "Empty Body"
-      +++
-      MD
+        +++
+        title = "Empty Body"
+        +++
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("Empty Body")
@@ -997,10 +1222,10 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles YAML front matter with empty body" do
       raw = <<-MD
-      ---
-      title: Empty Body
-      ---
-      MD
+        ---
+        title: Empty Body
+        ---
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("Empty Body")
@@ -1013,11 +1238,11 @@ describe Hwaro::Content::Processors::Markdown do
   describe "special characters in front matter" do
     it "handles Unicode title in YAML" do
       raw = <<-MD
-      ---
-      title: 안녕하세요
-      ---
-      Body
-      MD
+        ---
+        title: 안녕하세요
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("안녕하세요")
@@ -1025,11 +1250,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles Unicode title in TOML" do
       raw = <<-MD
-      +++
-      title = "日本語のタイトル"
-      +++
-      Body
-      MD
+        +++
+        title = "日本語のタイトル"
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("日本語のタイトル")
@@ -1037,11 +1262,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles title with quotes in YAML" do
       raw = <<-MD
-      ---
-      title: "Title with 'single' and inner quotes"
-      ---
-      Body
-      MD
+        ---
+        title: "Title with 'single' and inner quotes"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:title].should contain("single")
@@ -1049,11 +1274,11 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles title with special markdown characters" do
       raw = <<-MD
-      ---
-      title: "Title with # and * and [brackets]"
-      ---
-      Body
-      MD
+        ---
+        title: "Title with # and * and [brackets]"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:title].should contain("#")
@@ -1062,12 +1287,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles description with HTML entities" do
       raw = <<-MD
-      ---
-      title: Post
-      description: "Desc with <b>bold</b> & ampersands"
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        description: "Desc with <b>bold</b> & ampersands"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:description].not_nil!.should contain("<b>bold</b>")
@@ -1076,12 +1301,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles empty tags array in YAML" do
       raw = <<-MD
-      ---
-      title: Post
-      tags: []
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        tags: []
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq([] of String)
@@ -1089,12 +1314,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles empty tags array in TOML" do
       raw = <<-MD
-      +++
-      title = "Post"
-      tags = []
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        tags = []
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:tags].should eq([] of String)
@@ -1102,12 +1327,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles empty authors array in YAML" do
       raw = <<-MD
-      ---
-      title: Post
-      authors: []
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        authors: []
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:authors].should eq([] of String)
@@ -1115,12 +1340,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles empty aliases array in TOML" do
       raw = <<-MD
-      +++
-      title = "Post"
-      aliases = []
-      +++
-      Body
-      MD
+        +++
+        title = "Post"
+        aliases = []
+        +++
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:aliases].should eq([] of String)
@@ -1156,20 +1381,20 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "preserves markdown formatting in content body" do
       raw = <<-MD
-      ---
-      title: Test
-      ---
-      # Heading
+        ---
+        title: Test
+        ---
+        # Heading
 
-      **Bold** and *italic* text.
+        **Bold** and *italic* text.
 
-      - List item 1
-      - List item 2
+        - List item 1
+        - List item 2
 
-      ```
-      code block
-      ```
-      MD
+        ```
+        code block
+        ```
+        MD
 
       result = processor.parse(raw)
       result[:content].should contain("# Heading")
@@ -1184,45 +1409,45 @@ describe Hwaro::Content::Processors::Markdown do
   describe "comprehensive TOML front matter" do
     it "parses all supported fields together" do
       raw = <<-MD
-      +++
-      title = "Complete Post"
-      description = "Full description"
-      image = "/img/cover.jpg"
-      draft = false
-      date = "2024-06-15"
-      updated = "2024-07-01"
-      toc = true
-      render = true
-      in_sitemap = true
-      slug = "complete"
-      weight = 10
-      tags = ["crystal", "test"]
-      aliases = ["/old/"]
-      authors = ["alice"]
-      in_search_index = true
-      insert_anchor_links = true
-      redirect_to = ""
-      +++
-      Full body content here.
-      MD
+        +++
+        title = "Complete Post"
+        description = "Full description"
+        image = "/img/cover.jpg"
+        draft = false
+        date = "2024-06-15"
+        updated = "2024-07-01"
+        toc = true
+        render = true
+        in_sitemap = true
+        slug = "complete"
+        weight = 10
+        tags = ["crystal", "test"]
+        aliases = ["/old/"]
+        authors = ["alice"]
+        in_search_index = true
+        insert_anchor_links = true
+        redirect_to = ""
+        +++
+        Full body content here.
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("Complete Post")
       result[:description].should eq("Full description")
       result[:image].should eq("/img/cover.jpg")
-      result[:draft].should eq(false)
+      result[:draft].should be_false
       result[:date].should_not be_nil
       result[:updated].should_not be_nil
-      result[:toc].should eq(true)
-      result[:render].should eq(true)
-      result[:in_sitemap].should eq(true)
+      result[:toc].should be_true
+      result[:render].should be_true
+      result[:in_sitemap].should be_true
       result[:slug].should eq("complete")
       result[:weight].should eq(10)
       result[:tags].should eq(["crystal", "test"])
       result[:aliases].should eq(["/old/"])
       result[:authors].should eq(["alice"])
-      result[:in_search_index].should eq(true)
-      result[:insert_anchor_links].should eq(true)
+      result[:in_search_index].should be_true
+      result[:insert_anchor_links].should be_true
       result[:content].should contain("Full body content here.")
     end
   end
@@ -1233,49 +1458,137 @@ describe Hwaro::Content::Processors::Markdown do
   describe "comprehensive YAML front matter" do
     it "parses all supported fields together" do
       raw = <<-MD
-      ---
-      title: Complete Post
-      description: Full description
-      image: /img/cover.jpg
-      draft: false
-      date: "2024-06-15"
-      updated: "2024-07-01"
-      toc: true
-      render: true
-      in_sitemap: true
-      slug: complete
-      weight: 10
-      tags:
-        - crystal
-        - test
-      aliases:
-        - /old/
-      authors:
-        - alice
-      in_search_index: true
-      insert_anchor_links: true
-      ---
-      Full body content here.
-      MD
+        ---
+        title: Complete Post
+        description: Full description
+        image: /img/cover.jpg
+        draft: false
+        date: "2024-06-15"
+        updated: "2024-07-01"
+        toc: true
+        render: true
+        in_sitemap: true
+        slug: complete
+        weight: 10
+        tags:
+          - crystal
+          - test
+        aliases:
+          - /old/
+        authors:
+          - alice
+        in_search_index: true
+        insert_anchor_links: true
+        ---
+        Full body content here.
+        MD
 
       result = processor.parse(raw)
       result[:title].should eq("Complete Post")
       result[:description].should eq("Full description")
       result[:image].should eq("/img/cover.jpg")
-      result[:draft].should eq(false)
+      result[:draft].should be_false
       result[:date].should_not be_nil
       result[:updated].should_not be_nil
-      result[:toc].should eq(true)
-      result[:render].should eq(true)
-      result[:in_sitemap].should eq(true)
+      result[:toc].should be_true
+      result[:render].should be_true
+      result[:in_sitemap].should be_true
       result[:slug].should eq("complete")
       result[:weight].should eq(10)
       result[:tags].should eq(["crystal", "test"])
       result[:aliases].should eq(["/old/"])
       result[:authors].should eq(["alice"])
-      result[:in_search_index].should eq(true)
-      result[:insert_anchor_links].should eq(true)
+      result[:in_search_index].should be_true
+      result[:insert_anchor_links].should be_true
       result[:content].should contain("Full body content here.")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Series and expires fields
+  # ---------------------------------------------------------------------------
+  describe "series and expires fields" do
+    it "parses series from TOML" do
+      raw = <<-MD
+        +++
+        title = "Part 1"
+        series = "My Tutorial"
+        series_weight = 1
+        +++
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:series].should eq("My Tutorial")
+      result[:series_weight].should eq(1)
+    end
+
+    it "parses series from YAML" do
+      raw = <<-MD
+        ---
+        title: Part 2
+        series: My Tutorial
+        series_weight: 2
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:series].should eq("My Tutorial")
+      result[:series_weight].should eq(2)
+    end
+
+    it "defaults series to nil" do
+      raw = <<-MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:series].should be_nil
+      result[:series_weight].should eq(0)
+    end
+
+    it "parses expires from TOML" do
+      raw = <<-MD
+        +++
+        title = "Expiring"
+        expires = "2025-12-31"
+        +++
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:expires].should_not be_nil
+      result[:expires].not_nil!.year.should eq(2025)
+    end
+
+    it "parses expires from YAML" do
+      raw = <<-MD
+        ---
+        title: Expiring
+        expires: "2025-06-30"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:expires].should_not be_nil
+      result[:expires].not_nil!.month.should eq(6)
+    end
+
+    it "defaults expires to nil" do
+      raw = <<-MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:expires].should be_nil
     end
   end
 
@@ -1285,12 +1598,12 @@ describe Hwaro::Content::Processors::Markdown do
   describe "date parsing" do
     it "parses ISO 8601 date" do
       raw = <<-MD
-      ---
-      title: Post
-      date: "2024-01-15"
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        date: "2024-01-15"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should_not be_nil
@@ -1301,12 +1614,12 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "parses date with time component" do
       raw = <<-MD
-      ---
-      title: Post
-      date: "2024-06-15T10:30:00"
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        date: "2024-06-15T10:30:00"
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should_not be_nil
@@ -1315,14 +1628,501 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "handles nil date gracefully" do
       raw = <<-MD
-      ---
-      title: Post
-      ---
-      Body
-      MD
+        ---
+        title: Post
+        ---
+        Body
+        MD
 
       result = processor.parse(raw)
       result[:date].should be_nil
+    end
+
+    it "parses RFC 3339 date with timezone" do
+      raw = <<-MD
+        ---
+        title: Post
+        date: "2024-06-15T10:30:00+09:00"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+      result[:date].not_nil!.month.should eq(6)
+    end
+
+    it "parses RFC 3339 date with Z timezone" do
+      raw = <<-MD
+        ---
+        title: Post
+        date: "2024-01-01T00:00:00Z"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.year.should eq(2024)
+    end
+
+    it "parses date with space-separated time" do
+      raw = <<-MD
+        ---
+        title: Post
+        date: "2024-06-15 14:30:00"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should_not be_nil
+      result[:date].not_nil!.hour.should eq(14)
+    end
+
+    it "handles empty date string gracefully" do
+      raw = <<-MD
+        ---
+        title: Post
+        date: ""
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+    end
+
+    it "handles invalid date string gracefully" do
+      raw = <<-MD
+        ---
+        title: Post
+        date: "not-a-date"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+    end
+
+    it "treats an out-of-range YAML date as nil without dropping the rest of the front matter" do
+      # "2024-13-45" is format-valid but value-invalid, so Time.parse raises
+      # ArgumentError (not Time::Format::Error). parse_time must swallow it and
+      # return nil for the date while title/tags survive — one bad date must
+      # not blank out the whole page (which previously fell through to the
+      # broad rescue and produced an "Untitled" page).
+      raw = <<-MD
+        ---
+        title: Post
+        date: "2024-13-45"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+      result[:title].should eq("Post")
+    end
+
+    it "treats an impossible calendar date (Feb 30) as nil and keeps the title" do
+      raw = <<-MD
+        ---
+        title: Feb
+        date: "2024-02-30"
+        ---
+        Body
+        MD
+
+      result = processor.parse(raw)
+      result[:date].should be_nil
+      result[:title].should eq("Feb")
+    end
+
+    it "treats an out-of-range TOML quoted date as nil and keeps the title" do
+      raw = <<-MD
+        +++
+        title = "T"
+        date = "2024-13-45"
+        +++
+        Body
+        MD
+
+      result = processor.parse(raw, "content/post.md")
+      result[:date].should be_nil
+      result[:title].should eq("T")
+    end
+  end
+
+  describe "malformed cascade" do
+    it "warns and ignores a scalar cascade value instead of raising" do
+      log = with_captured_log do
+        result = processor.parse("+++\ntitle = \"S\"\ncascade = \"oops\"\n+++\nbody", "content/_index.md")
+        result[:cascade].empty?.should be_true
+      end
+      log.should contain("`cascade` must be a table")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Integers above Int32::MAX
+  #
+  # Regression: `as_i?` on TOML/YAML/JSON `Any` is a TYPE guard with no RANGE
+  # guard, so a value that is perfectly in range for the Int64 these parsers
+  # produce raised OverflowError out of a *nil-safe* accessor. The blanket
+  # rescue then reported the document as having NO front matter at all: the
+  # `draft` flag was lost so the page shipped, and the raw fence was rendered
+  # into the body.
+  # ---------------------------------------------------------------------------
+  describe "front matter integers above Int32::MAX" do
+    it "keeps TOML front matter when weight exceeds Int32::MAX" do
+      raw = <<-MD
+        +++
+        title = "Unreleased"
+        draft = true
+        weight = 3000000000
+        +++
+
+        Internal notes.
+        MD
+
+      result = processor.parse(raw, "content/w.md")
+      result[:title].should eq("Unreleased")
+      result[:draft].should be_true
+      result[:weight].should eq(Int32::MAX)
+      result[:content].should_not contain("+++")
+    end
+
+    it "keeps YAML front matter when weight exceeds Int32::MAX" do
+      raw = <<-MD
+        ---
+        title: W
+        draft: true
+        weight: 3000000000
+        ---
+
+        body
+        MD
+
+      result = processor.parse(raw, "content/w.md")
+      result[:title].should eq("W")
+      result[:draft].should be_true
+      result[:weight].should eq(Int32::MAX)
+    end
+
+    it "keeps JSON front matter when weight exceeds Int32::MAX" do
+      raw = "{\"title\": \"J\", \"draft\": true, \"weight\": 3000000000}\n\nbody\n"
+
+      result = processor.parse(raw, "content/j.md")
+      result[:title].should eq("J")
+      result[:draft].should be_true
+      result[:weight].should eq(Int32::MAX)
+    end
+
+    it "round-trips a large [extra] integer as Int64" do
+      raw = <<-MD
+        +++
+        title = "Unreleased"
+        draft = true
+
+        [extra]
+        build_id = 1755043200000
+        +++
+
+        Internal notes.
+        MD
+
+      result = processor.parse(raw, "content/secret.md")
+      result[:draft].should be_true
+      result[:extra]["build_id"].should eq(1755043200000_i64)
+    end
+
+    it "clamps an oversized menu weight instead of losing the front matter" do
+      raw = <<-MD
+        +++
+        title = "M"
+
+        [menus.main]
+        weight = 4200000000
+        +++
+
+        body
+        MD
+
+      result = processor.parse(raw, "content/m.md")
+      result[:title].should eq("M")
+      result[:menus]["main"].weight.should eq(Int32::MAX)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Non-string scalars where a string/list is expected
+  #
+  # These used to be dropped in total silence, so the page shipped as
+  # "Untitled" with no tags and no hint of why. The value is still ignored —
+  # coercing it would change output for sites that build today — but the
+  # mistake is now named.
+  # ---------------------------------------------------------------------------
+  describe "mistyped front matter scalars" do
+    it "warns when title is not a string" do
+      log = with_captured_log do
+        result = processor.parse("+++\ntitle = 2024\n+++\nbody", "content/n.md")
+        result[:title].should eq("Untitled")
+      end
+      log.should contain("content/n.md: `title` must be a string")
+    end
+
+    it "warns when slug and description are not strings" do
+      log = with_captured_log do
+        result = processor.parse("+++\ntitle = \"T\"\ndescription = 42\nslug = 7\n+++\nbody", "content/s.md")
+        result[:description].should be_nil
+        result[:slug].should be_nil
+      end
+      log.should contain("`description` must be a string")
+      log.should contain("`slug` must be a string")
+    end
+
+    it "warns when tags is a bare string instead of a list" do
+      log = with_captured_log do
+        result = processor.parse("+++\ntitle = \"T\"\ntags = \"solo\"\n+++\nbody", "content/t.md")
+        result[:tags].empty?.should be_true
+      end
+      log.should contain("`tags` must be a list of strings")
+    end
+
+    it "stays silent for an explicitly empty YAML key" do
+      log = with_captured_log do
+        result = processor.parse("---\ntitle: T\ndescription:\n---\nbody", "content/e.md")
+        result[:title].should eq("T")
+        result[:description].should be_nil
+      end
+      log.should_not contain("must be a string")
+    end
+
+    it "stays silent when no file_path is given (library use)" do
+      log = with_captured_log do
+        result = processor.parse("+++\ntitle = 2024\n+++\nbody")
+        result[:title].should eq("Untitled")
+      end
+      log.should_not contain("must be a string")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Anchor links and TOC
+  # ---------------------------------------------------------------------------
+  describe "render_with_anchors" do
+    it "inserts anchor links before heading content" do
+      content = "# Hello World"
+      html, _toc = processor.render_with_anchors(content, anchor_style: "before")
+      html.should contain("anchor")
+      html.should contain("href=\"#hello-world\"")
+    end
+
+    it "inserts anchor links after heading content" do
+      content = "# Hello World"
+      html, _toc = processor.render_with_anchors(content, anchor_style: "after")
+      html.should contain("anchor")
+      html.should contain("href=\"#hello-world\"")
+    end
+
+    it "does not insert anchors with default heading style" do
+      content = "# Hello World"
+      html, _toc = processor.render_with_anchors(content, anchor_style: "heading")
+      html.should_not contain("class=\"anchor\"")
+    end
+
+    it "returns TOC headers" do
+      content = "# H1\n## H2\n### H3"
+      _html, toc = processor.render_with_anchors(content)
+      toc.size.should be >= 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # TOC with duplicate heading IDs
+  # ---------------------------------------------------------------------------
+  describe "TOC duplicate heading IDs" do
+    it "generates unique IDs for duplicate headings" do
+      content = "## Section\n\nContent\n\n## Section\n\nMore content\n\n## Section"
+      html, _toc = Hwaro::Processor::Markdown.render(content)
+      # All three headings should have unique IDs
+      html.should contain("id=\"section\"")
+      html.should contain("id=\"section-1\"")
+      html.should contain("id=\"section-2\"")
+    end
+
+    it "builds nested TOC tree" do
+      content = "## Parent\n\n### Child\n\n## Sibling"
+      _html, toc = Hwaro::Processor::Markdown.render(content)
+      toc.size.should eq(2)             # Parent and Sibling at top level
+      toc[0].children.size.should eq(1) # Child under Parent
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Markdown render edge cases
+  # ---------------------------------------------------------------------------
+  describe "render edge cases" do
+    it "handles content with no headings or images" do
+      content = "Just a simple paragraph."
+      html, toc = Hwaro::Processor::Markdown.render(content)
+      html.should contain("simple paragraph")
+      toc.should be_empty
+    end
+
+    it "handles empty content" do
+      _html, toc = Hwaro::Processor::Markdown.render("")
+      toc.should be_empty
+    end
+
+    it "handles content with only inline HTML" do
+      content = "Hello <strong>world</strong>"
+      html, _toc = Hwaro::Processor::Markdown.render(content)
+      html.should contain("<strong>world</strong>")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Content that merely RESEMBLES front matter
+  #
+  # Regression (P2/P3): a document may legitimately open with a `---`
+  # thematic break or a `{`-leading construct (shortcode, Jinja tag,
+  # attribute list). Those must parse as body content — the old code
+  # truncated the first block (YAML shape) or aborted the whole build
+  # (JSON shape).
+  # ---------------------------------------------------------------------------
+  describe "content that merely resembles front matter" do
+    it "keeps the full body when the file opens with a --- thematic break (scalar YAML)" do
+      raw = "---\n\nFirst paragraph block.\n\n---\n\nSecond block.\n"
+
+      result = processor.parse(raw, "content/breaks.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("First paragraph block.")
+      result[:content].should contain("Second block.")
+    end
+
+    it "treats a YAML sequence between --- fences as content, not front matter" do
+      raw = "---\n- alpha\n- beta\n---\nrest of the document\n"
+
+      result = processor.parse(raw, "content/list.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("- alpha")
+      result[:content].should contain("rest of the document")
+    end
+
+    it "does not abort on an invalid-YAML first block that does not look like front matter" do
+      # `*emphasis*` reads as a YAML alias and fails to parse, but nothing in
+      # the block is a `key:` line — this is a document opening with a
+      # thematic break, not broken front matter.
+      raw = "---\n*emphasis* opening line\n---\nbody text\n"
+
+      result = processor.parse(raw, "content/em.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("*emphasis* opening line")
+      result[:content].should contain("body text")
+    end
+
+    it "still strips empty front matter fences (--- immediately closed)" do
+      raw = "---\n---\nbody only\n"
+
+      result = processor.parse(raw, "content/empty.md")
+      result[:title].should eq("Untitled")
+      result[:content].should_not contain("---")
+      result[:content].should contain("body only")
+    end
+
+    it "keeps a lone ~ block as body content (YAML null scalar is not empty front matter)" do
+      # `~` parses to YAML null, but the block TEXT is not empty — treating
+      # a null-parse as empty front matter silently dropped the `~` line.
+      raw = "---\n~\n---\nbody text\n"
+
+      result = processor.parse(raw, "content/tilde.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("~")
+      result[:content].should contain("body text")
+    end
+
+    it "raises HWARO_E_CONTENT for invalid YAML front matter with a Unicode key" do
+      # The `key:` heuristic must recognize non-ASCII keys, otherwise broken
+      # front matter with a Korean key silently renders as body text.
+      raw = "---\n제목: [broken\n---\nbody\n"
+
+      err = expect_raises(Hwaro::HwaroError) do
+        processor.parse(raw, "content/ko.md")
+      end
+      err.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
+    end
+
+    it "treats a body starting with {{ shortcode }} as content, not JSON front matter" do
+      raw = "{{ youtube(id=\"abc\") }}\n\nMore body\n"
+
+      result = processor.parse(raw, "content/sc.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("{{ youtube(id=\"abc\") }}")
+      result[:content].should contain("More body")
+    end
+
+    it "treats a body starting with a {% ... %} tag as content" do
+      raw = "{% alert(type=\"info\") %}hey{% end %}\n"
+
+      result = processor.parse(raw, "content/tag.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("{% alert")
+    end
+
+    it "treats a body starting with a {:...} attribute list as content" do
+      raw = "{:.lead}\nA styled opening paragraph.\n"
+
+      result = processor.parse(raw, "content/attr.md")
+      result[:title].should eq("Untitled")
+      result[:content].should contain("{:.lead}")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # UTF-8 BOM
+  #
+  # Regression: the fences below are `\A`-anchored and the JSON test is a bare
+  # leading `{`, so a BOM'd file matched none of them. Front matter then fell
+  # through as body text: the page rendered "Untitled" with its literal `+++`
+  # block printed into the output, and no warning was emitted.
+  # ---------------------------------------------------------------------------
+  describe "BOM-prefixed front matter" do
+    it "parses TOML front matter behind a BOM" do
+      result = processor.parse("\uFEFF+++\ntitle = \"BOM Post\"\n+++\n\nBody text\n")
+      result[:title].should eq("BOM Post")
+      result[:content].should contain("Body text")
+      result[:content].should_not contain("+++")
+    end
+
+    it "parses YAML front matter behind a BOM" do
+      result = processor.parse("\uFEFF---\ntitle: BOM YAML\n---\n\nBody text\n")
+      result[:title].should eq("BOM YAML")
+      result[:content].should_not contain("---")
+    end
+
+    it "parses JSON front matter behind a BOM" do
+      result = processor.parse("\uFEFF{\"title\": \"BOM JSON\"}\n\nBody text\n")
+      result[:title].should eq("BOM JSON")
+      result[:content].should contain("Body text")
+    end
+
+    it "keeps a BOM'd body without front matter intact" do
+      result = processor.parse("\uFEFFJust body text\n")
+      result[:content].should eq("Just body text\n")
+    end
+
+    # A self-referencing YAML anchor parses fine and yields a CYCLIC
+    # YAML::Any; walking it into `extra` used to blow the stack (exit 11,
+    # unrescuable) rather than surface as a front-matter error.
+    it "reports a self-referencing YAML anchor as a content error" do
+      ex = expect_raises(Hwaro::HwaroError) do
+        processor.parse("---\ntitle: T\nextra:\n  x: &a\n    b: *a\n---\nBody\n", "post.md")
+      end
+      ex.code.should eq(Hwaro::Errors::HWARO_E_CONTENT)
+      ex.message.to_s.should contain("nesting")
     end
   end
 end

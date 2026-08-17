@@ -143,6 +143,35 @@ describe Hwaro::Content::Seo::Feeds do
       end
     end
 
+    it "does not generate language feed when the language has no content pages" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+
+      # fr has generate_feed=true (default) but no fr content pages — its
+      # feed's channel <link> would point at a non-existent /fr/ home (404).
+      config.languages["fr"] = Hwaro::Models::LanguageConfig.new("fr")
+
+      en_page = Hwaro::Models::Page.new("posts/hello.md")
+      en_page.title = "Hello World"
+      en_page.url = "/posts/hello/"
+      en_page.language = nil
+      en_page.draft = false
+      en_page.render = true
+      en_page.is_index = false
+      en_page.raw_content = "English content"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([en_page], config, output_dir)
+
+        File.exists?(File.join(output_dir, "fr", "rss.xml")).should be_false
+      end
+    end
+
     it "generates feeds for multiple non-default languages" do
       config = Hwaro::Models::Config.new
       config.feeds.enabled = true
@@ -480,9 +509,9 @@ describe Hwaro::Content::Seo::Feeds do
       Dir.mktmpdir do |output_dir|
         Hwaro::Content::Seo::Feeds.generate([ko_page], config, output_dir)
 
-        # Language feeds should still be generated even when main feed is disabled,
-        # because the multilingual block runs independently
-        File.exists?(File.join(output_dir, "ko", "rss.xml")).should be_true
+        # Global [feeds] enabled=false means no feeds at all: per-language
+        # generate_feed only opts OUT within a globally-enabled config.
+        File.exists?(File.join(output_dir, "ko", "rss.xml")).should be_false
       end
     end
 
@@ -885,6 +914,37 @@ describe Hwaro::Content::Seo::Feeds do
         content.should contain("<rss version=\"2.0\"")
         content.should contain("<title>Test Site</title>")
         content.should contain("<description>A test site</description>")
+      end
+    end
+
+    it "keeps the path-sort-first page when two pages collide on one URL (matches the written output)" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      winner = Hwaro::Models::Page.new("posts/2025/foo.md")
+      winner.title = "Winner (written to disk)"
+      winner.url = "/foo/"
+      winner.render = true
+      winner.raw_content = "a"
+
+      loser = Hwaro::Models::Page.new("posts/2026/foo.md")
+      loser.title = "Loser (suppressed on disk)"
+      loser.url = "/foo/"
+      loser.render = true
+      loser.raw_content = "b"
+
+      Dir.mktmpdir do |output_dir|
+        # Later-path page listed FIRST: the dedupe must pick by path sort
+        # (compute_output_url_winners' rule), not by input order.
+        Hwaro::Content::Seo::Feeds.generate([loser, winner], config, output_dir)
+
+        content = File.read(File.join(output_dir, "rss.xml"))
+        content.should contain("Winner (written to disk)")
+        content.should_not contain("Loser (suppressed on disk)")
       end
     end
 
@@ -1335,8 +1395,44 @@ describe Hwaro::Content::Seo::Feeds do
       )
 
       rss.should contain("<title>My Blog</title>")
-      rss.should contain("<link>https://example.com</link>")
+      # Channel <link> ends with "/" to match the homepage canonical.
+      rss.should contain("<link>https://example.com/</link>")
       rss.should contain("<description>A developer blog</description>")
+    end
+
+    # Regression (#10/#11): with an empty base_url the channel <link> must not
+    # be an empty (invalid) element — it falls back to "/" (site root).
+    it "emits a non-empty channel link when base_url is empty" do
+      config = Hwaro::Models::Config.new
+      config.base_url = ""
+      config.title = "My Blog"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [] of Hwaro::Models::Page, config, "rss.xml", false, "My Blog", ""
+      )
+
+      rss.should contain("<link>/</link>")
+      rss.should_not contain("<link></link>")
+    end
+
+    # Regression (#6): full_content feed bodies must absolutize relative links
+    # so readers (which resolve content out of page context) don't break them.
+    it "absolutizes relative links in <content:encoded> against the page URL" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.feeds.full_content = true
+
+      page = Hwaro::Models::Page.new("guide/config.md")
+      page.title = "Config"
+      page.url = "/guide/config/"
+      page.content = %(<p><a href="../quick-start/">start</a> <img src="/img/a.png"/></p>)
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Blog", ""
+      )
+
+      rss.should contain("https://example.com/guide/quick-start/")
+      rss.should contain("https://example.com/img/a.png")
     end
 
     it "includes self-referencing atom:link" do
@@ -1447,6 +1543,50 @@ describe Hwaro::Content::Seo::Feeds do
       rss.should_not contain("<pubDate>")
     end
 
+    # Regression for https://github.com/hahwul/hwaro/issues/487
+    # Per RFC 822/2822, day-of-month must be two digits; some readers reject
+    # single-digit days.
+    it "uses two-digit day-of-month in pubDate (RFC 822)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Single-digit Day"
+      page.url = "/post/"
+      page.date = Time.utc(2026, 3, 4, 12, 0, 0)
+      page.raw_content = "Content"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("<pubDate>Wed, 04 Mar 2026 12:00:00 +0000</pubDate>")
+    end
+
+    # Regression for https://github.com/hahwul/hwaro/issues/487
+    # Date-only TOML/YAML values are anchored to the build host's local TZ by
+    # the parser; converting them to UTC at output time used to push the
+    # calendar date back by one day on `+09:00` hosts.
+    it "preserves the calendar date for TZ-less midnight values" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Date Only"
+      page.url = "/post/"
+      # Mimic what a TOML local-date (`date = 2026-03-05`) becomes after
+      # parsing on a `+09:00` host: midnight in `Asia/Seoul`.
+      seoul = Time::Location.fixed("Asia/Seoul", 9 * 3600)
+      page.date = Time.local(2026, 3, 5, 0, 0, 0, location: seoul)
+      page.raw_content = "Content"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("<pubDate>Thu, 05 Mar 2026 00:00:00 +0000</pubDate>")
+    end
+
     it "includes description with content" do
       config = Hwaro::Models::Config.new
       config.base_url = "https://example.com"
@@ -1461,6 +1601,148 @@ describe Hwaro::Content::Seo::Feeds do
       )
 
       rss.should contain("<description>")
+    end
+
+    # Regressions for gh#526.
+    it "uses frontmatter description for the item summary (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.description = "Hand-written summary"
+      page.raw_content = "# Hello\n\nThis is the body that should NOT replace the description."
+      page.content = "<h1>Hello</h1>\n<p>This is the body that should NOT replace the description.</p>"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("<description>Hand-written summary</description>")
+      rss.should_not contain("<description>&lt;h1&gt;Hello")
+    end
+
+    it "strips markup from a <!-- more --> summary instead of dumping raw markdown (gh#491)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      # No frontmatter description: the feed should use the summary, but as
+      # plain text — not the raw markdown chunk with `##` and code fences.
+      page.summary = "## Intro\n\nHello world"
+      page.summary_html = "<h2>Intro</h2>\n<p>Hello world</p>"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("<description>Intro Hello world</description>")
+      rss.should_not contain("##")
+    end
+
+    it "emits <content:encoded> with the full body when full_content is on (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.feeds.full_content = true
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.description = "Summary"
+      page.content = "<p>Full <strong>body</strong>.</p>"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("xmlns:content=\"http://purl.org/rss/1.0/modules/content/\"")
+      rss.should contain("<content:encoded><![CDATA[<p>Full <strong>body</strong>.</p>]]></content:encoded>")
+    end
+
+    it "skips <content:encoded> when full_content is off (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.feeds.full_content = false
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.description = "Summary"
+      page.content = "<p>Full body.</p>"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should_not contain("<content:encoded>")
+    end
+
+    it "emits <category> per tag and per taxonomy term (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.tags = ["crystal", "rss"]
+      page.taxonomies = {
+        "categories" => ["programming"],
+        "authors"    => ["alice"],
+      }
+      page.raw_content = "Body"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.should contain("<category>crystal</category>")
+      rss.should contain("<category>rss</category>")
+      rss.should contain("<category>programming</category>")
+      rss.should contain("<category>alice</category>")
+    end
+
+    it "deduplicates categories that overlap tags and taxonomies (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.tags = ["crystal"]
+      page.taxonomies = {
+        "tags" => ["crystal"], # overlap with page.tags
+      }
+      page.raw_content = "Body"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      rss.scan(/<category>crystal<\/category>/).size.should eq(1)
+    end
+
+    it "escapes ]]> sequences inside CDATA bodies (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.feeds.full_content = true
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.description = "Summary"
+      page.content = "<p>before ]]> after</p>"
+
+      rss = Hwaro::Content::Seo::Feeds.generate_rss(
+        [page], config, "rss.xml", false, "Test", ""
+      )
+
+      # The inner ]]> must be split so the outer CDATA terminates
+      # only at the synthetic closing `]]>`.
+      rss.should contain("]]]]><![CDATA[>")
+      rss.scan(/]]>/).size.should eq(2)
     end
 
     it "escapes XML special characters in title" do
@@ -1583,8 +1865,9 @@ describe Hwaro::Content::Seo::Feeds do
       )
 
       atom.should contain("<title>My Feed</title>")
-      atom.should contain("<link href=\"https://example.com\"")
-      atom.should contain("<id>https://example.com</id>")
+      # Atom alternate <link>/<id> end with "/" to match the homepage canonical.
+      atom.should contain("<link href=\"https://example.com/\"")
+      atom.should contain("<id>https://example.com/</id>")
       atom.should contain("<subtitle>Feed description</subtitle>")
       atom.should contain("<updated>")
     end
@@ -1719,6 +2002,28 @@ describe Hwaro::Content::Seo::Feeds do
       atom.should contain("C++ &amp; Java: &lt;Comparison&gt;")
     end
 
+    it "emits <category term> per tag and per taxonomy term (gh#526)" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Post"
+      page.url = "/post/"
+      page.tags = ["crystal", "atom"]
+      page.taxonomies = {
+        "categories" => ["programming"],
+      }
+      page.raw_content = "Body"
+
+      atom = Hwaro::Content::Seo::Feeds.generate_atom(
+        [page], config, "atom.xml", false, "Test", ""
+      )
+
+      atom.should contain("<category term=\"crystal\" />")
+      atom.should contain("<category term=\"atom\" />")
+      atom.should contain("<category term=\"programming\" />")
+    end
+
     it "handles page URL without leading slash" do
       config = Hwaro::Models::Config.new
       config.base_url = "https://example.com"
@@ -1809,9 +2114,9 @@ describe Hwaro::Content::Seo::Feeds do
 
         content = File.read(File.join(output_dir, "rss.xml"))
         # New should appear before Mid, and Mid before Old
-        new_pos = content.index("New Post").not_nil!
-        mid_pos = content.index("Mid Post").not_nil!
-        old_pos = content.index("Old Post").not_nil!
+        new_pos = content.index!("New Post")
+        mid_pos = content.index!("Mid Post")
+        old_pos = content.index!("Old Post")
         new_pos.should be < mid_pos
         mid_pos.should be < old_pos
       end
@@ -2001,6 +2306,378 @@ describe Hwaro::Content::Seo::Feeds do
         content.should contain("<channel>")
         content.should contain("<title>Empty Feed</title>")
         content.scan(/<item>/).size.should eq(0)
+      end
+    end
+  end
+
+  describe "item title fallback" do
+    it "falls back to the site title for a title-less RSS item (homepage)" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "My Site"
+      config.description = "desc"
+
+      home = Hwaro::Models::Page.new("index.md")
+      home.title = "" # title-less root index
+      home.url = "/"
+      home.draft = false
+      home.render = true
+      home.is_index = true
+      home.raw_content = "Welcome"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([home], config, output_dir)
+        feed = File.read(File.join(output_dir, "rss.xml"))
+        feed.scan(/<item>/).size.should eq(1)
+        feed.should_not contain("<title></title>")
+        feed.should contain("<title>My Site</title>")
+      end
+    end
+
+    it "falls back to the site title for a title-less Atom entry" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "My Site"
+      config.description = "desc"
+
+      home = Hwaro::Models::Page.new("index.md")
+      home.title = ""
+      home.url = "/"
+      home.draft = false
+      home.render = true
+      home.is_index = true
+      home.raw_content = "Welcome"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([home], config, output_dir)
+        feed = File.read(File.join(output_dir, "atom.xml"))
+        feed.scan(/<entry>/).size.should eq(1)
+        feed.should_not contain("<title></title>")
+      end
+    end
+  end
+
+  describe "feed filename and collision parity" do
+    it "basename-normalizes feeds.filename so self URL matches the written file" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "feeds/rss.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      page = Hwaro::Models::Page.new("posts/hello.md")
+      page.title = "Hello"
+      page.url = "/posts/hello/"
+      page.render = true
+      page.raw_content = "body"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+        File.exists?(File.join(output_dir, "rss.xml")).should be_true
+        File.exists?(File.join(output_dir, "feeds", "rss.xml")).should be_false
+        feed = File.read(File.join(output_dir, "rss.xml"))
+        feed.should contain("https://example.com/rss.xml")
+        feed.should_not contain("https://example.com/feeds/rss.xml")
+      end
+    end
+
+    it "dedupes section feeds by the path-sort-first URL winner" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = false
+      config.feeds.type = "rss"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      section = Hwaro::Models::Section.new("posts/_index.md")
+      section.section = "posts"
+      section.url = "/posts/"
+      section.title = "Posts"
+      section.generate_feeds = true
+      section.render = true
+
+      a = Hwaro::Models::Page.new("posts/a.md")
+      a.title = "Winner"
+      a.url = "/posts/same/"
+      a.section = "posts"
+      a.render = true
+      a.date = Time.utc(2026, 1, 2)
+      a.raw_content = "a"
+
+      b = Hwaro::Models::Page.new("posts/z.md")
+      b.title = "Loser"
+      b.url = "/posts/same/"
+      b.section = "posts"
+      b.render = true
+      b.date = Time.utc(2026, 1, 3)
+      b.raw_content = "b"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([section, a, b], config, output_dir)
+        feed = File.read(File.join(output_dir, "posts", "rss.xml"))
+        feed.should contain("Winner")
+        feed.should_not contain("Loser")
+      end
+    end
+  end
+
+  describe "atom entry dates" do
+    it "emits the same calendar date for date-only frontmatter on a non-UTC host" do
+      # Regression: date-only frontmatter parses as local midnight; the Atom
+      # <updated> used a raw .to_utc which rolls the calendar date back a day
+      # on a UTC+ host (e.g. 2026-03-05 → 2026-03-04T15:00:00Z). It must
+      # re-anchor to UTC of the same wall-clock date like the RSS path does.
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      page = Hwaro::Models::Page.new("posts/hello.md")
+      page.title = "Hello"
+      page.url = "/posts/hello/"
+      page.render = true
+      page.is_index = false
+      page.raw_content = "body"
+      # Local midnight in a +09:00 zone (independent of the host's real zone).
+      page.date = Time.local(2026, 3, 5, 0, 0, 0, location: Time::Location.fixed(9 * 3600))
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+        feed = File.read(File.join(output_dir, "atom.xml"))
+        feed.should contain("<updated>2026-03-05T00:00:00Z</updated>")
+      end
+    end
+
+    it "picks the feed-level <updated> from normalized entry times, not raw instants" do
+      # Regression (A19): the feed-level <updated> took max over raw
+      # instants BEFORE timezone re-anchoring. A date-only entry parsed as
+      # local midnight in +09:00 (raw instant 2026-03-04T15:00Z, normalized
+      # 2026-03-05T00:00Z) lost the raw max to a 2026-03-04T20:00Z entry,
+      # leaving the feed <updated> older than its newest entry <updated>.
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "atom"
+      config.feeds.filename = "atom.xml"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      newest = Hwaro::Models::Page.new("posts/newest.md")
+      newest.title = "Newest"
+      newest.url = "/posts/newest/"
+      newest.render = true
+      newest.is_index = false
+      newest.raw_content = "body"
+      # Normalizes to 2026-03-05T00:00:00Z (raw instant 2026-03-04T15:00Z).
+      newest.date = Time.local(2026, 3, 5, 0, 0, 0, location: Time::Location.fixed(9 * 3600))
+
+      older = Hwaro::Models::Page.new("posts/older.md")
+      older.title = "Older"
+      older.url = "/posts/older/"
+      older.render = true
+      older.is_index = false
+      older.raw_content = "body"
+      # Raw instant is newer than newest's raw instant, but normalized older.
+      older.date = Time.utc(2026, 3, 4, 20, 0, 0)
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([newest, older], config, output_dir)
+        feed = File.read(File.join(output_dir, "atom.xml"))
+        feed_head = feed.split("<entry>").first
+        feed_head.should contain("<updated>2026-03-05T00:00:00Z</updated>")
+        feed_head.should_not contain("<updated>2026-03-04T20:00:00Z</updated>")
+      end
+    end
+  end
+
+  describe "section feed language filtering" do
+    it "filters the default-language section feed by default_language_only" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+      config.feeds.default_language_only = true
+
+      section = Hwaro::Models::Section.new("posts/_index.md")
+      section.title = "Posts"
+      section.url = "/posts/"
+      section.section = "posts"
+      section.render = true
+      section.generate_feeds = true
+
+      en_post = Hwaro::Models::Page.new("posts/hello.md")
+      en_post.title = "EN Post"
+      en_post.url = "/posts/hello/"
+      en_post.section = "posts"
+      en_post.render = true
+      en_post.raw_content = "English"
+
+      ko_post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_post.title = "KO Post"
+      ko_post.url = "/ko/posts/hello/"
+      ko_post.section = "posts"
+      ko_post.language = "ko"
+      ko_post.render = true
+      ko_post.raw_content = "한국어"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([section.as(Hwaro::Models::Page), en_post, ko_post], config, output_dir)
+
+        feed = File.read(File.join(output_dir, "posts", "rss.xml"))
+        feed.should contain("EN Post")
+        feed.should_not contain("KO Post")
+      end
+    end
+
+    it "keeps all languages in the default-language section feed when default_language_only is false" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+      config.feeds.default_language_only = false
+
+      section = Hwaro::Models::Section.new("posts/_index.md")
+      section.title = "Posts"
+      section.url = "/posts/"
+      section.section = "posts"
+      section.render = true
+      section.generate_feeds = true
+
+      en_post = Hwaro::Models::Page.new("posts/hello.md")
+      en_post.title = "EN Post"
+      en_post.url = "/posts/hello/"
+      en_post.section = "posts"
+      en_post.render = true
+      en_post.raw_content = "English"
+
+      ko_post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_post.title = "KO Post"
+      ko_post.url = "/ko/posts/hello/"
+      ko_post.section = "posts"
+      ko_post.language = "ko"
+      ko_post.render = true
+      ko_post.raw_content = "한국어"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([section.as(Hwaro::Models::Page), en_post, ko_post], config, output_dir)
+
+        feed = File.read(File.join(output_dir, "posts", "rss.xml"))
+        feed.should contain("EN Post")
+        feed.should contain("KO Post")
+      end
+    end
+
+    it "filters a non-default-language section feed to that language only" do
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+
+      ko_section = Hwaro::Models::Section.new("posts/_index.ko.md")
+      ko_section.title = "포스트"
+      ko_section.url = "/ko/posts/"
+      ko_section.section = "posts"
+      ko_section.language = "ko"
+      ko_section.render = true
+      ko_section.generate_feeds = true
+
+      en_post = Hwaro::Models::Page.new("posts/hello.md")
+      en_post.title = "EN Post"
+      en_post.url = "/posts/hello/"
+      en_post.section = "posts"
+      en_post.render = true
+      en_post.raw_content = "English"
+
+      ko_post = Hwaro::Models::Page.new("posts/hello.ko.md")
+      ko_post.title = "KO Post"
+      ko_post.url = "/ko/posts/hello/"
+      ko_post.section = "posts"
+      ko_post.language = "ko"
+      ko_post.render = true
+      ko_post.raw_content = "한국어"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([ko_section.as(Hwaro::Models::Page), en_post, ko_post], config, output_dir)
+
+        feed = File.read(File.join(output_dir, "ko", "posts", "rss.xml"))
+        feed.should contain("KO Post")
+        feed.should_not contain("EN Post")
+      end
+    end
+  end
+
+  describe "RSS content:encoded truncation" do
+    it "honors feeds.truncate in content:encoded when full_content is true" do
+      # Regression (A7): feeds.truncate is documented as "truncate content
+      # to N characters (0 = full content)" and the Atom generator honors it
+      # even under full_content=true; the RSS <content:encoded> emitted the
+      # full body regardless.
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.full_content = true
+      config.feeds.truncate = 10
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      page = Hwaro::Models::Page.new("posts/long.md")
+      page.title = "Long Post"
+      page.url = "/posts/long/"
+      page.render = true
+      page.is_index = false
+      page.raw_content = "This is a very long body that must be truncated in the feed output."
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+
+        feed = File.read(File.join(output_dir, "rss.xml"))
+        feed.should contain("<content:encoded><![CDATA[This is a ...]]></content:encoded>")
+        feed.should_not contain("truncated in the feed output")
+      end
+    end
+
+    it "HTML-escapes the truncated plain text so a literal < survives feed readers" do
+      # With truncate > 0 the CDATA carries entity-DECODED plain text, but
+      # consumers parse <content:encoded> as HTML — a literal `<`/`&` breaks
+      # rendering. The truncated text must be re-escaped before embedding.
+      config = Hwaro::Models::Config.new
+      config.feeds.enabled = true
+      config.feeds.type = "rss"
+      config.feeds.filename = "rss.xml"
+      config.feeds.full_content = true
+      config.feeds.truncate = 10
+      config.base_url = "https://example.com"
+      config.title = "Test Site"
+
+      page = Hwaro::Models::Page.new("posts/code.md")
+      page.title = "Code Post"
+      page.url = "/posts/code/"
+      page.render = true
+      page.is_index = false
+      page.raw_content = "for n < 10 the loop keeps running and running"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Feeds.generate([page], config, output_dir)
+
+        feed = File.read(File.join(output_dir, "rss.xml"))
+        feed.should contain("<content:encoded><![CDATA[for n &lt; 10...]]></content:encoded>")
       end
     end
   end

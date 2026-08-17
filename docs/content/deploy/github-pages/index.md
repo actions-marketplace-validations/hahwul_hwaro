@@ -20,7 +20,7 @@ Use the official [`hahwul/hwaro`](https://github.com/hahwul/hwaro) action to bui
 You can auto-generate the workflow file using:
 
 ```bash
-hwaro tool ci github-actions
+hwaro tool platform github-pages
 ```
 
 Or create `.github/workflows/deploy.yml` manually:
@@ -82,6 +82,10 @@ If your Hwaro site is in a subdirectory (e.g., `docs/`), set `build_dir`:
     build_dir: "docs"
     token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+### OG Image Caching
+
+The action automatically caches OG images between deploys. Before each build, it restores previously generated images from the `gh-pages` branch and enables `--cache` mode. Only pages with changed content (title, description, URL) or updated OG config will have their images regenerated. This significantly speeds up builds for large sites.
 
 ### Configure GitHub Pages
 
@@ -243,3 +247,9 @@ my-site/
 ├── config.toml
 └── README.md
 ```
+
+## See Also
+
+- [Deploy Configuration](/deploy/config/) — Target setup and matchers
+- [CLI Reference](/start/cli/) — All deploy command options
+- Other platforms: [GitLab CI](/deploy/gitlab-ci/) | [Netlify](/deploy/netlify/) | [Vercel](/deploy/vercel/) | [Codeberg Pages](/deploy/codeberg-pages/)

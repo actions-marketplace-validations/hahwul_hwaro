@@ -1,0 +1,181 @@
+# Content Stats Service
+#
+# Computes statistics about content files: total/draft/published counts,
+# word count metrics, tag distribution, and monthly publishing frequency.
+
+require "json"
+require "yaml"
+require "toml"
+require "./content_lister"
+require "../utils/frontmatter_scanner"
+require "../utils/logger"
+
+module Hwaro
+  module Services
+    struct StatsResult
+      include JSON::Serializable
+
+      property total : Int32
+      property drafts : Int32
+      property published : Int32
+      property words_total : Int32
+      property words_avg : Int32
+      property words_min : Int32
+      property words_max : Int32
+      property tags : Hash(String, Int32)
+      property monthly : Hash(String, Int32)
+
+      def initialize(
+        @total : Int32 = 0,
+        @drafts : Int32 = 0,
+        @published : Int32 = 0,
+        @words_total : Int32 = 0,
+        @words_avg : Int32 = 0,
+        @words_min : Int32 = 0,
+        @words_max : Int32 = 0,
+        @tags : Hash(String, Int32) = {} of String => Int32,
+        @monthly : Hash(String, Int32) = {} of String => Int32,
+      )
+      end
+    end
+
+    class ContentStats
+      TOML_FRONTMATTER_RE = Utils::FrontmatterScanner::TOML_FRONTMATTER_RE
+      YAML_FRONTMATTER_RE = Utils::FrontmatterScanner::YAML_FRONTMATTER_RE
+
+      @content_dir : String
+
+      def initialize(@content_dir : String = "content")
+      end
+
+      def run : StatsResult
+        lister = ContentLister.new(@content_dir)
+        items = lister.list_all
+
+        return StatsResult.new if items.empty?
+
+        drafts = items.count(&.draft)
+        published = items.size - drafts
+
+        # Word counts, tag distribution, and publishing frequency reflect
+        # what `hwaro build` actually ships, so drafts are excluded from
+        # the metrics — `total` / `drafts` / `published` above already
+        # describe the on-disk content set (gh#528 C).
+        published_items = items.reject(&.draft)
+
+        word_counts = [] of Int32
+        tags = {} of String => Int32
+        monthly = {} of String => Int32
+
+        published_items.each do |item|
+          content = begin
+            File.read(item.path)
+          rescue IO::Error
+            next
+          end
+
+          body = extract_body(content)
+          wc = count_words(body)
+          word_counts << wc
+
+          # Extract tags
+          extract_tags(content, item.path).each do |tag|
+            tags[tag] = (tags[tag]? || 0) + 1
+          end
+
+          # Monthly frequency
+          if date = item.date
+            key = date.to_s("%Y-%m")
+            monthly[key] = (monthly[key]? || 0) + 1
+          end
+        end
+
+        words_total = word_counts.sum
+        # Divide by the number of files actually read (word_counts), not the
+        # published count — a file unreadable between listing and read is skipped
+        # from word_counts but would otherwise dilute the average. Matches the
+        # population used by words_min/words_max below.
+        words_avg = word_counts.empty? ? 0 : words_total // word_counts.size
+        words_min = word_counts.min? || 0
+        words_max = word_counts.max? || 0
+
+        # Sort tags by count descending
+        sorted_tags = tags.to_a.sort_by { |_, count| -count }.to_h
+
+        # Sort monthly by key
+        sorted_monthly = monthly.to_a.sort_by(&.first).to_h
+
+        StatsResult.new(
+          total: items.size,
+          drafts: drafts,
+          published: published,
+          words_total: words_total,
+          words_avg: words_avg,
+          words_min: words_min,
+          words_max: words_max,
+          tags: sorted_tags,
+          monthly: sorted_monthly,
+        )
+      end
+
+      private def extract_body(content : String) : String
+        Utils::FrontmatterScanner.strip_frontmatter(content)
+      end
+
+      private def count_words(body : String) : Int32
+        # Strip code blocks, then count with the same tokenizer the build uses
+        # for `page.word_count` / `page.reading_time`. Splitting on whitespace
+        # alone counted `##`, `|` and `|-----|` as words, so the report
+        # disagreed with the numbers the site itself renders.
+        stripped = body.gsub(/(?ms)^(`{3,}|~{3,})[^\n]*\n.*?^\1\s*$/, "")
+        Utils::TextUtils.count_words(stripped)
+      end
+
+      # Front matter that does not parse costs this file its tags, never the
+      # whole report: `tool stats` is a read-only summary of a tree the author
+      # is still editing, and one typo used to abort it.
+      #
+      # `ArgumentError` is rescued alongside the parse exceptions because both
+      # front-matter parsers build values eagerly: an out-of-range but
+      # syntactically valid date (`date = 2024-02-30`) raises Crystal's
+      # `ArgumentError("Invalid time")` from `Time.new`, not a
+      # `TOML::ParseException`, so the narrow rescue let it unwind the run.
+      # The file is named on the way past so the omission is not silent —
+      # `tool validate` reports the same file with the same message.
+      private def extract_tags(content : String, path : String) : Array(String)
+        if match = content.match(TOML_FRONTMATTER_RE)
+          begin
+            toml_data = TOML.parse(match[1])
+            if tags_val = toml_data["tags"]?
+              raw = tags_val.raw
+              if raw.is_a?(Array)
+                return raw.compact_map { |item| item.as(TOML::Any).raw.as?(String) }
+              end
+            end
+          rescue ex : TOML::ParseException | ArgumentError
+            warn_unparsed_frontmatter(path, "TOML", ex)
+          end
+        elsif match = content.match(YAML_FRONTMATTER_RE)
+          begin
+            yaml_data = YAML.parse(match[1])
+            if h = yaml_data.as_h?
+              if tags_node = h[YAML::Any.new("tags")]?
+                if arr = tags_node.as_a?
+                  return arr.compact_map(&.as_s?)
+                end
+              end
+            end
+          rescue ex : YAML::ParseException | ArgumentError
+            warn_unparsed_frontmatter(path, "YAML", ex)
+          end
+        end
+
+        [] of String
+      end
+
+      private def warn_unparsed_frontmatter(path : String, dialect : String, ex : Exception) : Nil
+        Logger.warn "#{path}: #{dialect} frontmatter parse error: #{ex.message}; tags not counted."
+      end
+    end
+  end
+end

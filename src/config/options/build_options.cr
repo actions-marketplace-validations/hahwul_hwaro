@@ -1,3 +1,5 @@
+require "../../utils/errors"
+
 module Hwaro
   module Config
     module Options
@@ -6,8 +8,16 @@ module Hwaro
         property base_url : String?
         property drafts : Bool
         property include_expired : Bool
+        property include_future : Bool
         property minify : Bool
         property parallel : Bool
+        # Number of concurrent render workers (fibers) for the parallel render
+        # phase. 0 = auto (the default), which derives the count from the
+        # site's per-page listing fan-out rather than the CPU count — see
+        # Phases::Render#auto_render_workers for the measurements behind it.
+        # An explicit value overrides that heuristic outright, which is what
+        # benchmarking wants. Never changes output — only render concurrency.
+        property workers : Int32
         property cache : Bool
         property full : Bool
         property highlight : Bool
@@ -19,14 +29,34 @@ module Hwaro
         property stream : Bool
         property memory_limit : String?
         property env : String?
+        property skip_og_image : Bool
+        property skip_image_processing : Bool
+        # Keep existing output files between rebuilds. Used by `hwaro serve`'s
+        # watch-triggered rebuilds so repeated full rebuilds don't wipe the
+        # already-processed resized images (see `ImageHooks#process_images`
+        # mtime-skip logic, which only works when destinations survive).
+        property preserve_output : Bool
+        # When set (dev-server only), render only the homepage + the N most
+        # recent pages on the initial pass; the remaining pages are stashed
+        # on the Builder and rendered by a background fiber after the server
+        # is already serving. Drops "ready" time on large sites from O(all)
+        # to O(N). Always paired with `fast_start_count`.
+        property fast_start : Bool
+        property fast_start_count : Int32
+
+        # True when this build is being run as part of `hwaro serve` (dev server).
+        # Hooks can use this to change behavior (e.g. lazy OG generation).
+        property serve_mode : Bool = false
 
         def initialize(
           @output_dir : String = "public",
           @base_url : String? = nil,
           @drafts : Bool = false,
           @include_expired : Bool = false,
+          @include_future : Bool = false,
           @minify : Bool = false,
           @parallel : Bool = true,
+          @workers : Int32 = 0,
           @cache : Bool = false,
           @full : Bool = false,
           @highlight : Bool = true,
@@ -38,7 +68,20 @@ module Hwaro
           @stream : Bool = false,
           @memory_limit : String? = nil,
           @env : String? = nil,
+          @skip_og_image : Bool = false,
+          @skip_image_processing : Bool = false,
+          @preserve_output : Bool = false,
+          @fast_start : Bool = false,
+          @fast_start_count : Int32 = 20,
+          @serve_mode : Bool = false,
         )
+          # Validate NOW, not lazily from `batch_size`. That was first reached
+          # in the render phase — after `setup_output_dir` had already wiped
+          # `public/` — so `hwaro build --memory-limit bogus` destroyed the
+          # previous output and THEN exited 2.
+          if limit = @memory_limit
+            parse_memory_limit(limit)
+          end
         end
 
         def streaming? : Bool
@@ -62,18 +105,42 @@ module Hwaro
         end
 
         private def parse_memory_limit(value : String) : Int64
-          case value.strip
-          when /^(\d+(?:\.\d+)?)\s*[Gg]$/
-            ($1.to_f * 1024 * 1024 * 1024).to_i64
-          when /^(\d+(?:\.\d+)?)\s*[Mm]$/
-            ($1.to_f * 1024 * 1024).to_i64
-          when /^(\d+(?:\.\d+)?)\s*[Kk]$/
-            ($1.to_f * 1024).to_i64
-          when /^(\d+)$/
-            $1.to_i64
-          else
-            raise "Invalid memory limit format: #{value}. Use format like '2G', '512M', or '256K'."
+          bytes =
+            case value.strip
+            when /^(\d+(?:\.\d+)?)\s*[Gg]$/
+              $1.to_f * 1024 * 1024 * 1024
+            when /^(\d+(?:\.\d+)?)\s*[Mm]$/
+              $1.to_f * 1024 * 1024
+            when /^(\d+(?:\.\d+)?)\s*[Kk]$/
+              $1.to_f * 1024
+            when /^(\d+)$/
+              $1.to_f
+            else
+              raise memory_limit_error("Invalid memory limit format: #{value}")
+            end
+
+          # Validate the resolved size before narrowing to Int64 so callers get a
+          # clear message instead of a degenerate batch size (0 -> batch of 1) or
+          # a raw "Arithmetic overflow" from `.to_i64` on an enormous value.
+          if bytes < 1
+            raise memory_limit_error("Invalid memory limit: #{value}. Must be a positive size")
+          elsif bytes >= Int64::MAX.to_f
+            raise memory_limit_error("Memory limit too large: #{value}. Maximum is #{Int64::MAX} bytes (~8 EiB)")
           end
+
+          bytes.to_i64
+        end
+
+        # Classified so a bad `--memory-limit` exits like every other usage
+        # error (HWARO_E_USAGE / exit 2, JSON envelope under --json) instead
+        # of surfacing as a bare `Error: …` with exit 1. Mirrors the handling
+        # `CLI.register_jobs` gives `--jobs`.
+        private def memory_limit_error(message : String) : Hwaro::HwaroError
+          Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: message,
+            hint: "Pass a positive size such as --memory-limit 2G, 512M, or 256K. Omit it to build without a memory cap.",
+          )
         end
       end
     end

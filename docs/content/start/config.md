@@ -7,6 +7,31 @@ toc = true
 
 All site configuration lives in `config.toml` at the project root.
 
+Unknown top-level keys are reported instead of silently ignored — a typo'd
+`[markdonw]` or `titel = "…"` would otherwise disable a feature with no
+feedback. Hwaro warns with a suggestion when one is close to a real key:
+
+```
+Unknown key 'markdonw' in config.toml — hwaro does not read it. Did you mean 'markdown'?
+```
+
+The check covers top-level keys only; keys nested inside a section are
+validated by that section's own loader.
+
+## Site Settings
+
+```toml
+title = "My Site"
+description = "Site description for SEO"
+base_url = "https://example.com"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| title | string | Site title |
+| description | string | Site description |
+| base_url | string | Production URL (no trailing slash) |
+
 ## Environment Variables
 
 You can reference environment variables in `config.toml`. Values are substituted before TOML parsing.
@@ -23,23 +48,7 @@ description = "${SITE_DESC:-My awesome site}"
 | `$VAR` | Same as above (bare form) |
 | `${VAR:-default}` | Use `default` if `VAR` is unset or empty |
 
-Missing variables without defaults are left as-is and produce a build warning.
-
-See [Environment Variables](/features/env-variables/) for template usage and more examples.
-
-## Site Settings
-
-```toml
-title = "My Site"
-description = "Site description for SEO"
-base_url = "https://example.com"
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| title | string | Site title |
-| description | string | Site description |
-| base_url | string | Production URL (no trailing slash) |
+Missing variables without defaults are left as-is and produce a build warning. See [Environment Variables](/features/env-variables/) for template usage.
 
 ## Build Options
 
@@ -49,6 +58,8 @@ output_dir = "public"
 drafts = false
 parallel = true
 cache = false
+hooks.pre = ["npm install", "npx tsc"]
+hooks.post = ["npm run minify"]
 ```
 
 | Key | Type | Default | Description |
@@ -57,16 +68,10 @@ cache = false
 | drafts | bool | false | Include draft content |
 | parallel | bool | true | Parallel processing |
 | cache | bool | false | Enable build caching |
+| hooks.pre | array | [] | Commands to run before build |
+| hooks.post | array | [] | Commands to run after build |
 
-### Build Hooks
-
-Run commands before/after build:
-
-```toml
-[build]
-hooks.pre = ["npm install", "npx tsc"]
-hooks.post = ["npm run minify"]
-```
+See [Build Hooks](/features/build-hooks/) for error handling and use cases.
 
 ## Markdown
 
@@ -75,9 +80,9 @@ hooks.post = ["npm run minify"]
 safe = false
 lazy_loading = true
 emoji = true
-footnotes = false
-task_lists = false
-definition_lists = false
+footnotes = true
+task_lists = true
+definition_lists = true
 mermaid = false
 math = false
 math_engine = "katex"
@@ -88,12 +93,19 @@ math_engine = "katex"
 | safe | bool | false | Strip raw HTML from markdown |
 | lazy_loading | bool | false | Automatically add `loading="lazy"` to images |
 | emoji | bool | false | Convert emoji shortcodes (e.g. `:smile:`) to emoji characters |
-| footnotes | bool | false | Enable footnote syntax (`[^1]`) |
-| task_lists | bool | false | Enable task list syntax (`- [ ]` / `- [x]`) |
-| definition_lists | bool | false | Enable definition list syntax (`Term\n: Definition`) |
+| footnotes | bool | true | Enable footnote syntax (`[^1]`) |
+| task_lists | bool | true | Enable task list syntax (`- [ ]` / `- [x]`) |
+| task_list_classes | bool | false | Add GFM classes (`task-list-item`, `contains-task-list`) to task-list markup |
+| definition_lists | bool | true | Enable definition list syntax (`Term\n: Definition`) |
 | mermaid | bool | false | Render ` ```mermaid ` blocks as `<div class="mermaid">` |
 | math | bool | false | Enable math syntax (`$...$` and `$$...$$`) |
 | math_engine | string | "katex" | Math rendering engine (`"katex"` or `"mathjax"`) |
+| smart_punctuation | bool | false | Typographic quotes/dashes/ellipses (`"x"` → “x”, `--` → –, `...` → …) |
+| containers | bool | false | `:::note Title` … `:::` custom containers (admonition markup) |
+| insert_anchor_links | string | "none" | Site-wide heading anchor links: `"none"`, `"left"`, or `"right"` (page front matter overrides) |
+| external_links_target_blank | bool | false | Add `target="_blank" rel="noopener"` to absolute http(s) links |
+| external_links_no_follow | bool | false | Add `rel="nofollow"` to absolute http(s) links |
+| external_links_no_referrer | bool | false | Add `rel="noreferrer"` to absolute http(s) links |
 
 See [Markdown Extensions](/features/markdown-extensions/) for syntax details and examples.
 
@@ -111,309 +123,52 @@ Rewrite content directory paths to custom URL paths. Useful for site restructuri
 |-------------------|-------------------|----------------|
 | `content/old/posts/a.md` | `posts/` | `/old/posts/a/` -> `/posts/a/` |
 
-## SEO
+Rules are evaluated in declaration order and the **first** source that matches the page's directory (exactly or as a parent prefix) wins — later rules are never consulted for that page. Declare specific prefixes before broad ones (`"posts/tech"` before `"posts"`), or the broad rule shadows the specific one. This applies to token patterns too, and especially to the `""` catch-all: put it **last**, after every other rule.
 
-### Feeds
+### Token patterns
+
+A target containing `:token` segments is a Hugo-style pattern that rebuilds the whole URL instead of remapping the directory:
 
 ```toml
-[feeds]
-enabled = true
-type = "rss"
-limit = 20
-truncate = 0
-filename = "feed.xml"
-sections = []
-default_language_only = true   # true: main feed = default language only, false: all languages
+[permalinks]
+"posts" = "/:year/:month/:day/:slug/"
+```
+
+With `content/posts/hello.md` dated `2026-03-05`, the page is published at `/2026/03/05/hello/`.
+
+| Token | Expands to |
+|-------|------------|
+| `:year` | Page date year (`2026`) |
+| `:month` | Page date month, zero-padded (`03`) |
+| `:day` | Page date day, zero-padded (`05`) |
+| `:slug` | Front-matter `slug`, or the filename stem when unset |
+| `:title` | Slugified front-matter `title` (falls back to `:slug` when it slugifies to nothing) |
+| `:section` | The page's section path (`posts/tech`); empty for root pages, collapsing the segment |
+| `:filename` | The filename stem, ignoring any `slug` override |
+
+Notes:
+
+- Tokens must be whole path segments; unknown tokens fail the config load.
+- Patterns apply to leaf pages only. Section `_index` and bundle `index` pages skip pattern rules (they keep their directory URL, or a later plain remap rule).
+- A page without a `date` that matches a pattern using `:year`/`:month`/`:day` fails the build — add a date, set an explicit `path` in front matter, or drop the date tokens. Pages that never publish are exempt: drafts (without `--drafts`), expired/future-dated pages, and headless `render: false` pages don't block the build.
+- An explicit `path` in front matter always wins over any permalink rule.
+- An empty source key (`""` or `"/"`) makes a pattern rule a catch-all for every page — declare it last, since first-match ordering means it would shadow any rule after it.
+- For non-default languages the `/lang/` prefix comes first: `/ko/2026/03/05/hello/`.
+
+## Links
+
+Control how unresolved `@/path.md` internal links are treated during the build.
+
+```toml
+[links]
+broken_internal = "error"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| enabled | bool | false | Enable feed generation |
-| type | string | "rss" | Feed format (`"rss"` or `"atom"`) |
-| limit | int | 10 | Maximum number of items in the feed |
-| truncate | int | 0 | Truncate content to N characters (0 = no truncation) |
-| filename | string | "" | Output filename (auto-determined if empty) |
-| sections | array | [] | Limit feed to specific sections |
-| default_language_only | bool | true | Only include default language in main feed |
+| broken_internal | string | "warn" | `"warn"` logs each unresolved `@/` link and keeps the raw markup; `"error"` fails the build (exit code 5) with one aggregated list of every offender |
 
-### Sitemap
-
-```toml
-[sitemap]
-enabled = true
-filename = "sitemap.xml"
-changefreq = "weekly"
-priority = 0.5
-exclude = ["/private", "/drafts"]
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Enable sitemap generation |
-| filename | string | "sitemap.xml" | Output filename |
-| changefreq | string | "weekly" | Default change frequency (`always`, `hourly`, `daily`, `weekly`, `monthly`, `yearly`, `never`) |
-| priority | float | 0.5 | Default priority (0.0 to 1.0) |
-| exclude | array | [] | Exclude paths (prefixes) from sitemap |
-
-### Robots.txt
-
-```toml
-[robots]
-enabled = true
-
-[[robots.rules]]
-user_agent = "*"
-allow = ["/"]
-disallow = ["/private"]
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | true | Enable robots.txt generation |
-| filename | string | "robots.txt" | Output filename |
-| rules | array | [] | List of robot rules |
-
-Each rule in `rules` supports:
-
-| Key | Type | Description |
-|-----|------|-------------|
-| user_agent | string | User-agent to match (e.g. `"*"`, `"Googlebot"`) |
-| allow | array | Paths to allow |
-| disallow | array | Paths to disallow |
-
-### OpenGraph
-
-```toml
-[og]
-default_image = "/images/og.png"
-type = "website"
-twitter_card = "summary_large_image"
-twitter_site = "@username"
-twitter_creator = "@authorname"
-fb_app_id = "your_fb_app_id"
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| default_image | string | — | Fallback image when page has none |
-| type | string | "article" | OpenGraph type (`website`, `article`) |
-| twitter_card | string | "summary_large_image" | Twitter card type (`summary`, `summary_large_image`) |
-| twitter_site | string | — | Site's Twitter handle |
-| twitter_creator | string | — | Author's Twitter handle |
-| fb_app_id | string | — | Facebook App ID |
-
-### Auto OG Images
-
-Automatically generate Open Graph preview images from page titles:
-
-```toml
-[og.auto_image]
-enabled = true
-background = "#1a1a2e"
-text_color = "#ffffff"
-accent_color = "#e94560"
-font_size = 48
-logo = "static/logo.png"
-output_dir = "og-images"
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Auto-generate OG images for pages without a custom image |
-| background | string | "#1a1a2e" | Background color |
-| text_color | string | "#ffffff" | Title and description text color |
-| accent_color | string | "#e94560" | Accent color (top/bottom bars, site name) |
-| font_size | int | 48 | Title font size in pixels |
-| logo | string | — | Path to logo file (e.g., `static/logo.png`) |
-| output_dir | string | "og-images" | Output directory for generated images |
-
-See [SEO](/features/seo/) for template usage and output examples.
-
-## AMP
-
-Generate AMP (Accelerated Mobile Pages) versions of content pages:
-
-```toml
-[amp]
-enabled = true
-path_prefix = "amp"
-sections = ["posts"]
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Generate AMP versions of pages |
-| path_prefix | string | "amp" | URL prefix for AMP pages (e.g., `/amp/posts/hello/`) |
-| sections | array | [] | Sections to generate AMP for (empty = all sections) |
-
-AMP pages are automatically:
-- Stripped of disallowed tags (inline `<script>`, `style` attributes)
-- Converted (`<img>` to `<amp-img>`, `<iframe>` to `<amp-iframe>`)
-- Injected with AMP boilerplate CSS and runtime
-- Linked from canonical pages via `<link rel="amphtml">`
-
-## PWA
-
-Generate Progressive Web App files for offline access and installability:
-
-```toml
-[pwa]
-enabled = true
-name = "My Site"
-short_name = "Site"
-theme_color = "#ffffff"
-background_color = "#ffffff"
-display = "standalone"
-start_url = "/"
-icons = ["static/icon-192.png", "static/icon-512.png"]
-offline_page = "/offline.html"
-precache_urls = ["/", "/about/", "/css/main.css"]
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Generate PWA files (manifest.json, sw.js) |
-| name | string | site title | Full app name |
-| short_name | string | name or site title | Short app name (shown on home screen) |
-| theme_color | string | "#ffffff" | Browser toolbar color |
-| background_color | string | "#ffffff" | Splash screen background |
-| display | string | "standalone" | Display mode (`standalone`, `fullscreen`, `minimal-ui`, `browser`) |
-| start_url | string | "/" | Start URL when app launches |
-| icons | array | [] | Icon file paths (sizes extracted from filenames, e.g. `icon-192.png`) |
-| offline_page | string | — | Page to show when offline |
-| precache_urls | array | [] | URLs to cache on install |
-
-## LLMs.txt
-
-Generate instruction files for AI/LLM crawlers:
-
-```toml
-[llms]
-enabled = true
-filename = "llms.txt"
-instructions = "This site's content is provided under the MIT license."
-full_enabled = true
-full_filename = "llms-full.txt"
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Generate `llms.txt` |
-| filename | string | "llms.txt" | Output filename |
-| instructions | string | "" | Instructions text for LLM crawlers |
-| full_enabled | bool | false | Generate full content version (`llms-full.txt`) |
-| full_filename | string | "llms-full.txt" | Full version filename |
-
-See [LLMs.txt](/features/llms-txt/) for details.
-
-## Search
-
-```toml
-[search]
-enabled = true
-format = "fuse_json"
-fields = ["title", "content"]
-filename = "search.json"
-exclude = ["/private", "/drafts"]
-tokenize_cjk = false
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Generate search index |
-| format | string | "fuse_json" | Search index format |
-| fields | array | ["title", "content"] | Fields to include in index |
-| filename | string | "search.json" | Output filename |
-| exclude | array | [] | Exclude paths (prefixes) from search index |
-| tokenize_cjk | bool | false | Enable CJK bigram tokenization for search |
-
-## Pagination
-
-Site-level pagination defaults. These apply when sections enable pagination via front matter.
-
-```toml
-[pagination]
-enabled = false
-per_page = 10
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Enable pagination globally |
-| per_page | int | 10 | Default items per page |
-
-See [Pagination](/features/pagination/) for section-level configuration and template usage.
-
-## Series
-
-Group posts into ordered series for sequential reading.
-
-```toml
-[series]
-enabled = true
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Enable series grouping |
-
-In front matter, assign a series name and optional ordering weight:
-
-```toml
-+++
-title = "Part 1: Getting Started"
-series = "Crystal Tutorial"
-series_weight = 1
-+++
-```
-
-Pages with the same `series` value are grouped together, sorted by `series_weight` (then `date`, then `title`).
-
-Use in templates:
-
-```jinja
-{% if page.series %}
-<nav class="series-nav">
-  <h4>{{ page.series }} (Part {{ page.series_index }} of {{ page.series_pages | length }})</h4>
-  <ol>
-  {% for part in page.series_pages %}
-    <li{% if part.series_index == page.series_index %} class="current"{% endif %}>
-      <a href="{{ part.url }}">{{ part.title }}</a>
-    </li>
-  {% endfor %}
-  </ol>
-</nav>
-{% endif %}
-```
-
-Each series page exposes: `title`, `url`, `description`, `date`, `series_index`.
-
-## Related Posts
-
-Recommend related content based on shared taxonomy terms.
-
-```toml
-[related]
-enabled = true
-limit = 5
-taxonomies = ["tags", "categories"]
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| enabled | bool | false | Enable related posts |
-| limit | int | 5 | Maximum related posts per page |
-| taxonomies | array | ["tags"] | Taxonomies to use for similarity scoring |
-
-Use in templates:
-
-```jinja
-{% for post in page.related_posts %}
-  <a href="{{ post.url }}">{{ post.title }}</a>
-{% endfor %}
-```
-
-Each related post exposes: `title`, `url`, `description`, `date`, `image`, `section`.
+See [Internal Links](/writing/pages/#internal-links) for the `@/` link syntax and the `--cache` caveat in strict mode.
 
 ## Taxonomies
 
@@ -421,7 +176,7 @@ Each related post exposes: `title`, `url`, `description`, `date`, `image`, `sect
 [[taxonomies]]
 name = "tags"
 feed = true
-paginate = 10
+paginate_by = 10
 
 [[taxonomies]]
 name = "categories"
@@ -433,118 +188,120 @@ feed = true
 | name | string | — | Taxonomy name (used in front matter) |
 | feed | bool | false | Generate RSS feed for each term |
 | sitemap | bool | true | Include taxonomy pages in sitemap |
-| paginate | int | — | Pages per pagination page |
+| paginate_by | int | — | Items per page on term pages |
+| sort_by | string | "date" | Order of pages within a term: `"date"` (newest first), `"title"`, or `"weight"` |
+| reverse | bool | false | Flip whichever order `sort_by` produced |
+| terms_sort_by | string | "name" | Order of the terms list on the taxonomy index: `"name"` or `"count"` |
 
-## Syntax Highlighting
+Term feeds stay reverse-chronological regardless of `sort_by`. See
+[Taxonomies](/writing/taxonomies/#sorting) for the full sorting rules.
 
-```toml
-[highlight]
-enabled = true
-theme = "github-dark"
-use_cdn = true
-```
+## Menus
 
-## Auto Includes
-
-Automatically include CSS/JS from static directories:
+Named navigation menus, rendered in templates via `site.menus` / `get_menu()`.
 
 ```toml
-[auto_includes]
-enabled = true
-dirs = ["assets/css", "assets/js"]
-```
-
-## Multilingual
-
-```toml
-default_language = "en"
-
-[languages.en]
-language_name = "English"
+[[menus.main]]
+name = "Posts"
+url = "/posts/"
 weight = 1
 
-[languages.ko]
-language_name = "한국어"
+[[menus.main]]
+name = "About"
+url = "/about/"
 weight = 2
-generate_feed = true
-build_search_index = true
-taxonomies = ["tags", "categories"]
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| default_language | string | "en" | Default language code |
-| language_name | string | — | Human-readable language name |
-| weight | int | 0 | Sort order (lower = first) |
-| generate_feed | bool | false | Generate RSS feed for this language |
-| build_search_index | bool | false | Include in search index |
-| taxonomies | array | [] | Taxonomies for this language |
+| name | string | — | **Required.** Entry skipped (with a warning) if missing. |
+| url | string | "" | Root-relative or absolute `http(s)://`/`//` URL. |
+| weight | int | 0 | Sort order within the menu. |
+| identifier | string | `name` | Unique key other entries reference via `parent`. |
+| parent | string | none | Nest this entry under another entry's `identifier`. |
 
-See [Multilingual](/features/multilingual/) for content structure and template usage.
+Pages/sections can also join a menu from their own front matter (`menus = ["main"]`) without touching this file. A `[languages.<code>]` block with no menus table inherits this global set; declaring `[[languages.<code>.menus.<name>]]` replaces it for that language. See [Menus](/features/menus/) for the full reference (hierarchy, per-language behavior, `active_path` styling).
 
-## Deployment
+## Static Files
 
-Configure deployment targets for the `hwaro deploy` command.
+Everything under `static/` is copied verbatim into the site root, preserving its directory structure — `static/css/app.css` is served at `/css/app.css`. Hidden entries are included too, so `static/.well-known/security.txt` is published at `/.well-known/security.txt`. By default Hwaro filters out common OS, editor, and VCS cruft so it never ships to production.
 
 ```toml
-[deployment]
-confirm = false
-dry_run = false
-force = false
-max_deletes = 256
-source_dir = "public"
-
-[[deployment.targets]]
-name = "prod"
-url = "file:///var/www/mysite"
-
-[[deployment.targets]]
-name = "s3"
-url = "s3://your-bucket"
-command = "aws s3 sync {source}/ {url} --delete"
+[static]
+use_default_excludes = true              # filter built-in cruft (default)
+exclude = ["*.bak", "drafts/**"]         # extra patterns to skip
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| confirm | bool | false | Ask for confirmation before deploying |
-| dry_run | bool | false | Show changes without writing |
-| force | bool | false | Force upload (ignore file comparisons) |
-| max_deletes | int | 256 | Maximum deletions allowed (-1 to disable) |
-| source_dir | string | "public" | Source directory to deploy |
+| use_default_excludes | bool | true | Filter the built-in cruft denylist (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `.git`, vim swap files, …) |
+| exclude | array | [] | Extra patterns to skip. A glob like `*.bak` matches at any depth, `drafts/**` scopes a subtree, and a literal name is anchored to an exact file or directory (`drafts` drops `drafts/…`) |
 
-### Target Options
+The built-in denylist only removes cruft — legitimate dot-paths such as `.well-known/` and `.domains` are **never** filtered and are always published, identically for cold and `--cache`/incremental builds. Set `use_default_excludes = false` to disable the built-in filtering entirely.
 
-| Key | Type | Description |
-|-----|------|-------------|
-| name | string | Target identifier |
-| url | string | Destination URL or path |
-| command | string | Custom deploy command (overrides URL-based deployment) |
-| include | string | Glob pattern for files to include |
-| exclude | string | Glob pattern for files to exclude |
-| strip_index_html | bool | Remove `index.html` from paths |
+## Development Server
 
-Custom commands support placeholders: `{source}`, `{url}`, `{target}`.
-
-## Content Files
-
-Publish non-Markdown files from `content/` to the output directory:
+Options for `hwaro serve` only — they never affect `hwaro build` output.
 
 ```toml
-[content.files]
-allow_extensions = ["jpg", "jpeg", "png", "gif", "svg", "webp", "pdf"]
-disallow_extensions = ["psd", "ai"]
-disallow_paths = ["drafts/**", "**/_*"]
+[serve]
+fast = true                          # always serve in fast dev mode
+
+[serve.headers]
+X-Frame-Options = "SAMEORIGIN"
+Cache-Control = "no-store"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| allow_extensions | array | [] | File extensions to publish |
-| disallow_extensions | array | [] | File extensions to exclude |
-| disallow_paths | array | [] | Glob patterns for paths to exclude |
+| fast | bool | false | Serve as if `--fast` was passed (skips OG image generation and image processing); explicit CLI skip flags still apply |
+| headers | table | {} | Custom HTTP response headers added to every dev-server response; CLI `--header` values win on duplicate keys |
 
-See [Content Files](/features/content-files/) for details.
+See the [serve command](/start/cli/#serve) for the matching CLI flags.
+
+## Feature Configuration Reference
+
+Each feature has its own documentation with full configuration details. Below is a quick reference of all `config.toml` sections.
+
+| Config Section | Documentation | Description |
+|----------------|---------------|-------------|
+| `[feeds]` | [SEO](/features/seo/) | RSS/Atom feed generation |
+| `[sitemap]` | [SEO](/features/seo/) | Sitemap XML generation |
+| `[robots]` | [SEO](/features/seo/) | Robots.txt generation |
+| `[og]` | [SEO](/features/seo/) | OpenGraph & Twitter Card meta tags |
+| `[og.auto_image]` | [Auto OG Images](/features/og-images/) | Auto-generate OG preview images (including `lazy_generate` for fast dev server) |
+| `[search]` | [Search](/features/search/) | Client-side search index |
+| `[highlight]` | [Syntax Highlighting](/features/syntax-highlighting/) | Code syntax highlighting |
+| `[pagination]` | [Pagination](/features/pagination/) | Section pagination |
+| `[auto_includes]` | [Auto Includes](/features/auto-includes/) | Auto-include CSS/JS files |
+| `[assets]` | [Asset Pipeline](/features/asset-pipeline/) | CSS/JS minification & fingerprinting |
+| `[sass]` | [Sass/SCSS](/features/sass/) | Built-in SCSS compilation (pure Crystal) |
+| `[image_processing]` | [Image Processing](/features/image-processing/) | Image resizing & LQIP |
+| `[image_processing.lqip]` | [Image Processing](/features/image-processing/#lqip-low-quality-image-placeholders) | Base64 blur-up placeholders |
+| `[content.files]` | [Content Files](/features/content-files/) | Publish non-Markdown files |
+| `[static]` | [Static Files](#static-files) | Filter cruft / exclude paths from the `static/` copy |
+| `[serve]` | [Development Server](#development-server) | Dev-server response headers & fast mode |
+| `[links]` | [Links](#links) | Broken internal `@/` link handling (warn or fail the build) |
+| `[series]` | [Series](/features/series/) | Group posts into ordered series |
+| `[related]` | [Related Posts](/features/related-posts/) | Related content recommendations |
+| `[llms]` | [LLMs.txt](/features/llms-txt/) | AI/LLM crawler instructions |
+| `[pwa]` | [PWA](/features/pwa/) | Progressive Web App support |
+| `[amp]` | [AMP](/features/amp/) | Accelerated Mobile Pages |
+| `[deployment]` | [Deploy](/deploy/) | Deploy targets configuration |
+| `[doctor]` | [Doctor](/start/tools/doctor/) | Suppress known diagnostic issues |
+| `languages.*` | [Multilingual](/features/multilingual/) | Multi-language support |
+| `[[menus.*]]` | [Menus](/features/menus/) | Named navigation menus |
+
+## Plugins
+
+```toml
+[plugins]
+processors = ["markdown"]
+```
 
 ## Full Example
+
+A complete `config.toml` with all core sections. Copy and adjust to your needs.
 
 ```toml
 title = "My Blog"
@@ -556,6 +313,7 @@ default_language = "en"
 output_dir = "public"
 drafts = false
 parallel = true
+cache = false
 hooks.pre = ["npm ci"]
 hooks.post = ["npm run optimize"]
 
@@ -568,58 +326,10 @@ task_lists = true
 
 [permalinks]
 "old/posts" = "posts"
+"posts" = "/:year/:month/:day/:slug/"
 
-[feeds]
-enabled = true
-limit = 20
-
-[sitemap]
-enabled = true
-changefreq = "weekly"
-priority = 0.5
-
-[pagination]
-enabled = false
-per_page = 10
-
-[series]
-enabled = true
-
-[related]
-enabled = true
-limit = 5
-taxonomies = ["tags", "categories"]
-
-[robots]
-enabled = true
-
-[llms]
-enabled = true
-instructions = "Content under MIT license."
-full_enabled = true
-
-[og]
-default_image = "/images/og-default.png"
-twitter_card = "summary_large_image"
-twitter_site = "@myblog"
-twitter_creator = "@myblog"
-
-[search]
-enabled = true
-format = "fuse_json"
-fields = ["title", "content"]
-
-[highlight]
-enabled = true
-theme = "github-dark"
-use_cdn = true
-
-[auto_includes]
-enabled = true
-dirs = ["assets/css", "assets/js"]
-
-[content.files]
-allow_extensions = ["jpg", "jpeg", "png", "gif", "svg", "webp"]
+[plugins]
+processors = ["markdown"]
 
 [[taxonomies]]
 name = "tags"
@@ -628,20 +338,17 @@ feed = true
 [[taxonomies]]
 name = "categories"
 
-[deployment]
-source_dir = "public"
+[[menus.main]]
+name = "Posts"
+url = "/posts/"
 
-[[deployment.targets]]
-name = "prod"
-url = "file:///var/www/myblog"
+# Feature sections — see Feature Configuration Reference above
+# [feeds], [sitemap], [robots], [og], [search], [highlight],
+# [pagination], [auto_includes], [assets], [sass], [image_processing],
+# [series], [related], [llms], [pwa], [amp], [deployment], etc.
 ```
 
 ## See Also
 
-- [Features](/features/) — All built-in features
 - [CLI](/start/cli/) — Command-line options that override config
 - [Environment-Specific Config](/features/env-config/) — Per-environment overrides (`config.production.toml`)
-- [Environment Variables](/features/env-variables/) — Env var substitution in config and templates
-- [Multilingual](/features/multilingual/) — Multilingual configuration details
-- [LLMs.txt](/features/llms-txt/) — LLM instructions configuration
-- [Build Hooks](/features/build-hooks/) — Pre/post build commands

@@ -1,0 +1,378 @@
+require "yaml"
+require "json"
+require "set"
+require "./base"
+
+module Hwaro
+  module Services
+    module Importers
+      class EleventyImporter < Base
+        # 11ty supports multiple template formats; we handle Markdown + Nunjucks/Liquid
+
+        # Nunjucks/Liquid tag patterns
+        TEMPLATE_TAG_PATTERN = /\{[%{].*?[%}]\}/
+
+        # Paths (section/slug) written this run, to disambiguate collisions.
+        @used_paths = Set(String).new
+
+        def run(options : Config::Options::ImportOptions) : ImportResult
+          path = options.path
+          output_dir = options.output_dir
+          imported = 0
+          skipped = 0
+          errors = 0
+          wrapped = 0
+
+          @used_paths.clear
+          reset_written_paths
+
+          unless Dir.exists?(path)
+            return ImportResult.new(
+              success: false,
+              message: "Eleventy project directory not found: #{path}",
+            )
+          end
+
+          # 11ty content can be anywhere; common locations are src/, posts/, content/
+          # Also check the root for .md files
+          files = collect_content_files(path)
+
+          if files.empty?
+            return ImportResult.new(
+              success: true,
+              message: "No content files found in #{path}",
+            )
+          end
+
+          # Load directory data files (11ty convention)
+          dir_data = load_directory_data(path)
+
+          files.each do |file_path|
+            result = import_file(file_path, path, output_dir, dir_data, options.drafts, options.verbose, options.force)
+            case result
+            when :imported
+              imported += 1
+            when :imported_wrapped
+              imported += 1
+              wrapped += 1
+            when :skipped
+              skipped += 1
+            end
+          rescue ex
+            errors += 1
+            Logger.warn "Error importing #{file_path}: #{ex.message}"
+          end
+
+          if wrapped > 0
+            Logger.warn "#{wrapped} file(s) contained Nunjucks/Liquid template tags. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
+          end
+
+          report_collisions
+
+          ImportResult.new(
+            success: imported > 0 || errors == 0,
+            message: "Eleventy import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
+            imported_count: imported,
+            skipped_count: skipped,
+            error_count: errors,
+          )
+        end
+
+        private def collect_content_files(path : String) : Array(String)
+          # Skip common non-content directories
+          walk_files(path, skip_dir: ->(entry : String) {
+            entry.starts_with?(".") || {"node_modules", "_site", "_includes", "_layouts", "_data"}.includes?(entry)
+          })
+        end
+
+        # Load 11ty directory data files (dirname.json or dirname.11tydata.json)
+        private def load_directory_data(base_path : String) : Hash(String, Hash(String, YAML::Any))
+          data = {} of String => Hash(String, YAML::Any)
+
+          scan_data_files(base_path, base_path, data)
+          data
+        end
+
+        private def scan_data_files(dir : String, base_path : String, data : Hash(String, Hash(String, YAML::Any)))
+          dirname = File.basename(dir)
+
+          # Check for dirname.json
+          json_data_file = File.join(dir, "#{dirname}.json")
+          eleventydata_file = File.join(dir, "#{dirname}.11tydata.json")
+
+          data_file = if File.exists?(eleventydata_file)
+                        eleventydata_file
+                      elsif File.exists?(json_data_file)
+                        json_data_file
+                      end
+
+          if data_file
+            begin
+              json = JSON.parse(File.read(data_file))
+              if h = json.as_h?
+                relative_dir = dir.sub(base_path, "").lstrip('/')
+                parsed = {} of String => YAML::Any
+                h.each do |k, v|
+                  parsed[k] = json_any_to_yaml_any(v)
+                end
+                data[relative_dir] = parsed
+              end
+            rescue JSON::ParseException | File::Error
+              # Skip invalid or unreadable data files
+            end
+          end
+
+          Dir.each_child(dir) do |entry|
+            full_path = File.join(dir, entry)
+            # Skip symlinked directories: a cycle would raise ELOOP out of
+            # this walk and abort the whole import (same guard as
+            # `Base#walk_files_into`).
+            next if File.symlink?(full_path)
+            if File.directory?(full_path) && !entry.starts_with?(".") && entry != "node_modules" && entry != "_site"
+              scan_data_files(full_path, base_path, data)
+            end
+          end
+        end
+
+        private def json_any_to_yaml_any(value : JSON::Any) : YAML::Any
+          raw = value.raw
+          case raw
+          when String
+            YAML::Any.new(raw)
+          when Int64
+            YAML::Any.new(raw)
+          when Float64
+            YAML::Any.new(raw)
+          when Bool
+            YAML::Any.new(raw)
+          when Array
+            arr = raw.map { |item| json_any_to_yaml_any(item.as(JSON::Any)) }
+            YAML::Any.new(arr.as(Array(YAML::Any)))
+          when Hash
+            hash = {} of YAML::Any => YAML::Any
+            raw.each do |k, v|
+              hash[YAML::Any.new(k)] = json_any_to_yaml_any(v.as(JSON::Any))
+            end
+            YAML::Any.new(hash)
+          when Nil
+            YAML::Any.new("")
+          else
+            YAML::Any.new(raw.to_s)
+          end
+        end
+
+        private def import_file(
+          file_path : String,
+          base_path : String,
+          output_dir : String,
+          dir_data : Hash(String, Hash(String, YAML::Any)),
+          include_drafts : Bool,
+          verbose : Bool,
+          force : Bool,
+        ) : Symbol
+          raw = read_text(file_path)
+          frontmatter_yaml, body = split_yaml_frontmatter(raw)
+
+          fields = Hash(String, FieldValue).new
+
+          # Merge directory data as defaults
+          relative_dir = File.dirname(file_path).sub(base_path, "").lstrip('/')
+          basename = File.basename(file_path, File.extname(file_path))
+
+          # `index.md` means two different things in an 11ty project, and the
+          # split has to happen here rather than inside the title fallback
+          # below — that guard only ran for files WITHOUT a title, so a
+          # titled homepage (the normal case) fell through and was buried at
+          # `content/posts/index.md`, leaving the site with no home page.
+          #
+          #   - site root `index.md`       → hwaro's homepage, `content/index.md`
+          #   - collection `blog/index.md` → the section landing page, which
+          #     is hwaro's `content/blog/_index.md`
+          #
+          # Neither is discarded: a landing page carries author-written copy
+          # (intro prose, a description) that has a real destination here, and
+          # dropping it lost content outright.
+          is_site_root_index = basename == "index" && relative_dir.empty?
+          is_collection_index = basename == "index" && !relative_dir.empty? && !relative_dir.includes?('/')
+
+          merged_yaml = merge_directory_data(dir_data, relative_dir, frontmatter_yaml)
+
+          if merged_yaml
+            if yaml_hash = YAML.parse(merged_yaml).as_h?
+              # Title
+              if title = yaml_hash["title"]?
+                fields["title"] = yaml_string(title)
+              end
+
+              # Date
+              if date_val = yaml_hash["date"]?
+                case date_val.raw
+                when Time
+                  fields["date"] = format_date(date_val.raw.as(Time))
+                when String
+                  date_str = date_val.as_s
+                  # 11ty special date values
+                  unless date_str == "Last Modified" || date_str == "Created" || date_str == "git Last Modified" || date_str == "git Created"
+                    parsed = parse_date(date_str)
+                    fields["date"] = format_date(parsed) if parsed
+                  end
+                end
+              end
+
+              # Draft or excluded from collections
+              draft_val = yaml_hash["draft"]?
+              exclude_val = yaml_hash["eleventyExcludeFromCollections"]?
+              is_draft = !draft_val.nil? && draft_val.raw == true
+              is_excluded = !exclude_val.nil? && exclude_val.raw == true
+              if is_draft || is_excluded
+                unless include_drafts
+                  return :skipped
+                end
+                fields["draft"] = true
+              end
+
+              # Tags (11ty uses tags for collection membership)
+              if tags_val = yaml_hash["tags"]?
+                tags = [] of String
+                case tags_val.raw
+                when Array
+                  tags_val.as_a.each do |t|
+                    tag_str = yaml_string(t)
+                    # Skip 11ty collection tags like "post", "posts", "all"
+                    next if tag_str == "post" || tag_str == "posts" || tag_str == "all"
+                    tags << tag_str
+                  end
+                when String
+                  tag_str = tags_val.as_s
+                  unless tag_str == "post" || tag_str == "posts" || tag_str == "all"
+                    tags << tag_str
+                  end
+                end
+                fields["tags"] = tags unless tags.empty?
+              end
+
+              # Description
+              if desc = yaml_hash["description"]? || yaml_hash["excerpt"]? || yaml_hash["summary"]?
+                fields["description"] = yaml_string(desc)
+              end
+
+              # Image
+              if image = yaml_hash["image"]? || yaml_hash["featuredImage"]? || yaml_hash["cover"]?
+                fields["image"] = yaml_string(image)
+              end
+
+              # Template / layout
+              if layout = yaml_hash["layout"]?
+                fields["template"] = yaml_string(layout)
+              end
+            end
+          end
+
+          # Fallback title from filename. The site root index keeps an empty
+          # title, matching hwaro's own scaffolded `content/index.md`.
+          unless fields.has_key?("title") || is_site_root_index
+            name = basename
+            name = File.basename(File.dirname(file_path)) if name == "index"
+            fields["title"] = name.gsub(/[-_]/, " ").split.map(&.capitalize).join(" ")
+          end
+
+          # Fallback date from file
+          unless fields.has_key?("date")
+            # Try to extract date from filename (YYYY-MM-DD-slug.md)
+            filename = File.basename(file_path)
+            if match = /^(\d{4}-\d{2}-\d{2})/.match(filename)
+              parsed = parse_date(match[1])
+              fields["date"] = format_date(parsed) if parsed
+            elsif info = File.info?(file_path)
+              fields["date"] = format_date(info.modification_time)
+            end
+          end
+
+          # Track files with Nunjucks/Liquid tags; the `run` method
+          # emits a single summary with the count so users know how
+          # many files need manual conversion.
+          has_template_tags = body.matches?(TEMPLATE_TAG_PATTERN)
+          if has_template_tags
+            Logger.warn "Template tags detected in #{file_path} — manual conversion needed."
+          end
+
+          # Determine section — the site root index belongs at the content
+          # root, not under the default `posts` section.
+          section = is_site_root_index ? "" : top_section_from_path(file_path, base_path, "posts")
+
+          slug = if is_collection_index
+                   # `blog/index.md` → `content/blog/_index.md`, hwaro's own
+                   # section landing page. `_index` is not slugified: it is a
+                   # structural filename, not a title.
+                   "_index"
+                 elsif basename == "index" && !is_site_root_index
+                   slugify(File.basename(File.dirname(file_path)))
+                 else
+                   slugify(basename)
+                 end
+
+          # Avoid collision on section/slug path
+          path_key = "#{section}/#{slug}"
+          unless @used_paths.add?(path_key)
+            base_slug = slug
+            n = 1
+            loop do
+              candidate = "#{base_slug}-#{n}"
+              path_key = "#{section}/#{candidate}"
+              if @used_paths.add?(path_key)
+                slug = candidate
+                break
+              end
+              n += 1
+            end
+            Logger.warn "Slug collision: #{section}/#{base_slug} already used, renamed to #{section}/#{slug}"
+          end
+
+          frontmatter = generate_frontmatter(fields)
+          body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
+          written = write_content_file(output_dir, section, slug, frontmatter, body.strip, verbose, force)
+          return :skipped unless written
+          has_template_tags ? :imported_wrapped : :imported
+        end
+
+        # Merge directory data with per-file frontmatter (file data takes precedence)
+        private def merge_directory_data(
+          dir_data : Hash(String, Hash(String, YAML::Any)),
+          relative_dir : String,
+          frontmatter_yaml : String?,
+        ) : String?
+          dir_defaults = dir_data[relative_dir]?
+
+          if frontmatter_yaml
+            if dir_defaults
+              begin
+                file_yaml = YAML.parse(frontmatter_yaml)
+                if file_hash = file_yaml.as_h?
+                  # Build merged hash: directory defaults + file overrides
+                  merged = {} of YAML::Any => YAML::Any
+                  dir_defaults.each do |k, v|
+                    merged[YAML::Any.new(k)] = v
+                  end
+                  file_hash.each do |k, v|
+                    merged[k] = v
+                  end
+                  return YAML.dump(merged).strip
+                end
+              rescue YAML::ParseException
+                return frontmatter_yaml
+              end
+            end
+            frontmatter_yaml
+          elsif dir_defaults
+            # Build YAML from directory data only
+            hash = {} of YAML::Any => YAML::Any
+            dir_defaults.each do |k, v|
+              hash[YAML::Any.new(k)] = v
+            end
+            YAML.dump(hash).strip
+          end
+        end
+      end
+    end
+  end
+end

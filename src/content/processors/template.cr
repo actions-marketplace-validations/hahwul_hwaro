@@ -16,6 +16,7 @@ require "csv"
 require "crinja"
 require "./filters/*"
 require "../../utils/crinja_utils"
+require "../../utils/errors"
 
 module Hwaro
   module Content
@@ -36,7 +37,7 @@ module Hwaro
         end
 
         # Add a scalar value (String, Bool, Int, Nil) to the context
-        def add(name : String, value : String | Bool | Int32 | Int64 | Nil)
+        def add(name : String, value : String | Bool | Int32 | Int64?)
           @variables[name] = Crinja::Value.new(value)
         end
 
@@ -114,9 +115,23 @@ module Hwaro
           # TOC variables (basic, will be enriched by builder with actual TOC data)
           vars["toc"] = Crinja::Value.new("")
           toc_obj = {
-            "html" => Crinja::Value.new(""),
+            "html"    => Crinja::Value.new(""),
+            "headers" => Crinja::Value.new([] of Crinja::Value),
           }
           vars["toc_obj"] = Crinja::Value.new(toc_obj)
+
+          # SEO variables (basic defaults, enriched by builder with page-specific data)
+          seo_obj = {
+            "canonical_url"   => Crinja::Value.new(""),
+            "og_type"         => Crinja::Value.new(""),
+            "og_image"        => Crinja::Value.new(""),
+            "twitter_card"    => Crinja::Value.new(""),
+            "twitter_site"    => Crinja::Value.new(""),
+            "twitter_creator" => Crinja::Value.new(""),
+            "fb_app_id"       => Crinja::Value.new(""),
+            "hreflang"        => Crinja::Value.new([] of Crinja::Value),
+          }
+          vars["seo"] = Crinja::Value.new(seo_obj)
 
           # Time-related variables
           now = Time.local
@@ -153,28 +168,54 @@ module Hwaro
           @env.loader = loader
         end
 
-        # Render a template string with the given context
-        def render(template_string : String, context : TemplateContext) : String
-          template = @env.from_string(template_string)
+        # Render a template string with the given context. Pass `name`/`filename`
+        # when the string came from a file so Crinja errors report file:line:col.
+        def render(template_string : String, context : TemplateContext, name : String = "", filename : String? = nil) : String
+          template = Crinja::Template.new(template_string, @env, name, filename)
           template.render(context.to_crinja_vars)
+        rescue ex : Crinja::Error
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_TEMPLATE,
+            message: "Template error for #{context.page.path}: #{ex.message}",
+            cause: ex,
+          )
         end
 
-        # Render a template string with raw hash
-        def render(template_string : String, variables : Hash(String, Crinja::Value)) : String
-          template = @env.from_string(template_string)
+        # Render a template string with raw hash. Pass `name`/`filename`
+        # when the string came from a file so Crinja errors report file:line:col.
+        def render(template_string : String, variables : Hash(String, Crinja::Value), name : String = "", filename : String? = nil) : String
+          template = Crinja::Template.new(template_string, @env, name, filename)
           template.render(variables)
+        rescue ex : Crinja::Error
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_TEMPLATE,
+            message: "Template error: #{ex.message}",
+            cause: ex,
+          )
         end
 
         # Load and render a template by name
         def render_template(template_name : String, context : TemplateContext) : String
           template = @env.get_template(template_name)
           template.render(context.to_crinja_vars)
+        rescue ex : Crinja::Error
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_TEMPLATE,
+            message: "Template error in '#{template_name}' for #{context.page.path}: #{ex.message}",
+            cause: ex,
+          )
         end
 
         # Load and render a template by name with raw hash
         def render_template(template_name : String, variables : Hash(String, Crinja::Value)) : String
           template = @env.get_template(template_name)
           template.render(variables)
+        rescue ex : Crinja::Error
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_TEMPLATE,
+            message: "Template error in '#{template_name}': #{ex.message}",
+            cause: ex,
+          )
         end
 
         # Register custom filters specific to Hwaro
@@ -187,6 +228,24 @@ module Hwaro
           Filters::MathFilters.register(@env)
           Filters::I18nFilters.register(@env)
           Filters::MiscFilters.register(@env)
+          Filters::MenuFilters.register(@env)
+        end
+
+        # Shared body for the `empty`/`present` Crinja tests: a value is empty
+        # when it's an empty string/array/hash or nil.
+        private def value_empty?(value : Crinja::Raw) : Bool
+          case value
+          when String
+            value.empty?
+          when Array
+            value.empty?
+          when Hash
+            value.empty?
+          when Nil
+            true
+          else
+            false
+          end
         end
 
         # Register custom tests
@@ -214,36 +273,12 @@ module Hwaro
 
           # Test if value is empty (string, array, hash)
           @env.tests["empty"] = Crinja.test do
-            value = target.raw
-            case value
-            when String
-              value.empty?
-            when Array
-              value.empty?
-            when Hash
-              value.empty?
-            when Nil
-              true
-            else
-              false
-            end
+            value_empty?(target.raw)
           end
 
           # Test if value is present (not empty and not nil)
           @env.tests["present"] = Crinja.test do
-            value = target.raw
-            case value
-            when String
-              !value.empty?
-            when Array
-              !value.empty?
-            when Hash
-              !value.empty?
-            when Nil
-              false
-            else
-              true
-            end
+            !value_empty?(target.raw)
           end
 
           regex_cache = {} of String => Regex
@@ -263,7 +298,7 @@ module Hwaro
                 regex_cache[regex_str] ||= Regex.new(regex_str)
               end
               target.to_s.matches?(regex)
-            rescue
+            rescue ArgumentError
               false
             end
           end
@@ -271,6 +306,16 @@ module Hwaro
 
         # Register custom functions
         private def register_custom_functions
+          register_now_function
+          register_url_for_function
+          register_lookup_functions
+          register_image_function
+          register_data_function
+          register_asset_functions
+          register_env_function
+        end
+
+        private def register_now_function
           # now() function - returns current time
           @env.functions["now"] = Crinja.function({format: nil}) do
             format = arguments["format"]
@@ -282,22 +327,21 @@ module Hwaro
               Crinja::Value.new(time.to_s(format.to_s))
             end
           end
+        end
 
+        private def register_url_for_function
           # url_for() function - generate URL for a path
           @env.functions["url_for"] = Crinja.function({path: ""}) do
             path = arguments["path"].to_s
             base_url = env.resolve("base_url").to_s
-
-            if path.starts_with?("/")
-              Crinja::Value.new(base_url.rstrip("/") + path)
-            else
-              Crinja::Value.new(base_url.rstrip("/") + "/" + path)
-            end
+            Crinja::Value.new(Filters::UrlFilters.absolutize(path, base_url))
           end
 
           # get_url() function - alias for url_for to match
           @env.functions["get_url"] = @env.functions["url_for"]
+        end
 
+        private def register_lookup_functions
           # get_page() function - get page data by path
           # Usage: {% set about = get_page(path="about.md") %}
           #        {{ about.title }}
@@ -310,7 +354,7 @@ module Hwaro
               raw_map = pages_map.raw.as(Hash)
               if found = raw_map[path_arg]?
                 return found
-              elsif found = raw_map["/#{path_arg.chomp(".md")}/"]?
+              elsif found = raw_map["/#{path_arg.chomp(".markdown").chomp(".md")}/"]?
                 return found
               end
               # If map is present but page not found, return nil (miss)
@@ -331,7 +375,7 @@ module Hwaro
                   page_path = raw_page["path"]?.try(&.to_s) || ""
                   page_url = raw_page["url"]?.try(&.to_s) || ""
 
-                  if page_path == path_arg || page_url == path_arg || page_url == "/#{path_arg.chomp(".md")}/"
+                  if page_path == path_arg || page_url == path_arg || page_url == "/#{path_arg.chomp(".markdown").chomp(".md")}/"
                     result = page_val
                     break
                   end
@@ -398,6 +442,37 @@ module Hwaro
             result
           end
 
+          # get_menu() function - get a named menu's resolved entry tree.
+          # Usage: {% for item in get_menu(name="main") %}
+          # Resolves against the CURRENT page's language (falling back to
+          # the site's default language), so the same template renders each
+          # language's own menu — unlike `site.menus`, which is fixed to the
+          # default language. Returns an empty array (not nil) for an unknown
+          # or unregistered menu name, so `{% for %}` never errors.
+          @env.functions["get_menu"] = Crinja.function({name: ""}) do
+            menu_name = arguments["name"].to_s
+            lang = env.resolve("page_language").to_s
+            default_lang = env.resolve("_i18n_default_language").to_s
+
+            menus_val = env.resolve("__menus__")
+            result = Crinja::Value.new([] of Crinja::Value)
+
+            raw_menus = menus_val.raw
+            if raw_menus.is_a?(Hash)
+              lang_menus = raw_menus[lang]?.try(&.raw)
+              found = lang_menus[menu_name]? if lang_menus.is_a?(Hash)
+
+              if !found && lang != default_lang
+                default_menus = raw_menus[default_lang]?.try(&.raw)
+                found = default_menus[menu_name]? if default_menus.is_a?(Hash)
+              end
+
+              result = found if found
+            end
+
+            result
+          end
+
           # get_taxonomy_url() function - get URL for a taxonomy term
           # Usage: {{ get_taxonomy_url(kind="tags", term="crystal") }}
           @env.functions["get_taxonomy_url"] = Crinja.function({kind: "", term: ""}) do
@@ -405,13 +480,59 @@ module Hwaro
             term = arguments["term"].to_s
             base_url = env.resolve("base_url").to_s
 
-            # Generate slug from term (use TextUtils for consistency with taxonomy pages)
-            slug = Utils::TextUtils.slugify(term)
+            # Resolve the slug from the disambiguated term→slug map built in
+            # build_global_vars, so a collision (e.g. "C++"/"C#" → "c") links to
+            # the SAME unique path the taxonomy generator wrote, not a shared
+            # base slug. Fall back to safe_slugify when the map is absent or the
+            # term is unknown — plain slugify("🎉") is "" → "/tags//" (a dead
+            # double-slash link), so safe_slugify is the right fallback.
+            # A multilingual site writes `/<lang>/<taxonomy>/<slug>/` term pages
+            # for every non-default language that enables the taxonomy. Prefer
+            # the CURRENT page's language when such a page exists: the root
+            # `/tags/<slug>/` either 404s (term present only in that language) or
+            # lands the reader on the default language's listing.
+            # `__taxonomy_lang_slugs__` only carries terms the generator actually
+            # wrote, so a miss safely falls through to the root URL below.
+            lang = env.resolve("page_language").to_s
+            default_lang = env.resolve("_i18n_default_language").to_s
+            lang_prefix = ""
+            slug = nil
 
-            url = "/#{kind}/#{slug}/"
+            if !lang.empty? && lang != default_lang
+              lang_raw = env.resolve("__taxonomy_lang_slugs__").raw
+              if lang_raw.is_a?(Hash) && (per_lang = lang_raw[lang]?)
+                per_lang_raw = per_lang.raw
+                if per_lang_raw.is_a?(Hash) && (kind_map = per_lang_raw[kind]?)
+                  kind_raw = kind_map.raw
+                  if kind_raw.is_a?(Hash) && (mapped = kind_raw[term]?)
+                    slug = mapped.to_s
+                    lang_prefix = "/#{lang}"
+                  end
+                end
+              end
+            end
+
+            unless slug
+              slugs_raw = env.resolve("__taxonomy_slugs__").raw
+              if slugs_raw.is_a?(Hash)
+                if kind_map = slugs_raw[kind]?
+                  kind_raw = kind_map.raw
+                  if kind_raw.is_a?(Hash)
+                    if mapped = kind_raw[term]?
+                      slug = mapped.to_s
+                    end
+                  end
+                end
+              end
+            end
+            slug ||= Utils::TextUtils.safe_slugify(term)
+
+            url = "#{lang_prefix}/#{kind}/#{slug}/"
             Crinja::Value.new(base_url.rstrip("/") + url)
           end
+        end
 
+        private def register_image_function
           # resize_image() function - returns URL to a resized image variant
           # Usage: {{ resize_image(path="/images/photo.jpg", width=800).url }}
           # Returns object with:
@@ -421,13 +542,19 @@ module Hwaro
           # Note: actual output dimensions depend on aspect ratio preservation.
           @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0}) do
             path = arguments["path"].to_s
-            width = Math.max(0, arguments["width"].as_number.to_i)
-            height = Math.max(0, arguments["height"].as_number.to_i)
+            # Lenient coercion: shortcode arguments are always Strings, so a
+            # `width="800"` forwarded from `{% img(width="800") %}` must resize
+            # rather than raise Crinja::TypeError and abort the page.
+            width = Utils::CrinjaUtils.to_count(arguments["width"])
+            height = Utils::CrinjaUtils.to_count(arguments["height"])
 
             base_url = env.resolve("base_url").to_s
 
-            # Normalize path to start with /
-            normalized = path.starts_with?("/") ? path : "/#{path}"
+            # Normalize path to start with /. The resize/LQIP maps are keyed by
+            # the decoded filesystem path, so decode any percent-encoding from
+            # the incoming URL before the lookup; the returned variant is
+            # re-encoded below so the emitted .url is a valid href.
+            normalized = URI.decode(path.starts_with?("/") ? path : "/#{path}")
 
             # Try to find a resized variant from the image hooks map
             resized_url = if width > 0
@@ -435,18 +562,37 @@ module Hwaro
                           end
 
             final_url = if resized = resized_url
-                          base_url.rstrip("/") + resized
+                          base_url.rstrip("/") + URI.encode_path(resized)
                         else
-                          base_url.rstrip("/") + normalized
+                          base_url.rstrip("/") + URI.encode_path(normalized)
                         end
 
+            # Look up LQIP data
+            lqip_data = Content::Hooks::ImageHooks.find_lqip(normalized)
+            lqip_value = lqip_data.try { |d| d["lqip"]? } || ""
+            dominant_color_value = lqip_data.try { |d| d["dominant_color"]? } || ""
+
             Crinja::Value.new({
-              "url"    => Crinja::Value.new(final_url),
-              "width"  => Crinja::Value.new(width),
-              "height" => Crinja::Value.new(height),
+              "url"            => Crinja::Value.new(final_url),
+              "width"          => Crinja::Value.new(width),
+              "height"         => Crinja::Value.new(height),
+              "lqip"           => Crinja::Value.new(lqip_value),
+              "dominant_color" => Crinja::Value.new(dominant_color_value),
             })
           end
+        end
 
+        # Memoized load_data results, shared across engine instances (each
+        # parallel render worker gets its own env, so an instance cache would
+        # miss on every worker). Keyed by resolved path; the stored mtime
+        # invalidates naturally when the data file changes, so `serve`
+        # sessions pick up edits. Mutex-guarded — workers call load_data
+        # concurrently under -Dpreview_mt. Without this, a load_data() call
+        # in a base layout re-read and re-parsed the file once per page.
+        @@load_data_cache = {} of String => {Int64, Crinja::Value}
+        @@load_data_mutex = Mutex.new
+
+        private def register_data_function
           # load_data() function - load data from JSON/TOML/YAML files
           # Usage: {% set data = load_data(path="data/menu.json") %}
           @env.functions["load_data"] = Crinja.function({path: ""}) do
@@ -460,34 +606,31 @@ module Hwaro
               # Resolve symlinks BEFORE boundary check to prevent TOCTOU attacks.
               project_root = File.realpath(Dir.current)
               resolved = File.expand_path(path, project_root)
-              resolved = File.realpath(resolved) rescue nil
+              resolved = begin
+                File.realpath(resolved)
+              rescue File::Error
+                nil
+              end
 
               if resolved &&
                  (resolved == project_root || resolved.starts_with?(project_root + "/")) &&
-                 File.exists?(resolved) && File.file?(resolved)
-                content = File.read(resolved)
+                 (info = File.info?(resolved)) && info.file?
+                # to_unix_ms (Int64) like the build cache — to_unix_ns is Int128
+                mtime = info.modification_time.to_unix_ms
 
-                if path.ends_with?(".json")
-                  # Parse JSON
-                  json_data = JSON.parse(content)
-                  result = json_to_crinja(json_data)
-                elsif path.ends_with?(".toml")
-                  # Parse TOML
-                  toml_data = TOML.parse(content)
-                  result = toml_to_crinja(toml_data)
-                elsif path.ends_with?(".yaml") || path.ends_with?(".yml")
-                  # Parse YAML
-                  yaml_data = YAML.parse(content)
-                  result = yaml_to_crinja(yaml_data)
-                elsif path.ends_with?(".csv")
-                  # Parse CSV using stdlib parser (handles quoted fields correctly)
-                  csv_data = CSV.parse(content).map do |row|
-                    Crinja::Value.new(row.map { |cell| Crinja::Value.new(cell.strip) })
+                # One lock across lookup + parse: data files are tiny, and it
+                # also means N parallel workers cold-starting on the same
+                # file parse it once instead of racing to parse in duplicate.
+                result = @@load_data_mutex.synchronize do
+                  cached = @@load_data_cache[resolved]?
+                  if cached && cached[0] == mtime
+                    cached[1]
+                  elsif parsed = parse_data_content(path, File.read(resolved))
+                    @@load_data_cache[resolved] = {mtime, parsed}
+                    parsed
+                  else
+                    Crinja::Value.new(nil)
                   end
-                  result = Crinja::Value.new(csv_data)
-                else
-                  ext = File.extname(path)
-                  Logger.debug "load_data('#{path}'): unsupported file type '#{ext}' (supported: .json, .toml, .yaml, .yml, .csv)"
                 end
               end
             rescue ex
@@ -497,7 +640,30 @@ module Hwaro
 
             result
           end
+        end
 
+        # Parse a data file's content by the extension carried on `path` (the
+        # template-facing argument). Returns nil for unsupported types.
+        private def parse_data_content(path : String, content : String) : Crinja::Value?
+          if path.ends_with?(".json")
+            json_to_crinja(JSON.parse(content))
+          elsif path.ends_with?(".toml")
+            toml_to_crinja(TOML.parse(content))
+          elsif path.ends_with?(".yaml") || path.ends_with?(".yml")
+            yaml_to_crinja(YAML.parse(content))
+          elsif path.ends_with?(".csv")
+            # Parse CSV using stdlib parser (handles quoted fields correctly)
+            csv_data = CSV.parse(content).map do |row|
+              Crinja::Value.new(row.map { |cell| Crinja::Value.new(cell.strip) })
+            end
+            Crinja::Value.new(csv_data)
+          else
+            Logger.debug "load_data('#{path}'): unsupported file type '#{File.extname(path)}' (supported: .json, .toml, .yaml, .yml, .csv)"
+            nil
+          end
+        end
+
+        private def register_asset_functions
           # asset() function - resolve asset path from pipeline manifest
           # Usage: {{ asset(name="main.css") }}
           # Returns fingerprinted path if asset pipeline is enabled,
@@ -518,7 +684,9 @@ module Hwaro
 
           # asset_url is an alias for asset
           @env.functions["asset_url"] = @env.functions["asset"]
+        end
 
+        private def register_env_function
           # env() function - read environment variables in templates
           # Usage: {{ env("ANALYTICS_ID") }}
           #        {{ env("API_KEY", default="none") }}

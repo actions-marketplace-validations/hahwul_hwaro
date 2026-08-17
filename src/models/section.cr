@@ -14,6 +14,11 @@ module Hwaro
       # New: Page template - default template for pages in this section
       property page_template : String?
 
+      # Front-matter [cascade] table: default values inherited by descendant
+      # pages and sections (the section itself is not affected). Deeper
+      # cascades override shallower ones; a page's own front matter always wins.
+      property cascade : Hash(String, ExtraValue)
+
       # New: Paginate path - custom path pattern for pagination (e.g., "page", "p")
       property paginate_path : String
 
@@ -30,22 +35,12 @@ module Hwaro
         @page_template = nil
         @paginate_path = "page"
         @subsections = [] of Section
-      end
-
-      # Get effective page template (for pages in this section)
-      def effective_page_template : String?
-        @page_template
+        @cascade = {} of String => ExtraValue
       end
 
       # Add a subsection
       def add_subsection(section : Section)
         @subsections << section
-      end
-
-      # Find subsection by name (exact section match first, then case-insensitive title)
-      def find_subsection(name : String) : Section?
-        @subsections.find { |s| s.section == name } ||
-          @subsections.find { |s| s.title.downcase == name.downcase }
       end
 
       # Get all pages including from subsections (recursive)

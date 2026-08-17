@@ -1,6 +1,8 @@
 require "html"
 require "../../models/config"
 require "../../models/page"
+require "../../utils/text_utils"
+require "../processors/internal_link_resolver"
 
 module Hwaro
   module Content
@@ -8,9 +10,28 @@ module Hwaro
       module Tags
         extend self
 
-        def canonical_tag(page : Models::Page, config : Models::Config) : String
-          # Use permalink if available, otherwise construct from base_url + url
-          url = page.permalink || "#{config.base_url_stripped}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+        # Compute the canonical URL for a page (absolute URL with base_url).
+        # `url_override` (the paginator's page-aware URL) self-canonicalizes
+        # paginated pages instead of collapsing them onto page 1.
+        def canonical_url(page : Models::Page, config : Models::Config, url_override : String? = nil) : String
+          # The paginator's page-aware override wins so paginated pages
+          # self-canonicalize. `page.permalink` is the generated absolute URL
+          # (base_url + page.url), i.e. the page-1/section URL — using it for a
+          # paginated render would point every page at page 1.
+          #
+          # The result is percent-encoded like feeds/sitemap URLs so a
+          # non-ASCII path (e.g. a Unicode taxonomy term) canonicalizes to
+          # the exact same RFC 3986 URL those XML surfaces advertise.
+          raw = if u = url_override
+                  "#{config.base_url_stripped}#{u.starts_with?("/") ? u : "/#{u}"}"
+                else
+                  page.permalink || "#{config.base_url_stripped}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+                end
+          Utils::TextUtils.encode_url_path(raw)
+        end
+
+        def canonical_tag(page : Models::Page, config : Models::Config, url_override : String? = nil) : String
+          url = canonical_url(page, config, url_override)
           # Fast path: skip HTML.escape when URL has no escapable chars (common case for URLs)
           escaped = url.includes?('&') || url.includes?('"') || url.includes?('<') || url.includes?('>') ? HTML.escape(url) : url
           %(<link rel="canonical" href="#{escaped}">)
@@ -23,15 +44,22 @@ module Hwaro
           base = config.base_url_stripped
 
           String.build(page.translations.size * 80) do |str|
-            # Add current page
+            # Add current page. URLs are percent-encoded to match the
+            # sitemap's xhtml:link alternates for the same pages.
             current_url = page.permalink || "#{base}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+            current_url = Utils::TextUtils.encode_url_path(current_url)
             lang_code = page.language || config.default_language
             str << %(<link rel="alternate" hreflang="#{HTML.escape(lang_code)}" href="#{HTML.escape(current_url)}">)
 
             # Add translations (already ordered by ordered_language_codes via link_translations!)
             page.translations.each do |t|
               next if t.is_current
-              abs_url = t.url.starts_with?("http") ? t.url : "#{base}#{t.url.starts_with?("/") ? t.url : "/#{t.url}"}"
+              abs_url = if Processors::InternalLinkResolver.has_own_origin?(t.url)
+                          t.url
+                        else
+                          "#{base}#{t.url.starts_with?("/") ? t.url : "/#{t.url}"}"
+                        end
+              abs_url = Utils::TextUtils.encode_url_path(abs_url)
               str << '\n'
               str << %(<link rel="alternate" hreflang="#{HTML.escape(t.code)}" href="#{HTML.escape(abs_url)}">)
             end

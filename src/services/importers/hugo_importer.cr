@@ -11,6 +11,9 @@ module Hwaro
           output_dir = options.output_dir
           include_drafts = options.drafts
           verbose = options.verbose
+          force = options.force
+
+          reset_written_paths
 
           content_dir = File.join(hugo_path, "content")
 
@@ -24,21 +27,29 @@ module Hwaro
           imported = 0
           skipped = 0
           errors = 0
+          wrapped = 0
 
           scan_markdown_files(content_dir).each do |file_path|
-            begin
-              result = process_file(file_path, content_dir, output_dir, include_drafts, verbose)
-              case result
-              when :imported
-                imported += 1
-              when :skipped
-                skipped += 1
-              end
-            rescue ex
-              errors += 1
-              Logger.warn "Error processing #{file_path}: #{ex.message}"
+            result = process_file(file_path, content_dir, output_dir, include_drafts, verbose, force)
+            case result
+            when :imported
+              imported += 1
+            when :imported_wrapped
+              imported += 1
+              wrapped += 1
+            when :skipped
+              skipped += 1
             end
+          rescue ex
+            errors += 1
+            Logger.warn "Error processing #{file_path}: #{ex.message}"
           end
+
+          if wrapped > 0
+            Logger.warn "#{wrapped} file(s) contained Hugo shortcodes. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
+          end
+
+          report_collisions
 
           ImportResult.new(
             success: imported > 0 || errors == 0,
@@ -50,20 +61,7 @@ module Hwaro
         end
 
         private def scan_markdown_files(content_dir : String) : Array(String)
-          files = [] of String
-          scan_dir(content_dir, files)
-          files
-        end
-
-        private def scan_dir(dir : String, files : Array(String))
-          Dir.each_child(dir) do |entry|
-            path = File.join(dir, entry)
-            if File.directory?(path)
-              scan_dir(path, files)
-            elsif entry.ends_with?(".md") || entry.ends_with?(".markdown")
-              files << path
-            end
-          end
+          walk_files(content_dir)
         end
 
         private def process_file(
@@ -72,8 +70,9 @@ module Hwaro
           output_dir : String,
           include_drafts : Bool,
           verbose : Bool,
+          force : Bool,
         ) : Symbol
-          raw = File.read(file_path)
+          raw = read_text(file_path)
           fm_data, body = extract_frontmatter(raw)
 
           # Check draft status (only if frontmatter exists)
@@ -82,13 +81,16 @@ module Hwaro
             return :skipped
           end
 
-          # Warn about Hugo shortcodes in body
-          if body.includes?("{{<") || body.includes?("{{%")
-            Logger.warn "Hugo shortcodes detected in #{file_path} — manual conversion may be needed"
+          # Track files with Hugo shortcodes so the `run` method can
+          # emit a single summary telling the user how many files need
+          # manual conversion.
+          has_shortcodes = body.includes?("{{<") || body.includes?("{{%")
+          if has_shortcodes
+            Logger.warn "Hugo shortcodes detected in #{file_path} — manual conversion needed."
           end
 
           # Map Hugo fields to Hwaro frontmatter
-          fields = {} of String => String | Bool | Array(String) | Nil
+          fields = {} of String => FieldValue
           slug_val : String? = nil
 
           if data = fm_data
@@ -97,8 +99,9 @@ module Hwaro
               fields["title"] = title
             end
 
-            # date
-            if date_str = string_value(data, "date")
+            # date (falling back to Hugo's publishDate so a page dated only
+            # via publishDate doesn't lose its date entirely)
+            if date_str = string_value(data, "date") || string_value(data, "publishDate")
               parsed = parse_date(date_str)
               fields["date"] = format_date(parsed) if parsed
             end
@@ -118,13 +121,21 @@ module Hwaro
 
             # tags
             tags = array_string_value(data, "tags")
-
-            # categories — merge into tags
-            categories = array_string_value(data, "categories")
-            unless categories.empty?
-              tags = tags + categories
-            end
             fields["tags"] = tags unless tags.empty?
+
+            # categories — preserve as its own taxonomy key; hwaro's
+            # scaffold `[[taxonomies]]` defines tags and categories as
+            # separate classifications.
+            categories = array_string_value(data, "categories")
+            fields["categories"] = categories unless categories.empty?
+
+            # authors — Hugo's `authors` list maps 1:1 onto hwaro's own
+            # `authors` front matter (the blog scaffold writes it, and the
+            # WordPress/Astro importers already populate it). Dropping it
+            # lost author attribution on every Hugo import and made
+            # `hwaro → hugo export → hugo import` non-round-tripping.
+            authors = array_string_value(data, "authors")
+            fields["authors"] = authors unless authors.empty?
 
             # series
             if series = string_value(data, "series")
@@ -133,9 +144,15 @@ module Hwaro
               fields["series"] = series_arr.first? unless series_arr.empty?
             end
 
-            # weight
-            if weight = string_value(data, "weight")
-              fields["weight"] = weight
+            # weight — must stay numeric: hwaro's frontmatter reader takes
+            # `as_i?`, so a quoted `weight = "3"` silently reads as weight 0
+            # and every imported page loses its ordering.
+            if weight_val = data["weight"]?
+              case weight_raw = weight_val.raw
+              when Int64   then fields["weight"] = weight_raw
+              when Float64 then fields["weight"] = weight_raw.to_i64
+              when String  then fields["weight"] = weight_raw.to_i64?
+              end
             end
 
             # slug
@@ -158,18 +175,8 @@ module Hwaro
 
           frontmatter = generate_frontmatter(fields)
 
-          # Determine relative path for output structure
-          relative_path = file_path.sub(content_dir, "").lstrip('/')
-
           # Determine section and filename
-          parts = relative_path.split("/")
-          if parts.size > 1
-            section = parts[0..-2].join("/")
-            filename = parts.last
-          else
-            section = ""
-            filename = parts.first
-          end
+          section, filename = section_from_path(file_path, content_dir, "")
 
           # Determine slug for the file
           if filename == "_index.md" || filename == "_index.markdown"
@@ -180,15 +187,35 @@ module Hwaro
             file_slug = filename.sub(/\.(md|markdown)$/, "")
           end
 
-          written = write_content_file(output_dir, section, file_slug, frontmatter, body.strip, verbose)
-          written ? :imported : :skipped
+          body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
+          written, dest_path = write_content_file_to(output_dir, section, file_slug, frontmatter, body.strip, verbose, force)
+
+          # Leaf bundle (`posts/my-post/index.md`): the co-located images
+          # belong beside the written `.md`, and were never copied at all —
+          # leaving every `![](cover.png)` in the imported post 404ing.
+          #
+          # The destination comes from the path `write_content_file_to`
+          # actually chose, not from `output_dir/section`: a front-matter
+          # `slug` or a claim collision moves the `.md` elsewhere, and the
+          # assets have to follow it. Assets are also copied when the `.md`
+          # was SKIPPED — on a re-import the post already exists, and
+          # requiring `--force` (which rewrites content) just to recover
+          # missing images was a trap.
+          #
+          # `section` must be non-empty: a bare `content/index.md` is the site
+          # root, not a bundle, and sweeping the whole content root's loose
+          # files into the output is not what the author asked for.
+          if dest_path && !section.empty? && (filename == "index.md" || filename == "index.markdown")
+            copy_bundle_assets(File.dirname(file_path), File.dirname(dest_path), output_dir, verbose, force)
+          end
+
+          return :skipped unless written
+          has_shortcodes ? :imported_wrapped : :imported
         end
 
-        # Regex for TOML frontmatter: +++ on first line, +++ on its own line
+        # Regex for TOML frontmatter: +++ on first line, +++ on its own line.
+        # (YAML frontmatter reuses the inherited Base::YAML_FM_REGEX.)
         TOML_FM_REGEX = /\A\+\+\+[ \t]*\n(.*?\n?)^\+\+\+[ \t]*$\n?(.*)\z/m
-
-        # Regex for YAML frontmatter: --- on first line, --- on its own line
-        YAML_FM_REGEX = /\A---[ \t]*\n(.*?\n?)^---[ \t]*$\n?(.*)\z/m
 
         private def extract_frontmatter(raw : String) : {Hash(String, TOML::Any)?, String} | {Hash(String, YAML::Any)?, String}
           if raw.starts_with?("+++")
@@ -198,7 +225,7 @@ module Hwaro
               begin
                 data = TOML.parse(toml_str)
                 return {data, body}
-              rescue
+              rescue TOML::ParseException
                 return {nil, raw}
               end
             end
@@ -208,14 +235,23 @@ module Hwaro
               body = match[2].lstrip('\n')
               begin
                 yaml_data = YAML.parse(yaml_str)
-                if yaml_data.as_h?
+                if h = yaml_data.as_h?
                   data = {} of String => TOML::Any
-                  yaml_data.as_h.each do |k, v|
-                    data[k.as_s] = yaml_any_to_toml_any(v)
+                  h.each do |k, v|
+                    key_str = yaml_string(k)
+                    data[key_str] = yaml_any_to_toml_any(v)
                   end
                   return {data, body}
+                elsif yaml_data.raw.nil?
+                  # Empty/comment-only frontmatter: no fields, but drop the
+                  # fences — returning `raw` leaked literal `---` lines into
+                  # the imported page body.
+                  return {nil, body}
                 end
-              rescue
+                # Non-mapping block (a leading horizontal rule): treat the
+                # whole document as body.
+              rescue ex : YAML::ParseException
+                Logger.debug "YAML front matter parse failed: #{ex.message}"
                 return {nil, raw}
               end
             end
@@ -224,7 +260,10 @@ module Hwaro
           {nil, raw}
         end
 
-        private def yaml_any_to_toml_any(value : YAML::Any) : TOML::Any
+        # `depth` guards a cyclic YAML::Any (self-referencing anchor); see
+        # `Utils::Nesting`.
+        private def yaml_any_to_toml_any(value : YAML::Any, depth : Int32 = 0) : TOML::Any
+          Utils::Nesting.check!(depth)
           raw = value.raw
           case raw
           when String
@@ -238,12 +277,14 @@ module Hwaro
           when Bool
             TOML::Any.new(raw)
           when Array
-            arr = raw.map { |item| yaml_any_to_toml_any(item.as(YAML::Any)) }
+            arr = raw.map { |item| yaml_any_to_toml_any(item.as(YAML::Any), depth + 1) }
             TOML::Any.new(arr)
           when Hash
             hash = {} of String => TOML::Any
             raw.each do |k, v|
-              hash[k.as(YAML::Any).as_s] = yaml_any_to_toml_any(v.as(YAML::Any))
+              k_any = k.as(YAML::Any)
+              key_str = yaml_string(k_any)
+              hash[key_str] = yaml_any_to_toml_any(v.as(YAML::Any), depth + 1)
             end
             TOML::Any.new(hash)
           when Nil

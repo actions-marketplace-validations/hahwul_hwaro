@@ -1,20 +1,53 @@
 require "file_utils"
+require "html"
+require "crinja"
 require "../../models/config"
 require "../../models/page"
 require "../../models/section"
+require "../../utils/errors"
 require "../../utils/logger"
 require "../../utils/text_utils"
 require "../../utils/sort_utils"
+require "../../utils/path_utils"
+require "../../utils/output_guard"
 require "../processors/markdown"
+require "../processors/internal_link_resolver"
 
 module Hwaro
   module Content
     module Seo
       class Feeds
-        def self.generate(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false)
+        # Builder-provided template renderer for user feed overrides:
+        # (template_source, context) -> rendered feed. Kept as a Proc so this
+        # generator stays decoupled from the builder's Crinja plumbing — the
+        # builder constructs it over a fresh env per call (the shared env is
+        # not MT-safe and SEO tasks run in parallel fibers).
+        alias Renderer = Proc(String, Hash(String, Crinja::Value), String)
+
+        # User template keys that override the built-in feed output, per feed
+        # type. `templates/rss.xml.jinja` loads under the key "rss.xml"
+        # (template keys strip only the final template extension).
+        FEED_TEMPLATE_KEYS = {"rss" => "rss.xml", "atom" => "atom.xml"}
+
+        def self.generate(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false, skip_if_unchanged : Bool = false, templates : Hash(String, String)? = nil, renderer : Renderer? = nil)
+          if skip_if_unchanged && config.feeds.enabled
+            # Basename only: process_feed refuses nested filename components
+            # (path-traversal defense), so the skip probe must match the
+            # path that is actually written.
+            feed_file = safe_feed_filename(config.feeds.filename, config.feeds.type)
+            if File.exists?(File.join(output_dir, feed_file))
+              Logger.debug "  Feeds unchanged (cache hit), skipping."
+              return
+            end
+          end
+
           # 1. Generate Main Site Feed
           if config.feeds.enabled
-            site_pages = pages.reject { |p| p.draft || !p.render || p.is_a?(Models::Section) }
+            # `output_suppressed`: the render phase declined to write this
+            # page's file (another page owns it), so a feed entry pointing at
+            # its URL is a dead link.
+            site_pages = pages.reject { |p| p.draft || p.unpublished || !p.render || p.output_suppressed || p.is_a?(Models::Section) }
+            site_pages = dedupe_by_output_url(site_pages)
 
             # Filter by section if configured for main feed
             if !config.feeds.sections.empty?
@@ -34,41 +67,68 @@ module Hwaro
               }
             end
 
-            process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose)
+            process_feed(site_pages, config, output_dir, config.feeds.filename, config.title, "", verbose,
+              templates: templates, renderer: renderer, kind: "main")
           end
 
           # 2. Generate Section Feeds — pre-group pages by section for O(1) lookup
           pages_by_section = {} of String => Array(Models::Page)
           pages.each do |p|
-            next if p.draft || !p.render || p.is_a?(Models::Section)
+            next if p.draft || p.unpublished || !p.render || p.is_a?(Models::Section)
             (pages_by_section[p.section] ||= [] of Models::Page) << p
           end
 
           pages.each do |page|
             # Check if it's a section and has feed generation enabled
-            if page.is_a?(Models::Section) && page.generate_feeds && page.render && !page.draft
+            if page.is_a?(Models::Section) && page.generate_feeds && page.render && !page.draft && !page.unpublished
               section_pages = pages_by_section[page.section]? || [] of Models::Page
 
+              # A section feed is a per-language surface: the section object
+              # for each language carries that language's URL (e.g. /posts/
+              # vs /ko/posts/), so its feed must not interleave other
+              # languages. The default-language section feed follows the
+              # same `default_language_only` rule as the main feed; a
+              # non-default-language section feed only ever carries its own
+              # language.
+              if config.multilingual?
+                default_lang = config.default_language
+                section_lang = page.language || default_lang
+                if section_lang == default_lang
+                  if config.feeds.default_language_only
+                    section_pages = section_pages.select { |p| (p.language || default_lang) == default_lang }
+                  end
+                else
+                  section_pages = section_pages.select { |p| p.language == section_lang }
+                end
+              end
+
+              section_pages = dedupe_by_output_url(section_pages)
+
               # Construct output path for section feed
-              # e.g., output_dir/posts/rss.xml
-              section_output_dir = File.join(output_dir, page.url.lchop("/"))
-              FileUtils.mkdir_p(section_output_dir)
+              # e.g., output_dir/posts/rss.xml — sanitize + OutputGuard so a
+              # custom_path of `../../outside` cannot escape the public tree
+              # (HTML writers already guard; feed dirs used to skip).
+              section_output_dir = feed_output_dir_for(output_dir, page.url)
+              next unless section_output_dir
 
               feed_title = "#{config.title} - #{page.title}"
 
-              process_feed(section_pages, config, section_output_dir, "", feed_title, page.url, verbose)
+              process_feed(section_pages, config, section_output_dir, "", feed_title, page.url, verbose,
+                templates: templates, renderer: renderer, kind: "section", section_url: page.url)
             end
           end
 
-          # 3. Generate Language-specific Feeds (for non-default languages)
-          if config.multilingual?
-            generate_language_feeds(pages, config, output_dir, verbose)
+          # 3. Generate Language-specific Feeds (for non-default languages).
+          # Global `[feeds] enabled = false` disables these too — per-language
+          # `generate_feed` only opts OUT within a globally-enabled config.
+          if config.feeds.enabled && config.multilingual?
+            generate_language_feeds(pages, config, output_dir, verbose, templates, renderer)
           end
         end
 
         # Generate per-language feeds for non-default languages.
         # Each language with generate_feed=true gets its own feed at /{lang}/rss.xml (or atom.xml).
-        private def self.generate_language_feeds(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false)
+        private def self.generate_language_feeds(pages : Array(Models::Page), config : Models::Config, output_dir : String, verbose : Bool = false, templates : Hash(String, String)? = nil, renderer : Renderer? = nil)
           default_lang = config.default_language
 
           config.languages.each do |lang_code, lang_config|
@@ -80,8 +140,9 @@ module Hwaro
 
             # Filter pages for this language (single pass)
             lang_pages = pages.select { |p|
-              !p.draft && p.render && !p.is_a?(Models::Section) && p.language == lang_code
+              !p.draft && !p.unpublished && p.render && !p.output_suppressed && !p.is_a?(Models::Section) && p.language == lang_code
             }
+            lang_pages = dedupe_by_output_url(lang_pages)
 
             # Apply section filter if configured on the main feed
             if !config.feeds.sections.empty?
@@ -90,9 +151,13 @@ module Hwaro
               }
             end
 
+            # Don't emit a feed for a language with no content — its channel
+            # <link> would point at a non-existent /{lang}/ home (404).
+            next if lang_pages.empty?
+
             # Build the output directory: output_dir/{lang}/
-            lang_output_dir = File.join(output_dir, lang_code)
-            FileUtils.mkdir_p(lang_output_dir)
+            lang_output_dir = feed_output_dir_for(output_dir, "/#{lang_code}/")
+            next unless lang_output_dir
 
             # Build a language-specific feed title
             lang_name = lang_config.language_name
@@ -102,7 +167,8 @@ module Hwaro
             # e.g., "/ko/" so the self-referencing link becomes base_url/ko/rss.xml
             base_path = "/#{lang_code}/"
 
-            process_feed(lang_pages, config, lang_output_dir, "", feed_title, base_path, verbose, lang_code)
+            process_feed(lang_pages, config, lang_output_dir, "", feed_title, base_path, verbose, lang_code,
+              templates: templates, renderer: renderer, kind: "language")
           end
         end
 
@@ -115,6 +181,12 @@ module Hwaro
           base_path : String = "",
           verbose : Bool = false,
           language : String? = nil,
+          templates : Hash(String, String)? = nil,
+          renderer : Renderer? = nil,
+          kind : String = "main",
+          section_url : String? = nil,
+          taxonomy : String? = nil,
+          term : String? = nil,
         )
           # Determine feed type and filename
           feed_type = config.feeds.type.downcase
@@ -122,11 +194,9 @@ module Hwaro
             feed_type = "rss"
           end
 
-          filename = if !custom_filename.empty?
-                       custom_filename
-                     else
-                       feed_type == "atom" ? "atom.xml" : "rss.xml"
-                     end
+          # Basename only — nested components would desync the self URL from
+          # the write path (basename at write, full string in build_feed_url).
+          filename = safe_feed_filename(custom_filename, feed_type)
 
           # Sort a copy to avoid mutating the caller's array
           pages = pages.sort { |a, b| Utils::SortUtils.compare_by_date(a, b) }
@@ -136,32 +206,254 @@ module Hwaro
             pages = pages.first(config.feeds.limit)
           end
 
-          # Generate feed content
-          feed_content = case feed_type
-                         when "atom"
-                           generate_atom(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path, language)
+          # Determine whether feed content will be plain text or HTML.
+          # get_content_for_feed returns plain text when:
+          # - full_content is false (uses description or 300-char summary)
+          # - truncate > 0 (strips HTML and truncates)
+          is_text = !config.feeds.full_content || config.feeds.truncate > 0
+
+          # Generate feed content. A user template for the active feed type
+          # (templates/rss.xml.jinja or atom.xml.jinja) overrides the built-in
+          # output — the template file itself is the opt-in. When it's absent
+          # the programmatic path below stays byte-identical to before.
+          template_key = FEED_TEMPLATE_KEYS[feed_type]
+          template_source = templates.try(&.[template_key]?)
+
+          feed_content = if template_source && renderer
+                           context = build_template_context(
+                             pages, config, feed_type, filename, is_text, feed_title, base_path, language,
+                             kind: kind, section_url: section_url, taxonomy: taxonomy, term: term,
+                           )
+                           render_feed_template(template_key, template_source, renderer, context)
                          else
-                           generate_rss(pages, config, filename, config.feeds.truncate > 0, feed_title, base_path, language)
+                           case feed_type
+                           when "atom"
+                             generate_atom(pages, config, filename, is_text, feed_title, base_path, language)
+                           else
+                             generate_rss(pages, config, filename, is_text, feed_title, base_path, language)
+                           end
                          end
 
-          # Write feed file (basename prevents path traversal via config filename)
-          feed_path = File.join(output_dir, File.basename(filename))
-          File.write(feed_path, feed_content)
+          # Write feed file (filename is already basename-normalized above)
+          feed_path = File.join(output_dir, filename)
+          Hwaro::Utils::FileSafe.atomic_write(feed_path, feed_content)
           Logger.action :create, feed_path if verbose
+        end
+
+        # Keep the page the build actually wrote when two pages collide on
+        # one URL (path-sort-first winner, matching
+        # render.cr#compute_output_url_winners). Used for main, section,
+        # language, and taxonomy feeds so no surface advertises a loser.
+        def self.dedupe_by_output_url(pages : Array(Models::Page)) : Array(Models::Page)
+          url_winners = {} of String => Models::Page
+          pages.each do |p|
+            if prev = url_winners[p.url]?
+              url_winners[p.url] = p if p.path < prev.path
+            else
+              url_winners[p.url] = p
+            end
+          end
+          pages.select { |p| url_winners[p.url].same?(p) }
+        end
+
+        # Config `feeds.filename` and empty custom names resolve to a single
+        # basename under the feed's output directory.
+        def self.safe_feed_filename(custom_filename : String, feed_type : String) : String
+          if custom_filename.empty?
+            feed_type.downcase == "atom" ? "atom.xml" : "rss.xml"
+          else
+            File.basename(custom_filename)
+          end
+        end
+
+        # Safe subdirectory under `output_dir` for a section/lang/taxonomy
+        # feed. Returns nil (and warns) when the URL escapes the public tree.
+        def self.feed_output_dir_for(output_dir : String, url : String) : String?
+          # Refuse-outright, like every other writer: a collapsed path would
+          # put a section feed at the output root, over the site feed.
+          segments, refused = Utils::PathUtils.split_safe_segments(url.lchop("/"))
+          if refused
+            Logger.warn "Skipping feed output outside output directory: #{url}"
+            return
+          end
+          url_path = segments.join("/")
+          candidate = url_path.empty? ? output_dir : File.join(output_dir, url_path)
+          unless Utils::OutputGuard.within_output_dir?(candidate, output_dir)
+            Logger.warn "Skipping feed output outside output directory: #{url}"
+            return
+          end
+          Hwaro::Utils::FileSafe.mkdir_p(candidate)
+          candidate
+        end
+
+        # Render a user feed template, classifying any failure as a template
+        # error (exit code 4) that names the offending key and the escape
+        # hatch. Rendering happens at Generate time, far from the template's
+        # edit, so a bare Crinja backtrace would be hard to attribute.
+        private def self.render_feed_template(
+          template_key : String,
+          source : String,
+          renderer : Renderer,
+          context : Hash(String, Crinja::Value),
+        ) : String
+          renderer.call(source, context)
+        rescue ex : Hwaro::HwaroError
+          raise ex
+        rescue ex
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_TEMPLATE,
+            message: "Feed template '#{template_key}' failed to render: #{ex.message}",
+            hint: "Check templates/#{template_key}.jinja; delete it to fall back to the built-in feed.",
+          )
+        end
+
+        # Template context for user feed templates. Everything a feed body
+        # needs is precomputed here with the same helpers the programmatic
+        # generators use (URLs absolute + percent-encoded, dates normalized
+        # and preformatted), so a template never has to re-derive feed
+        # semantics — XML escaping via the `xml_escape` filter is the
+        # template author's job.
+        def self.build_template_context(
+          pages : Array(Models::Page),
+          config : Models::Config,
+          feed_type : String,
+          filename : String,
+          is_text : Bool,
+          feed_title : String,
+          base_path : String,
+          language : String?,
+          *,
+          kind : String,
+          section_url : String?,
+          taxonomy : String?,
+          term : String?,
+        ) : Hash(String, Crinja::Value)
+          base_url, feed_url = build_feed_url(config, base_path, filename)
+          home_url = feed_home_url(config, base_path)
+
+          # Deterministic feed timestamp: newest content date across entries
+          # (same rule as the Atom generator) so identical input renders
+          # byte-identical output. Normalize BEFORE taking the max — the
+          # timezone re-anchor can reorder instants (a date-only +09:00
+          # midnight normalizes 9h forward), and the feed <updated> must
+          # never be older than its newest entry's <updated>.
+          newest = pages.compact_map { |p| (src = p.updated || p.date) ? normalize_feed_time(src) : nil }.max?
+          feed_updated = newest || Utils::SortUtils::FALLBACK_DATE
+          feed_author = config.title.empty? ? feed_title : config.title
+
+          page_values = pages.map do |page|
+            entry_src = page.updated || page.date
+            entry_updated = entry_src ? normalize_feed_time(entry_src) : Utils::SortUtils::FALLBACK_DATE
+            Crinja.value({
+              "title"           => page.title.empty? ? config.title : page.title,
+              "url"             => page_full_url(page, base_url),
+              "date"            => page.date,
+              "updated"         => page.updated,
+              "date_rfc822"     => page.date.try { |d| format_rfc822(d) },
+              "updated_rfc3339" => entry_updated.to_rfc3339,
+              "description"     => page.description,
+              "summary"         => summary_for_feed(page, config),
+              "content"         => get_content_for_feed(page, config),
+              "content_html"    => full_content_for_feed(page, config),
+              "content_is_html" => !is_text,
+              "authors"         => page.authors,
+              "categories"      => feed_categories(page),
+              "section"         => page.section,
+              "language"        => page.language,
+            })
+          end
+
+          {
+            "feed" => Crinja.value({
+              "type"            => feed_type,
+              "kind"            => kind,
+              "title"           => feed_title,
+              "description"     => config.description,
+              "url"             => feed_url,
+              "home_url"        => home_url,
+              "base_url"        => base_url,
+              "language"        => language,
+              "updated"         => feed_updated,
+              "updated_rfc3339" => feed_updated.to_rfc3339,
+              "updated_rfc822"  => format_rfc822(feed_updated),
+              "author"          => feed_author,
+              "section_url"     => section_url,
+              "taxonomy"        => taxonomy,
+              "term"            => term,
+            }),
+            "pages" => Crinja::Value.new(page_values),
+          } of String => Crinja::Value
         end
 
         # Build the self-referencing feed URL from config, base path, and filename.
         private def self.build_feed_url(config : Models::Config, base_path : String, filename : String) : {String, String}
           base_url = config.base_url.rstrip('/')
           feed_url_path = base_path.empty? ? filename : File.join(base_path, filename)
-          feed_url = "#{base_url}/#{feed_url_path.lchop("/")}"
+          # RSS/Atom require RFC 3986 URIs — percent-encode non-ASCII paths
+          # (e.g. a taxonomy term feed under `/tags/한국어/`).
+          feed_url = Utils::TextUtils.encode_url_path("#{base_url}/#{feed_url_path.lchop("/")}")
           {base_url, feed_url}
+        end
+
+        # The canonical HTML URL the feed represents — the site root for the
+        # main feed, the section page for a section feed, or the language home
+        # for a per-language feed (base_path is "/ko/" etc.). Used for the RSS
+        # channel/Atom alternate <link> and as the Atom <id>, so every feed
+        # points at the right page and carries a unique IRI (RFC 4287).
+        private def self.feed_home_url(config : Models::Config, base_path : String) : String
+          base_url = config.base_url.rstrip('/')
+          # End with "/" so the channel <link> / Atom <id> match the homepage
+          # canonical (base_url + "/") and the per-language branch below. When
+          # base_url is empty this yields "/" rather than an empty (invalid)
+          # <link> element.
+          return "#{base_url}/" if base_path.empty?
+          Utils::TextUtils.encode_url_path("#{base_url}/#{base_path.strip("/")}/")
+        end
+
+        # Absolutize feed-body links so RSS <content:encoded> / Atom <content>
+        # render correctly in readers (which consume the HTML out of the page's
+        # URL context). Falls back to the subpath-prefix pass when base_url is
+        # empty (no host to absolutize against).
+        private def self.absolutize_feed_html(html : String, page : Models::Page, config : Models::Config) : String
+          base_url = config.base_url.rstrip('/')
+          if base_url.empty?
+            Processors::InternalLinkResolver.prefix_root_relative_links(html, config.base_url, config.base_path)
+          else
+            Processors::InternalLinkResolver.absolutize_links(html, page_full_url(page, base_url))
+          end
         end
 
         # Build the full absolute URL for a page.
         private def self.page_full_url(page : Models::Page, base_url : String) : String
           path = page.url.starts_with?('/') ? page.url : "/#{page.url}"
-          base_url.empty? ? path : base_url + path
+          Utils::TextUtils.encode_url_path(base_url.empty? ? path : base_url + path)
+        end
+
+        # Convert a feed timestamp to UTC, but re-anchor "midnight in a non-UTC
+        # zone" to UTC of the same wall-clock date. Date-only TOML/YAML values
+        # (e.g. `date = 2026-03-05`) are parsed as local midnight; a naive
+        # `.to_utc` on a `+09:00` host pushes the calendar date back a day
+        # (`2026-03-04T15:00:00Z`). Both RSS `<pubDate>` and Atom `<updated>`
+        # route through here so the two feeds report the same calendar date.
+        private def self.normalize_feed_time(time : Time) : Time
+          if time.location != Time::Location::UTC &&
+             time.hour == 0 && time.minute == 0 &&
+             time.second == 0 && time.nanosecond == 0
+            Time.utc(time.year, time.month, time.day)
+          else
+            time.to_utc
+          end
+        end
+
+        # Format a Time as an RFC 822/2822 datetime suitable for RSS `<pubDate>`.
+        # `Time#to_rfc2822` omits the leading zero on day-of-month, which some
+        # readers reject; force `two_digit_day: true`.
+        private def self.format_rfc822(time : Time) : String
+          normalized = normalize_feed_time(time)
+          String.build do |io|
+            formatter = Time::Format::Formatter.new(normalized, io)
+            formatter.rfc_2822(time_zone_gmt: false, two_digit_day: true)
+          end
         end
 
         def self.generate_rss(
@@ -174,13 +466,17 @@ module Hwaro
           language : String? = nil,
         ) : String
           base_url, feed_url = build_feed_url(config, base_path, filename)
+          full_content = config.feeds.full_content
 
           String.build(500 + pages.size * 300) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            str << "<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n"
+            # Declare the `content:` namespace so we can emit
+            # <content:encoded> alongside the summary <description>
+            # (gh#526).
+            str << "<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:content=\"http://purl.org/rss/1.0/modules/content/\">\n"
             str << "  <channel>\n"
             str << "    <title>#{Utils::TextUtils.escape_xml(feed_title)}</title>\n"
-            str << "    <link>#{Utils::TextUtils.escape_xml(config.base_url)}</link>\n"
+            str << "    <link>#{Utils::TextUtils.escape_xml(feed_home_url(config, base_path))}</link>\n"
             str << "    <description>#{Utils::TextUtils.escape_xml(config.description)}</description>\n"
 
             if language
@@ -191,18 +487,55 @@ module Hwaro
 
             pages.each do |page|
               str << "    <item>\n"
-              str << "      <title>#{Utils::TextUtils.escape_xml(page.title)}</title>\n"
+              # The root index commonly has an empty title; fall back to the site
+              # title so the feed item is never `<title></title>` (mirrors llms.cr).
+              item_title = page.title.empty? ? config.title : page.title
+              str << "      <title>#{Utils::TextUtils.escape_xml(item_title)}</title>\n"
 
               full_url = page_full_url(page, base_url)
               escaped_url = Utils::TextUtils.escape_xml(full_url)
               str << "      <link>#{escaped_url}</link>\n"
               str << "      <guid>#{escaped_url}</guid>\n"
 
-              content = get_content_for_feed(page, config.feeds.truncate)
-              str << "      <description>#{Utils::TextUtils.escape_xml(content)}</description>\n"
+              # `<description>` is meant to be a summary. Prefer the
+              # frontmatter description, then the rendered `summary`,
+              # then a truncated body (gh#526).
+              summary = summary_for_feed(page, config)
+              str << "      <description>#{Utils::TextUtils.escape_xml(summary)}</description>\n"
+
+              # Emit the body in `<content:encoded>` when the user opts
+              # into full content (default). `feeds.truncate` applies here
+              # too — it is documented as "truncate content to N characters
+              # (0 = full content)" and the Atom generator already honors it
+              # under full_content via get_content_for_feed, so RSS routes
+              # through the same helper (truncated plain text when
+              # truncate > 0, full absolutized HTML otherwise). CDATA so
+              # consumers don't have to double-decode entities.
+              if full_content
+                encoded = get_content_for_feed(page, config)
+                # truncate > 0 makes get_content_for_feed return
+                # entity-DECODED plain text, but feed readers parse
+                # <content:encoded> as HTML — re-escape it so a literal
+                # `<` or `&` can't break rendering. The full-HTML path
+                # (truncate = 0) must stay byte-identical.
+                encoded = Utils::TextUtils.escape_xml(encoded) if config.feeds.truncate > 0
+                unless encoded.empty?
+                  str << "      <content:encoded><![CDATA[#{escape_cdata(encoded)}]]></content:encoded>\n"
+                end
+              end
 
               if pub_date = page.date
-                str << "      <pubDate>#{pub_date.to_rfc2822}</pubDate>\n"
+                str << "      <pubDate>#{format_rfc822(pub_date)}</pubDate>\n"
+              end
+
+              # Frontmatter taxonomies (`tags`, `categories`, …) become
+              # `<category>` elements (gh#526). RSS treats them as a
+              # flat list, so we emit one per term across all
+              # taxonomies. Tags first (matching the order most blogs
+              # advertise), then any taxonomy values not already
+              # represented.
+              feed_categories(page).each do |term|
+                str << "      <category>#{Utils::TextUtils.escape_xml(term)}</category>\n"
               end
 
               str << "    </item>\n"
@@ -222,8 +555,21 @@ module Hwaro
           base_path : String,
           language : String? = nil,
         ) : String
-          now = Time.utc
           base_url, feed_url = build_feed_url(config, base_path, filename)
+          home_url = feed_home_url(config, base_path)
+          # Atom <updated> must be deterministic: derive it from the newest
+          # content date (updated||date) across entries rather than the build
+          # wall-clock, so two builds of identical input stay byte-identical.
+          # Normalize BEFORE taking the max — the timezone re-anchor can
+          # reorder instants (a date-only +09:00 midnight normalizes 9h
+          # forward), and the feed <updated> must never be older than its
+          # newest entry's <updated>. Falls back to the epoch sentinel when
+          # no entry carries a date.
+          newest = pages.compact_map { |p| (src = p.updated || p.date) ? normalize_feed_time(src) : nil }.max?
+          feed_updated = newest || Utils::SortUtils::FALLBACK_DATE
+          # RFC 4287 §4.1.1: a feed MUST carry an author unless every entry
+          # does. Emit a feed-level author unconditionally using the site title.
+          feed_author = config.title.empty? ? feed_title : config.title
 
           String.build(500 + pages.size * 350) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -235,10 +581,14 @@ module Hwaro
             end
 
             str << "  <title>#{Utils::TextUtils.escape_xml(feed_title)}</title>\n"
-            str << "  <link href=\"#{Utils::TextUtils.escape_xml(config.base_url)}\" />\n"
+            str << "  <link href=\"#{Utils::TextUtils.escape_xml(home_url)}\" />\n"
             str << "  <link href=\"#{Utils::TextUtils.escape_xml(feed_url)}\" rel=\"self\" />\n"
-            str << "  <updated>#{now.to_rfc3339}</updated>\n"
-            str << "  <id>#{Utils::TextUtils.escape_xml(config.base_url)}</id>\n"
+            str << "  <updated>#{feed_updated.to_rfc3339}</updated>\n"
+            str << "  <id>#{Utils::TextUtils.escape_xml(home_url)}</id>\n"
+
+            unless feed_author.empty?
+              str << "  <author><name>#{Utils::TextUtils.escape_xml(feed_author)}</name></author>\n"
+            end
 
             if !config.description.empty?
               str << "  <subtitle>#{Utils::TextUtils.escape_xml(config.description)}</subtitle>\n"
@@ -246,17 +596,32 @@ module Hwaro
 
             pages.each do |page|
               str << "  <entry>\n"
-              str << "    <title>#{Utils::TextUtils.escape_xml(page.title)}</title>\n"
+              entry_title = page.title.empty? ? config.title : page.title
+              str << "    <title>#{Utils::TextUtils.escape_xml(entry_title)}</title>\n"
 
               full_url = page_full_url(page, base_url)
               escaped_url = Utils::TextUtils.escape_xml(full_url)
               str << "    <link href=\"#{escaped_url}\" />\n"
               str << "    <id>#{escaped_url}</id>\n"
 
-              entry_date = (page.updated || page.date || now).to_utc
+              entry_src = page.updated || page.date
+              entry_date = entry_src ? normalize_feed_time(entry_src) : Utils::SortUtils::FALLBACK_DATE
               str << "    <updated>#{entry_date.to_rfc3339}</updated>\n"
 
-              content = get_content_for_feed(page, config.feeds.truncate)
+              # Per-entry authors (RFC 4287). Raw author ids; the feed-level
+              # author above guarantees validity for entries that carry none.
+              page.authors.each do |author|
+                next if author.strip.empty?
+                str << "    <author><name>#{Utils::TextUtils.escape_xml(author)}</name></author>\n"
+              end
+
+              # Frontmatter taxonomies become Atom <category> elements,
+              # mirroring the RSS feed's per-term <category> output (gh#526).
+              feed_categories(page).each do |term|
+                str << "    <category term=\"#{Utils::TextUtils.escape_xml(term)}\" />\n"
+              end
+
+              content = get_content_for_feed(page, config)
               content_type = is_text ? "text" : "html"
               str << "    <content type=\"#{content_type}\">#{Utils::TextUtils.escape_xml(content)}</content>\n"
 
@@ -267,27 +632,130 @@ module Hwaro
           end
         end
 
-        private def self.get_content_for_feed(page : Models::Page, truncate : Int32) : String
+        # Summary text for `<description>` / atom `<summary>`. Prefers
+        # frontmatter `description`, falls back to a plain-text rendering of
+        # the `<!-- more -->` summary, and finally to a plain-text excerpt
+        # of the body (gh#526). The summary is stripped of markup so raw
+        # markdown (`##` headings, code fences, math) never leaks into the
+        # feed `<description>` (gh#491).
+        private def self.summary_for_feed(page : Models::Page, config : Models::Config) : String
+          if desc = page.description
+            return desc unless desc.empty?
+          end
+
+          limit = config.feeds.truncate > 0 ? config.feeds.truncate : 300
+
+          if summary_html = page.summary_html
+            text = HTML.unescape(Utils::TextUtils.strip_html(summary_html)).strip
+            return truncate_for_feed(text, limit) unless text.empty?
+          end
+
+          # Fall back to a stripped + truncated body. Prefer the
+          # already-rendered HTML; degrade to the raw markdown only if
+          # render hasn't run.
+          html = page.content.empty? ? rendered_body_fallback(page, config) : page.content
+          text = HTML.unescape(Utils::TextUtils.strip_html(html)).strip
+          truncate_for_feed(text, limit)
+        end
+
+        # Markdown-render a page body for feed use when the Render phase
+        # didn't populate `page.content` (cache-hit pages on warm --cache
+        # builds, streaming mode). Passes the site's markdown options so
+        # the fallback matches rendered-page fidelity — notably safe-mode
+        # HTML stripping and emoji.
+        private def self.rendered_body_fallback(page : Models::Page, config : Models::Config) : String
+          md = config.markdown
+          hooks = Content::Processors::RenderHooks.fallback_context(page, config)
+          Processor::Markdown.render_body_cached(page.raw_content, safe: md.safe, emoji: md.emoji, lazy_loading: md.lazy_loading, markdown_config: md,
+            hooks: hooks, hooks_key: "#{page.url}:#{page.language}")
+        end
+
+        # Hard-truncate plain text to `limit` characters with an ellipsis.
+        private def self.truncate_for_feed(text : String, limit : Int32) : String
+          text.size > limit ? "#{text[0...limit]}..." : text
+        end
+
+        # Full HTML body suitable for `<content:encoded>` / atom
+        # `<content type="html">`. Uses the already-rendered HTML when
+        # available so we don't pay for a second markdown pass per page
+        # (gh#526).
+        private def self.full_content_for_feed(page : Models::Page, config : Models::Config) : String
+          html = page.content.empty? ? rendered_body_fallback(page, config) : page.content
+          # Absolutize body links so <content:encoded> resolves out of page
+          # context (root-relative AND document-relative). On an incremental
+          # (--cache) build the render phase only rewrites links for pages it
+          # re-renders; doing it here keeps the feed correct regardless of
+          # cache state.
+          absolutize_feed_html(html, page, config)
+        end
+
+        # Collect taxonomy terms that should appear as `<category>`
+        # elements in the feed: `tags` first, then every other
+        # taxonomy's terms not already emitted (gh#526). Deduplicated
+        # while preserving order so the feed mirrors how the post
+        # advertises itself.
+        private def self.feed_categories(page : Models::Page) : Array(String)
+          seen = Set(String).new
+          result = [] of String
+          page.tags.each do |tag|
+            next if tag.empty?
+            result << tag if seen.add?(tag)
+          end
+          page.taxonomies.each do |_, terms|
+            terms.each do |term|
+              next if term.empty?
+              result << term if seen.add?(term)
+            end
+          end
+          result
+        end
+
+        # Escape `]]>` so a body containing it can't terminate the CDATA
+        # section early. Replaces `]]>` with `]]]]><![CDATA[>` (the
+        # standard escape) so the run-on CDATA stays valid.
+        private def self.escape_cdata(text : String) : String
+          text.gsub("]]>", "]]]]><![CDATA[>")
+        end
+
+        private def self.get_content_for_feed(page : Models::Page, config : Models::Config) : String
+          truncate = config.feeds.truncate
+          full_content = config.feeds.full_content
+
+          # When full_content is false, prefer the front matter description
+          unless full_content
+            if desc = page.description
+              return desc unless desc.empty?
+            end
+            # Fall back to truncated content (default 300 chars)
+            truncate = 300 if truncate <= 0
+          end
+
           # Reuse already-rendered HTML from the Render phase when available,
           # avoiding an expensive duplicate Markdown → HTML conversion.
           html_content = if !page.content.empty?
                            page.content
                          else
-                           rendered, _ = Processor::Markdown.render(page.raw_content)
-                           rendered
+                           rendered_body_fallback(page, config)
                          end
 
           # Truncate if needed
           if truncate > 0
-            # Strip HTML tags to get plain text for safe truncation
-            text_content = Utils::TextUtils.strip_html(html_content)
+            # Strip HTML tags to get plain text for safe truncation, then decode
+            # entities: this plain-text branch ends up in a `type="text"` Atom
+            # element (and an RSS description), which consumers decode exactly
+            # once — leaving `&amp;` here would double-escape to `&amp;amp;`.
+            # Mirrors summary_for_feed's HTML.unescape.
+            text_content = HTML.unescape(Utils::TextUtils.strip_html(html_content))
             if text_content.size > truncate
               text_content[0...truncate] + "..."
             else
               text_content # Return plain text even if not truncated for consistency
             end
           else
-            html_content # No truncation - return full HTML
+            # Full HTML (Atom <content type="html">). Absolutize body links so
+            # they resolve out of page context, matching full_content_for_feed
+            # on the RSS path.
+            absolutize_feed_html(html_content, page, config)
           end
         end
       end

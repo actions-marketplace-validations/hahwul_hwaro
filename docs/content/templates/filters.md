@@ -7,6 +7,8 @@ toc = true
 
 Filters transform values in templates. Apply with the pipe `|` operator.
 
+Hwaro ships its own filters on top of the standard Crinja (Jinja2) built-ins — `upper`, `lower`, `join`, `map`, `select`, `batch`, and friends — so both kinds work anywhere below.
+
 ## Syntax
 
 ```jinja
@@ -25,7 +27,7 @@ Filters transform values in templates. Apply with the pipe `|` operator.
 | trim | Remove whitespace | {{ "  hi  " \| trim }} → hi |
 | replace | Replace text | {{ "hello" \| replace("l", "x") }} → hexxo |
 | slugify | URL slug | {{ "Hello World" \| slugify }} → hello-world |
-| truncate_words | Limit words | {{ text \| truncate_words(20) }} |
+| truncate_words | Limit words; `end` sets the suffix (default `...`) | {{ text \| truncate_words(20, end="…") }} |
 
 ## HTML Filters
 
@@ -35,6 +37,11 @@ Filters transform values in templates. Apply with the pipe `|` operator.
 | strip_html | Remove HTML tags | {{ html \| strip_html }} |
 | markdownify | Render Markdown | {{ text \| markdownify }} |
 | xml_escape | XML escape | {{ text \| xml_escape }} |
+
+`markdownify` follows the site's [`[markdown]`](/features/markdown-extensions/)
+settings for safe mode and `smart_punctuation`, so its output matches how the
+same text renders in page bodies. The rest of the extension pipeline
+(footnotes, definition lists, containers, …) is not applied.
 
 ## Array Filters
 
@@ -87,6 +94,16 @@ The `t` filter looks up translation keys from TOML files in the `i18n/` director
 |--------|-------------|---------|
 | absolute_url | Full URL with base | {{ "/about/" \| absolute_url }} |
 | relative_url | Prefix base_url | {{ "/img.png" \| relative_url }} |
+| active_path | Is this URL the current page (or an ancestor of it)? | {{ item.url \| active_path }} |
+
+`active_path` compares a URL (typically a [menu](/features/menus/) entry's `item.url`) against the current page. It's an exact match by default; pass `ancestor=true` to also match descendant pages:
+
+```jinja
+<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name }}</a>
+<a href="{{ item.href }}"{% if item.url | active_path(ancestor=true) %} class="open"{% endif %}>{{ item.name }}</a>
+```
+
+Both sides are normalized to one trailing slash before comparing, so `/posts` and `/posts/` are equal. The root path (`/`) only ever matches exactly, even with `ancestor=true`. An external `item.url` (`http://`, `https://`, `//`) never matches.
 
 ## Data Filters
 
@@ -135,23 +152,17 @@ Format codes:
 <img src="{{ "/logo.png" | relative_url }}">
 ```
 
-### String Processing
+### Strings and Chaining
 
 ```jinja
-{{ page.title | upper }}
-{{ page.title | slugify }}
-{{ long_text | truncate_words(50) }}
-```
+{{ page.title | lower | slugify }}
+{{ content | strip_html | truncate_words(100) }}
+{{ description | default(value="No description") | upper }}
 
-### Array Operations
-
-```jinja
 {% set tags = "a,b,c" | split(pat=",") %}
 {% for tag in tags %}
   <span>{{ tag | trim }}</span>
 {% endfor %}
-
-{{ page.authors | join(" & ") }}
 ```
 
 ### Collection Querying
@@ -168,23 +179,9 @@ Format codes:
   {% endfor %}
   </ul>
 {% endfor %}
-```
 
-### Collection Processing
-
-```jinja
-{# Remove duplicates from tags across all pages #}
+{# Unique tags across all pages #}
 {% set all_tags = site.pages | map(attribute="tags") | flatten | unique %}
-
-{# Remove empty entries #}
-{% set valid = items | compact %}
-```
-
-### Math Operations
-
-```jinja
-{# Calculate number of pages #}
-{% set total_pages = total_items / per_page | ceil %}
 ```
 
 ### Translations
@@ -200,21 +197,6 @@ Format codes:
 <p>{{ post_count }} {{ post_count | pluralize(singular="post", plural="posts") }}</p>
 ```
 
-### Debugging
-
-```jinja
-{# Inspect a value for debugging #}
-<!-- {{ page.extra | inspect }} -->
-```
-
-### Chaining
-
-```jinja
-{{ page.title | lower | slugify }}
-{{ content | strip_html | truncate_words(100) }}
-{{ description | default(value="No description") | upper }}
-```
-
 ---
 
 ## Tests
@@ -223,12 +205,12 @@ Tests evaluate conditions in `{% if %}` statements.
 
 | Test | Description | Example |
 |------|-------------|---------|
-| startswith | Starts with | {% if page.url is startswith("/blog/") %} |
-| endswith | Ends with | {% if page.url is endswith("/") %} |
-| containing | Contains | {% if page.url is containing("docs") %} |
-| matching | Regex match | {% if asset is matching("[.](jpg|png)$") %} |
-| empty | Is empty | {% if page.description is empty %} |
-| present | Is not empty | {% if page.title is present %} |
+| startswith | Starts with | `{% if page.url is startswith("/blog/") %}` |
+| endswith | Ends with | `{% if page.url is endswith("/") %}` |
+| containing | Contains | `{% if page.url is containing("docs") %}` |
+| matching | Regex match | `{% if asset is matching("[.](jpg\|png)$") %}` |
+| empty | Is empty | `{% if page.description is empty %}` |
+| present | Is not empty | `{% if page.title is present %}` |
 
 ### Test Examples
 

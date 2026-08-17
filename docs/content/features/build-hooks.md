@@ -1,7 +1,7 @@
 +++
 title = "Build Hooks"
 description = "Run custom shell commands before and after the build process"
-weight = 8
+weight = 15
 toc = true
 +++
 
@@ -29,7 +29,7 @@ hooks.post = ["npm run minify", "npx pagefind --site public"]
 Pre-build hooks run **before** any content processing begins. They are ideal for:
 
 - Installing dependencies
-- Compiling assets (TypeScript, Sass, etc.)
+- Compiling assets (TypeScript, Tailwind/PostCSS, etc. — SCSS has a [built-in compiler](/features/sass/))
 - Running data fetching scripts
 - Preprocessing content
 

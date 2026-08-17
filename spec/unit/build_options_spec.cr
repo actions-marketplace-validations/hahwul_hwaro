@@ -9,8 +9,10 @@ describe Hwaro::Config::Options::BuildOptions do
       opts.base_url.should be_nil
       opts.drafts.should be_false
       opts.include_expired.should be_false
+      opts.include_future.should be_false
       opts.minify.should be_false
       opts.parallel.should be_true
+      opts.workers.should eq(0)
       opts.cache.should be_false
       opts.full.should be_false
       opts.highlight.should be_true
@@ -22,6 +24,14 @@ describe Hwaro::Config::Options::BuildOptions do
       opts.stream.should be_false
       opts.memory_limit.should be_nil
       opts.env.should be_nil
+      opts.preserve_output.should be_false
+    end
+
+    it "round-trips preserve_output" do
+      # `preserve_output = true` is what `hwaro serve` flips on for watch
+      # rebuilds so the output dir isn't wiped between keystrokes (see #389).
+      opts = Hwaro::Config::Options::BuildOptions.new(preserve_output: true)
+      opts.preserve_output.should be_true
     end
 
     it "accepts custom values" do
@@ -102,9 +112,47 @@ describe Hwaro::Config::Options::BuildOptions do
     end
 
     it "raises on invalid memory limit format" do
-      opts = Hwaro::Config::Options::BuildOptions.new(memory_limit: "invalid")
+      # Validated in the constructor now, not lazily from batch_size: the
+      # lazy raise fired only in the render phase, AFTER setup_output_dir
+      # had already wiped public/.
       expect_raises(Exception, /Invalid memory limit format/) do
-        opts.batch_size
+        Hwaro::Config::Options::BuildOptions.new(memory_limit: "invalid")
+      end
+    end
+
+    it "raises on a zero memory limit instead of silently using a batch of 1" do
+      # Validated in the constructor now, not lazily from batch_size: the
+      # lazy raise fired only in the render phase, AFTER setup_output_dir
+      # had already wiped public/.
+      expect_raises(Exception, /Invalid memory limit: 0\. Must be a positive size/) do
+        Hwaro::Config::Options::BuildOptions.new(memory_limit: "0")
+      end
+    end
+
+    it "raises on a zero memory limit with a unit suffix" do
+      # Validated in the constructor now, not lazily from batch_size: the
+      # lazy raise fired only in the render phase, AFTER setup_output_dir
+      # had already wiped public/.
+      expect_raises(Exception, /Invalid memory limit: 0G/) do
+        Hwaro::Config::Options::BuildOptions.new(memory_limit: "0G")
+      end
+    end
+
+    it "raises a friendly error on an overflowing memory limit (not 'Arithmetic overflow')" do
+      # Validated in the constructor now, not lazily from batch_size: the
+      # lazy raise fired only in the render phase, AFTER setup_output_dir
+      # had already wiped public/.
+      expect_raises(Exception, /Memory limit too large/) do
+        Hwaro::Config::Options::BuildOptions.new(memory_limit: "999999999999999999999G")
+      end
+    end
+
+    it "raises a friendly error on an overflowing plain-bytes memory limit" do
+      # Validated in the constructor now, not lazily from batch_size: the
+      # lazy raise fired only in the render phase, AFTER setup_output_dir
+      # had already wiped public/.
+      expect_raises(Exception, /Memory limit too large/) do
+        Hwaro::Config::Options::BuildOptions.new(memory_limit: "99999999999999999999999999")
       end
     end
   end

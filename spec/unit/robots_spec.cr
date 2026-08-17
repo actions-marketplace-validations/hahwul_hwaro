@@ -245,13 +245,13 @@ describe Hwaro::Content::Seo::Robots do
         content.should contain("Sitemap: https://mysite.com/sitemap.xml")
 
         # Verify Sitemap is at the end
-        sitemap_pos = content.index("Sitemap:").not_nil!
-        last_disallow_pos = content.rindex("Disallow:").not_nil!
+        sitemap_pos = content.index!("Sitemap:")
+        last_disallow_pos = content.rindex!("Disallow:")
         sitemap_pos.should be > last_disallow_pos
       end
     end
 
-    it "handles a rule with empty allow and disallow lists" do
+    it "adds explicit Allow: / when both allow and disallow are empty" do
       config = Hwaro::Models::Config.new
       config.robots.enabled = true
 
@@ -265,8 +265,57 @@ describe Hwaro::Content::Seo::Robots do
 
         content = File.read(File.join(output_dir, "robots.txt"))
         content.should contain("User-agent: SomeBot")
-        content.should_not contain("Allow:")
-        content.should_not contain("Disallow:")
+        content.should contain("Allow: /")
+      end
+    end
+
+    it "does not add implicit Allow when disallow is present" do
+      config = Hwaro::Models::Config.new
+      config.robots.enabled = true
+
+      rule1 = Hwaro::Models::RobotsRule.new("*")
+      rule1.allow = [] of String
+      rule1.disallow = [] of String
+
+      rule2 = Hwaro::Models::RobotsRule.new("GPTBot")
+      rule2.allow = [] of String
+      rule2.disallow = ["/"]
+
+      config.robots.rules = [rule1, rule2]
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Robots.generate(config, output_dir)
+
+        content = File.read(File.join(output_dir, "robots.txt"))
+        # First rule should have explicit Allow: /
+        # Second rule should only have Disallow: /
+        lines = content.lines
+        gptbot_idx = lines.index!(&.includes?("User-agent: GPTBot"))
+        # The line after GPTBot should be Disallow, not Allow
+        lines[gptbot_idx + 1].should contain("Disallow: /")
+      end
+    end
+
+    it "collapses newlines in user_agent/disallow to prevent directive injection" do
+      config = Hwaro::Models::Config.new
+      config.robots.enabled = true
+
+      rule = Hwaro::Models::RobotsRule.new("Bot\nDisallow: /secret")
+      rule.allow = [] of String
+      rule.disallow = ["/a\n/b"]
+      config.robots.rules = [rule]
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Robots.generate(config, output_dir)
+
+        content = File.read(File.join(output_dir, "robots.txt"))
+        # The embedded newline collapses to a space, keeping it one line.
+        content.should contain("User-agent: Bot Disallow: /secret")
+        # No standalone injected directive line was forged.
+        content.lines.any? { |l| l.strip == "Disallow: /secret" }.should be_false
+        # The disallow path's newline collapses to a single line too.
+        content.should contain("Disallow: /a /b")
+        content.lines.any? { |l| l.strip == "/b" }.should be_false
       end
     end
 
@@ -288,8 +337,8 @@ describe Hwaro::Content::Seo::Robots do
         content = File.read(File.join(output_dir, "robots.txt"))
 
         # Check that rules are separated by a blank line
-        googlebot_idx = content.index("User-agent: Googlebot").not_nil!
-        bingbot_idx = content.index("User-agent: Bingbot").not_nil!
+        googlebot_idx = content.index!("User-agent: Googlebot")
+        bingbot_idx = content.index!("User-agent: Bingbot")
         between = content[googlebot_idx..bingbot_idx]
         between.should contain("\n\n")
       end
@@ -384,6 +433,40 @@ describe Hwaro::Models::RobotsConfig do
       config.rules << rule
       config.rules.size.should eq(1)
       config.rules.first.user_agent.should eq("Googlebot")
+    end
+
+    # Sitemap.generate basenames the configured filename before writing, so
+    # advertising the raw config value pointed crawlers at a path that is
+    # never produced.
+    it "advertises the sitemap at the path the sitemap generator actually writes" do
+      Dir.mktmpdir do |output_dir|
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com"
+        config.robots.enabled = true
+        config.sitemap.enabled = true
+        config.sitemap.filename = "reports/sitemap.xml"
+
+        Hwaro::Content::Seo::Robots.generate(config, output_dir)
+
+        content = File.read(File.join(output_dir, "robots.txt"))
+        content.should contain("Sitemap: https://example.com/sitemap.xml")
+        content.should_not contain("reports/")
+      end
+    end
+
+    it "advertises a custom sitemap filename verbatim when it has no directory" do
+      Dir.mktmpdir do |output_dir|
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com"
+        config.robots.enabled = true
+        config.sitemap.enabled = true
+        config.sitemap.filename = "sitemap-index.xml"
+
+        Hwaro::Content::Seo::Robots.generate(config, output_dir)
+
+        File.read(File.join(output_dir, "robots.txt"))
+          .should contain("Sitemap: https://example.com/sitemap-index.xml")
+      end
     end
 
     it "can set multiple rules" do

@@ -1,6 +1,8 @@
+require "file_utils"
 require "option_parser"
 require "../../metadata"
 require "../../../utils/logger"
+require "../../../utils/file_safe"
 require "../../../services/platform_config"
 require "../../../models/config"
 
@@ -11,7 +13,7 @@ module Hwaro
         class PlatformCommand
           # Single source of truth for command metadata
           NAME               = "platform"
-          DESCRIPTION        = "Generate hosting platform config files"
+          DESCRIPTION        = "Generate platform config and CI/CD workflow files"
           POSITIONAL_ARGS    = ["platform"]
           POSITIONAL_CHOICES = Services::PlatformConfig::SUPPORTED_PLATFORMS
 
@@ -53,7 +55,7 @@ module Hwaro
             force = false
 
             OptionParser.parse(args) do |parser|
-              parser.banner = "Usage: hwaro tool platform <netlify|vercel|cloudflare> [options]"
+              parser.banner = "Usage: hwaro tool platform <#{Services::PlatformConfig::SUPPORTED_PLATFORMS.join("|")}> [options]"
               parser.on("-o PATH", "--output PATH", "Output file path (default: auto-detected)") { |p| output_path = p }
               parser.on("--stdout", "Print to stdout instead of writing file") { stdout_mode = true }
               parser.on("-f", "--force", "Overwrite existing file without warning") { force = true }
@@ -67,12 +69,12 @@ module Hwaro
                 exit
               end
               parser.unknown_args do |unknown|
-                platform = unknown.first? if unknown.any?
+                platform = unknown.first? if unknown.present?
               end
             end
 
             unless platform_name = platform
-              Logger.error "Platform name required. Use: netlify, vercel, or cloudflare"
+              Logger.error "Platform name required. Use: #{Services::PlatformConfig::SUPPORTED_PLATFORMS.join(", ")}"
               exit(1)
             end
 
@@ -82,11 +84,12 @@ module Hwaro
               exit(1)
             end
 
-            unless File.exists?("config.toml")
-              Logger.warn "config.toml not found. Running outside a Hwaro project directory?"
-            end
-
-            config = Models::Config.load
+            config = if File.exists?("config.toml")
+                       Models::Config.load
+                     else
+                       Logger.warn "config.toml not found. Running outside a Hwaro project directory?"
+                       Models::Config.new
+                     end
             generator = Services::PlatformConfig.new(config)
             content = generator.generate(platform_name)
             filename = if op = output_path
@@ -103,8 +106,10 @@ module Hwaro
                 exit(1)
               end
 
+              dir = File.dirname(filename)
+              Hwaro::Utils::FileSafe.mkdir_p(dir) unless dir == "." || Dir.exists?(dir)
               File.write(filename, content)
-              Logger.success "Generated #{filename}"
+              Logger.outcome("created", filename)
             end
           end
         end

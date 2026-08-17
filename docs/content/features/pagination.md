@@ -1,7 +1,7 @@
 +++
 title = "Pagination"
 description = "Split large content lists into multiple pages"
-weight = 4
+weight = 6
 +++
 
 Split large content lists into multiple pages.
@@ -83,7 +83,35 @@ Pagination object for custom rendering:
 | paginator.next | String? | URL to next pager |
 | paginator.pages | Array | Array of pages for the current pager |
 | paginator.current_index | Int | Current pager index (1-indexed) |
-| paginator.total_pages | Int | Total number of items across all pagers |
+| paginator.total_pages | Int | Total number of pages |
+
+### pagination_obj
+
+Structured pagination object with individual fields for building fully custom pagination markup:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| pagination_obj.html | String | Pre-rendered pagination HTML (same as `pagination`) |
+| pagination_obj.current_page | Int | Current page number (1-indexed) |
+| pagination_obj.total_pages | Int | Total number of pages |
+| pagination_obj.per_page | Int | Items per page |
+| pagination_obj.total_items | Int | Total number of items across all pages |
+| pagination_obj.has_previous | Bool | Whether a previous page exists |
+| pagination_obj.has_next | Bool | Whether a next page exists |
+| pagination_obj.previous_url | String | URL to previous page (empty if none) |
+| pagination_obj.next_url | String | URL to next page (empty if none) |
+| pagination_obj.first_url | String | URL to first page |
+| pagination_obj.last_url | String | URL to last page |
+
+```jinja
+{% if pagination_obj.has_previous %}
+  <a href="{{ pagination_obj.previous_url }}">← Newer</a>
+{% endif %}
+<span>Page {{ pagination_obj.current_page }} of {{ pagination_obj.total_pages }}</span>
+{% if pagination_obj.has_next %}
+  <a href="{{ pagination_obj.next_url }}">Older →</a>
+{% endif %}
+```
 
 ## Template Examples
 
@@ -109,50 +137,27 @@ Use the pre-rendered `pagination` variable:
 
 ### Custom Pagination
 
-Build your own pagination UI:
+Build your own pagination UI with the `paginator` object:
 
 ```jinja
 {% if paginator.number_pagers > 1 %}
 <nav class="pagination">
-  {% if paginator.previous %}
-  <a href="{{ paginator.previous }}" class="prev">← Previous</a>
-  {% endif %}
-  
-  <span class="current">
-    Page {{ paginator.current_index }} of {{ paginator.number_pagers }}
-  </span>
-  
-  {% if paginator.next %}
-  <a href="{{ paginator.next }}" class="next">Next →</a>
-  {% endif %}
-</nav>
-{% endif %}
-```
-
-### Full Pagination with Page Numbers
-
-```jinja
-{% if paginator.number_pagers > 1 %}
-<nav class="pagination">
-  {# First page #}
   {% if paginator.current_index > 1 %}
   <a href="{{ paginator.first }}">« First</a>
   {% endif %}
-  
-  {# Previous #}
+
   {% if paginator.previous %}
-  <a href="{{ paginator.previous }}">‹ Prev</a>
+  <a href="{{ paginator.previous }}" class="prev">‹ Prev</a>
   {% endif %}
-  
-  {# Current #}
-  <span class="current">{{ paginator.current_index }} / {{ paginator.number_pagers }}</span>
-  
-  {# Next #}
+
+  <span class="current">
+    Page {{ paginator.current_index }} of {{ paginator.number_pagers }}
+  </span>
+
   {% if paginator.next %}
-  <a href="{{ paginator.next }}">Next ›</a>
+  <a href="{{ paginator.next }}" class="next">Next ›</a>
   {% endif %}
-  
-  {# Last page #}
+
   {% if paginator.current_index < paginator.number_pagers %}
   <a href="{{ paginator.last }}">Last »</a>
   {% endif %}
@@ -189,13 +194,15 @@ Output:
 
 ## Taxonomy Pagination
 
-Taxonomies also support pagination in `config.toml`:
+Taxonomy term pages support pagination via `paginate_by` in `config.toml`:
 
 ```toml
 [[taxonomies]]
 name = "tags"
-paginate = 20
+paginate_by = 20
 ```
+
+Each term listing (e.g. `/tags/crystal/`) is split into pages of 20 items, with later pages at `/tags/crystal/page/2/`. The same `pagination` and `paginator` template variables are available in the taxonomy template.
 
 ## CSS Example
 

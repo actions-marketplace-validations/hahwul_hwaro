@@ -1,10 +1,25 @@
 require "toml"
+require "uri"
 require "./deployment"
+require "../utils/errors"
 require "../utils/text_utils"
+require "../utils/permalink_resolver"
 require "../utils/env_substitutor"
+require "../utils/path_utils"
+require "../content/processors/internal_link_resolver"
 
 module Hwaro
   module Models
+    # Cache-busting query suffix shared by the asset/highlight tag emitters.
+    def self.cache_bust_suffix(value : String) : String
+      value.empty? ? "" : "?v=#{HTML.escape(value)}"
+    end
+
+    # Join non-empty tag fragments with newlines.
+    def self.join_tags(*parts : String) : String
+      parts.reject(&.empty?).join("\n")
+    end
+
     class SitemapConfig
       property enabled : Bool
       property filename : String
@@ -87,6 +102,7 @@ module Hwaro
       property limit : Int32
       property sections : Array(String)
       property default_language_only : Bool
+      property full_content : Bool
 
       def initialize
         @enabled = false
@@ -96,6 +112,20 @@ module Hwaro
         @limit = 10
         @sections = [] of String
         @default_language_only = true
+        @full_content = true
+      end
+    end
+
+    # Internal link handling configuration
+    class LinksConfig
+      # How unresolved `@/path.md` internal links are treated during the
+      # render phase: "warn" (default) logs a warning and leaves the markup
+      # unchanged; "error" fails the build with a single aggregated list of
+      # every offender. Unknown values fall back to "warn".
+      property broken_internal : String
+
+      def initialize
+        @broken_internal = "warn"
       end
     end
 
@@ -146,7 +176,7 @@ module Hwaro
       end
 
       def enabled? : Bool
-        @allow_extensions.any?
+        @allow_extensions.present?
       end
 
       def publish?(relative_path : String) : Bool
@@ -157,7 +187,9 @@ module Hwaro
         return false unless @allow_extensions.includes?(ext)
         return false if @disallow_extensions.includes?(ext)
         @disallow_paths.each do |pattern|
-          return false if File.match?(pattern, normalized_path)
+          # A malformed glob is treated as non-matching by glob_match?, so a
+          # config typo can't crash the build; other patterns still apply.
+          return false if Utils::PathUtils.glob_match?(pattern, normalized_path)
         end
         true
       end
@@ -165,7 +197,7 @@ module Hwaro
       def self.normalize_extensions(values : Array(String)) : Array(String)
         values.compact_map do |ext|
           normalize_extension(ext)
-        end.uniq
+        end.uniq!
       end
 
       def self.normalize_paths(values : Array(String)) : Array(String)
@@ -184,8 +216,61 @@ module Hwaro
 
       private def self.normalize_extension(ext : String) : String?
         ext = ext.strip.downcase
-        return nil if ext.empty?
+        return if ext.empty?
         ext.starts_with?(".") ? ext : ".#{ext}"
+      end
+    end
+
+    # `hwaro new` content scaffolding configuration.
+    #
+    # Controls what `hwaro new` writes when there is no matching archetype:
+    #   - `front_matter_format` — "toml" (default) or "yaml"
+    #   - `default_fields`      — extra front matter keys (e.g. "description")
+    #     emitted with empty values so users can fill them in without having
+    #     to remember them.
+    #   - `bundle`              — when true, new pages default to the
+    #     leaf-bundle layout (`foo/index.md`) instead of a single file
+    #     (`foo.md`), which is the shape needed for multilingual siblings
+    #     and colocated page assets. Overridden by an archetype's own
+    #     `<!-- hwaro: bundle -->` directive, and by `--bundle`/`--no-bundle`
+    #     on the CLI (CLI > archetype > config).
+    #
+    # Fields listed in `default_fields` that overlap with built-ins
+    # (`title`, `date`, `draft`, `tags`) are ignored because those have
+    # dedicated handling and values.
+    class ContentNewConfig
+      FORMAT_TOML    = "toml"
+      FORMAT_YAML    = "yaml"
+      FORMAT_JSON    = "json"
+      VALID_FORMATS  = {FORMAT_TOML, FORMAT_YAML, FORMAT_JSON}
+      BUILTIN_FIELDS = {"title", "date", "draft", "tags"}
+
+      property front_matter_format : String
+      property default_fields : Array(String)
+      property bundle : Bool
+
+      def initialize
+        @front_matter_format = FORMAT_TOML
+        @default_fields = ["description"]
+        @bundle = false
+      end
+
+      def toml? : Bool
+        @front_matter_format == FORMAT_TOML
+      end
+
+      def yaml? : Bool
+        @front_matter_format == FORMAT_YAML
+      end
+
+      def json? : Bool
+        @front_matter_format == FORMAT_JSON
+      end
+
+      # Extra fields, with built-ins filtered out and duplicates removed,
+      # preserving configured order.
+      def extra_fields : Array(String)
+        @default_fields.reject { |f| BUILTIN_FIELDS.includes?(f) }.uniq!
       end
     end
 
@@ -193,10 +278,14 @@ module Hwaro
     class AutoIncludesConfig
       property enabled : Bool
       property dirs : Array(String)
+      # Set from [sass]; compiled SCSS outputs are invisible to the
+      # source-tree scan in `collect_tags` without it.
+      property sass_enabled : Bool
 
       def initialize
         @enabled = false
         @dirs = [] of String
+        @sass_enabled = false
       end
 
       # Generate CSS link tags for files in configured directories
@@ -213,17 +302,30 @@ module Hwaro
         end
       end
 
-      private def collect_tags(extension : String, base_url : String, cache_bust : String, &block : String -> String) : String
+      private def collect_tags(extension : String, base_url : String, cache_bust : String, & : String -> String) : String
         return "" unless @enabled
         return "" if @dirs.empty?
 
-        suffix = cache_bust.empty? ? "" : "?v=#{HTML.escape(cache_bust)}"
+        suffix = Models.cache_bust_suffix(cache_bust)
         tags = [] of String
         @dirs.each do |dir|
           static_dir = File.join("static", dir)
           next unless Dir.exists?(static_dir)
 
-          Dir.glob(File.join(static_dir, "**", "*.#{extension}")).sort.each do |file|
+          files = Dir.glob(File.join(static_dir, "**", "*.#{extension}"))
+          if extension == "css" && @sass_enabled
+            # Compiled SCSS is written to the output tree, not `static/`,
+            # so project each entry onto the `.css` it will produce.
+            # Partials never produce output; a hand-written sibling of the
+            # same name is already in `files`.
+            Dir.glob(File.join(static_dir, "**", "*.scss")).each do |scss|
+              next if File.basename(scss).starts_with?("_")
+              compiled = scss.sub(/\.scss\z/, ".css")
+              files << compiled unless files.includes?(compiled)
+            end
+          end
+
+          files.sort.each do |file|
             relative_path = file.sub(/^static\/?/, "/")
             tags << yield(HTML.escape("#{base_url}#{relative_path}#{suffix}"))
           end
@@ -235,7 +337,7 @@ module Hwaro
       def all_tags(base_url : String = "", cache_bust : String = "") : String
         css = css_tags(base_url, cache_bust)
         js = js_tags(base_url, cache_bust)
-        [css, js].reject(&.empty?).join("\n")
+        Models.join_tags(css, js)
       end
     end
 
@@ -256,18 +358,70 @@ module Hwaro
       property background : String
       property text_color : String
       property accent_color : String
+
+      # Optional second color for two-tone geometric styles (split / brutalist).
+      # When nil, a complementary tone is auto-derived from accent_color.
+      property secondary_color : String?
+
       property font_size : Int32
       property logo : String?
       property output_dir : String
+      property show_title : Bool
+      property style : String
+      property pattern_opacity : Float64
+      property pattern_scale : Float64
+      property background_image : String?
+      property overlay_opacity : Float64
+      property format : String
+      property font_path : String?
+      property logo_position : String
+
+      # Controls a semi-transparent panel behind the title/description area.
+      # Higher values make text more readable on busy/artistic backgrounds
+      # while still letting the background show through (0.0 = disabled).
+      # Modern editorial/brand styles benefit from 0.25~0.45.
+      property text_panel : Float64
+
+      # Whether to draw the thin top/bottom accent bars using accent_color.
+      # These are the classic "old school" OG accent lines, drawn for the
+      # pattern styles (default / dots / grid / diagonal / gradient / waves).
+      # Off by default for a cleaner, more modern look; set to true to opt in.
+      property accent_bars : Bool
+
+      # If true, skip automatic OG image generation during `hwaro serve`.
+      # Images will be generated on-demand the first time they are requested
+      # from the dev server. Greatly improves initial serve time on large sites.
+      property lazy_generate : Bool
 
       def initialize
         @enabled = false
-        @background = "#1a1a2e"
-        @text_color = "#ffffff"
-        @accent_color = "#e94560"
+        # Ember identity defaults (warm charcoal / warm off-white / ember),
+        # matching the scaffold and docs design tokens.
+        @background = "#171310"
+        @text_color = "#f4ede4"
+        @accent_color = "#ec7a66"
+        @secondary_color = nil
         @font_size = 48
         @logo = nil
         @output_dir = "og-images"
+        @show_title = true
+        @style = "default"
+        # Peak alpha for the pattern styles — each pattern applies its own
+        # internal falloff, so this is visible without being loud.
+        @pattern_opacity = 0.35
+        @pattern_scale = 1.0
+        @background_image = nil
+        @overlay_opacity = 0.45
+        # PNG is the default because social platforms (Facebook, X/Twitter,
+        # LinkedIn, Slack, Discord, iMessage) do not render SVG og:image —
+        # an SVG preview silently shows nothing. Generation falls back to SVG
+        # automatically if PNG font initialization is unavailable.
+        @format = "png"
+        @font_path = nil
+        @logo_position = "bottom-left"
+        @text_panel = 0.0
+        @accent_bars = false
+        @lazy_generate = false
       end
     end
 
@@ -291,26 +445,46 @@ module Hwaro
         @auto_image = AutoImageConfig.new
       end
 
-      # Generate OG meta tags
+      # Append a single conditional `<meta>` line (leading newline + 2-space
+      # indent) for the OG/Twitter tag builders.
+      private def append_meta(str, attr : String, name : String, value : String)
+        str << %(\n  <meta #{attr}="#{name}" content="#{Utils::TextUtils.escape_xml(value)}">)
+      end
+
+      # Generate OG meta tags.
+      #
+      # `og_type_override` lets the renderer force `og:type="website"` for
+      # the homepage, section indexes, taxonomy listings, and the 404
+      # page — the configured `@og_type` ("article" by default) only fits
+      # content pages. See render.cr's `og_type_for` helper (gh#522).
       def og_tags(
         title : String,
         description : String?,
         url : String,
         image : String?,
         base_url : String,
+        og_type_override : String? = nil,
       ) : String
+        og_type = og_type_override || @og_type
+        # Subsequent lines are joined with `\n  ` so the rendered output
+        # keeps the same 2-space indent the scaffold templates use for the
+        # `{{ og_all_tags }}` line. Without this, only the first tag picks
+        # up the template's indent and the rest start at column 0.
         String.build(256) do |str|
-          str << %(<meta property="og:title" content="#{Utils::TextUtils.escape_xml(title)}">\n)
-          str << %(<meta property="og:type" content="#{Utils::TextUtils.escape_xml(@og_type)}">\n)
-          str << %(<meta property="og:url" content="#{Utils::TextUtils.escape_xml(base_url)}#{Utils::TextUtils.escape_xml(url)}">)
+          str << %(<meta property="og:title" content="#{Utils::TextUtils.escape_xml(title)}">\n  )
+          str << %(<meta property="og:type" content="#{Utils::TextUtils.escape_xml(og_type)}">\n  )
+          # Percent-encode the path like feeds/sitemap do, so a non-ASCII URL
+          # (e.g. a Unicode taxonomy term) yields one consistent RFC 3986
+          # URL across every surface instead of raw UTF-8 here only.
+          str << %(<meta property="og:url" content="#{Utils::TextUtils.escape_xml(base_url)}#{Utils::TextUtils.escape_xml(Utils::TextUtils.encode_url_path(url))}">)
           if desc = description
-            str << %(\n<meta property="og:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+            append_meta(str, "property", "og:description", desc)
           end
           if img_url = resolve_image_url(image, base_url)
-            str << %(\n<meta property="og:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
+            append_meta(str, "property", "og:image", img_url)
           end
           if fb_id = @fb_app_id
-            str << %(\n<meta property="fb:app_id" content="#{Utils::TextUtils.escape_xml(fb_id)}">)
+            append_meta(str, "property", "fb:app_id", fb_id)
           end
         end
       end
@@ -322,29 +496,44 @@ module Hwaro
         image : String?,
         base_url : String,
       ) : String
+        # A "summary_large_image" card with no image renders as a blank preview
+        # on most platforms, so downgrade to the plain "summary" card when this
+        # page resolves to no image (e.g. auto OG images disabled and no
+        # per-page or default image set).
+        img_url = resolve_image_url(image, base_url)
+        card = (@twitter_card == "summary_large_image" && img_url.nil?) ? "summary" : @twitter_card
+
+        # See `og_tags` above for why subsequent lines are pre-indented.
         String.build(256) do |str|
-          str << %(<meta name="twitter:card" content="#{Utils::TextUtils.escape_xml(@twitter_card)}">\n)
+          str << %(<meta name="twitter:card" content="#{Utils::TextUtils.escape_xml(card)}">\n  )
           str << %(<meta name="twitter:title" content="#{Utils::TextUtils.escape_xml(title)}">)
           if desc = description
-            str << %(\n<meta name="twitter:description" content="#{Utils::TextUtils.escape_xml(desc)}">)
+            append_meta(str, "name", "twitter:description", desc)
           end
-          if img_url = resolve_image_url(image, base_url)
-            str << %(\n<meta name="twitter:image" content="#{Utils::TextUtils.escape_xml(img_url)}">)
+          if img_url
+            append_meta(str, "name", "twitter:image", img_url)
           end
           if site = @twitter_site
-            str << %(\n<meta name="twitter:site" content="#{Utils::TextUtils.escape_xml(site)}">)
+            append_meta(str, "name", "twitter:site", site)
           end
           if creator = @twitter_creator
-            str << %(\n<meta name="twitter:creator" content="#{Utils::TextUtils.escape_xml(creator)}">)
+            append_meta(str, "name", "twitter:creator", creator)
           end
         end
       end
 
-      # Resolve an image path to an absolute URL, falling back to default_image
-      private def resolve_image_url(image : String?, base_url : String) : String?
+      # Resolve an image path to an absolute URL, falling back to default_image.
+      # A value that already carries its own origin (any `scheme:` URL, or a
+      # protocol-relative `//cdn.example.com/og.png`) is returned untouched:
+      # the old `starts_with?("http")` test sent `//cdn…` down the
+      # root-relative branch and emitted `https://site.com//cdn.example.com/og.png`
+      # as og:image, while a relative path merely starting with the letters
+      # "http" (`http-guide/cover.png`) was left relative — invalid for OG.
+      def resolve_image_url(image : String?, base_url : String) : String?
         img = image || @default_image
-        return nil unless img
-        img.starts_with?("http") ? img : "#{base_url}#{img.starts_with?("/") ? img : "/#{img}"}"
+        return unless img
+        return img if Content::Processors::InternalLinkResolver.has_own_origin?(img)
+        "#{base_url}#{img.starts_with?("/") ? img : "/#{img}"}"
       end
 
       # Generate both OG and Twitter tags
@@ -354,10 +543,11 @@ module Hwaro
         url : String,
         image : String?,
         base_url : String,
+        og_type_override : String? = nil,
       ) : String
-        og = og_tags(title, description, url, image, base_url)
+        og = og_tags(title, description, url, image, base_url, og_type_override)
         twitter = twitter_tags(title, description, image, base_url)
-        [og, twitter].reject(&.empty?).join("\n")
+        Models.join_tags(og, twitter)
       end
     end
 
@@ -366,11 +556,33 @@ module Hwaro
       property enabled : Bool
       property theme : String
       property use_cdn : Bool
+      # "server" (default) highlights at build time (Tartrazine lexers,
+      # hljs-compatible CSS classes) so no JavaScript ships; "client" injects
+      # Highlight.js and highlights in the browser — theme CSS keeps working
+      # either way.
+      property mode : String
+      # Global default for fence-level `linenos` (see FenceOptions): when
+      # true, every fenced code block with a language gets line numbers
+      # unless it opts out with a per-block `{linenos=false}`. Off by
+      # default so existing output is unaffected.
+      property line_numbers : Bool
+      # Adds a copy-to-clipboard button to fenced code blocks (per-block
+      # `{copy=false}`/`{copy=true}` overrides). Off by default so existing
+      # output is byte-identical.
+      property copy : Bool
 
       def initialize
         @enabled = true
         @theme = "github"
         @use_cdn = true
+        @mode = "server"
+        @line_numbers = false
+        @copy = false
+      end
+
+      # True when code is highlighted at build time (no client-side JS).
+      def server? : Bool
+        @mode == "server"
       end
 
       # Generate the CSS link tag for highlighting
@@ -380,26 +592,46 @@ module Hwaro
         if @use_cdn
           %(<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/#{safe_theme}.min.css">)
         else
-          suffix = cache_bust.empty? ? "" : "?v=#{HTML.escape(cache_bust)}"
+          suffix = Models.cache_bust_suffix(cache_bust)
           %(<link rel="stylesheet" href="/assets/css/highlight/#{safe_theme}.min.css#{suffix}">)
         end
       end
 
-      # Generate the JS script tag for highlighting
+      # Generate the JS script tag for highlighting.
+      # Server-side highlighting needs no JavaScript at all — unless the
+      # copy button is on, whose (dependency-free) runtime ships either way.
       def js_tag(cache_bust : String = "") : String
         return "" unless @enabled
-        if @use_cdn
-          %(<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>\n<script>hljs.highlightAll();</script>)
-        else
-          suffix = cache_bust.empty? ? "" : "?v=#{HTML.escape(cache_bust)}"
-          %(<script src="/assets/js/highlight.min.js#{suffix}"></script>\n<script>hljs.highlightAll();</script>)
-        end
+        return copy ? COPY_SNIPPET : "" if server?
+        hljs = if @use_cdn
+                 %(<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>\n<script>hljs.highlightAll();</script>)
+               else
+                 suffix = Models.cache_bust_suffix(cache_bust)
+                 %(<script src="/assets/js/highlight.min.js#{suffix}"></script>\n<script>hljs.highlightAll();</script>)
+               end
+        copy ? "#{hljs}\n#{COPY_SNIPPET}" : hljs
       end
+
+      # Copy-to-clipboard runtime for `pre[data-copy]` blocks: one DOM pass
+      # on DOMContentLoaded, appends a button, and copies the code's text on
+      # click. An existing `.code-block` (named fences) or `.code-wrapper`
+      # parent is reused as the positioning anchor — inserting a new wrapper
+      # inside `.code-block` would break its `.code-block > pre` styling —
+      # otherwise the <pre> is wrapped in a fresh `.code-wrapper`. Copied
+      # text strips the baked-in `.ln` line-number gutter spans (server-mode
+      # `linenos`) so pasted code has no number prefixes. Theme-neutral —
+      # currentColor only, revealed on hover/focus — and small enough to
+      # inline, so no extra request in either highlight mode.
+      COPY_SNIPPET = <<-HTML
+        <style>.code-wrapper,.code-block{position:relative}.code-copy-btn{position:absolute;top:.4rem;right:.4rem;padding:.25rem .6rem;font:inherit;font-size:.75rem;color:inherit;background:transparent;border:1px solid currentColor;border-radius:.25rem;opacity:0;cursor:pointer;transition:opacity .15s}.code-wrapper:hover .code-copy-btn,.code-block:hover .code-copy-btn,.code-copy-btn:focus-visible,.code-copy-btn.copied{opacity:.75}</style>
+        <script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll("pre[data-copy]").forEach(function(pre){var w=pre.parentNode;var l=w.classList;if(!l||!(l.contains("code-wrapper")||l.contains("code-block"))){w=document.createElement("div");w.className="code-wrapper";pre.parentNode.insertBefore(w,pre);w.appendChild(pre);}var b=document.createElement("button");b.type="button";b.className="code-copy-btn";b.textContent="Copy";b.setAttribute("aria-label","Copy code");b.addEventListener("click",function(){var c=pre.querySelector("code");var t;if(c){var k=c.cloneNode(true);k.querySelectorAll("span.ln").forEach(function(n){n.remove();});t=k.textContent;}else{t=pre.textContent;}navigator.clipboard.writeText(t).then(function(){b.classList.add("copied");b.textContent="Copied!";setTimeout(function(){b.classList.remove("copied");b.textContent="Copy";},2000);});});w.appendChild(b);});});</script>
+        HTML
 
       # Generate both CSS and JS tags
       def tags(cache_bust : String = "") : String
         return "" unless @enabled
-        "#{css_tag(cache_bust)}\n#{js_tag(cache_bust)}"
+        js = js_tag(cache_bust)
+        js.empty? ? css_tag(cache_bust) : "#{css_tag(cache_bust)}\n#{js}"
       end
     end
 
@@ -408,6 +640,17 @@ module Hwaro
       property feed : Bool
       property sitemap : Bool
       property paginate_by : Int32?
+      # Ordering of pages within a term ("date", "title", "weight") —
+      # section semantics: date is newest-first, title/weight ascend, and
+      # `reverse` flips whichever order `sort_by` produced. Term FEEDS are
+      # exempt: RSS consumers assume reverse-chronological, so they stay
+      # date-desc regardless.
+      property sort_by : String = "date"
+      property reverse : Bool = false
+      # Ordering of the terms list (taxonomy index page + `get_taxonomy`
+      # items): "name" = alphabetical, "count" = page count descending
+      # (name-ascending tiebreak).
+      property terms_sort_by : String = "name"
 
       def initialize(@name : String)
         @feed = false
@@ -431,34 +674,179 @@ module Hwaro
     class BuildConfig
       property hooks : BuildHooksConfig
 
+      # Track template extends/include/import dependencies so a template
+      # edit only invalidates the pages that actually render it (cached
+      # builds and `hwaro serve`). Set to false to restore the previous
+      # behavior: any template change rebuilds every page.
+      property template_deps : Bool = true
+
       def initialize
         @hooks = BuildHooksConfig.new
+      end
+    end
+
+    # Serve (development server) configuration
+    #
+    # Currently used to configure custom response headers that are injected
+    # on every request while running `hwaro serve`. This makes it easy to
+    # reproduce production reverse-proxy / CDN header behaviour locally.
+    class ServeConfig
+      # Custom HTTP response headers applied to *all* responses during
+      # `hwaro serve` (including 404s, redirects, and static assets).
+      property headers : Hash(String, String)
+
+      # When true, `hwaro serve` will behave as if `--fast` was passed
+      # (skips heavy OG image generation and image processing by default).
+      # CLI flags can still override this.
+      property fast : Bool = false
+
+      def initialize
+        @headers = {} of String => String
+        @fast = false
       end
     end
 
     # Markdown parser configuration
     # Maps to Markd::Options for controlling markdown parsing behavior
     class MarkdownConfig
-      property safe : Bool             # If true, raw HTML will not be passed through (replaced by comments)
-      property lazy_loading : Bool     # If true, adds loading="lazy" to img tags
-      property emoji : Bool            # If true, converts emoji shortcodes (e.g. :smile:) to emoji characters
-      property footnotes : Bool        # If true, enables footnote syntax ([^1])
-      property task_lists : Bool       # If true, enables task list syntax (- [ ] / - [x])
-      property definition_lists : Bool # If true, enables definition list syntax (Term\n: Definition)
-      property mermaid : Bool          # If true, renders ```mermaid blocks as diagrams
-      property math : Bool             # If true, enables math syntax ($...$ and $$...$$)
-      property math_engine : String    # "katex" or "mathjax"
+      property safe : Bool              # If true, raw HTML will not be passed through (replaced by comments)
+      property lazy_loading : Bool      # If true, adds loading="lazy" to img tags
+      property emoji : Bool             # If true, converts emoji shortcodes (e.g. :smile:) to emoji characters
+      property footnotes : Bool         # If true, enables footnote syntax ([^1])
+      property task_lists : Bool        # If true, enables task list syntax (- [ ] / - [x])
+      property definition_lists : Bool  # If true, enables definition list syntax (Term\n: Definition)
+      property mermaid : Bool           # If true, renders ```mermaid blocks as diagrams
+      property math : Bool              # If true, enables math syntax ($...$ and $$...$$)
+      property math_engine : String     # "katex" or "mathjax"
+      property admonitions : Bool       # If true, GitHub-style `> [!NOTE]` blockquotes become admonition <div>s
+      property heading_ids : Bool       # If true, `## Heading {#custom-id}` sets an explicit id
+      property ins : Bool               # If true, enables inserted-text syntax (++ins++)
+      property mark : Bool              # If true, enables highlighted-text syntax (==mark==)
+      property sub : Bool               # If true, enables subscript syntax (~sub~)
+      property sup : Bool               # If true, enables superscript syntax (^sup^)
+      property attributes : Bool        # If true, enables `{#id .class key=val}` attribute blocks on headings/images
+      property smart_punctuation : Bool # If true, straight quotes/dashes/ellipses become typographic ones (markd smart mode)
+      # Site-wide policy for absolute http(s) links in rendered markdown
+      # (Zola parity). target_blank also adds rel="noopener".
+      property external_links_target_blank : Bool
+      property external_links_no_follow : Bool
+      property external_links_no_referrer : Bool
+      # If true, task-list markup gets GFM's classes (task-list-item /
+      # task-list-item-checkbox / contains-task-list) for CSS parity.
+      property task_list_classes : Bool
+      # Site-wide heading anchor links: "none" (default), "left", or
+      # "right" (Zola's values; "before"/"after" accepted as aliases for
+      # the internal style names). Page front matter overrides per page.
+      property insert_anchor_links : String
+      # If true, enables `:::type Title` … `:::` custom containers,
+      # rendered with the admonition markup (shared CSS). Unsupported
+      # under safe mode (the raw <div> wrapper would be stripped).
+      property containers : Bool
 
       def initialize
         @safe = false
         @lazy_loading = false
         @emoji = false
-        @footnotes = false
-        @task_lists = false
-        @definition_lists = false
+        @footnotes = true
+        @task_lists = true
+        @definition_lists = true
         @mermaid = false
         @math = false
         @math_engine = "katex"
+        @admonitions = true
+        @heading_ids = true
+        @ins = false
+        @mark = false
+        @sub = false
+        @sup = false
+        @attributes = false
+        @smart_punctuation = false
+        @external_links_target_blank = false
+        @external_links_no_follow = false
+        @external_links_no_referrer = false
+        @task_list_classes = false
+        @insert_anchor_links = "none"
+        @containers = false
+      end
+
+      # Compact fingerprint of every field that changes rendered body HTML.
+      # Keys Processor::Markdown.render_body_cached's memo so entries from a
+      # previous config (e.g. after a config reload in `serve`) can't be
+      # served for a build running with different markdown options.
+      def cache_fingerprint : String
+        String.build(21 + @math_engine.bytesize) do |io|
+          io << (@safe ? '1' : '0') << (@lazy_loading ? '1' : '0') << (@emoji ? '1' : '0')
+          io << (@footnotes ? '1' : '0') << (@task_lists ? '1' : '0') << (@definition_lists ? '1' : '0')
+          io << (@mermaid ? '1' : '0') << (@math ? '1' : '0') << (@admonitions ? '1' : '0')
+          io << (@heading_ids ? '1' : '0')
+          io << (@ins ? '1' : '0') << (@mark ? '1' : '0') << (@sub ? '1' : '0')
+          io << (@sup ? '1' : '0') << (@attributes ? '1' : '0') << (@smart_punctuation ? '1' : '0')
+          io << (@external_links_target_blank ? '1' : '0') << (@external_links_no_follow ? '1' : '0')
+          io << (@external_links_no_referrer ? '1' : '0') << (@task_list_classes ? '1' : '0')
+          io << (@containers ? '1' : '0')
+          io << @math_engine << ':' << @insert_anchor_links
+        end
+      end
+
+      # Generate CDN script tags for the math engine. The markdown processor
+      # emits `\(…\)`/`\[…\]` wrappers with `class="math math-{inline,display}"`
+      # but doesn't load the renderer — without these tags the math reaches
+      # the browser as literal TeX. Templates can opt out by overriding the
+      # `{{ math_tags }}` variable or by leaving `math = false` and inlining
+      # their own includes via [auto_includes].
+      def math_tags : String
+        return "" unless @math
+        case @math_engine
+        when "katex"
+          # auto-render finds class="math math-{inline,display}" automatically
+          # and replaces the inner TeX with rendered KaTeX. Pinned KaTeX 0.16.x
+          # to avoid surprise major-version churn in build outputs.
+          <<-HTML.gsub('\n', "")
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
+            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body);"></script>
+            HTML
+        when "mathjax"
+          # MathJax 3 reads `class="math math-*"` via the `[tex]` extension
+          # configured to recognise `\(…\)` and `\[…\]` delimiters (which is
+          # how the markdown processor emits them).
+          <<-HTML.gsub('\n', "")
+            <script>window.MathJax={tex:{inlineMath:[["\\\\(","\\\\)"]],displayMath:[["\\\\[","\\\\]"]]}};</script>
+            <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+            HTML
+        else
+          ""
+        end
+      end
+
+      # Generate the Mermaid.js script tag. Mirrors `math_tags`: the markdown
+      # processor emits `<div class="mermaid">…</div>`, but without a renderer
+      # those blocks ship to the browser as DOT-like source text. Pinned to
+      # 10.x to avoid major-version drift.
+      def mermaid_tags : String
+        return "" unless @mermaid
+        <<-HTML.gsub('\n', "")
+          <script type="module">
+            import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+            mermaid.initialize({ startOnLoad: true });
+          </script>
+          HTML
+      end
+    end
+
+    # A single `[[menus.<name>]]` entry from config. `name` is the only
+    # required field (entries missing it are skipped with a warning by the
+    # loader); everything else defaults so `[[menus.main]]\nname = "Posts"`
+    # is valid on its own.
+    class MenuItemConfig
+      property name : String
+      property url : String
+      property identifier : String
+      property parent : String?
+      property weight : Int32
+
+      def initialize(@name : String, @url : String = "", identifier : String? = nil, @parent : String? = nil, @weight : Int32 = 0)
+        @identifier = identifier || @name
       end
     end
 
@@ -470,6 +858,9 @@ module Hwaro
       property generate_feed : Bool
       property build_search_index : Bool
       property taxonomies : Array(String)
+      # `nil` means "no per-language override" → inherit the global
+      # `[[menus.*]]` set wholesale (see `load_languages`).
+      property menus : Hash(String, Array(MenuItemConfig))? = nil
 
       def initialize(@code : String)
         @language_name = code
@@ -508,6 +899,27 @@ module Hwaro
       end
     end
 
+    # Built-in Sass/SCSS compilation (pure Crystal, no external tools).
+    #
+    # When enabled, non-partial `*.scss` files under the static dir compile
+    # to sibling `.css` files in the output, `_*.scss` partials are only
+    # reachable via @use/@import, and raw `.scss` sources are excluded from
+    # the verbatim static copy.
+    #
+    # Config example (config.toml):
+    #   [sass]
+    #   enabled = true
+    #   minify = true
+    class SassConfig
+      property enabled : Bool
+      property minify : Bool
+
+      def initialize
+        @enabled = false
+        @minify = true
+      end
+    end
+
     # Image processing configuration
     #
     # Enables automatic image resizing during build using stb (statically linked).
@@ -522,11 +934,17 @@ module Hwaro
       property enabled : Bool
       property widths : Array(Int32)
       property quality : Int32
+      property lqip_enabled : Bool
+      property lqip_width : Int32
+      property lqip_quality : Int32
 
       def initialize
         @enabled = false
         @widths = [] of Int32
         @quality = 85
+        @lqip_enabled = false
+        @lqip_width = 32
+        @lqip_quality = 20
       end
     end
 
@@ -560,6 +978,9 @@ module Hwaro
       property icons : Array(String)
       property offline_page : String?
       property precache_urls : Array(String)
+      property cache_strategy : String
+
+      VALID_STRATEGIES = %w[cache-first network-first stale-while-revalidate]
 
       def initialize
         @enabled = false
@@ -572,13 +993,141 @@ module Hwaro
         @icons = [] of String
         @offline_page = nil
         @precache_urls = [] of String
+        @cache_strategy = "cache-first"
+      end
+    end
+
+    class DoctorConfig
+      property ignore : Array(String)
+
+      def initialize
+        @ignore = [] of String
+      end
+    end
+
+    # `[static]` — controls which files under `static/` get published.
+    #
+    # `static/` is copied verbatim into the site root, so OS/editor/VCS cruft
+    # placed there (`.DS_Store`, `Thumbs.db`, `.git/`, vim swap files, …) would
+    # otherwise be deployed. A built-in denylist filters the common offenders;
+    # `exclude` adds project-specific patterns — a glob like `*.bak` filters at
+    # any depth, `drafts/**` scopes a subtree, and a literal name is anchored to
+    # an exact file or directory (`drafts` drops `drafts/…`) — and
+    # `use_default_excludes = false` opts out of the built-in list entirely.
+    #
+    # Note: this only filters *cruft*. Legitimate dot-paths such as
+    # `.well-known/` are NOT in the denylist and are always published.
+    class StaticConfig
+      # Exact file/dir names that should essentially never be published.
+      # Matched per path segment, so an entry like `.git` filters that
+      # directory (and everything under it) at any depth.
+      DEFAULT_EXCLUDE_NAMES = Set{
+        ".DS_Store", ".AppleDouble", ".LSOverride", ".Spotlight-V100",
+        ".Trashes", ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems",
+        ".VolumeIcon.icns", "__MACOSX",
+        "Thumbs.db", "ehthumbs.db", "ehthumbs_vista.db", "desktop.ini", ".directory",
+        ".git", ".gitignore", ".gitattributes", ".gitmodules", ".gitkeep",
+        ".svn", ".hg", ".bzr",
+      }
+
+      # Suffixes for vim swap files, matched against the leaf file name only.
+      # Kept deliberately narrow: a name ending in `.swp`/`.swo` is never a
+      # legitimate published asset, so the always-on default denylist can't
+      # silently drop real content. Emacs-style `~` backups are intentionally
+      # NOT here — a trailing tilde is a legal file name, so filtering it is
+      # left to an explicit `exclude` pattern.
+      DEFAULT_EXCLUDE_SUFFIXES = [".swp", ".swo"]
+
+      # Glob metacharacters that distinguish an `exclude` glob from a literal
+      # path/name.
+      GLOB_METACHARS = /[*?\[{]/
+
+      property exclude : Array(String)
+      property use_default_excludes : Bool
+
+      def initialize
+        @exclude = [] of String
+        @use_default_excludes = true
+      end
+
+      # Whether `relative_path` (relative to `static/`) should be filtered out
+      # of the published output.
+      #
+      # `exclude` entries match two ways depending on their shape:
+      # - a glob (contains `* ? [ {`) matches the relative path, and — when it
+      #   has no `/` — the bare file name too, so `*.bak` filters at any depth
+      #   while `drafts/**` scopes to a subtree;
+      # - a literal is anchored: it matches that exact path or, when it names a
+      #   directory, the whole subtree under it. So `drafts` drops `drafts/...`
+      #   but `config` only drops a top-level `config`, never a same-named file
+      #   nested elsewhere.
+      def excluded?(relative_path : String) : Bool
+        normalized = Path[relative_path].to_posix.to_s
+        return false if normalized.empty? || normalized == "."
+
+        if @use_default_excludes
+          segments = normalized.split('/')
+          # Exact-name cruft (`.git`, `.DS_Store`, …) filters at any depth; the
+          # swap-file suffix check applies to the leaf name only, so a directory
+          # whose name happens to end in `.swp` doesn't take its subtree with it.
+          return true if segments.any? { |segment| DEFAULT_EXCLUDE_NAMES.includes?(segment) }
+          return true if DEFAULT_EXCLUDE_SUFFIXES.any? { |suffix| segments.last.ends_with?(suffix) }
+        end
+
+        return false if @exclude.empty?
+        basename = File.basename(normalized)
+        @exclude.any? { |pattern| pattern_matches?(pattern, normalized, basename) }
+      end
+
+      private def pattern_matches?(pattern : String, normalized : String, basename : String) : Bool
+        if GLOB_METACHARS.matches?(pattern)
+          # Glob: match the full relative path, plus the bare name for a
+          # path-less glob so it applies at any depth. A malformed glob (e.g.
+          # an unclosed `[` class) makes File.match? raise File::BadPatternError;
+          # treat it as non-matching rather than crashing the whole build on a
+          # single config typo.
+          Utils::PathUtils.glob_match?(pattern, normalized) ||
+            (!pattern.includes?('/') && Utils::PathUtils.glob_match?(pattern, basename))
+        else
+          # Literal: an exact file, or a directory subtree rooted at it.
+          normalized == pattern || normalized.starts_with?("#{pattern}/")
+        end
+      end
+    end
+
+    # `[outputs]` — declares extra per-page/per-section output formats
+    # beyond HTML (sibling `index.<fmt>` files rendered from a user-supplied
+    # `templates/<name>.<fmt>.jinja` template). See
+    # docs/content/features/output-formats.md for the full selection chain
+    # and front matter override (`page.extra["outputs"]`).
+    class OutputsConfig
+      VALID_FORMATS = %w[json txt xml csv]
+
+      # Formats every regular page emits (unless overridden by front matter).
+      property page : Array(String)
+      # Formats every section index emits (unless overridden by front matter).
+      property section : Array(String)
+      # Optional allowlist of section names formats apply to; empty = all
+      # sections. Matches a section name or any of its descendants, mirroring
+      # `FeedConfig#sections`.
+      property sections : Array(String)
+
+      def initialize
+        @page = [] of String
+        @section = [] of String
+        @sections = [] of String
+      end
+
+      # Whether any format is configured at all (page or section).
+      def any? : Bool
+        @page.present? || @section.present?
       end
     end
 
     class Config
       property title : String
       property description : String
-      property base_url : String
+      getter base_url : String
       property sitemap : SitemapConfig
       property robots : RobotsConfig
       property llms : LlmsConfig
@@ -586,25 +1135,35 @@ module Hwaro
       property search : SearchConfig
       property plugins : PluginConfig
       property content_files : ContentFilesConfig
+      property content_new : ContentNewConfig
       property pagination : PaginationConfig
       property highlight : HighlightConfig
       property auto_includes : AutoIncludesConfig
       property og : OpenGraphConfig
       property taxonomies : Array(TaxonomyConfig)
+      property menus : Hash(String, Array(MenuItemConfig))
       property default_language : String
       property languages : Hash(String, LanguageConfig)
       property build : BuildConfig
+      property serve : ServeConfig
       property markdown : MarkdownConfig
       property series : SeriesConfig
       property related : RelatedConfig
       property deployment : DeploymentConfig
       property assets : AssetsConfig
+      property sass : SassConfig
       property pwa : PwaConfig
       property amp : AmpConfig
       property image_processing : ImageProcessingConfig
+      property doctor : DoctorConfig
+      property static : StaticConfig
+      property outputs : OutputsConfig
+      property links : LinksConfig
       property permalinks : Hash(String, String)
       property raw : Hash(String, TOML::Any)
       @base_url_stripped : String? = nil
+      @base_path : String? = nil
+      @multilingual : Bool? = nil
 
       def initialize
         @title = "Hwaro Site"
@@ -617,24 +1176,42 @@ module Hwaro
         @search = SearchConfig.new
         @plugins = PluginConfig.new
         @content_files = ContentFilesConfig.new
+        @content_new = ContentNewConfig.new
         @pagination = PaginationConfig.new
         @highlight = HighlightConfig.new
         @auto_includes = AutoIncludesConfig.new
         @og = OpenGraphConfig.new
         @taxonomies = [] of TaxonomyConfig
+        @menus = {} of String => Array(MenuItemConfig)
         @default_language = "en"
         @languages = {} of String => LanguageConfig
         @build = BuildConfig.new
+        @serve = ServeConfig.new
         @markdown = MarkdownConfig.new
         @series = SeriesConfig.new
         @related = RelatedConfig.new
         @deployment = DeploymentConfig.new
         @assets = AssetsConfig.new
+        @sass = SassConfig.new
         @pwa = PwaConfig.new
         @amp = AmpConfig.new
         @image_processing = ImageProcessingConfig.new
+        @doctor = DoctorConfig.new
+        @static = StaticConfig.new
+        @outputs = OutputsConfig.new
+        @links = LinksConfig.new
         @permalinks = {} of String => String
         @raw = Hash(String, TOML::Any).new
+      end
+
+      # Normalize on assignment: a trailing slash makes `{{ base_url }}/path`
+      # templates (and canonical/og URLs) emit `//`. Strip it so the build is
+      # correct whether the trailing slash came from config.toml or `--base-url`
+      # (previously only `doctor --fix` normalized this).
+      def base_url=(value : String)
+        @base_url = value.rstrip("/")
+        @base_url_stripped = nil
+        @base_path = nil
       end
 
       # Cached base_url with trailing slash stripped (avoids repeated rstrip per page)
@@ -642,11 +1219,66 @@ module Hwaro
         @base_url_stripped ||= @base_url.rstrip("/")
       end
 
-      # Check if site is multilingual
+      # Path component of `base_url`, used to make root-relative links work when
+      # the site is deployed under a subpath (e.g. GitHub/GitLab project pages
+      # served at `https://user.github.io/repo/`). For `https://x.com/repo` this
+      # returns `/repo`; for a domain-root deployment (`https://x.com`) or an
+      # empty `base_url` it returns `""`. Trailing slashes are stripped so callers
+      # can build `base_path + page.url` without producing `//`.
+      def base_path : String
+        @base_path ||= begin
+          stripped = base_url_stripped
+          if stripped.empty?
+            ""
+          else
+            path = URI.parse(stripped).path.rstrip("/")
+            path == "/" ? "" : path
+          end
+        rescue URI::Error
+          ""
+        end
+      end
+
+      # Prefix a site-internal root-relative path (e.g. `/posts/x/`) with
+      # `base_path` so generated URLs resolve under a subpath deployment.
+      # Absolute `http(s)://` URLs and paths that are not root-relative are
+      # returned unchanged; a no-op when `base_path` is "" (domain-root deploy).
+      # Callers that may hold a path without a leading slash (e.g. some
+      # `page.url` values) should normalize it first — this helper only
+      # prefixes values that already start with "/".
+      def with_base_path(path : String) : String
+        return path if base_path.empty?
+        return path if path.starts_with?("http://") || path.starts_with?("https://")
+        # Protocol-relative URLs (`//cdn.example.com/x`) are external — leave
+        # them untouched, matching how render.cr / internal_link_resolver treat
+        # `//host`. Without this they'd become `/base//cdn.example.com/x`.
+        return path if path.starts_with?("//")
+        return path unless path.starts_with?("/")
+        "#{base_path}#{path}"
+      end
+
+      # Check if site is multilingual. Memoized — this runs several times
+      # per page during render, and the languages table only mutates during
+      # config load, before the first call. The `languages=` /
+      # `default_language=` setters invalidate; in-place mutation of the
+      # languages Hash after the first call would not (don't do that).
       def multilingual? : Bool
+        cached = @multilingual
+        return cached unless cached.nil?
+
         codes = @languages.keys
         codes << @default_language unless @default_language.empty?
-        codes.uniq.size > 1
+        @multilingual = codes.uniq.size > 1
+      end
+
+      def languages=(value : Hash(String, LanguageConfig))
+        @multilingual = nil
+        @languages = value
+      end
+
+      def default_language=(value : String)
+        @multilingual = nil
+        @default_language = value
       end
 
       # Get language config by code, returns nil if not found
@@ -656,35 +1288,119 @@ module Hwaro
 
       # Get sorted languages by weight
       def sorted_languages : Array(LanguageConfig)
-        @languages.values.sort_by(&.weight)
+        @languages.values.sort_by!(&.weight)
+      end
+
+      # Load and parse a `config.toml` into a populated `Config`.
+      #
+      # Raises `Hwaro::HwaroError(HWARO_E_CONFIG)` directly at the source for
+      # file-not-found and TOML parse errors so every caller (build, deploy,
+      # doctor, tool, services) gets a classified error with exit code 3
+      # without having to do substring matching on the exception message.
+      # File-not-found is classified as HWARO_E_CONFIG rather than HWARO_E_IO
+      # because a missing `config.toml` is a config-level user error, not an
+      # arbitrary IO failure.
+      # Accepts an absolute `http(s)://host[:port][/path]` URL or the empty
+      # string (which means "no absolute URL is configured"). Raises
+      # ArgumentError on anything else so callers can wrap the failure in
+      # whichever classified `HwaroError` code suits their context
+      # (`HWARO_E_CONFIG` for config.toml, `HWARO_E_USAGE` for CLI flags).
+      def self.validate_base_url!(value : String) : Nil
+        return if value.empty?
+
+        # Crystal's URI parser is lenient about whitespace and control
+        # characters: `https://exam ple.com` and a value with an embedded
+        # newline both parse with a non-empty host and pass every check below.
+        # The RAW string — not the parsed URI — is what gets concatenated with
+        # each page URL, so such a value is copied verbatim into <loc> in
+        # sitemap.xml, into rss.xml, into every canonical/og:url and into
+        # llms.txt. No absolute URL can legally contain these characters
+        # (RFC 3986 requires them percent-encoded), so reject them here rather
+        # than emit a whole site of unusable links.
+        if value.each_char.any? { |c| c.ascii_whitespace? || c.ascii_control? }
+          raise ArgumentError.new("Invalid base_url: #{value.inspect}. It must not contain whitespace or control characters.")
+        end
+
+        uri = begin
+          URI.parse(value)
+        rescue URI::Error
+          raise ArgumentError.new("Invalid base_url: '#{value}'. Expected http(s)://host[/path].")
+        end
+
+        scheme = uri.scheme
+        host = uri.host
+        if scheme.nil? || !%w[http https].includes?(scheme.downcase) || host.nil? || host.empty?
+          raise ArgumentError.new("Invalid base_url: '#{value}'. Expected http(s)://host[/path].")
+        end
+        # A query/fragment is not part of the origin+path that page URLs append
+        # to. base_path parses with URI#path (dropping query/fragment), so the
+        # raw base_url and the derived base_path would silently disagree and
+        # corrupt absolute (base_url + page.url) links. Reject it at the source.
+        unless (uri.query.nil? || uri.query.try(&.empty?)) && (uri.fragment.nil? || uri.fragment.try(&.empty?))
+          raise ArgumentError.new("Invalid base_url: '#{value}'. base_url must not contain a query string or fragment.")
+        end
+      end
+
+      # True when built-in Sass compilation is on and `relative_path` is an
+      # SCSS source — such files compile to `.css` instead of publishing
+      # verbatim through the static copy. The extension must be lowercase
+      # `.scss`, matching what the compiler's glob picks up — other casings
+      # keep publishing verbatim.
+      def sass_source?(relative_path : String) : Bool
+        sass.enabled && relative_path.ends_with?(".scss")
       end
 
       def self.load(config_path : String = "config.toml", env : String? = nil) : Config
         config = new
-        return config unless File.exists?(config_path)
+
+        unless File.exists?(config_path)
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_CONFIG,
+            message: "config.toml not found at #{config_path}",
+            hint: "Run 'hwaro init' to scaffold a project, or cd into a directory containing config.toml.",
+          )
+        end
 
         # Read file content and substitute environment variables before TOML parsing
         raw_content = File.read(config_path)
         substituted_content = Utils::EnvSubstitutor.substitute_with_warnings(raw_content, config_path)
-        config.raw = TOML.parse(substituted_content)
+        config.raw = parse_toml(substituted_content, config_path)
 
-        # Merge environment-specific override (e.g. config.production.toml)
+        # Merge environment-specific override (e.g. config.production.toml).
+        # A missing override is recoverable (we just use the base config), but
+        # it's the most common way to ship a localhost build to production by
+        # accident (typo `--env prdo`, file not committed, etc.), so the warning
+        # is intentionally explicit and names both the requested env and the
+        # exact filename we looked for.
         if env_name = env
           env_path = config_path.sub(/\.toml$/, ".#{env_name}.toml")
           if File.exists?(env_path)
             env_content = File.read(env_path)
             env_substituted = Utils::EnvSubstitutor.substitute_with_warnings(env_content, env_path)
-            env_raw = TOML.parse(env_substituted)
+            env_raw = parse_toml(env_substituted, env_path)
             config.raw = deep_merge(config.raw, env_raw)
             Logger.info "Loaded environment config: #{env_path}"
           else
-            Logger.warn "Environment config not found: #{env_path}"
+            Logger.warn "--env #{env_name}: override file '#{env_path}' not found; continuing with base #{config_path} only. If you intended to ship environment-specific settings (e.g. a production base_url), create #{env_path} or check for a typo in --env."
           end
         end
 
+        warn_unknown_top_level_keys(config.raw, config_path)
+
         config.title = config.raw["title"]?.try(&.as_s?) || config.title
         config.description = config.raw["description"]?.try(&.as_s?) || config.description
-        config.base_url = config.raw["base_url"]?.try(&.as_s?) || config.base_url
+        if raw_base_url = config.raw["base_url"]?.try(&.as_s?)
+          begin
+            validate_base_url!(raw_base_url)
+          rescue ex : ArgumentError
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_CONFIG,
+              message: ex.message || "Invalid base_url in #{config_path}",
+              hint: "Set base_url to an absolute URL such as \"https://example.com\" or \"http://localhost:3000\".",
+            )
+          end
+          config.base_url = raw_base_url
+        end
         config.default_language = config.raw["default_language"]?.try(&.as_s?) || config.default_language
 
         load_sitemap(config)
@@ -694,27 +1410,76 @@ module Hwaro
         load_search(config)
         load_plugins(config)
         load_content_files(config)
+        load_content_new(config)
         load_pagination(config)
         load_highlight(config)
         load_auto_includes(config)
         load_og(config)
+        load_menus(config)
         load_taxonomies(config)
         load_languages(config)
         load_build(config)
+        load_serve(config)
         load_markdown(config)
         load_series(config)
         load_related(config)
         load_permalinks(config)
         load_assets(config)
+        load_sass(config)
         load_pwa(config)
         load_amp(config)
         load_image_processing(config)
+        load_doctor(config)
+        load_static(config)
         load_deployment(config)
+        load_outputs(config)
+        load_links(config)
 
         config
       end
 
       # --- Private helpers -----------------------------------------------------------
+
+      # Every top-level key `load` reads (scalars + `load_*` section names).
+      # Used to warn on unrecognized keys instead of silently ignoring them —
+      # a typo'd `[markdonw]` or `titel =` otherwise disables a feature with
+      # zero feedback. Templates cannot read arbitrary raw config keys (the
+      # site/config objects expose structured fields only), so an unknown
+      # top-level key is always dead configuration.
+      KNOWN_TOP_LEVEL_KEYS = %w[
+        title description base_url default_language
+        amp assets auto_includes build content deployment doctor feeds
+        highlight image_processing languages links llms markdown menus og
+        outputs pagination permalinks plugins pwa related robots sass search
+        series serve sitemap static taxonomies
+      ]
+
+      private def self.warn_unknown_top_level_keys(raw : Hash(String, TOML::Any), config_path : String)
+        raw.each_key do |key|
+          next if KNOWN_TOP_LEVEL_KEYS.includes?(key)
+          hint = Utils::CommandSuggester.suggest(key, KNOWN_TOP_LEVEL_KEYS).try { |s| " Did you mean '#{s}'?" } || ""
+          Logger.warn "Unknown key '#{key}' in #{config_path} — hwaro does not read it.#{hint}"
+        end
+      end
+
+      # Parse a TOML string, re-raising any parser failure as a classified
+      # `HWARO_E_CONFIG` error so the CLI maps it to exit code 3 and the
+      # `--json` handlers emit the structured error payload. The hint points
+      # users at the offending file so they can fix the syntax.
+      private def self.parse_toml(content : String, path : String) : Hash(String, TOML::Any)
+        # A BOM'd config.toml (Notepad / PowerShell `>` / "UTF-8 with BOM")
+        # otherwise dies on `unexpected char '﻿' at 1:1` — an invisible
+        # character the user cannot see in their editor.
+        TOML.parse(Utils::TextUtils.strip_bom(content))
+      rescue ex : Hwaro::HwaroError
+        raise ex
+      rescue ex
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_CONFIG,
+          message: "Invalid TOML in #{path}: #{ex.message}",
+          hint: "Check TOML syntax in #{path}.",
+        )
+      end
 
       # Deep-merge two TOML hashes.  Values in `override` take precedence.
       # Sub-tables (hashes) are merged recursively; all other types are replaced.
@@ -747,15 +1512,43 @@ module Hwaro
       end
 
       # Safe integer loader: handles both integer and float TOML values.
+      # Uses the 64-bit accessor and clamps to Int32 range so an oversized
+      # config value (e.g. `per_page = 9999999999` or `1e30`) yields a clamped
+      # Int32 instead of raising OverflowError out of `as_i?`/`to_i` — which
+      # would abort the build with an unclassified crash instead of running.
       private def self.int_value(raw : TOML::Any?, default : Int32) : Int32
         return default unless raw
-        raw.as_i? || raw.as_f?.try(&.to_i) || default
+        # `finite?` guard: NaN.clamp is NaN and NaN.to_i64 raises OverflowError,
+        # so a `nan`/`-nan` float in config would otherwise crash the build.
+        val = raw.as_i64? || raw.as_f?.try { |f| f.finite? ? f.clamp(Int32::MIN.to_f64, Int32::MAX.to_f64).to_i64 : nil }
+        unless val
+          # Present but not a usable number (e.g. a quoted "20", a bool, NaN) —
+          # warn instead of silently using the default with zero feedback.
+          Logger.warn "Ignoring non-numeric config value #{raw.raw.inspect}; using default #{default}"
+          return default
+        end
+        val.clamp(Int32::MIN.to_i64, Int32::MAX.to_i64).to_i32
       end
 
       # Safe float loader: handles both float and integer TOML values.
+      # Uses as_i64? (Int64#to_f never overflows) to avoid the OverflowError
+      # that as_i? raises for integers above Int32::MAX.
       private def self.float_value(raw : TOML::Any?, default : Float64) : Float64
         return default unless raw
-        raw.as_f? || raw.as_i?.try(&.to_f) || default
+        val = raw.as_f? || raw.as_i64?.try(&.to_f)
+        unless val
+          Logger.warn "Ignoring non-numeric config value #{raw.raw.inspect}; using default #{default}"
+          return default
+        end
+        val
+      end
+
+      # Non-raising Int32 extraction from a single TOML value (nil if absent or
+      # non-numeric). Clamps to Int32 range like int_value so an oversized value
+      # never raises OverflowError out of as_i?/to_i at the inline call sites.
+      private def self.int_or_nil(raw : TOML::Any) : Int32?
+        val = raw.as_i64? || raw.as_f?.try { |f| f.finite? ? f.clamp(Int32::MIN.to_f64, Int32::MAX.to_f64).to_i64 : nil }
+        val.try(&.clamp(Int32::MIN.to_i64, Int32::MAX.to_i64).to_i32)
       end
 
       # Extracts a string-or-array TOML value into an Array(String).
@@ -764,6 +1557,38 @@ module Hwaro
         raw.as_a?.try(&.compact_map(&.as_s?)) ||
           raw.as_s?.try { |v| [v] } ||
           [] of String
+      end
+
+      # Basenames that do not name a file. Every generated-file emitter
+      # (sitemap, robots, search, feeds, llms) writes to
+      # `Path[output_dir, File.basename(configured_filename)]`, and
+      # `File.basename` maps each of these back to itself — so the write target
+      # collapses onto the output DIRECTORY instead of a file inside it. The
+      # atomic writer then tries to rename its temp file onto a directory and
+      # the build dies with a raw `IO::Error` naming an internal
+      # `.<pid>.<fiber>.tmp` path under exit 70, the code this project reserves
+      # for internal bugs.
+      NON_FILE_BASENAMES = {"", ".", "..", "/"}
+
+      # Reject a `[<table>] <key>` value that cannot become a file inside the
+      # output directory, with a classified config error naming the key instead
+      # of the internal temp-file IO::Error the emitters would otherwise raise.
+      #
+      # `allow_empty` is for the two keys where the empty string already means
+      # "use the built-in default" (`[feeds] filename` defaults to `""`, and
+      # llms.cr substitutes its defaults for an empty value) — rejecting those
+      # would break configs that build correctly today.
+      private def self.validate_output_filename!(table : String, key : String, value : String, example : String, allow_empty : Bool) : Nil
+        return if allow_empty && value.empty?
+        # A NUL byte survives both TOML and File.basename, and then raises a
+        # bare `ArgumentError: String contains null byte` out of the writer.
+        return unless NON_FILE_BASENAMES.includes?(File.basename(value)) || value.includes?(Char::ZERO)
+
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_CONFIG,
+          message: "Invalid [#{table}] #{key} = #{value.inspect}: it does not name a file.",
+          hint: "Set #{key} to a plain filename such as \"#{example}\", or remove the key to use the default.",
+        )
       end
 
       # --- Private section loaders ---------------------------------------------------
@@ -775,8 +1600,17 @@ module Hwaro
         elsif s = config.raw["sitemap"]?.try(&.as_h?)
           config.sitemap.enabled = bool_value(s["enabled"]?, config.sitemap.enabled)
           config.sitemap.filename = s["filename"]?.try(&.as_s?) || config.sitemap.filename
+          validate_output_filename!("sitemap", "filename", config.sitemap.filename, "sitemap.xml", allow_empty: false)
           config.sitemap.changefreq = s["changefreq"]?.try(&.as_s?) || config.sitemap.changefreq
-          config.sitemap.priority = float_value(s["priority"]?, config.sitemap.priority)
+          # Keep the priority raw here (NOT clamped) so `hwaro doctor` can detect
+          # an out-of-range value and warn/offer a fix. The sitemap EMITTER
+          # (sitemap.cr) clamps to [0.0, 1.0] so the generated XML stays valid
+          # even for users who never run doctor. NaN is the exception: it
+          # sails through both doctor's range checks and the emitter's clamp
+          # (NaN comparisons are all false) and lands in the XML as "NaN",
+          # so non-finite values fall back to the default here.
+          pr = float_value(s["priority"]?, config.sitemap.priority)
+          config.sitemap.priority = pr.finite? ? pr : config.sitemap.priority
           if exclude_arr = s["exclude"]?.try(&.as_a?)
             config.sitemap.exclude = exclude_arr.compact_map(&.as_s?)
           end
@@ -788,6 +1622,7 @@ module Hwaro
 
         config.robots.enabled = bool_value(s["enabled"]?, config.robots.enabled)
         config.robots.filename = s["filename"]?.try(&.as_s?) || config.robots.filename
+        validate_output_filename!("robots", "filename", config.robots.filename, "robots.txt", allow_empty: false)
 
         if rules = s["rules"]?.try(&.as_a?)
           config.robots.rules = rules.compact_map do |rule_any|
@@ -797,8 +1632,6 @@ module Hwaro
               rule.allow = string_or_array(rule_h["allow"]?)
               rule.disallow = string_or_array(rule_h["disallow"]?)
               rule
-            else
-              nil
             end
           end
         end
@@ -812,6 +1645,10 @@ module Hwaro
         config.llms.instructions = s["instructions"]?.try(&.as_s?) || config.llms.instructions
         config.llms.full_enabled = bool_value(s["full_enabled"]?, config.llms.full_enabled)
         config.llms.full_filename = s["full_filename"]?.try(&.as_s?) || config.llms.full_filename
+        # Empty stays legal here: llms.cr already substitutes llms.txt /
+        # llms-full.txt for an empty value, so those configs build today.
+        validate_output_filename!("llms", "filename", config.llms.filename, "llms.txt", allow_empty: true)
+        validate_output_filename!("llms", "full_filename", config.llms.full_filename, "llms-full.txt", allow_empty: true)
       end
 
       private def self.load_feeds(config : Config)
@@ -828,6 +1665,9 @@ module Hwaro
         end
 
         config.feeds.filename = s["filename"]?.try(&.as_s?) || config.feeds.filename
+        # Empty is the shipped default (safe_feed_filename derives rss.xml /
+        # atom.xml from `type`), so only non-file values are rejected.
+        validate_output_filename!("feeds", "filename", config.feeds.filename, "rss.xml", allow_empty: true)
         config.feeds.type = s["type"]?.try(&.as_s?) || config.feeds.type
         config.feeds.truncate = int_value(s["truncate"]?, config.feeds.truncate)
         config.feeds.limit = int_value(s["limit"]?, config.feeds.limit)
@@ -835,6 +1675,7 @@ module Hwaro
           config.feeds.sections = sections.compact_map(&.as_s?)
         end
         config.feeds.default_language_only = bool_value(s["default_language_only"]?, config.feeds.default_language_only)
+        config.feeds.full_content = bool_value(s["full_content"]?, config.feeds.full_content)
       end
 
       private def self.load_search(config : Config)
@@ -843,6 +1684,7 @@ module Hwaro
         config.search.enabled = bool_value(s["enabled"]?, config.search.enabled)
         config.search.format = s["format"]?.try(&.as_s?) || config.search.format
         config.search.filename = s["filename"]?.try(&.as_s?) || config.search.filename
+        validate_output_filename!("search", "filename", config.search.filename, "search.json", allow_empty: false)
         if fields = s["fields"]?.try(&.as_a?)
           config.search.fields = fields.compact_map(&.as_s?)
         end
@@ -881,6 +1723,37 @@ module Hwaro
         end
       end
 
+      # Loads `hwaro new` scaffold settings from `[content.new]` (preferred)
+      # or falls back to flat keys on `[content]` so short configs like
+      # `[content]\nfront_matter_format = "yaml"` also work. The fallback is
+      # scoped to the two recognised keys so unrelated `[content]` sub-tables
+      # (e.g. `[content.files]`) can never be misread as `new`-scaffold input.
+      private def self.load_content_new(config : Config)
+        return unless content_section = config.raw["content"]?.try(&.as_h?)
+
+        nested = content_section["new"]?.try(&.as_h?)
+        format_any = nested.try(&.[]?("front_matter_format")) || content_section["front_matter_format"]?
+        fields_any = nested.try(&.[]?("default_fields")) || content_section["default_fields"]?
+        bundle_any = nested.try(&.[]?("bundle")) || content_section["bundle"]?
+
+        if format = format_any.try(&.as_s?)
+          normalized = format.downcase
+          if ContentNewConfig::VALID_FORMATS.includes?(normalized)
+            config.content_new.front_matter_format = normalized
+          else
+            Logger.warn "Unknown content.new.front_matter_format '#{format}', keeping '#{config.content_new.front_matter_format}'"
+          end
+        end
+
+        if fields = fields_any.try(&.as_a?)
+          config.content_new.default_fields = fields.compact_map(&.as_s?)
+        end
+
+        if bundle = bundle_any.try(&.as_bool?)
+          config.content_new.bundle = bundle
+        end
+      end
+
       private def self.load_pagination(config : Config)
         return unless s = config.raw["pagination"]?.try(&.as_h?)
 
@@ -894,6 +1767,15 @@ module Hwaro
         config.highlight.enabled = bool_value(s["enabled"]?, config.highlight.enabled)
         config.highlight.theme = s["theme"]?.try(&.as_s?) || config.highlight.theme
         config.highlight.use_cdn = bool_value(s["use_cdn"]?, config.highlight.use_cdn)
+        config.highlight.line_numbers = bool_value(s["line_numbers"]?, config.highlight.line_numbers)
+        config.highlight.copy = bool_value(s["copy"]?, config.highlight.copy)
+        if mode = s["mode"]?.try(&.as_s?)
+          if mode == "client" || mode == "server"
+            config.highlight.mode = mode
+          else
+            Logger.warn "Unknown highlight.mode '#{mode}' — expected \"client\" or \"server\". Using \"server\"."
+          end
+        end
       end
 
       private def self.load_auto_includes(config : Config)
@@ -920,10 +1802,91 @@ module Hwaro
           config.og.auto_image.background = ai["background"]?.try(&.as_s?) || config.og.auto_image.background
           config.og.auto_image.text_color = ai["text_color"]?.try(&.as_s?) || config.og.auto_image.text_color
           config.og.auto_image.accent_color = ai["accent_color"]?.try(&.as_s?) || config.og.auto_image.accent_color
-          config.og.auto_image.font_size = int_value(ai["font_size"]?, config.og.auto_image.font_size)
+          config.og.auto_image.secondary_color = ai["secondary_color"]?.try(&.as_s?)
+          # Clamp to the OG canvas: og_image.cr hands this straight to
+          # stb_truetype as the glyph pixel scale, and a value far past the
+          # 1200x630 canvas (150000 was the observed threshold) makes
+          # stbtt_Rasterize write past its glyph bitmap — an out-of-bounds C
+          # write that takes the process down with SIGSEGV, or kills `hwaro
+          # serve` outright on one request when `lazy_generate` is on. A glyph
+          # taller than the image can never render usefully, so 630 is both the
+          # safe bound and the last visually meaningful one. The low bound is
+          # cosmetic: og_image.cr replaces anything <= 48 with a style default.
+          config.og.auto_image.font_size = int_value(ai["font_size"]?, config.og.auto_image.font_size).clamp(8, 630)
           config.og.auto_image.logo = ai["logo"]?.try(&.as_s?)
           config.og.auto_image.output_dir = ai["output_dir"]?.try(&.as_s?) || config.og.auto_image.output_dir
+          config.og.auto_image.show_title = bool_value(ai["show_title"]?, config.og.auto_image.show_title)
+          config.og.auto_image.style = ai["style"]?.try(&.as_s?) || config.og.auto_image.style
+          # Opacity-style floats share pattern_scale's hazard below: TOML
+          # accepts `nan`/`inf` literals, NaN survives the renderer's
+          # clamp(0.0, 1.0) (NaN comparisons are all false), and the pixel
+          # blend's `.to_u8` then raises OverflowError, aborting the build.
+          # A non-finite value falls back to the field's default.
+          po = float_value(ai["pattern_opacity"]?, config.og.auto_image.pattern_opacity)
+          config.og.auto_image.pattern_opacity = po.finite? ? po : config.og.auto_image.pattern_opacity
+          # Clamp to a sane range: the pattern renderer multiplies scale into
+          # Int32 expressions (e.g. (80 * scale).to_i), so a huge value overflows
+          # Int32 and crashes OG generation. 0.1..10.0 covers every visible scale;
+          # a non-finite (nan) value falls back to the default.
+          ps = float_value(ai["pattern_scale"]?, config.og.auto_image.pattern_scale)
+          config.og.auto_image.pattern_scale = ps.finite? ? ps.clamp(0.1, 10.0) : 1.0
+          config.og.auto_image.background_image = ai["background_image"]?.try(&.as_s?)
+          oo = float_value(ai["overlay_opacity"]?, config.og.auto_image.overlay_opacity)
+          config.og.auto_image.overlay_opacity = oo.finite? ? oo : config.og.auto_image.overlay_opacity
+          config.og.auto_image.format = ai["format"]?.try(&.as_s?) || config.og.auto_image.format
+          config.og.auto_image.font_path = ai["font_path"]?.try(&.as_s?)
+          if lp = ai["logo_position"]?.try(&.as_s?)
+            if {"bottom-left", "bottom-right", "top-left", "top-right"}.includes?(lp)
+              config.og.auto_image.logo_position = lp
+            end
+          end
+          tp = float_value(ai["text_panel"]?, config.og.auto_image.text_panel)
+          config.og.auto_image.text_panel = tp.finite? ? tp : config.og.auto_image.text_panel
+          config.og.auto_image.accent_bars = bool_value(ai["accent_bars"]?, config.og.auto_image.accent_bars)
+          config.og.auto_image.lazy_generate = bool_value(ai["lazy_generate"]?, config.og.auto_image.lazy_generate)
         end
+      end
+
+      # Parses a `menus` TOML table (either the top-level `[[menus.*]]` set
+      # or a per-language `[[languages.<code>.menus.*]]` override) into
+      # `{menu_name => [MenuItemConfig]}`. Shared by `load_menus` and
+      # `load_languages` so both surfaces accept identical entry shapes.
+      private def self.parse_menu_tables(h : Hash(String, TOML::Any)) : Hash(String, Array(MenuItemConfig))
+        result = {} of String => Array(MenuItemConfig)
+
+        h.each do |menu_name, menu_value|
+          entries = menu_value.as_a?
+          next unless entries
+
+          result[menu_name] = entries.compact_map do |entry_any|
+            entry_hash = entry_any.as_h?
+            unless entry_hash
+              Logger.warn "Ignoring non-table entry in [[menus.#{menu_name}]]"
+              next
+            end
+
+            name = entry_hash["name"]?.try(&.as_s?)
+            unless name
+              Logger.warn "Skipping [[menus.#{menu_name}]] entry missing required `name`"
+              next
+            end
+
+            item = MenuItemConfig.new(name)
+            item.url = entry_hash["url"]?.try(&.as_s?) || ""
+            item.weight = int_value(entry_hash["weight"]?, 0)
+            item.identifier = entry_hash["identifier"]?.try(&.as_s?) || name
+            item.parent = entry_hash["parent"]?.try(&.as_s?)
+            item
+          end
+        end
+
+        result
+      end
+
+      private def self.load_menus(config : Config)
+        return unless menus_section = config.raw["menus"]?.try(&.as_h?)
+
+        config.menus = parse_menu_tables(menus_section)
       end
 
       private def self.load_taxonomies(config : Config)
@@ -939,13 +1902,34 @@ module Hwaro
           taxonomy = TaxonomyConfig.new(name)
           taxonomy.feed = bool_value(taxonomy_hash["feed"]?, taxonomy.feed)
           taxonomy.sitemap = bool_value(taxonomy_hash["sitemap"]?, taxonomy.sitemap)
-          taxonomy.paginate_by = taxonomy_hash["paginate_by"]?.try { |v| v.as_i? || v.as_f?.try(&.to_i) }
+          taxonomy.paginate_by = taxonomy_hash["paginate_by"]?.try { |v| int_or_nil(v) }
+          if sort_by = taxonomy_hash["sort_by"]?.try(&.as_s?)
+            if {"date", "title", "weight"}.includes?(sort_by)
+              taxonomy.sort_by = sort_by
+            else
+              Logger.warn "Unknown taxonomy sort_by '#{sort_by}' for '#{name}' — expected \"date\", \"title\" or \"weight\". Using \"date\"."
+            end
+          end
+          taxonomy.reverse = bool_value(taxonomy_hash["reverse"]?, taxonomy.reverse)
+          if terms_sort_by = taxonomy_hash["terms_sort_by"]?.try(&.as_s?)
+            if {"name", "count"}.includes?(terms_sort_by)
+              taxonomy.terms_sort_by = terms_sort_by
+            else
+              Logger.warn "Unknown taxonomy terms_sort_by '#{terms_sort_by}' for '#{name}' — expected \"name\" or \"count\". Using \"name\"."
+            end
+          end
           taxonomy
         end
       end
 
       private def self.load_languages(config : Config)
         return unless s = config.raw["languages"]?.try(&.as_h?)
+
+        # Collect into a local hash and assign through `languages=` at the
+        # end: the setter invalidates the `multilingual?` memo, so the
+        # invariant holds structurally instead of depending on nothing
+        # having called `multilingual?` before this loader runs.
+        languages = config.languages.dup
 
         s.each do |lang_code, lang_data|
           next unless lang_hash = lang_data.as_h?
@@ -958,14 +1942,35 @@ module Hwaro
 
           if taxonomies = lang_hash["taxonomies"]?.try(&.as_a?)
             lang_config.taxonomies = taxonomies.compact_map(&.as_s?)
+          else
+            # No per-language `taxonomies` key → inherit the global
+            # `[[taxonomies]]` set rather than the hardcoded `["tags",
+            # "categories"]` default. Otherwise a `[languages.<code>]` block
+            # that omits the key silently restricts that language to two
+            # taxonomies, dropping any third (e.g. `authors`) from its output —
+            # for the default language that means a taxonomy generated before
+            # this block existed would disappear at the root. `load_taxonomies`
+            # runs before `load_languages`, so `config.taxonomies` is populated.
+            lang_config.taxonomies = config.taxonomies.map(&.name)
           end
 
-          config.languages[lang_code] = lang_config
+          if menus = lang_hash["menus"]?.try(&.as_h?)
+            lang_config.menus = parse_menu_tables(menus)
+          end
+          # No per-language `menus` key → leave `lang_config.menus` as `nil`,
+          # signalling "inherit the global `[[menus.*]]` set wholesale" to
+          # `Content::Menus.build`.
+
+          languages[lang_code] = lang_config
         end
+
+        config.languages = languages
       end
 
       private def self.load_build(config : Config)
         return unless s = config.raw["build"]?.try(&.as_h?)
+
+        config.build.template_deps = bool_value(s["template_deps"]?, config.build.template_deps)
 
         if hooks_section = s["hooks"]?.try(&.as_h?)
           if pre_hooks = hooks_section["pre"]?.try(&.as_a?)
@@ -975,6 +1980,23 @@ module Hwaro
             config.build.hooks.post = post_hooks.compact_map(&.as_s?)
           end
         end
+      end
+
+      private def self.load_serve(config : Config)
+        return unless s = config.raw["serve"]?.try(&.as_h?)
+
+        if headers_table = s["headers"]?.try(&.as_h?)
+          headers_table.each do |name, value|
+            next unless str = value.as_s?
+            next if name.each_char.any? { |c| c.ascii_control? || c == ':' } ||
+                    str.each_char.any?(&.ascii_control?)
+
+            config.serve.headers[name] = str
+          end
+        end
+
+        # Fast dev mode default (can be overridden by CLI flags like --fast or explicit --skip-*)
+        config.serve.fast = bool_value(s["fast"]?, config.serve.fast)
       end
 
       private def self.load_markdown(config : Config)
@@ -991,6 +2013,29 @@ module Hwaro
         if engine = s["math_engine"]?.try(&.as_s?)
           config.markdown.math_engine = engine
         end
+        config.markdown.admonitions = bool_value(s["admonitions"]?, config.markdown.admonitions)
+        config.markdown.heading_ids = bool_value(s["heading_ids"]?, config.markdown.heading_ids)
+        config.markdown.ins = bool_value(s["ins"]?, config.markdown.ins)
+        config.markdown.mark = bool_value(s["mark"]?, config.markdown.mark)
+        config.markdown.sub = bool_value(s["sub"]?, config.markdown.sub)
+        config.markdown.sup = bool_value(s["sup"]?, config.markdown.sup)
+        config.markdown.attributes = bool_value(s["attributes"]?, config.markdown.attributes)
+        config.markdown.smart_punctuation = bool_value(s["smart_punctuation"]?, config.markdown.smart_punctuation)
+        config.markdown.external_links_target_blank = bool_value(s["external_links_target_blank"]?, config.markdown.external_links_target_blank)
+        config.markdown.external_links_no_follow = bool_value(s["external_links_no_follow"]?, config.markdown.external_links_no_follow)
+        config.markdown.external_links_no_referrer = bool_value(s["external_links_no_referrer"]?, config.markdown.external_links_no_referrer)
+        config.markdown.task_list_classes = bool_value(s["task_list_classes"]?, config.markdown.task_list_classes)
+        config.markdown.containers = bool_value(s["containers"]?, config.markdown.containers)
+        if anchors = s["insert_anchor_links"]?.try(&.as_s?)
+          if anchors.in?("none", "left", "right", "before", "after")
+            config.markdown.insert_anchor_links = anchors
+          else
+            # Zola's "heading" style (whole heading as a link) is not
+            # implemented — warn and keep the default rather than silently
+            # rendering something different from what was asked for.
+            Logger.warn "config: unknown [markdown] insert_anchor_links value #{anchors.inspect} (expected none/left/right); using \"none\""
+          end
+        end
       end
 
       private def self.load_series(config : Config)
@@ -1003,9 +2048,26 @@ module Hwaro
         return unless s = config.raw["related"]?.try(&.as_h?)
 
         config.related.enabled = bool_value(s["enabled"]?, config.related.enabled)
-        config.related.limit = int_value(s["limit"]?, config.related.limit)
+        # Clamp at the source so every consumer sees a sane value. A negative
+        # limit reaches `Array#first(limit)` in the incremental related-posts
+        # rebuild (transform.cr) and raises `ArgumentError: Negative count`,
+        # crashing `serve` watch rebuilds (the full build guards `limit <= 0`,
+        # the incremental path did not — clamping fixes both uniformly).
+        config.related.limit = int_value(s["limit"]?, config.related.limit).clamp(0, Int32::MAX)
         if taxonomies = s["taxonomies"]?.try(&.as_a?)
           config.related.taxonomies = taxonomies.compact_map(&.as_s?)
+        end
+      end
+
+      private def self.load_links(config : Config)
+        return unless s = config.raw["links"]?.try(&.as_h?)
+
+        if mode = s["broken_internal"]?.try(&.as_s?)
+          if mode == "warn" || mode == "error"
+            config.links.broken_internal = mode
+          else
+            Logger.warn "Unknown [links] broken_internal value '#{mode}' — expected \"warn\" or \"error\"; keeping \"warn\"."
+          end
         end
       end
 
@@ -1014,7 +2076,20 @@ module Hwaro
 
         s.each do |k, v|
           if target = v.as_s?
-            config.permalinks[k] = target
+            # Token patterns (e.g. "/:year/:month/:slug/") rebuild whole
+            # URLs at resolve time. Validate tokens up front so a typo'd
+            # `:tokne` fails the config load instead of emitting literal
+            # `:tokne` path segments.
+            Utils::PermalinkResolver.validate_pattern!(k, target) if Utils::PermalinkResolver.pattern?(target)
+            # Strip surrounding slashes from BOTH the source key and the
+            # target — only the OUTER slashes; interior structure (pattern
+            # or remap) must survive verbatim. The resolver matches against
+            # slash-free directory paths and interpolates the target as
+            # `/#{effective_dir}/`, so a key or target written with
+            # leading/trailing slashes (e.g. `"/blog/"`) would otherwise
+            # silently never match (source) or produce double-slash URLs
+            # like `http://host//blog//p/` (target).
+            config.permalinks[k.strip("/")] = target.strip("/")
           end
         end
       end
@@ -1045,6 +2120,16 @@ module Hwaro
         end
       end
 
+      private def self.load_sass(config : Config)
+        if s = config.raw["sass"]?.try(&.as_h?)
+          config.sass.enabled = bool_value(s["enabled"]?, config.sass.enabled)
+          config.sass.minify = bool_value(s["minify"]?, config.sass.minify)
+        end
+        # [auto_includes] enumerates the *source* tree, so it has to know
+        # whether `.scss` entries will become sibling `.css` outputs.
+        config.auto_includes.sass_enabled = config.sass.enabled
+      end
+
       private def self.load_amp(config : Config)
         return unless s = config.raw["amp"]?.try(&.as_h?)
 
@@ -1072,6 +2157,13 @@ module Hwaro
         if precache = s["precache_urls"]?.try(&.as_a?)
           config.pwa.precache_urls = precache.compact_map(&.as_s?)
         end
+        if strategy = s["cache_strategy"]?.try(&.as_s?)
+          if PwaConfig::VALID_STRATEGIES.includes?(strategy)
+            config.pwa.cache_strategy = strategy
+          else
+            Logger.warn "Unknown pwa.cache_strategy '#{strategy}', using 'cache-first'"
+          end
+        end
       end
 
       private def self.load_image_processing(config : Config)
@@ -1081,9 +2173,33 @@ module Hwaro
         config.image_processing.quality = int_value(s["quality"]?, config.image_processing.quality).clamp(1, 100)
         if widths = s["widths"]?.try(&.as_a?)
           config.image_processing.widths = widths.compact_map { |w|
-            val = w.as_i? || w.as_f?.try(&.to_i)
+            val = int_or_nil(w)
             val && val > 0 ? val : nil
           }
+        end
+
+        # LQIP sub-config: [image_processing.lqip]
+        if lqip = s["lqip"]?.try(&.as_h?)
+          config.image_processing.lqip_enabled = bool_value(lqip["enabled"]?, config.image_processing.lqip_enabled)
+          config.image_processing.lqip_width = int_value(lqip["width"]?, config.image_processing.lqip_width).clamp(8, 128)
+          config.image_processing.lqip_quality = int_value(lqip["quality"]?, config.image_processing.lqip_quality).clamp(1, 100)
+        end
+      end
+
+      private def self.load_doctor(config : Config)
+        return unless s = config.raw["doctor"]?.try(&.as_h?)
+
+        if ignore = s["ignore"]?.try(&.as_a?)
+          config.doctor.ignore = ignore.compact_map(&.as_s?)
+        end
+      end
+
+      private def self.load_static(config : Config)
+        return unless s = config.raw["static"]?.try(&.as_h?)
+
+        config.static.use_default_excludes = bool_value(s["use_default_excludes"]?, config.static.use_default_excludes)
+        if exclude_any = s["exclude"]?
+          config.static.exclude = string_or_array(exclude_any)
         end
       end
 
@@ -1103,11 +2219,11 @@ module Hwaro
         end
 
         max_deletes_any = s["maxDeletes"]? || s["max_deletes"]?
-        if max_deletes_val = max_deletes_any.try { |v| v.as_i? || v.as_f?.try(&.to_i) }
+        if max_deletes_val = max_deletes_any.try { |v| int_or_nil(v) }
           config.deployment.max_deletes = max_deletes_val
         end
 
-        if workers_val = s["workers"]?.try { |v| v.as_i? || v.as_f?.try(&.to_i) }
+        if workers_val = s["workers"]?.try { |v| int_or_nil(v) }
           config.deployment.workers = workers_val
         end
 
@@ -1131,7 +2247,12 @@ module Hwaro
 
           target = DeploymentTarget.new
           target.name = name
-          target.url = target_h["URL"]?.try(&.as_s?) || target_h["url"]?.try(&.as_s?) || ""
+          # `path = "/tmp/out"` is the obvious shape for the
+          # local-filesystem case and matches what Hugo / Jekyll users
+          # try first. Treat it as an alias for `url`; the deployer
+          # already routes bare local paths to its native copy
+          # implementation (gh#529).
+          target.url = target_h["URL"]?.try(&.as_s?) || target_h["url"]?.try(&.as_s?) || target_h["path"]?.try(&.as_s?) || ""
           target.command = target_h["command"]?.try(&.as_s?)
           target.include = target_h["include"]?.try(&.as_s?)
           target.exclude = target_h["exclude"]?.try(&.as_s?)
@@ -1166,6 +2287,37 @@ module Hwaro
           end
           matcher
         end
+      end
+
+      private def self.load_outputs(config : Config)
+        return unless s = config.raw["outputs"]?.try(&.as_h?)
+
+        if page_any = s["page"]?
+          config.outputs.page = validate_output_formats(string_or_array(page_any))
+        end
+        if section_any = s["section"]?
+          config.outputs.section = validate_output_formats(string_or_array(section_any))
+        end
+        if sections = s["sections"]?.try(&.as_a?)
+          config.outputs.sections = sections.compact_map(&.as_s?)
+        end
+      end
+
+      # Validate `[outputs]` format names against `OutputsConfig::VALID_FORMATS`.
+      # Raises a classified `HWARO_E_CONFIG` error (rather than warning and
+      # falling back) because an unknown format silently produces no output —
+      # a user who typos "jso" for "json" deserves a build failure, not a
+      # quietly-missing file.
+      private def self.validate_output_formats(formats : Array(String)) : Array(String)
+        formats.each do |fmt|
+          next if OutputsConfig::VALID_FORMATS.includes?(fmt)
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_CONFIG,
+            message: "Unknown output format '#{fmt}' in [outputs]. Valid formats: #{OutputsConfig::VALID_FORMATS.join(", ")}.",
+            hint: "Use one of: #{OutputsConfig::VALID_FORMATS.join(", ")}.",
+          )
+        end
+        formats
       end
     end
   end

@@ -122,37 +122,37 @@ describe Hwaro::Utils::JsMinifier do
     # Double-quoted string preservation
     # =========================================================================
     it "preserves strings with // inside" do
-      js = %{var url = "http://example.com";}
+      js = %(var url = "http://example.com";)
       result = Hwaro::Utils::JsMinifier.minify(js)
       result.should contain("http://example.com")
     end
 
     it "preserves strings with /* inside" do
-      js = %{var s = "/* not a comment */";}
+      js = %(var s = "/* not a comment */";)
       result = Hwaro::Utils::JsMinifier.minify(js)
       result.should contain("/* not a comment */")
     end
 
     it "preserves strings with escaped double quotes" do
-      js = %{var s = "he said \\"hello\\"";}
+      js = %(var s = "he said \\"hello\\"";)
       result = Hwaro::Utils::JsMinifier.minify(js)
       result.should contain("he said \\\"hello\\\"")
     end
 
     it "preserves empty double-quoted strings" do
-      js = %{var s = "";}
+      js = %(var s = "";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{""})
+      result.should contain(%(""))
     end
 
     it "preserves strings with backslashes" do
-      js = %{var s = "path\\\\to\\\\file";}
+      js = %(var s = "path\\\\to\\\\file";)
       result = Hwaro::Utils::JsMinifier.minify(js)
       result.should contain("path\\\\to\\\\file")
     end
 
     it "preserves string with backslash-n" do
-      js = %{var s = "line1\\nline2";}
+      js = %(var s = "line1\\nline2";)
       result = Hwaro::Utils::JsMinifier.minify(js)
       result.should contain("line1\\nline2")
     end
@@ -224,15 +224,55 @@ describe Hwaro::Utils::JsMinifier do
       result.should contain("${fn(c)}")
     end
 
+    it "does not terminate early on a string containing '}' inside interpolation" do
+      # The '}' inside the string literal must not be counted as the
+      # interpolation's closing brace, which would close the template early
+      # and strip the trailing `/* ... */` as a comment.
+      js = "let a = `A${ ('}') + 'x' }B`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("`A${ ('}') + 'x' }B`")
+    end
+
+    it "preserves object literals inside interpolation" do
+      js = "let a = `v=${ {x: 1}.x }`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("`v=${ {x: 1}.x }`")
+    end
+
+    it "preserves nested template literals and their comment-like content" do
+      js = "let a = `A${ ('}') + `/* not a comment */` }B`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      # The nested template and its `/* ... */` body must survive intact.
+      result.should contain("`/* not a comment */`")
+      result.should contain("}B`")
+    end
+
+    it "is not misaligned by a backtick inside a block comment in an interpolation" do
+      # The backtick inside the `/* ` */` comment must not be treated as a
+      # nested template start; the template ends at its real backtick and the
+      # trailing standalone comment is still stripped.
+      js = "fn(`${a + /* ` */ 1}`); /* strip */ var x = 1;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("`${a + /* ` */ 1}`")
+      result.should_not contain("strip")
+    end
+
+    it "is not misaligned by a backtick inside a line comment in an interpolation" do
+      js = "var s = `${a // ` b\n}`; /* gone */ var z = 1;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("`${a // ` b\n}`")
+      result.should_not contain("gone")
+    end
+
     # =========================================================================
     # Consecutive string and comment
     # =========================================================================
     it "handles string followed by comment on same line" do
-      js = %{var s = "value"; // comment\nvar t = "other";}
+      js = %(var s = "value"; // comment\nvar t = "other";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{var s = "value";})
+      result.should contain(%(var s = "value";))
       result.should_not contain("comment")
-      result.should contain(%{var t = "other";})
+      result.should contain(%(var t = "other";))
     end
 
     it "handles comment followed by string" do
@@ -243,10 +283,10 @@ describe Hwaro::Utils::JsMinifier do
     end
 
     it "handles adjacent strings" do
-      js = %{var a = "one" + "two";}
+      js = %(var a = "one" + "two";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{"one"})
-      result.should contain(%{"two"})
+      result.should contain(%("one"))
+      result.should contain(%("two"))
     end
 
     # =========================================================================
@@ -261,7 +301,7 @@ describe Hwaro::Utils::JsMinifier do
     it "removes trailing whitespace from lines" do
       js = "var x = 1;   \nvar y = 2;  "
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.lines.each do |line|
+      result.each_line do |line|
         line.should eq(line.rstrip)
       end
     end
@@ -296,9 +336,9 @@ describe Hwaro::Utils::JsMinifier do
     end
 
     it "handles input that is just a string" do
-      js = %{"hello"}
+      js = %("hello")
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should eq(%{"hello"})
+      result.should eq(%("hello"))
     end
 
     it "handles input that is just a number" do
@@ -382,16 +422,16 @@ describe Hwaro::Utils::JsMinifier do
     end
 
     it "preserves JSON-like content" do
-      js = %{var config = {"url": "http://api.example.com", "timeout": 5000};}
+      js = %(var config = {"url": "http://api.example.com", "timeout": 5000};)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{"url": "http://api.example.com"})
-      result.should contain(%{"timeout": 5000})
+      result.should contain(%("url": "http://api.example.com"))
+      result.should contain(%("timeout": 5000))
     end
 
     it "handles regex-like pattern in string" do
-      js = %{var pattern = "/test/gi";}
+      js = %(var pattern = "/test/gi";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{"/test/gi"})
+      result.should contain(%("/test/gi"))
     end
 
     it "handles switch statement" do
@@ -412,9 +452,9 @@ describe Hwaro::Utils::JsMinifier do
     # Unicode
     # =========================================================================
     it "preserves unicode in strings" do
-      js = %{var name = "한글 이름";}
+      js = %(var name = "한글 이름";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{"한글 이름"})
+      result.should contain(%("한글 이름"))
     end
 
     it "preserves unicode in identifiers" do
@@ -424,9 +464,9 @@ describe Hwaro::Utils::JsMinifier do
     end
 
     it "preserves emoji in strings" do
-      js = %{var msg = "Hello 👋 World";}
+      js = %(var msg = "Hello 👋 World";)
       result = Hwaro::Utils::JsMinifier.minify(js)
-      result.should contain(%{"Hello 👋 World"})
+      result.should contain(%("Hello 👋 World"))
     end
 
     # =========================================================================
@@ -466,7 +506,7 @@ describe Hwaro::Utils::JsMinifier do
     # Unterminated constructs
     # =========================================================================
     it "handles unterminated string at end of input" do
-      js = %{var s = "unterminated}
+      js = %(var s = "unterminated)
       result = Hwaro::Utils::JsMinifier.minify(js)
       # Should not crash, output something reasonable
       result.should contain("var s = ")
@@ -490,6 +530,114 @@ describe Hwaro::Utils::JsMinifier do
       result.should contain("var x = 1;")
       # The */ is just literal characters
       result.should contain("*/")
+    end
+
+    it "handles nested braces inside template literal interpolation" do
+      js = "var s = `${obj.map(x => { return x; })}`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("`${obj.map(x => { return x; })}`")
+    end
+
+    it "handles multiple template literal interpolations" do
+      js = "var s = `${a} + ${b} = ${a + b}`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("${a}")
+      result.should contain("${b}")
+      result.should contain("${a + b}")
+    end
+
+    it "handles comment-like pattern in template literal" do
+      js = "var s = `// not a comment\n/* also not */`;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("// not a comment")
+      result.should contain("/* also not */")
+    end
+
+    it "preserves regex-like division after parenthesis" do
+      js = "var x = (a + b) / c;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("(a + b) / c")
+    end
+
+    it "handles string with backslash at end" do
+      js = %(var s = "end\\\\"; var x = 1;)
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("var x = 1;")
+    end
+
+    # =========================================================================
+    # Regex literal preservation
+    # =========================================================================
+    it "preserves regex literal in assignment" do
+      js = "var re = /foo/gi;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("/foo/gi")
+    end
+
+    it "preserves regex literal after operator" do
+      js = "if (/bar/.test(x)) {}"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("/bar/.test(x)")
+    end
+
+    it "preserves regex literal after comma" do
+      js = "fn(a, /pattern/)"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("/pattern/")
+    end
+
+    it "preserves regex with escaped slash" do
+      js = "var re = /foo\\/bar/;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("/foo\\/bar/")
+    end
+
+    it "treats slash after identifier as division" do
+      js = "var x = a / b;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("a / b")
+    end
+
+    it "treats slash after closing paren as division" do
+      js = "var x = (a + b) / c;"
+      result = Hwaro::Utils::JsMinifier.minify(js)
+      result.should contain("(a + b) / c")
+    end
+
+    # =========================================================================
+    # Block-comment removal must leave a token separator (A1)
+    # =========================================================================
+    it "keeps tokens separated when a block comment sits between them" do
+      result = Hwaro::Utils::JsMinifier.minify("return/*x*/g(1)")
+      result.should eq("return g(1)")
+    end
+
+    it "keeps the function keyword separated from its name across a block comment" do
+      result = Hwaro::Utils::JsMinifier.minify("function/*c*/name(){}")
+      result.should eq("function name(){}")
+    end
+
+    it "emits a newline for a block comment containing a line terminator (ASI)" do
+      # A multi-line comment counts as a LineTerminator for automatic
+      # semicolon insertion, so `return /*\n*/ 42` must stay `return` and
+      # `42` on separate lines — collapsing to one line changes semantics.
+      result = Hwaro::Utils::JsMinifier.minify("return /*\n*/ 42")
+      result.should eq("return\n 42")
+    end
+
+    it "handles terser-style pure annotations without fusing tokens" do
+      result = Hwaro::Utils::JsMinifier.minify("return/*#__PURE__*/e(t)")
+      result.should eq("return e(t)")
+    end
+
+    it "leaves a counterfeit out-of-range JSPL placeholder token intact" do
+      # A real template literal makes protected_spans non-empty so the restore
+      # gsub actually runs; the bogus \x00JSPL999\x00 token has an out-of-range
+      # index, so the bounds guard emits it unchanged rather than raising.
+      # If the guard regressed, minify would raise IndexError here and fail.
+      result = Hwaro::Utils::JsMinifier.minify("var t = `hi`; var s = \"\u{0}JSPL999\u{0}\";")
+      result.should contain("\u{0}JSPL999\u{0}") # bogus token survives verbatim
+      result.should contain("`hi`")              # real template literal restored
     end
   end
 end

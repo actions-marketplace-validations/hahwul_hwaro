@@ -38,6 +38,14 @@ module Hwaro
         # Raw files (JSON, XML, etc.)
         property raw_files : Array(RawFile)
 
+        # Sections removed by an early (pre-ParseContent) draft/expired/future
+        # filter — e.g. a custom AfterReadContent hook — whose [cascade] must
+        # still reach their descendants. apply_cascades merges these with the
+        # surviving sections when building the cascade map. The default build
+        # filters inside the ParseContent phase (after cascades apply), so
+        # this stays empty there.
+        property excluded_cascade_sections : Array(Models::Section)
+
         # Templates
         property templates : Hash(String, String)
 
@@ -53,12 +61,48 @@ module Hwaro
         # Track build statistics
         property stats : BuildStats
 
+        # When `--fast-start` is active, this is populated with the subset of
+        # pages the initial pass should process (homepage + recent N + section
+        # indexes). BeforeRender hooks (OG image, image resize) consult this to
+        # skip work for the deferred subset; the background render pass clears
+        # it and re-runs those hooks for the rest. Nil outside of fast-start.
+        property priority_pages : Array(Models::Page)?
+
+        # True when the current run only handles a subset of the site's
+        # pages — set on both passes of a `--fast-start` session
+        # (priority + deferred). Hooks that persist per-page state
+        # (e.g. the OG image manifest) use this to skip the "truncate
+        # entries for missing pages" prune, so the second pass doesn't
+        # wipe the first pass's writes.
+        property partial_render : Bool = false
+
+        # Profiler reference (only set when --profile is active).
+        # Allows expensive hooks (OG image, image resize) to record their
+        # own timing so the true cost distribution inside the Render phase
+        # becomes visible.
+        property profiler : Hwaro::Profiler?
+
+        # The Builder driving this run. Hooks that render through a Builder
+        # (taxonomy generation) reuse it — its Crinja value caches are warm
+        # with every page already converted — instead of constructing a fresh
+        # Builder that re-converts the whole site a second time.
+        property builder : Build::Builder?
+
+        # True when the global page/section set changed since the previous
+        # cached build (page added/removed, listing metadata moved). Set by
+        # the Render phase BEFORE it records the new fingerprints — Generate
+        # can't re-check the cache itself at that point — so the SEO/search
+        # `skip_if_unchanged` fast path doesn't keep a deleted page in the
+        # sitemap/search index when no surviving page happened to re-render.
+        property page_or_section_set_changed : Bool = false
+
         @all_pages_cache : Array(Models::Page)?
 
         def initialize(@options : Config::Options::BuildOptions)
           @pages = [] of Models::Page
           @sections = [] of Models::Section
           @raw_files = [] of RawFile
+          @excluded_cascade_sections = [] of Models::Section
           @templates = {} of String => String
           @output_dir = options.output_dir
           @metadata = {} of String => String | Bool | Int32 | Float64
@@ -97,11 +141,20 @@ module Hwaro
         end
 
         def get_bool(key : String, default : Bool = false) : Bool
-          @metadata[key]?.try(&.as?(Bool)) || default
+          # NOTE: `value || default` is wrong here — a legitimately stored
+          # `false` is falsy and would collapse to `default`, inverting the
+          # flag a previous hook set. Distinguish "absent / wrong type" (nil)
+          # from a stored `false`.
+          val = @metadata[key]?.try(&.as?(Bool))
+          val.nil? ? default : val
         end
 
         def get_int(key : String, default : Int32 = 0) : Int32
-          @metadata[key]?.try(&.as?(Int32)) || default
+          # Same nil-vs-stored-value distinction as get_bool. `0 || default`
+          # happens to work (0 is truthy in Crystal) but the explicit form
+          # keeps the two getters consistent and intent-revealing.
+          val = @metadata[key]?.try(&.as?(Int32))
+          val.nil? ? default : val
         end
       end
 
@@ -110,6 +163,11 @@ module Hwaro
         property pages_read : Int32
         property pages_rendered : Int32
         property pages_skipped : Int32
+        # Outputs an error route refused to publish (a URL whose segment
+        # traverses, a refused alias). Distinct from `pages_skipped`, which
+        # counts drafts/future/expired filtered out by design.
+        property pages_unpublished : Int32 = 0
+        property pages_failed : Int32
         property files_written : Int32
         property cache_hits : Int32
         property raw_files_processed : Int32
@@ -120,6 +178,7 @@ module Hwaro
           @pages_read = 0
           @pages_rendered = 0
           @pages_skipped = 0
+          @pages_failed = 0
           @files_written = 0
           @cache_hits = 0
           @raw_files_processed = 0

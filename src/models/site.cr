@@ -18,10 +18,22 @@ module Hwaro
       # Lookup indices for performance
       property pages_by_section : Hash(String, Array(Page))
       property sections_by_parent : Hash(String, Array(Section))
-      property sections_by_name : Hash(String, Section)
+      # Keyed by (section path, language) so a multilingual site's per-language
+      # `_index.<lang>.md` files don't collide — previously a single
+      # `Hash(String, Section)` kept only the first-globbed language, making
+      # section title/description/sort_by/page_template resolve to the wrong
+      # language. Use `section_for(name, language)` to look up with fallback.
+      property sections_by_name : Hash(Tuple(String, String?), Section)
       property pages_for_section_cache : Hash(Tuple(String, String?), Array(Page))
       @lookup_index_built : Bool = false
       @all_content_cache : Array(Page)?
+      # Guards the lazy memo Hashes above: pages_for_section runs inside
+      # parallel render fibers (render_section_with_pagination), and an
+      # unsynchronized Hash insert there is undefined behavior under
+      # -Dpreview_mt. Held only around cache reads/writes — not the compute —
+      # so the transparent-section recursion can't self-deadlock; a racy
+      # duplicate compute is harmless (both fibers store the same result).
+      @memo_mutex : Mutex = Mutex.new
 
       def initialize(@config : Config)
         @pages = [] of Page
@@ -33,14 +45,23 @@ module Hwaro
 
         @pages_by_section = {} of String => Array(Page)
         @sections_by_parent = {} of String => Array(Section)
-        @sections_by_name = {} of String => Section
+        @sections_by_name = {} of Tuple(String, String?) => Section
         @pages_for_section_cache = {} of Tuple(String, String?) => Array(Page)
+      end
+
+      # Resolve a section by path for a given language, falling back to the
+      # language-neutral (default-language) index when no language-specific
+      # `_index.<lang>.md` exists, then to the configured default language.
+      def section_for(name : String, language : String?) : Section?
+        @sections_by_name[{name, language}]? ||
+          @sections_by_name[{name, nil}]? ||
+          @sections_by_name[{name, @config.default_language}]?
       end
 
       def taxonomy_terms(name : String) : Array(String)
         terms = @taxonomies[name]?
         return [] of String unless terms
-        terms.keys.sort
+        terms.keys.sort!
       end
 
       def taxonomy_pages(name : String, term : String) : Array(Page)
@@ -48,7 +69,9 @@ module Hwaro
       end
 
       def all_content : Array(Page)
-        @all_content_cache ||= (pages + sections.map { |s| s.as(Page) }).sort_by!(&.path)
+        @memo_mutex.synchronize do
+          @all_content_cache ||= (pages + sections.map { |s| s.as(Page) }).sort_by!(&.path)
+        end
       end
 
       def build_lookup_index
@@ -68,8 +91,8 @@ module Hwaro
         end
 
         @sections.each do |s|
-          # Index by section name for O(1) lookup
-          @sections_by_name[s.section] ||= s
+          # Index by (section name, language) for O(1) language-aware lookup
+          @sections_by_name[{s.section, s.language}] ||= s
 
           # s.section is the section this object represents (e.g. "blog").
           # We want to index it by its PARENT section (e.g. "").
@@ -94,14 +117,18 @@ module Hwaro
         # Normalize section name: remove leading/trailing slashes and handle root
         normalized_name = section_name.strip.strip('/')
 
-        # Guard against infinite recursion from circular transparent sections
-        seen = visited || Set(String).new
-        return [] of Page if seen.includes?(normalized_name)
-        seen.add(normalized_name)
+        # Guard against infinite recursion from circular transparent sections.
+        # The Set is created lazily at the first recursive call (below) — the
+        # top-level call was allocating one per invocation even on cache hits.
+        if visited
+          return [] of Page if visited.includes?(normalized_name)
+          visited.add(normalized_name)
+        end
+        seen = visited
 
         if @lookup_index_built && items.nil?
           cache_key = {normalized_name, language}
-          if cached = @pages_for_section_cache[cache_key]?
+          if cached = @memo_mutex.synchronize { @pages_for_section_cache[cache_key]? }
             return cached
           end
 
@@ -125,6 +152,7 @@ module Hwaro
                 subsection_name = Path[s.path].dirname.to_s
                 subsection_name = "" if subsection_name == "."
 
+                seen ||= Set{normalized_name}
                 result.concat(pages_for_section(subsection_name, language, nil, seen))
               else
                 # Non-transparent sections are included as Section (Page) objects
@@ -133,7 +161,7 @@ module Hwaro
             end
           end
 
-          @pages_for_section_cache[cache_key] = result
+          @memo_mutex.synchronize { @pages_for_section_cache[cache_key] = result }
           return result
         end
 
@@ -158,6 +186,7 @@ module Hwaro
             if parent_dir == normalized_name
               if p.transparent
                 # Recursive bubble up: get pages from this sub-section
+                seen ||= Set{normalized_name}
                 result.concat(pages_for_section(p_dirname, language, content_items, seen))
               else
                 # Non-transparent sections are included as Section (Page) objects

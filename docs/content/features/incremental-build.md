@@ -1,11 +1,15 @@
 +++
 title = "Incremental Build"
 description = "Only rebuild changed files for faster builds on large sites"
-weight = 10
+weight = 13
 toc = true
 +++
 
 Incremental build tracks file checksums and dependency changes to skip unchanged pages, significantly reducing rebuild times for large sites.
+
+```bash
+hwaro build --cache
+```
 
 ## When to Use
 
@@ -46,17 +50,31 @@ When mtime hasn't changed, the file is considered unchanged without reading its 
 
 ### Dependency invalidation
 
-Beyond per-file checksums, Hwaro tracks global dependencies:
+Beyond per-file checksums, Hwaro tracks what each page actually depends on:
 
-- **Template checksum** — a combined hash of all template files
-- **Config checksum** — a hash of `config.toml`
+- **Template closure** — the page's template plus everything it transitively
+  `extends`, `include`s, or `import`s, plus any shortcode templates the page
+  content invokes. Each page's cache entry stores a fingerprint of this
+  closure, so editing `partials/footer.html` only rebuilds the pages whose
+  template chain renders that partial.
+- **Cascade fingerprint** — the merged section `[cascade]` values applied to
+  the page, so editing a parent `_index.md` cascade rebuilds its descendants.
+- **Config checksum** — a hash of the effective merged config. A config
+  change invalidates **all** entries.
+- **Render hooks** — a fingerprint of every configured `templates/hooks/render-*`
+  template (see [Render Hooks](/templates/render-hooks/)) is folded into every
+  page's template closure. Since a hook isn't reached via a page's
+  `{% include %}`/`{% extends %}` graph, editing one re-renders **every**
+  page rather than a narrowed set.
 
-If either changes between builds, **all cache entries are invalidated** and every page is rebuilt. This ensures that template or config changes are always reflected across the entire site.
+Template dependency tracking requires every template reference to be a string
+literal. If any template uses a dynamic reference (`{% include some_var %}`),
+Hwaro falls back to whole-site invalidation: any template change rebuilds
+every page. You can also opt out explicitly:
 
-```
-Build N:   templates hash = abc123, config hash = def456
-Build N+1: templates hash = abc123, config hash = def456  → incremental (only changed content rebuilt)
-Build N+2: templates hash = xyz789, config hash = def456  → full invalidation (template changed)
+```toml
+[build]
+template_deps = false  # any template change rebuilds every page
 ```
 
 ### What gets skipped
@@ -74,7 +92,7 @@ The development server (`hwaro serve`) uses a more targeted incremental strategy
 | Change Type | Strategy |
 |-------------|----------|
 | Content files only | Re-parse and re-render only affected pages + neighbors |
-| Template files only | Re-render all pages with existing content (skip parsing) |
+| Template files only | Re-render only pages whose template closure includes an edited template (all pages when tracking is off, the graph has dynamic references, or the edited file is under `templates/hooks/`) |
 | Config file | Full rebuild |
 | Static files only | Copy only changed files |
 
@@ -111,7 +129,7 @@ hwaro build --cache
 hwaro build --cache --full
 
 # Combine with other flags
-hwaro build --cache --minify --parallel
+hwaro build --cache --minify
 ```
 
 ## See Also

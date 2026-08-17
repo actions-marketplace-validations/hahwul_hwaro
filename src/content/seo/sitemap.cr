@@ -1,4 +1,5 @@
 require "../../models/page"
+require "../discovery_pages"
 require "../../models/site"
 require "../../utils/logger"
 require "../../utils/text_utils"
@@ -7,31 +8,48 @@ module Hwaro
   module Content
     module Seo
       class Sitemap
-        def self.generate(pages : Array(Models::Page), site : Models::Site, output_dir : String, verbose : Bool = false)
+        def self.generate(pages : Array(Models::Page), site : Models::Site, output_dir : String, verbose : Bool = false, skip_if_unchanged : Bool = false)
           # Check if sitemap is enabled
           return unless site.config.sitemap.enabled
 
-          sitemap_pages = pages.select { |p| p.in_sitemap && p.render }
-
-          # Filter out excluded paths
-          unless site.config.sitemap.exclude.empty?
-            excluded_paths = site.config.sitemap.exclude.map do |path|
-              path.starts_with?('/') ? path : "/#{path}"
-            end
-
-            sitemap_pages.reject! do |page|
-              page_url = page.url.starts_with?('/') ? page.url : "/#{page.url}"
-              excluded_paths.any? { |excluded| page_url == excluded || page_url.starts_with?(excluded.ends_with?("/") ? excluded : excluded + "/") }
-            end
+          # `File.basename` here too — the write below basenames the configured
+          # filename, so probing the raw value made the cache-hit check look for
+          # a path that is never written and re-emit the sitemap every build.
+          if skip_if_unchanged && File.exists?(File.join(output_dir, File.basename(site.config.sitemap.filename)))
+            Logger.debug "  Sitemap unchanged (cache hit), skipping."
+            return
           end
 
+          # Match feeds/llms/search behavior: drafts and preview-only
+          # unpublished pages (--include-future/--include-expired) are
+          # excluded from public discovery surfaces even when the build is
+          # run with the corresponding include flag.
+          # `output_suppressed` too: a page the render phase declined to write
+          # because another page owns its output file must not be advertised
+          # as a URL — on a case-folding host it is a guaranteed 404.
+          sitemap_pages = pages.select { |p| p.in_sitemap && p.render && !p.draft && !p.unpublished && !p.output_suppressed }
+
+          sitemap_pages = DiscoveryPages.dedupe_by_url(sitemap_pages)
+          DiscoveryPages.reject_excluded!(sitemap_pages, site.config.sitemap.exclude)
+
           if sitemap_pages.empty?
-            Logger.info "  No pages to include in sitemap."
+            # Still (re)write the file: returning here left a PREVIOUS
+            # build's sitemap on disk when the last eligible page was
+            # drafted/excluded — stale URLs kept being served and deployed.
+            # An empty urlset is valid per the sitemap protocol.
+            Logger.info "  No pages to include in sitemap — writing an empty sitemap."
+            empty_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
+                        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n" \
+                        "</urlset>\n"
+            filename = File.basename(site.config.sitemap.filename)
+            sitemap_path = Path[output_dir, filename].to_s
+            Hwaro::Utils::FileSafe.atomic_write(sitemap_path, empty_xml)
+            Logger.action :create, sitemap_path if verbose
             return
           end
 
           if site.config.base_url.empty?
-            Logger.warn "base_url is empty. Sitemap will contain relative URLs instead of absolute URLs."
+            Logger.warn "base_url is empty. Sitemap, feeds, robots.txt, and SEO/social (canonical, og:url) URLs will use relative (or omitted) URLs instead of absolute ones. Set base_url for production deploys."
           end
 
           # Pre-compute config values once outside the loop
@@ -39,21 +57,62 @@ module Hwaro
           changefreq = site.config.sitemap.changefreq
           has_changefreq = !changefreq.empty?
           escaped_changefreq = has_changefreq ? Utils::TextUtils.escape_xml(changefreq) : ""
-          priority = site.config.sitemap.priority
+          # Clamp to the sitemap protocol's [0.0, 1.0] at the emit site so an
+          # out-of-range configured value can't produce an invalid sitemap. The
+          # loaded config value is left raw on purpose so `hwaro doctor` can still
+          # detect and warn about the misconfiguration (and offer to fix it).
+          priority = site.config.sitemap.priority.clamp(0.0, 1.0)
           priority_str = "    <priority>#{priority}</priority>\n"
+
+          # A translation link whose target page is never written (render =
+          # false, or a draft/preview-only unpublished page) would advertise
+          # a 404 to crawlers. Build the set of URLs that actually get output
+          # (same eligibility the <loc> entries use, minus in_sitemap — an
+          # in_sitemap=false page is still written and is a valid alternate)
+          # and filter hreflang alternates through it.
+          written_urls = Set(String).new
+          pages.each do |p|
+            written_urls << p.url if p.render && !p.draft && !p.unpublished
+          end
+
+          # Multilingual sites benefit from `<xhtml:link rel="alternate"
+          # hreflang="...">` entries on every translated URL — Google's
+          # recommended way to expose hreflang in sitemaps. Only declare
+          # the namespace when we'll actually use it (#486).
+          has_translations = sitemap_pages.any? { |p| p.translations.any? { |t| written_urls.includes?(t.url) } }
 
           xml_content = String.build(sitemap_pages.size * 256) do |str|
             str << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            str << "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+            if has_translations
+              str << "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n"
+            else
+              str << "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+            end
 
             sitemap_pages.each do |page|
               path = page.url.starts_with?('/') ? page.url : "/#{page.url}"
               full_url = base.empty? ? path : base + path
 
-              escaped_url = Utils::TextUtils.escape_xml(full_url)
+              # Percent-encode before XML-escaping: the sitemap protocol
+              # requires RFC 3986 URIs, so non-ASCII paths must be escaped.
+              escaped_url = Utils::TextUtils.escape_xml(Utils::TextUtils.encode_url_path(full_url))
 
               str << "  <url>\n"
               str << "    <loc>#{escaped_url}</loc>\n"
+
+              # Hreflang alternates — emit one per translation (including
+              # the current page itself; Google's spec asks for a self-
+              # referencing entry).
+              page.translations.each do |t|
+                next unless written_urls.includes?(t.url)
+                t_path = t.url.starts_with?('/') ? t.url : "/#{t.url}"
+                t_full = base.empty? ? t_path : base + t_path
+                str << "    <xhtml:link rel=\"alternate\" hreflang=\""
+                str << Utils::TextUtils.escape_xml(t.code)
+                str << "\" href=\""
+                str << Utils::TextUtils.escape_xml(Utils::TextUtils.encode_url_path(t_full))
+                str << "\" />\n"
+              end
 
               # Add lastmod if available
               if date = (page.updated || page.date)
@@ -74,9 +133,9 @@ module Hwaro
 
           filename = File.basename(site.config.sitemap.filename)
           sitemap_path = Path[output_dir, filename].to_s
-          File.write(sitemap_path, xml_content)
+          Hwaro::Utils::FileSafe.atomic_write(sitemap_path, xml_content)
           Logger.action :create, sitemap_path if verbose
-          Logger.info "  Generated sitemap with #{sitemap_pages.size} URLs."
+          Logger.info "  Generated sitemap with #{sitemap_pages.size} URLs." if verbose
         end
       end
     end

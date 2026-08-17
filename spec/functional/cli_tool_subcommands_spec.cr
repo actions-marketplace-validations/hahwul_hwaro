@@ -1,0 +1,512 @@
+require "../spec_helper"
+
+# =============================================================================
+# Functional CLI integration tests for `hwaro tool` subcommands that were
+# previously uncovered by `cli_commands_spec.cr` (which already covers
+# tool list, tool convert, tool doctor, and the top-level doctor).
+#
+# Each test spawns the built binary at bin/hwaro and asserts on exit status
+# plus filesystem side effects. CI builds the binary via `shards build`
+# before running specs.
+#
+# Note on streams: Hwaro::Logger.info / .success write to Logger.io (STDOUT
+# by default). Hwaro::Logger.warn / .error write to Logger.err_io (STDERR
+# by default). Tests assert on the captured stream that matches the
+# originating log method.
+# =============================================================================
+
+private HWARO_BIN = File.expand_path("../../bin/hwaro", __DIR__)
+
+# Pre-flight check: surface a clear error if the binary is missing rather
+# than letting every test fail with an inscrutable Process.run error.
+Spec.before_suite do
+  unless File.exists?(HWARO_BIN) && File::Info.executable?(HWARO_BIN)
+    raise "Binary #{HWARO_BIN} is missing or not executable. Run `shards build` first."
+  end
+end
+
+private def with_initialized_project(&)
+  temp_dir = File.tempname("hwaro_test")
+  Dir.mkdir(temp_dir)
+  project_dir = File.join(temp_dir, "test_site")
+  Dir.mkdir(project_dir)
+  begin
+    init_status = Process.run(HWARO_BIN, ["init", project_dir],
+      output: IO::Memory.new, error: IO::Memory.new)
+    init_status.success?.should be_true
+    yield project_dir
+  ensure
+    FileUtils.rm_rf(temp_dir) if Dir.exists?(temp_dir)
+  end
+end
+
+# Every test in this file runs the binary inside a temp project directory,
+# so chdir is required (not optional). Process.run is invoked uniformly.
+private def run_hwaro(args : Array(String), chdir : String)
+  output = IO::Memory.new
+  error = IO::Memory.new
+  status = Process.run(HWARO_BIN, args, chdir: chdir, output: output, error: error)
+  {status, output.to_s, error.to_s}
+end
+
+# Variant for router-level tests that don't require an initialized project.
+private def run_hwaro_no_chdir(args : Array(String))
+  output = IO::Memory.new
+  error = IO::Memory.new
+  status = Process.run(HWARO_BIN, args, output: output, error: error)
+  {status, output.to_s, error.to_s}
+end
+
+describe "hwaro tool (router)" do
+  it "exits 1 and prints help when no subcommand is given" do
+    status, output, _ = run_hwaro_no_chdir(["tool"])
+    status.success?.should be_false
+    output.should contain("Usage")
+    output.should contain("subcommand")
+  end
+
+  it "exits with HWARO_E_USAGE on an unknown subcommand" do
+    status, output, error = run_hwaro_no_chdir(["tool", "nonexistent-subcommand"])
+    status.success?.should be_false
+    status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+    # Structured classified error on stderr; help banner must not be
+    # dumped to stdout on a typo.
+    error.should contain("HWARO_E_USAGE")
+    error.should contain("unknown command 'tool nonexistent-subcommand'")
+    error.should contain("hwaro tool --help")
+    output.should_not contain("Available subcommands")
+  end
+
+  it "suggests the closest subcommand for near-miss typos" do
+    status, _, error = run_hwaro_no_chdir(["tool", "stts"])
+    status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+    error.should contain("Did you mean 'stats'?")
+  end
+
+  it "omits the suggestion when no candidate is close" do
+    status, _, error = run_hwaro_no_chdir(["tool", "xyzabc"])
+    status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+    error.should_not contain("Did you mean")
+    error.should contain("hwaro tool --help")
+  end
+
+  it "emits a JSON error payload under --json for an unknown subcommand" do
+    status, output, _ = run_hwaro_no_chdir(["tool", "nonexistent-subcommand", "--json"])
+    status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+    parsed = JSON.parse(output.strip)
+    parsed["status"].as_s.should eq("error")
+    parsed["error"]["code"].as_s.should eq("HWARO_E_USAGE")
+    parsed["error"]["message"].as_s.should contain("unknown command")
+  end
+
+  it "prints help and exits 0 when invoked with help" do
+    status, output, _ = run_hwaro_no_chdir(["tool", "help"])
+    status.success?.should be_true
+    output.should contain("Available subcommands")
+  end
+
+  it "categorizes visible subcommands under Content / Site headings" do
+    status, output, _ = run_hwaro_no_chdir(["tool", "--help"])
+    status.success?.should be_true
+    output.should contain("Content:")
+    output.should contain("Site:")
+  end
+end
+
+describe "hwaro tool stats" do
+  it "prints statistics for an initialized project" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "stats"], chdir: project_dir)
+      status.success?.should be_true
+    end
+  end
+
+  it "emits JSON matching the documented schema under --json" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(["tool", "stats", "--json"], chdir: project_dir)
+      status.success?.should be_true
+      # Must be a single JSON object parseable by external tools.
+      parsed = JSON.parse(output.strip)
+      parsed["total"].as_i?.should_not be_nil
+      parsed["published"].as_i?.should_not be_nil
+      parsed["drafts"].as_i?.should_not be_nil
+      parsed["word_count"]["total"].as_i?.should_not be_nil
+      parsed["tags"].as_h?.should_not be_nil
+    end
+  end
+end
+
+describe "hwaro tool validate" do
+  it "validates content of an initialized project" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "validate"], chdir: project_dir)
+      # Default scaffold has no validation errors → exit 0
+      status.success?.should be_true
+    end
+  end
+
+  it "emits {findings:[…]} under --json" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(["tool", "validate", "--json"], chdir: project_dir)
+      status.success?.should be_true
+      parsed = JSON.parse(output.strip)
+      parsed["findings"].as_a?.should_not be_nil
+    end
+  end
+end
+
+describe "hwaro tool unused-assets" do
+  it "scans an initialized project without errors" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "unused-assets"], chdir: project_dir)
+      status.success?.should be_true
+    end
+  end
+
+  it "deletes unused files under --delete --force --json and keeps stdout valid JSON" do
+    with_initialized_project do |project_dir|
+      orphan = File.join(project_dir, "static", "orphan.png")
+      File.write(orphan, "x")
+
+      status, output, _ = run_hwaro(["tool", "unused-assets", "--delete", "--force", "--json"], chdir: project_dir)
+
+      status.success?.should be_true
+      File.exists?(orphan).should be_false
+      # stdout must remain a single parseable JSON document — the
+      # `Deleted: …` log lines must not leak onto stdout in JSON mode.
+      parsed = JSON.parse(output.strip)
+      parsed["unused_files"].as_a.map(&.as_s).should contain("static/orphan.png")
+    end
+  end
+
+  it "does not delete under --delete --json without --force, and warns on stderr" do
+    with_initialized_project do |project_dir|
+      orphan = File.join(project_dir, "static", "orphan.png")
+      File.write(orphan, "x")
+
+      status, output, error = run_hwaro(["tool", "unused-assets", "--delete", "--json"], chdir: project_dir)
+
+      status.success?.should be_true
+      # Destructive action is skipped without --force, but not silently:
+      # the file survives, stdout stays parseable, and stderr explains why.
+      File.exists?(orphan).should be_true
+      JSON.parse(output.strip)
+      error.should contain("--force")
+    end
+  end
+end
+
+describe "hwaro tool check-links" do
+  it "exits 0 or 1 (no crash) on an initialized project" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "check-links"], chdir: project_dir)
+      # check-links exits 0 when no broken links and 1 when some are found.
+      # Anything else (e.g. signal-based exit from a crash) is a bug.
+      [0, 1].includes?(status.exit_code).should be_true
+    end
+  end
+
+  it "emits {dead_internal, dead_external} under --json" do
+    with_initialized_project do |project_dir|
+      _, output, _ = run_hwaro(["tool", "check-links", "--json", "--internal-only"], chdir: project_dir)
+      parsed = JSON.parse(output.strip)
+      parsed["dead_internal"].as_a?.should_not be_nil
+      parsed["dead_external"].as_a?.should_not be_nil
+    end
+  end
+end
+
+describe "hwaro tool platform" do
+  it "generates vercel.json for the vercel platform" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "platform", "vercel", "--force"], chdir: project_dir)
+      status.success?.should be_true
+      File.exists?(File.join(project_dir, "vercel.json")).should be_true
+    end
+  end
+
+  it "generates netlify.toml for the netlify platform" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "platform", "netlify", "--force"], chdir: project_dir)
+      status.success?.should be_true
+      File.exists?(File.join(project_dir, "netlify.toml")).should be_true
+    end
+  end
+
+  it "exits 1 and prints 'Unsupported platform' on an unknown platform" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(
+        ["tool", "platform", "definitely-not-real"], chdir: project_dir
+      )
+      status.success?.should be_false
+      err.should contain("Unsupported platform")
+    end
+  end
+
+  it "prints to stdout and writes no file when --stdout is passed" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(
+        ["tool", "platform", "vercel", "--stdout"], chdir: project_dir
+      )
+      status.success?.should be_true
+      output.size.should be > 0
+      File.exists?(File.join(project_dir, "vercel.json")).should be_false
+    end
+  end
+end
+
+describe "hwaro tool ci" do
+  it "generates .github/workflows/deploy.yml for github-actions" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(
+        ["tool", "ci", "github-actions", "--force"], chdir: project_dir
+      )
+      status.success?.should be_true
+      File.exists?(File.join(project_dir, ".github/workflows/deploy.yml")).should be_true
+    end
+  end
+
+  it "exits 1 when no provider is given" do
+    with_initialized_project do |project_dir|
+      status, _, _ = run_hwaro(["tool", "ci"], chdir: project_dir)
+      status.success?.should be_false
+    end
+  end
+
+  it "warns about deprecation in favor of `tool platform github-pages`" do
+    with_initialized_project do |project_dir|
+      _, output, err = run_hwaro(
+        ["tool", "ci", "github-actions", "--stdout"], chdir: project_dir
+      )
+      # Deprecation notice uses Logger.warn → stderr.
+      err.should contain("DEPRECATED")
+      # Co-signal: the actual workflow content was also generated to stdout,
+      # confirming the deprecation log didn't short-circuit the command.
+      output.should contain("workflow")
+    end
+  end
+end
+
+describe "hwaro tool agents-md" do
+  it "prints local-mode AGENTS.md content to stdout by default" do
+    with_initialized_project do |project_dir|
+      # `init` writes AGENTS.md by default — remove it to verify the no-write
+      # path of `tool agents-md` doesn't touch the file.
+      agents_md = File.join(project_dir, "AGENTS.md")
+      File.delete(agents_md) if File.exists?(agents_md)
+
+      status, output, _ = run_hwaro(["tool", "agents-md"], chdir: project_dir)
+      status.success?.should be_true
+      output.should contain("AGENTS.md")
+      File.exists?(File.join(project_dir, "AGENTS.md")).should be_false
+    end
+  end
+
+  it "writes AGENTS.md when --write is passed" do
+    with_initialized_project do |project_dir|
+      agents_md = File.join(project_dir, "AGENTS.md")
+      File.delete(agents_md) if File.exists?(agents_md)
+
+      status, _, _ = run_hwaro(
+        ["tool", "agents-md", "--write", "--force"], chdir: project_dir
+      )
+      status.success?.should be_true
+      File.exists?(File.join(project_dir, "AGENTS.md")).should be_true
+    end
+  end
+
+  it "supports --remote mode" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(["tool", "agents-md", "--remote"], chdir: project_dir)
+      status.success?.should be_true
+      output.size.should be > 0
+    end
+  end
+end
+
+describe "hwaro tool import" do
+  it "exits with HWARO_E_USAGE when source-type is missing" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(["tool", "import"], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("<source-type>")
+    end
+  end
+
+  it "exits with HWARO_E_USAGE when path is missing" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(["tool", "import", "hugo"], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("<path>")
+    end
+  end
+
+  it "exits with HWARO_E_USAGE on unknown source-type" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(
+        ["tool", "import", "definitely-not-real", "/tmp"], chdir: project_dir
+      )
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("unknown source type")
+    end
+  end
+
+  it "exits with HWARO_E_USAGE when source directory yields no importable content" do
+    with_initialized_project do |project_dir|
+      Dir.mktmpdir do |empty|
+        FileUtils.mkdir_p(File.join(empty, "content"))
+        status, _, err = run_hwaro(
+          ["tool", "import", "hugo", empty, "-o", File.join(project_dir, "out")],
+          chdir: project_dir
+        )
+        status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+        err.should contain("HWARO_E_USAGE")
+        err.should contain("no importable content")
+      end
+    end
+  end
+end
+
+describe "hwaro tool export" do
+  it "exits with HWARO_E_USAGE when target-type is missing" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(["tool", "export"], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("<target-type>")
+    end
+  end
+
+  it "exits with HWARO_E_USAGE on unknown target-type" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(
+        ["tool", "export", "definitely-not-real"], chdir: project_dir
+      )
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("unknown target type")
+    end
+  end
+
+  # Regression: `-o .` made every destination collapse back onto the source
+  # file the exporter had just read, so the command rewrote the project's own
+  # content/ in place (front matter re-serialized, comments dropped, `@/`
+  # links flattened) and reported success. `hwaro build -o .` already
+  # refused; export must too.
+  it "exits with HWARO_E_CONFIG on -o . and leaves content byte-identical" do
+    with_initialized_project do |project_dir|
+      before = Dir.glob(File.join(project_dir, "content", "**", "*.md")).sort.map { |f| {f, File.read(f)} }
+      before.should_not be_empty
+
+      status, _, err = run_hwaro(["tool", "export", "hugo", "-o", "."], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_CONFIG)
+      err.should contain("HWARO_E_CONFIG")
+
+      before.each do |(path, content)|
+        File.read(path).should eq(content)
+      end
+    end
+  end
+end
+
+describe "hwaro tool convert" do
+  it "exits with HWARO_E_USAGE when format is missing" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(["tool", "convert"], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("<format>")
+    end
+  end
+
+  it "exits with HWARO_E_USAGE on unknown format" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(
+        ["tool", "convert", "to-xml"], chdir: project_dir
+      )
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("unknown format")
+    end
+  end
+
+  it "exits HWARO_E_IO and emits a failing ConversionResult JSON for a missing content dir" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(
+        ["tool", "convert", "to-yaml", "-c", "does-not-exist", "--json"],
+        chdir: project_dir
+      )
+      # Same code as the human path below: an exit status that depends on the
+      # output format hands machine consumers a different answer for the
+      # identical failure. The payload shape is unchanged.
+      status.exit_code.should eq(Hwaro::Errors::EXIT_IO)
+      parsed = JSON.parse(output.strip)
+      parsed["success"].as_bool.should be_false
+      parsed["message"].as_s.should contain("not found")
+    end
+  end
+
+  it "exits HWARO_E_IO for a missing content dir without --json" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(
+        ["tool", "convert", "to-yaml", "-c", "does-not-exist"],
+        chdir: project_dir
+      )
+      status.exit_code.should eq(Hwaro::Errors::EXIT_IO)
+      err.should contain("HWARO_E_IO")
+      err.should contain("not found")
+    end
+  end
+end
+
+describe "hwaro tool list" do
+  it "exits with HWARO_E_USAGE when filter is missing" do
+    with_initialized_project do |project_dir|
+      status, _, err = run_hwaro(["tool", "list"], chdir: project_dir)
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      err.should contain("HWARO_E_USAGE")
+      err.should contain("<filter>")
+    end
+  end
+
+  it "emits a JSON error payload under --json when filter is missing" do
+    with_initialized_project do |project_dir|
+      status, output, _ = run_hwaro(
+        ["tool", "list", "--json"], chdir: project_dir
+      )
+      status.exit_code.should eq(Hwaro::Errors::EXIT_USAGE)
+      parsed = JSON.parse(output.strip)
+      parsed["error"]["code"].as_s.should eq("HWARO_E_USAGE")
+    end
+  end
+end
+
+describe "hwaro doctor (top-level alias)" do
+  # Note: top-level command registration with CommandRegistry is exercised
+  # via `cli_commands_spec.cr` (which instantiates Runner). This block
+  # focuses on the alias's metadata equivalence with Tool::DoctorCommand.
+
+  it "exposes the same description as Tool::DoctorCommand" do
+    Hwaro::CLI::Commands::DoctorCommand::DESCRIPTION.should eq(
+      Hwaro::CLI::Commands::Tool::DoctorCommand::DESCRIPTION
+    )
+  end
+
+  it "exposes the same flags as Tool::DoctorCommand" do
+    Hwaro::CLI::Commands::DoctorCommand.metadata.flags.should eq(
+      Hwaro::CLI::Commands::Tool::DoctorCommand::FLAGS
+    )
+  end
+
+  it "exposes the same positional args/choices" do
+    Hwaro::CLI::Commands::DoctorCommand.metadata.positional_args.should eq(
+      Hwaro::CLI::Commands::Tool::DoctorCommand::POSITIONAL_ARGS
+    )
+    Hwaro::CLI::Commands::DoctorCommand.metadata.positional_choices.should eq(
+      Hwaro::CLI::Commands::Tool::DoctorCommand::POSITIONAL_CHOICES
+    )
+  end
+end

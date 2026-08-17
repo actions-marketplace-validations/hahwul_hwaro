@@ -5,99 +5,126 @@ SHARD_FILE     = "shard.yml"
 HWARO_FILE     = "src/hwaro.cr"
 SNAPCRAFT_FILE = "snap/snapcraft.yaml"
 SPEC_FILE      = "spec/hwaro_spec.cr"
+FLAKE_FILE     = "flake.nix"
+PKGBUILD_FILE  = "aur/PKGBUILD"
 
 # Extract version from shard.yml
 def get_shard_version : String?
-  begin
-    shard = YAML.parse(File.read(SHARD_FILE))
-    shard["version"].as_s
-  rescue
-    nil
-  end
+  shard = YAML.parse(File.read(SHARD_FILE))
+  shard["version"].as_s
+rescue
+  nil
 end
 
 # Extract VERSION from src/hwaro.cr
 def get_hwaro_version : String?
-  begin
-    content = File.read(HWARO_FILE)
-    match = content.match(/VERSION\s*=\s*"([^"]+)"/)
-    match ? match[1] : nil
-  rescue
-    nil
-  end
+  content = File.read(HWARO_FILE)
+  match = content.match(/VERSION\s*=\s*"([^"]+)"/)
+  match ? match[1] : nil
+rescue
+  nil
 end
 
 # Extract version from snapcraft.yaml
 def get_snapcraft_version : String?
-  begin
-    snapcraft = YAML.parse(File.read(SNAPCRAFT_FILE))
-    snapcraft["version"].as_s
-  rescue
-    nil
-  end
+  snapcraft = YAML.parse(File.read(SNAPCRAFT_FILE))
+  snapcraft["version"].as_s
+rescue
+  nil
 end
 
 # Extract version from spec/hwaro_spec.cr
 def get_spec_version : String?
-  begin
-    content = File.read(SPEC_FILE)
-    match = content.match(/VERSION\.should eq\("([^"]+)"\)/)
-    match ? match[1] : nil
-  rescue
-    nil
-  end
+  content = File.read(SPEC_FILE)
+  match = content.match(/VERSION\.should eq\("([^"]+)"\)/)
+  match ? match[1] : nil
+rescue
+  nil
+end
+
+# Extract version from flake.nix
+def get_flake_version : String?
+  content = File.read(FLAKE_FILE)
+  match = content.match(/version\s*=\s*"([^"]+)"/)
+  match ? match[1] : nil
+rescue
+  nil
+end
+
+# Extract pkgver from aur/PKGBUILD
+def get_pkgbuild_version : String?
+  content = File.read(PKGBUILD_FILE)
+  match = content.match(/^pkgver=([\d.]+)/m)
+  match ? match[1] : nil
+rescue
+  nil
 end
 
 # Update shard.yml version
 def update_shard_version(new_version : String) : Bool
-  begin
-    content = File.read(SHARD_FILE)
-    updated = content.gsub(/^(version:\s*)[\d.]+/m, "\\1#{new_version}")
-    File.write(SHARD_FILE, updated)
-    true
-  rescue ex
-    puts "  Error updating #{SHARD_FILE}: #{ex.message}"
-    false
-  end
+  content = File.read(SHARD_FILE)
+  updated = content.gsub(/^(version:\s*)[\d.]+/m, "\\1#{new_version}")
+  File.write(SHARD_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{SHARD_FILE}: #{ex.message}"
+  false
 end
 
 # Update src/hwaro.cr VERSION
 def update_hwaro_version(new_version : String) : Bool
-  begin
-    content = File.read(HWARO_FILE)
-    updated = content.gsub(/VERSION\s*=\s*"[^"]+"/, "VERSION = \"#{new_version}\"")
-    File.write(HWARO_FILE, updated)
-    true
-  rescue ex
-    puts "  Error updating #{HWARO_FILE}: #{ex.message}"
-    false
-  end
+  content = File.read(HWARO_FILE)
+  updated = content.gsub(/VERSION\s*=\s*"[^"]+"/, "VERSION = \"#{new_version}\"")
+  File.write(HWARO_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{HWARO_FILE}: #{ex.message}"
+  false
 end
 
 # Update snapcraft.yaml version
 def update_snapcraft_version(new_version : String) : Bool
-  begin
-    content = File.read(SNAPCRAFT_FILE)
-    updated = content.gsub(/^(version:\s*)['"]?[\d.]+['"]?/m, "\\1#{new_version}")
-    File.write(SNAPCRAFT_FILE, updated)
-    true
-  rescue ex
-    puts "  Error updating #{SNAPCRAFT_FILE}: #{ex.message}"
-    false
-  end
+  content = File.read(SNAPCRAFT_FILE)
+  updated = content.gsub(/^(version:\s*)['"]?[\d.]+['"]?/m, "\\1#{new_version}")
+  File.write(SNAPCRAFT_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{SNAPCRAFT_FILE}: #{ex.message}"
+  false
 end
 
 # Update spec/hwaro_spec.cr version
 def update_spec_version(new_version : String) : Bool
-  begin
-    content = File.read(SPEC_FILE)
-    updated = content.gsub(/VERSION\.should eq\("[^"]+"\)/, "VERSION.should eq(\"#{new_version}\")")
-    File.write(SPEC_FILE, updated)
-    true
-  rescue ex
-    puts "  Error updating #{SPEC_FILE}: #{ex.message}"
-    false
-  end
+  content = File.read(SPEC_FILE)
+  updated = content.gsub(/VERSION\.should eq\("[^"]+"\)/, "VERSION.should eq(\"#{new_version}\")")
+  File.write(SPEC_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{SPEC_FILE}: #{ex.message}"
+  false
+end
+
+# Update flake.nix version
+def update_flake_version(new_version : String) : Bool
+  content = File.read(FLAKE_FILE)
+  updated = content.gsub(/^(\s*version\s*=\s*")[\d.]+(";\s*)$/m, "\\1#{new_version}\\2")
+  File.write(FLAKE_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{FLAKE_FILE}: #{ex.message}"
+  false
+end
+
+# Update aur/PKGBUILD pkgver (and reset pkgrel to 1)
+def update_pkgbuild_version(new_version : String) : Bool
+  content = File.read(PKGBUILD_FILE)
+  updated = content.gsub(/^pkgver=[\d.]+/m, "pkgver=#{new_version}")
+  updated = updated.gsub(/^pkgrel=\d+/m, "pkgrel=1")
+  File.write(PKGBUILD_FILE, updated)
+  true
+rescue ex
+  puts "  Error updating #{PKGBUILD_FILE}: #{ex.message}"
+  false
 end
 
 # Validate version format (semver-like: X.Y.Z)
@@ -116,16 +143,20 @@ shard_v = get_shard_version
 hwaro_v = get_hwaro_version
 snapcraft_v = get_snapcraft_version
 spec_v = get_spec_version
+flake_v = get_flake_version
+pkgbuild_v = get_pkgbuild_version
 
 puts "Current versions:"
 puts "  #{SHARD_FILE.ljust(25)} #{shard_v || "Not found"}"
 puts "  #{HWARO_FILE.ljust(25)} #{hwaro_v || "Not found"}"
 puts "  #{SNAPCRAFT_FILE.ljust(25)} #{snapcraft_v || "Not found"}"
 puts "  #{SPEC_FILE.ljust(25)} #{spec_v || "Not found"}"
+puts "  #{FLAKE_FILE.ljust(25)} #{flake_v || "Not found"}"
+puts "  #{PKGBUILD_FILE.ljust(25)} #{pkgbuild_v || "Not found"}"
 puts
 
 # Check if versions match
-versions = [shard_v, hwaro_v, snapcraft_v, spec_v].compact
+versions = [shard_v, hwaro_v, snapcraft_v, spec_v, flake_v, pkgbuild_v].compact
 unique_versions = versions.uniq
 
 if unique_versions.size > 1
@@ -203,6 +234,28 @@ if spec_v
   total_count += 1
   print "  Updating #{SPEC_FILE}... "
   if update_spec_version(new_version)
+    puts "✓"
+    success_count += 1
+  else
+    puts "✗"
+  end
+end
+
+if flake_v
+  total_count += 1
+  print "  Updating #{FLAKE_FILE}... "
+  if update_flake_version(new_version)
+    puts "✓"
+    success_count += 1
+  else
+    puts "✗"
+  end
+end
+
+if pkgbuild_v
+  total_count += 1
+  print "  Updating #{PKGBUILD_FILE}... "
+  if update_pkgbuild_version(new_version)
     puts "✓"
     success_count += 1
   else

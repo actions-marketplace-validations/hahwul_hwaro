@@ -26,22 +26,7 @@ Retrieve any page by path or URL:
 |------|------|-------------|
 | path | String | Relative source path (e.g. `about.md`) or URL path (e.g. `/about/`) |
 
-**Returns:** Page? (nil if not found)
-
-**Returned Properties:**
-
-| Property | Type |
-|----------|------|
-| title | String |
-| description | String? |
-| url | String |
-| date | String? |
-| section | String |
-| draft | Bool |
-| weight | Int |
-| summary | String? |
-| word_count | Int |
-| reading_time | Int |
+**Returns:** Page? (nil if not found) — exposes the standard [Page properties](/templates/data-model/#page), minus per-render computed fields (`permalink`, `lower`/`higher`, `ancestors`, `series_index`, `series_pages`, `related_posts`).
 
 **Examples:**
 
@@ -147,6 +132,12 @@ Access taxonomy terms and their pages:
 | name | String |
 | items | Array<Term> |
 
+`items` is ordered by the taxonomy's
+[`terms_sort_by`](/writing/taxonomies/#sorting): `"name"` (the default —
+alphabetical) or `"count"` (page count descending, name-ascending
+tiebreak). Counts are site-wide across every language, matching the root
+taxonomy index page.
+
 **Term Properties:**
 
 | Property | Type |
@@ -176,6 +167,41 @@ Generate URL for a taxonomy term:
 | term | String | Term name |
 
 **Returns:** String (absolute URL)
+
+---
+
+### get_menu()
+
+Access a named menu's resolved entry tree ([Menus](/features/menus/)):
+
+```jinja
+{% for item in get_menu(name="main") %}
+<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name }}</a>
+{% endfor %}
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| name | String | Menu name (e.g., "main", "footer") |
+
+**Returns:** Array\<Entry\> — resolved against the **current page's** language, falling back to the default language when that language has no entries for `name`. An unknown/unregistered menu name returns an empty array (never nil), so a `{% for %}` loop never errors.
+
+**Entry Properties:**
+
+| Property | Type | Description |
+|----------|------|--------------|
+| name | String | Display label |
+| url | String | Bare root-relative path, or untouched external URL |
+| href | String | `url` with `base_path` applied (internal) or unchanged (external) — use this in `<a href>` |
+| identifier | String | Unique key within the menu |
+| weight | Int | Sort order |
+| external | Bool | `true` for `http://`, `https://`, or `//` URLs |
+| children | Array\<Entry\> | Nested entries |
+| page | Page? | The registering page's data (front-matter-registered entries only) |
+
+Prefer `site.menus.<name>` only when you specifically need the **default language's** menu regardless of the current page — `get_menu()` is almost always the right choice inside a shared nav partial.
 
 ---
 
@@ -313,6 +339,31 @@ Alias for `url_for()`. You can use either name:
 
 ---
 
+### asset()
+
+Resolve a bundled or fingerprinted asset to its final URL. When the [asset pipeline](/features/asset-pipeline/) is enabled, the input name is looked up in the build manifest so you always get the hashed filename.
+
+```jinja
+<link rel="stylesheet" href="{{ asset(name='main.css') }}">
+<script src="{{ asset(name='app.js') }}"></script>
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| name | String | Bundle or asset name (e.g. `main.css`, `app.js`) |
+
+**Returns:** String — absolute URL under `base_url`. When no manifest entry is found, the name is returned as a path under `base_url` unchanged, so templates keep working before you turn the pipeline on.
+
+---
+
+### asset_url()
+
+Alias for `asset()`. Use whichever reads better in your templates.
+
+---
+
 ### now()
 
 Get current datetime:
@@ -375,8 +426,12 @@ Returns a resized image variant. When [image processing](/features/image-process
 | url | String | URL to the resized variant (or original if unavailable) |
 | width | Int | Requested width |
 | height | Int | Requested height |
+| lqip | String | Base64 data URI of a tiny JPEG placeholder (empty if LQIP disabled) |
+| dominant_color | String | Hex color string of the image's dominant color, e.g. `#a3b2c1` (empty if LQIP disabled) |
 
 The function selects the closest available width from the configured `widths`. If you request `width=500` and the configured widths are `[320, 640, 1024]`, it returns the 640px variant (smallest width >= requested). If nothing is large enough, it falls back to the largest available.
+
+The `lqip` and `dominant_color` properties require `[image_processing.lqip]` to be enabled. When disabled, they return empty strings.
 
 **Examples:**
 
@@ -400,6 +455,24 @@ The function selects the closest available width from the configured `widths`. I
   {% set thumb = resize_image(path=page.image, width=320) %}
   <img src="{{ thumb.url }}" alt="{{ page_title }}">
 {% endif %}
+
+{# LQIP blur-up placeholder #}
+{% set img = resize_image(path="/images/hero.jpg", width=1024) %}
+<img
+  src="{{ img.url }}"
+  style="background-image: url({{ img.lqip }}); background-size: cover;"
+  loading="lazy"
+  alt="Hero"
+>
+
+{# Dominant color placeholder #}
+{% set img = resize_image(path="/images/photo.jpg", width=640) %}
+<img
+  src="{{ img.url }}"
+  style="background-color: {{ img.dominant_color }}"
+  loading="lazy"
+  alt="Photo"
+>
 ```
 
 Requires `[image_processing]` to be enabled in `config.toml`. See [Image Processing](/features/image-processing/) for setup details.
@@ -448,4 +521,5 @@ data/
 ## See Also
 
 - [Data Model](/templates/data-model/) — Site, Section, Page types
+- [Data Model › Paginator](/templates/data-model/#paginator) — pagination object in section templates
 - [Filters](/templates/filters/) — Value transformation

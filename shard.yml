@@ -1,10 +1,10 @@
 name: hwaro
-version: 0.6.0
+version: 0.18.1
 
 authors:
   - HAHWUL <hahwul@gmail.com>
 
-crystal: ">= 1.19.0"
+crystal: ">= 1.21.0"
 
 license: MIT
 
@@ -21,11 +21,11 @@ dependencies:
     github: straight-shoota/crinja
   emoji:
     github: veelenga/emoji.cr
+  tartrazine:
+    github: ralsina/tartrazine
+    version: ~> 0.20.0
 
-#development_dependencies:
-#  ameba:
-#    github: crystal-ameba/ameba
-#    branch: master
-#  cyclonedx-cr:
-#    github: hahwul/cyclonedx-cr
-#    branch: main
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    branch: master

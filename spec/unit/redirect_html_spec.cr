@@ -33,6 +33,44 @@ describe Hwaro::Utils::RedirectHtml do
       result.should contain("Redirecting to")
       result.should contain("<a href=")
     end
+
+    it "refuses a javascript: redirect (no live href, refresh, or navigation)" do
+      result = Hwaro::Utils::RedirectHtml.full_redirect("javascript:alert(document.cookie)")
+      result.should_not contain("href=\"javascript:")
+      result.should_not contain("http-equiv=\"refresh\"")
+      result.should_not contain("window.location.href")
+      result.should contain("blocked")
+    end
+
+    it "refuses a javascript: redirect even with obfuscated whitespace/case" do
+      result = Hwaro::Utils::RedirectHtml.full_redirect("JaVaScRiPt:alert(1)")
+      result.should_not contain("window.location.href")
+      result.should contain("blocked")
+    end
+
+    it "still allows ordinary http(s) and relative redirects" do
+      Hwaro::Utils::RedirectHtml.full_redirect("https://example.com/").should contain("window.location.href")
+      Hwaro::Utils::RedirectHtml.full_redirect("/blog/post/").should contain("window.location.href")
+    end
+
+    it "escapes U+2028/U+2029 line terminators in the JS string literal" do
+      # A bare U+2028/U+2029 would terminate the JS string on pre-ES2019 engines,
+      # breaking the redirect. They must be \u-escaped in the <script> context.
+      r1 = Hwaro::Utils::RedirectHtml.full_redirect("/path\u{2028}x")
+      r1.should contain("\\u2028")
+      r1.should contain("window.location.href") # treated as safe relative URL
+      r2 = Hwaro::Utils::RedirectHtml.full_redirect("/path\u{2029}x")
+      r2.should contain("\\u2029")
+      r2.should contain("window.location.href")
+    end
+
+    it "escapes newline and carriage return in the JS string literal" do
+      r1 = Hwaro::Utils::RedirectHtml.full_redirect("/a\nb")
+      r1.should contain("window.location.href = \"/a\\nb\";") # JS literal escaped, no raw newline
+      r2 = Hwaro::Utils::RedirectHtml.full_redirect("/a\rb")
+      r2.should contain("\\r")
+      r2.should contain("window.location.href")
+    end
   end
 
   describe ".simple_redirect" do

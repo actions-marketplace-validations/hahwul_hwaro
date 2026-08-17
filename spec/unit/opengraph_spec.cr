@@ -13,6 +13,42 @@ describe Hwaro::Models::OpenGraphConfig do
     end
   end
 
+  describe "#resolve_image_url" do
+    # `starts_with?("http")` was wrong in both directions: it missed
+    # `//cdn…`/`data:` (which then took the root-relative branch and produced
+    # `https://site.com//cdn.example.com/og.png`), and it false-positived on a
+    # relative path that merely starts with the letters "http".
+    it "leaves a protocol-relative image untouched" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.resolve_image_url("//cdn.example.com/og.png", "https://site.com")
+        .should eq("//cdn.example.com/og.png")
+    end
+
+    it "leaves a data: image untouched" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.resolve_image_url("data:image/png;base64,AAAA", "https://site.com")
+        .should eq("data:image/png;base64,AAAA")
+    end
+
+    it "leaves an https image untouched" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.resolve_image_url("https://cdn.example.com/og.png", "https://site.com")
+        .should eq("https://cdn.example.com/og.png")
+    end
+
+    it "absolutizes a relative path that merely starts with 'http'" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.resolve_image_url("http-guide/cover.png", "https://site.com")
+        .should eq("https://site.com/http-guide/cover.png")
+    end
+
+    it "absolutizes a root-relative path" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.resolve_image_url("/img/og.png", "https://site.com")
+        .should eq("https://site.com/img/og.png")
+    end
+  end
+
   describe "#og_tags" do
     it "generates basic OG tags with title, type, and url" do
       config = Hwaro::Models::OpenGraphConfig.new
@@ -168,6 +204,37 @@ describe Hwaro::Models::OpenGraphConfig do
       tags.should contain(%(<meta property="og:type" content="website">))
     end
 
+    # Regression for gh#522: render.cr should be able to override
+    # og:type per page kind (homepage/section/taxonomy/404 -> "website",
+    # content -> the configured @og_type) without mutating the shared
+    # config object.
+    it "honors a per-call og_type_override without touching @og_type (gh#522)" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      # Default config says articles.
+      config.og_type.should eq("article")
+
+      home_tags = config.og_tags(
+        title: "Home",
+        description: nil,
+        url: "/",
+        image: nil,
+        base_url: "https://example.com",
+        og_type_override: "website",
+      )
+      home_tags.should contain(%(<meta property="og:type" content="website">))
+
+      # Subsequent call without override still uses the configured type,
+      # proving the override didn't mutate state.
+      post_tags = config.og_tags(
+        title: "Post",
+        description: nil,
+        url: "/posts/p/",
+        image: nil,
+        base_url: "https://example.com",
+      )
+      post_tags.should contain(%(<meta property="og:type" content="article">))
+    end
+
     it "escapes HTML special characters in title" do
       config = Hwaro::Models::OpenGraphConfig.new
       tags = config.og_tags(
@@ -217,12 +284,51 @@ describe Hwaro::Models::OpenGraphConfig do
       tags = config.twitter_tags(
         title: "My Page",
         description: nil,
-        image: nil,
+        image: "/images/card.png",
         base_url: "https://example.com"
       )
 
       tags.should contain(%(<meta name="twitter:card" content="summary_large_image">))
       tags.should contain(%(<meta name="twitter:title" content="My Page">))
+    end
+
+    it "downgrades summary_large_image to summary when there is no image" do
+      config = Hwaro::Models::OpenGraphConfig.new # defaults to summary_large_image
+      tags = config.twitter_tags(
+        title: "My Page",
+        description: nil,
+        image: nil,
+        base_url: "https://example.com"
+      )
+
+      # A large-image card with no image renders as a blank preview.
+      tags.should contain(%(<meta name="twitter:card" content="summary">))
+      tags.should_not contain("summary_large_image")
+    end
+
+    it "keeps summary_large_image when an image is present" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      tags = config.twitter_tags(
+        title: "My Page",
+        description: nil,
+        image: "/images/card.png",
+        base_url: "https://example.com"
+      )
+
+      tags.should contain(%(<meta name="twitter:card" content="summary_large_image">))
+    end
+
+    it "respects a non-large card type even without an image" do
+      config = Hwaro::Models::OpenGraphConfig.new
+      config.twitter_card = "summary"
+      tags = config.twitter_tags(
+        title: "My Page",
+        description: nil,
+        image: nil,
+        base_url: "https://example.com"
+      )
+
+      tags.should contain(%(<meta name="twitter:card" content="summary">))
     end
 
     it "includes description when provided" do
@@ -273,6 +379,8 @@ describe Hwaro::Models::OpenGraphConfig do
       )
 
       tags.should contain(%(<meta name="twitter:image" content="https://example.com/images/default-twitter.png">))
+      # default_image satisfies the image requirement, so the large card stays.
+      tags.should contain(%(<meta name="twitter:card" content="summary_large_image">))
     end
 
     it "does not include image tag when no image available" do

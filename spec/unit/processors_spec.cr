@@ -21,10 +21,10 @@ describe Hwaro::Content::Processors::TableParser do
   describe "process" do
     it "converts a basic table to HTML" do
       content = <<-MARKDOWN
-      | Header 1 | Header 2 |
-      |----------|----------|
-      | Cell 1   | Cell 2   |
-      MARKDOWN
+        | Header 1 | Header 2 |
+        |----------|----------|
+        | Cell 1   | Cell 2   |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<table>")
@@ -39,10 +39,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles left alignment" do
       content = <<-MARKDOWN
-      | Left |
-      |:-----|
-      | Text |
-      MARKDOWN
+        | Left |
+        |:-----|
+        | Text |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<th>Left</th>")
@@ -51,10 +51,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles center alignment" do
       content = <<-MARKDOWN
-      | Center |
-      |:------:|
-      | Text   |
-      MARKDOWN
+        | Center |
+        |:------:|
+        | Text   |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("text-align: center;")
@@ -62,10 +62,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles right alignment" do
       content = <<-MARKDOWN
-      | Right |
-      |------:|
-      | Text  |
-      MARKDOWN
+        | Right |
+        |------:|
+        | Text  |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("text-align: right;")
@@ -73,10 +73,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles mixed alignments" do
       content = <<-MARKDOWN
-      | Left | Center | Right |
-      |:-----|:------:|------:|
-      | A    | B      | C     |
-      MARKDOWN
+        | Left | Center | Right |
+        |:-----|:------:|------:|
+        | A    | B      | C     |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<th>Left</th>")
@@ -86,12 +86,12 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles multiple rows" do
       content = <<-MARKDOWN
-      | Name  | Age |
-      |-------|-----|
-      | Alice | 30  |
-      | Bob   | 25  |
-      | Carol | 35  |
-      MARKDOWN
+        | Name  | Age |
+        |-------|-----|
+        | Alice | 30  |
+        | Bob   | 25  |
+        | Carol | 35  |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<td>Alice</td>")
@@ -101,10 +101,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles table without leading/trailing pipes" do
       content = <<-MARKDOWN
-      Header 1 | Header 2
-      ---------|----------
-      Cell 1   | Cell 2
-      MARKDOWN
+        Header 1 | Header 2
+        ---------|----------
+        Cell 1   | Cell 2
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<table>")
@@ -114,16 +114,16 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "preserves non-table content" do
       content = <<-MARKDOWN
-      # Title
+        # Title
 
-      Some paragraph text.
+        Some paragraph text.
 
-      | Header |
-      |--------|
-      | Cell   |
+        | Header |
+        |--------|
+        | Cell   |
 
-      More text after table.
-      MARKDOWN
+        More text after table.
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("# Title")
@@ -134,9 +134,9 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "handles empty table body" do
       content = <<-MARKDOWN
-      | Header 1 | Header 2 |
-      |----------|----------|
-      MARKDOWN
+        | Header 1 | Header 2 |
+        |----------|----------|
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("<table>")
@@ -146,10 +146,10 @@ describe Hwaro::Content::Processors::TableParser do
 
     it "escapes HTML characters in cells" do
       content = <<-MARKDOWN
-      | Code |
-      |------|
-      | <div> |
-      MARKDOWN
+        | Code |
+        |------|
+        | <div> |
+        MARKDOWN
 
       result = Hwaro::Content::Processors::TableParser.process(content)
       result.should contain("&lt;div&gt;")
@@ -168,10 +168,10 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
   describe "render" do
     it "renders code blocks with language class and hljs class when highlight is enabled" do
       content = <<-MARKDOWN
-      ```ruby
-      puts "hello"
-      ```
-      MARKDOWN
+        ```ruby
+        puts "hello"
+        ```
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content, highlight: true)
       html.should contain("language-ruby")
@@ -182,10 +182,10 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
 
     it "renders code blocks with language class only when highlight is disabled" do
       content = <<-MARKDOWN
-      ```ruby
-      puts "hello"
-      ```
-      MARKDOWN
+        ```ruby
+        puts "hello"
+        ```
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content, highlight: false)
       html.should contain("language-ruby")
@@ -194,10 +194,10 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
 
     it "renders code blocks without language class when no language specified" do
       content = <<-MARKDOWN
-      ```
-      plain text
-      ```
-      MARKDOWN
+        ```
+        plain text
+        ```
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content, highlight: true)
       html.should contain("<code>")
@@ -206,10 +206,10 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
 
     it "escapes special characters in language names" do
       content = <<-MARKDOWN
-      ```c++
-      int main() {}
-      ```
-      MARKDOWN
+        ```c++
+        int main() {}
+        ```
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content, highlight: true)
       html.should contain("language-c++")
@@ -236,14 +236,14 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
   describe "table rendering integration" do
     it "renders markdown tables as HTML tables" do
       content = <<-MARKDOWN
-      # Title
+        # Title
 
-      | Name | Age |
-      |------|-----|
-      | Alice | 30 |
+        | Name | Age |
+        |------|-----|
+        | Alice | 30 |
 
-      Some text after.
-      MARKDOWN
+        Some text after.
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content)
       html.should contain("<table>")
@@ -258,10 +258,10 @@ describe Hwaro::Content::Processors::SyntaxHighlighter do
 
     it "renders tables with alignment styles" do
       content = <<-MARKDOWN
-      | Left | Center | Right |
-      |:-----|:------:|------:|
-      | A    | B      | C     |
-      MARKDOWN
+        | Left | Center | Right |
+        |:-----|:------:|------:|
+        | A    | B      | C     |
+        MARKDOWN
 
       html = Hwaro::Content::Processors::SyntaxHighlighter.render(content)
       html.should contain("text-align: center;")
@@ -301,6 +301,8 @@ describe Hwaro::Models::HighlightConfig do
     config.enabled.should be_true
     config.theme.should eq("github")
     config.use_cdn.should be_true
+    config.mode.should eq("server")
+    config.copy.should be_false
   end
 
   describe "css_tag" do
@@ -325,8 +327,53 @@ describe Hwaro::Models::HighlightConfig do
   end
 
   describe "js_tag" do
+    it "returns empty string in server mode (default)" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.js_tag.should eq("")
+    end
+
+    it "returns only the copy runtime in server mode when copy is enabled" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.copy = true
+      config.js_tag.should contain("code-copy-btn")
+      config.js_tag.should contain("pre[data-copy]")
+      config.js_tag.should_not contain("highlight.min.js")
+    end
+
+    it "copy runtime strips the .ln gutter from copied text and anchors on an existing code-block" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.copy = true
+      tag = config.js_tag
+      # Server-mode linenos bake `<span class="ln">N </span>` into <code> —
+      # the click handler must remove them before reading textContent.
+      tag.should contain(%(querySelectorAll("span.ln")))
+      # A named fence's .code-block wrapper is reused as the positioning
+      # anchor instead of nesting a fresh .code-wrapper inside it (which
+      # would break the scaffold's `.code-block > pre` styling).
+      tag.should contain(%(contains("code-block")))
+      tag.should contain(".code-wrapper,.code-block{position:relative}")
+    end
+
+    it "appends the copy runtime after the hljs scripts in client mode" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.mode = "client"
+      config.copy = true
+      tag = config.js_tag
+      tag.should contain("hljs.highlightAll()")
+      tag.should contain("code-copy-btn")
+      tag.index!("hljs.highlightAll()").should be < tag.index!("code-copy-btn")
+    end
+
+    it "omits the copy runtime when highlighting is disabled" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.copy = true
+      config.enabled = false
+      config.js_tag.should eq("")
+    end
+
     it "returns CDN script when use_cdn is true" do
       config = Hwaro::Models::HighlightConfig.new
+      config.mode = "client"
       config.js_tag.should contain("cdnjs.cloudflare.com")
       config.js_tag.should contain("highlight.min.js")
       config.js_tag.should contain("hljs.highlightAll()")
@@ -334,6 +381,7 @@ describe Hwaro::Models::HighlightConfig do
 
     it "returns local script when use_cdn is false" do
       config = Hwaro::Models::HighlightConfig.new
+      config.mode = "client"
       config.use_cdn = false
       config.js_tag.should contain("/assets/js/highlight.min.js")
       config.js_tag.should_not contain("cdnjs.cloudflare.com")
@@ -341,14 +389,23 @@ describe Hwaro::Models::HighlightConfig do
 
     it "returns empty string when disabled" do
       config = Hwaro::Models::HighlightConfig.new
+      config.mode = "client"
       config.enabled = false
       config.js_tag.should eq("")
     end
   end
 
   describe "tags" do
-    it "returns combined CSS and JS tags" do
+    it "returns only the CSS tag in server mode (default)" do
       config = Hwaro::Models::HighlightConfig.new
+      tags = config.tags
+      tags.should contain("stylesheet")
+      tags.should_not contain("highlight.min.js")
+    end
+
+    it "returns combined CSS and JS tags in client mode" do
+      config = Hwaro::Models::HighlightConfig.new
+      config.mode = "client"
       tags = config.tags
       tags.should contain("stylesheet")
       tags.should contain("highlight.min.js")
@@ -394,14 +451,14 @@ describe Hwaro::Processor::Markdown do
   describe "parse" do
     it "captures front matter keys for taxonomy detection" do
       content = <<-MARKDOWN
-      +++
-      title = "Post"
-      tags = ["a"]
-      categories = []
-      +++
+        +++
+        title = "Post"
+        tags = ["a"]
+        categories = []
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:front_matter_keys].should contain("tags")
@@ -410,13 +467,13 @@ describe Hwaro::Processor::Markdown do
 
     it "keeps empty taxonomy arrays for configured keys" do
       content = <<-MARKDOWN
-      ---
-      title: Post
-      categories: []
-      ---
+        ---
+        title: Post
+        categories: []
+        ---
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:taxonomies].has_key?("categories").should be_true
@@ -425,146 +482,408 @@ describe Hwaro::Processor::Markdown do
 
     it "parses TOML frontmatter with in_sitemap" do
       content = <<-MARKDOWN
-      +++
-      title = "Test Page"
-      draft = false
-      in_sitemap = false
-      +++
+        +++
+        title = "Test Page"
+        draft = false
+        in_sitemap = false
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:title].should eq("Test Page")
-      result[:draft].should eq(false)
-      result[:in_sitemap].should eq(false)
+      result[:draft].should be_false
+      result[:in_sitemap].should be_false
     end
 
     it "defaults in_sitemap to true when not specified in TOML" do
       content = <<-MARKDOWN
-      +++
-      title = "Test Page"
-      +++
+        +++
+        title = "Test Page"
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
-      result[:in_sitemap].should eq(true)
+      result[:in_sitemap].should be_true
     end
 
     it "parses YAML frontmatter with in_sitemap" do
       content = <<-MARKDOWN
-      ---
-      title: Test Page
-      draft: false
-      in_sitemap: false
-      ---
+        ---
+        title: Test Page
+        draft: false
+        in_sitemap: false
+        ---
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:title].should eq("Test Page")
-      result[:draft].should eq(false)
-      result[:in_sitemap].should eq(false)
+      result[:draft].should be_false
+      result[:in_sitemap].should be_false
     end
 
     it "defaults in_sitemap to true when not specified in YAML" do
       content = <<-MARKDOWN
-      ---
-      title: Test Page
-      ---
+        ---
+        title: Test Page
+        ---
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
-      result[:in_sitemap].should eq(true)
+      result[:in_sitemap].should be_true
     end
 
     it "handles in_sitemap explicitly set to true in TOML" do
       content = <<-MARKDOWN
-      +++
-      title = "Test Page"
-      in_sitemap = true
-      +++
+        +++
+        title = "Test Page"
+        in_sitemap = true
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
-      result[:in_sitemap].should eq(true)
+      result[:in_sitemap].should be_true
     end
 
     it "handles in_sitemap explicitly set to true in YAML" do
       content = <<-MARKDOWN
-      ---
-      title: Test Page
-      in_sitemap: true
-      ---
+        ---
+        title: Test Page
+        in_sitemap: true
+        ---
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
-      result[:in_sitemap].should eq(true)
+      result[:in_sitemap].should be_true
     end
 
     it "parses pagination settings from TOML frontmatter" do
       content = <<-MARKDOWN
-      +++
-      title = "Wiki"
-      paginate = 5
-      pagination_enabled = true
-      sort_by = "title"
-      reverse = true
-      +++
+        +++
+        title = "Wiki"
+        paginate = 5
+        pagination_enabled = true
+        sort_by = "title"
+        reverse = true
+        +++
 
-      # Wiki Section
-      MARKDOWN
+        # Wiki Section
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:paginate].should eq(5)
-      result[:pagination_enabled].should eq(true)
+      result[:pagination_enabled].should be_true
       result[:sort_by].should eq("title")
-      result[:reverse].should eq(true)
+      result[:reverse].should be_true
     end
 
     it "parses pagination settings from YAML frontmatter" do
       content = <<-MARKDOWN
-      ---
-      title: Wiki
-      paginate: 10
-      pagination_enabled: false
-      sort_by: date
-      reverse: false
-      ---
+        ---
+        title: Wiki
+        paginate: 10
+        pagination_enabled: false
+        sort_by: date
+        reverse: false
+        ---
 
-      # Wiki Section
-      MARKDOWN
+        # Wiki Section
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:paginate].should eq(10)
-      result[:pagination_enabled].should eq(false)
+      result[:pagination_enabled].should be_false
       result[:sort_by].should eq("date")
-      result[:reverse].should eq(false)
+      result[:reverse].should be_false
     end
 
     it "defaults pagination settings to nil when not specified" do
       content = <<-MARKDOWN
-      +++
-      title = "Test Page"
-      +++
+        +++
+        title = "Test Page"
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       result[:paginate].should be_nil
       result[:pagination_enabled].should be_nil
       result[:sort_by].should be_nil
       result[:reverse].should be_nil
+    end
+
+    it "parses a Zola-style [taxonomies] table in TOML frontmatter" do
+      content = <<-MARKDOWN
+        +++
+        title = "Work"
+        [taxonomies]
+        tech = ["crystal", "security"]
+        tags = ["tool"]
+        authors = ["hahwul"]
+        +++
+        Body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:taxonomies]["tech"].should eq(["crystal", "security"])
+      result[:taxonomies]["tags"].should eq(["tool"])
+      # tags/authors under the table also populate the dedicated fields
+      result[:tags].should eq(["tool"])
+      result[:authors].should eq(["hahwul"])
+      # and the table must not leak into extra
+      result[:extra].has_key?("taxonomies").should be_false
+    end
+
+    it "parses a taxonomies map in YAML frontmatter" do
+      content = <<-MARKDOWN
+        ---
+        title: Work
+        taxonomies:
+          tech: [crystal]
+        ---
+        Body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:taxonomies]["tech"].should eq(["crystal"])
+    end
+
+    it "prefers top-level tags over a [taxonomies] tags entry" do
+      content = <<-MARKDOWN
+        +++
+        title = "Work"
+        tags = ["primary"]
+        [taxonomies]
+        tags = ["secondary"]
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      # The explicit top-level key wins everywhere — dedicated fields and
+      # the taxonomies hash stay consistent.
+      result[:taxonomies]["tags"].should eq(["primary"])
+      result[:tags].should eq(["primary"])
+    end
+
+    it "accepts Zola's paginate_by as an alias for paginate" do
+      content = <<-MARKDOWN
+        ---
+        title: Posts
+        paginate_by: 5
+        ---
+
+        All posts.
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:paginate].should eq(5)
+    end
+
+    it "prefers paginate over paginate_by when both are set" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+        paginate = 3
+        paginate_by = 7
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:paginate].should eq(3)
+    end
+  end
+
+  describe "menu front matter registration" do
+    it "returns an empty hash when no menus/menu key is present" do
+      content = <<-MARKDOWN
+        +++
+        title = "Plain"
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].should eq({} of String => Hwaro::Models::MenuRegistration)
+    end
+
+    it "parses a bare string menus value in TOML" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+        menus = "main"
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.should eq(["main"])
+      result[:menus]["main"].name.should be_nil
+      result[:menus]["main"].weight.should be_nil
+    end
+
+    it "parses an array of menu names in TOML" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+        menus = ["main", "footer"]
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.sort!.should eq(["footer", "main"])
+    end
+
+    it "parses table-form menu registration with overrides in TOML" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+
+        [menus.main]
+        name = "All Posts"
+        weight = 5
+        parent = "content"
+        identifier = "posts"
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      reg = result[:menus]["main"]
+      reg.name.should eq("All Posts")
+      reg.weight.should eq(5)
+      reg.parent.should eq("content")
+      reg.identifier.should eq("posts")
+    end
+
+    it "prefers the plural menus key over the singular menu alias" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+        menus = ["main"]
+        menu = ["footer"]
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.should eq(["main"])
+    end
+
+    it "falls back to the singular menu alias when menus is absent" do
+      content = <<-MARKDOWN
+        +++
+        title = "Posts"
+        menu = "footer"
+        +++
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.should eq(["footer"])
+    end
+
+    it "parses a bare string menus value in YAML" do
+      content = <<-MARKDOWN
+        ---
+        title: Posts
+        menus: main
+        ---
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.should eq(["main"])
+    end
+
+    it "parses an array of menu names in YAML" do
+      content = <<-MARKDOWN
+        ---
+        title: Posts
+        menus:
+          - main
+          - footer
+        ---
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.sort!.should eq(["footer", "main"])
+    end
+
+    it "parses table-form menu registration with overrides in YAML" do
+      content = <<-MARKDOWN
+        ---
+        title: Posts
+        menus:
+          main:
+            name: All Posts
+            weight: 5
+            parent: content
+            identifier: posts
+        ---
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      reg = result[:menus]["main"]
+      reg.name.should eq("All Posts")
+      reg.weight.should eq(5)
+      reg.parent.should eq("content")
+      reg.identifier.should eq("posts")
+    end
+
+    it "parses a bare string menus value in JSON" do
+      content = <<-MARKDOWN
+        {
+          "title": "Posts",
+          "menus": "main"
+        }
+        Body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.should eq(["main"])
+    end
+
+    it "parses an array of menu names in JSON" do
+      content = <<-MARKDOWN
+        {
+          "title": "Posts",
+          "menus": ["main", "footer"]
+        }
+        Body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      result[:menus].keys.sort!.should eq(["footer", "main"])
+    end
+
+    it "parses table-form menu registration with overrides in JSON" do
+      content = <<-MARKDOWN
+        {
+          "title": "Posts",
+          "menus": {
+            "main": {
+              "name": "All Posts",
+              "weight": 5,
+              "parent": "content",
+              "identifier": "posts"
+            }
+          }
+        }
+        Body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      reg = result[:menus]["main"]
+      reg.name.should eq("All Posts")
+      reg.weight.should eq(5)
+      reg.parent.should eq("content")
+      reg.identifier.should eq("posts")
     end
   end
 
@@ -581,11 +900,35 @@ describe Hwaro::Processor::Markdown do
       html.should_not contain("loading=\"lazy\"")
     end
 
+    it "does not corrupt a raw <img> with a '>' inside a quoted attribute" do
+      # A '>' inside a quoted attribute value is legal HTML5; the old regex
+      # treated it as the tag end and mangled the tag.
+      content = "<img src=\"a.png\" alt=\"a > b\">"
+      html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
+      html.should contain("loading=\"lazy\"")
+      html.should contain("alt=\"a > b\"")
+      html.should_not contain("/> b")
+    end
+
     it "preserves existing loading attribute" do
       content = "<img src='image.jpg' loading='eager'>"
       html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
       html.should contain("loading='eager'")
       html.should_not contain("loading=\"lazy\"")
+    end
+
+    it "sees a loading attribute that sits after a quoted '>'" do
+      content = "<img alt=\"Home > Docs\" src=\"a.png\" loading=\"eager\">"
+      html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
+      html.should contain("loading=\"eager\"")
+      html.should_not contain("loading=\"lazy\"")
+    end
+
+    it "does not mistake data-loading for the loading attribute" do
+      content = "<img src=\"a.png\" data-loading=\"spinner\">"
+      html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
+      html.should contain("loading=\"lazy\"")
+      html.should contain("data-loading=\"spinner\"")
     end
 
     it "works with render_with_anchors" do
@@ -629,22 +972,34 @@ describe Hwaro::Processor::Markdown do
       html, _ = Hwaro::Content::Processors::Markdown.new.render_with_anchors(content, emoji: true)
       html.should_not contain(":smile:")
     end
+
+    it "converts shortcodes correctly when the document contains multibyte text" do
+      # Byte-oriented scan regression: with multibyte chars (accented/CJK)
+      # present, conversion must still apply to text and skip code blocks.
+      content = "café :wave: 日本語 :smile:\n\n```\n:tada: in code\n```"
+      html, _ = Hwaro::Processor::Markdown.render(content, emoji: true)
+      html.should_not contain(":wave:")
+      html.should_not contain(":smile:")
+      html.should contain("café")
+      html.should contain("日本語")
+      html.should contain(":tada:") # code block untouched
+    end
   end
 
   describe "extra values extraction" do
     it "extracts extra values from TOML" do
       content = <<-MARKDOWN
-      +++
-      title = "Test Page"
-      extra_string = "hello"
-      extra_int = 42
-      extra_float = 3.14
-      extra_bool = true
-      extra_array = ["a", "b"]
-      +++
+        +++
+        title = "Test Page"
+        extra_string = "hello"
+        extra_int = 42
+        extra_float = 3.14
+        extra_bool = true
+        extra_array = ["a", "b"]
+        +++
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       extra = result[:extra]
@@ -652,25 +1007,25 @@ describe Hwaro::Processor::Markdown do
       extra["extra_string"].should eq("hello")
       extra["extra_int"].should eq(42_i64)
       extra["extra_float"].should eq(3.14)
-      extra["extra_bool"].should eq(true)
+      extra["extra_bool"].should be_true
       extra["extra_array"].should eq(["a", "b"])
     end
 
     it "extracts extra values from YAML" do
       content = <<-MARKDOWN
-      ---
-      title: Test Page
-      extra_string: hello
-      extra_int: 42
-      extra_float: 3.14
-      extra_bool: true
-      extra_array:
-        - a
-        - b
-      ---
+        ---
+        title: Test Page
+        extra_string: hello
+        extra_int: 42
+        extra_float: 3.14
+        extra_bool: true
+        extra_array:
+          - a
+          - b
+        ---
 
-      # Content
-      MARKDOWN
+        # Content
+        MARKDOWN
 
       result = Hwaro::Processor::Markdown.parse(content)
       extra = result[:extra]
@@ -678,8 +1033,200 @@ describe Hwaro::Processor::Markdown do
       extra["extra_string"].should eq("hello")
       extra["extra_int"].should eq(42_i64)
       extra["extra_float"].should eq(3.14)
-      extra["extra_bool"].should eq(true)
+      extra["extra_bool"].should be_true
       extra["extra_array"].should eq(["a", "b"])
+    end
+
+    it "flattens the TOML [extra] subtable into page.extra" do
+      content = <<-MARKDOWN
+        +++
+        title = "Extra subtable test"
+
+        [extra]
+        color = "red"
+        rating = 5
+        tags_inner = ["a", "b"]
+        +++
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      extra["color"].should eq("red")
+      extra["rating"].should eq(5_i64)
+      extra["tags_inner"].should eq(["a", "b"])
+      extra.has_key?("extra").should be_false
+    end
+
+    it "flattens a nested YAML extra mapping into page.extra" do
+      content = <<-MARKDOWN
+        ---
+        title: Extra subtable test
+        extra:
+          color: red
+          rating: 5
+          tags_inner:
+            - a
+            - b
+        ---
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      extra["color"].should eq("red")
+      extra["rating"].should eq(5_i64)
+      extra["tags_inner"].should eq(["a", "b"])
+      extra.has_key?("extra").should be_false
+    end
+
+    it "flattens a nested JSON extra object into page.extra" do
+      content = <<-MARKDOWN
+        {
+          "title": "Extra subtable test",
+          "extra": {
+            "color": "red",
+            "rating": 5,
+            "tags_inner": ["a", "b"]
+          }
+        }
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      extra["color"].should eq("red")
+      extra["rating"].should eq(5_i64)
+      extra["tags_inner"].should eq(["a", "b"])
+      extra.has_key?("extra").should be_false
+    end
+
+    it "preserves nested TOML [extra.author] as a hash on page.extra" do
+      content = <<-MARKDOWN
+        +++
+        title = "Nested extra test"
+
+        [extra.author]
+        name = "Bob"
+        email = "b@example.com"
+
+        [extra.seo]
+        og_image = "/a.png"
+        +++
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      author = extra["author"].as(Hash(String, Hwaro::Models::ExtraValue))
+      author["name"].should eq("Bob")
+      author["email"].should eq("b@example.com")
+
+      seo = extra["seo"].as(Hash(String, Hwaro::Models::ExtraValue))
+      seo["og_image"].should eq("/a.png")
+    end
+
+    it "preserves a nested YAML extra mapping as a hash on page.extra" do
+      content = <<-MARKDOWN
+        ---
+        title: Nested extra test
+        extra:
+          author:
+            name: Bob
+            email: b@example.com
+          seo:
+            og_image: /a.png
+        ---
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      author = extra["author"].as(Hash(String, Hwaro::Models::ExtraValue))
+      author["name"].should eq("Bob")
+      author["email"].should eq("b@example.com")
+
+      seo = extra["seo"].as(Hash(String, Hwaro::Models::ExtraValue))
+      seo["og_image"].should eq("/a.png")
+    end
+
+    it "preserves a nested JSON extra object as a hash on page.extra" do
+      content = <<-MARKDOWN
+        {
+          "title": "Nested extra test",
+          "extra": {
+            "author": { "name": "Bob", "email": "b@example.com" },
+            "seo":    { "og_image": "/a.png" }
+          }
+        }
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      author = extra["author"].as(Hash(String, Hwaro::Models::ExtraValue))
+      author["name"].should eq("Bob")
+      author["email"].should eq("b@example.com")
+    end
+
+    it "preserves TOML arrays-of-tables inside extra" do
+      content = <<-MARKDOWN
+        +++
+        title = "Array-of-tables"
+
+        [[extra.authors]]
+        name = "Alice"
+
+        [[extra.authors]]
+        name = "Bob"
+        +++
+
+        # Content
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      authors = result[:extra]["authors"].as(Array(Hwaro::Models::ExtraValue))
+      authors.size.should eq(2)
+      authors[0].as(Hash(String, Hwaro::Models::ExtraValue))["name"].should eq("Alice")
+      authors[1].as(Hash(String, Hwaro::Models::ExtraValue))["name"].should eq("Bob")
+    end
+
+    it "exposes nested extra as traversable Crinja value via from_extra" do
+      content = <<-MARKDOWN
+        +++
+        title = "Nested extra"
+        [extra.author]
+        name = "Bob"
+        +++
+
+        body
+        MARKDOWN
+
+      result = Hwaro::Processor::Markdown.parse(content)
+      extra = result[:extra]
+
+      # Mirror `render.cr`'s template exposure path.
+      crinja_extra = {} of String => Crinja::Value
+      extra.each { |k, v| crinja_extra[k] = Hwaro::Utils::CrinjaUtils.from_extra(v) }
+
+      env = Crinja.new
+      env.context["page"] = Crinja::Value.new({
+        "extra" => Crinja::Value.new(crinja_extra),
+      })
+      rendered = env.from_string("{{ page.extra.author.name }}").render
+      rendered.should eq("Bob")
     end
   end
 end

@@ -15,12 +15,12 @@ describe Hwaro::Config::Options::ScaffoldType do
       Hwaro::Config::Options::ScaffoldType.from_string("docs").should eq(Hwaro::Config::Options::ScaffoldType::Docs)
     end
 
-    it "parses 'blog-dark'" do
-      Hwaro::Config::Options::ScaffoldType.from_string("blog-dark").should eq(Hwaro::Config::Options::ScaffoldType::BlogDark)
+    it "parses 'bare'" do
+      Hwaro::Config::Options::ScaffoldType.from_string("bare").should eq(Hwaro::Config::Options::ScaffoldType::Bare)
     end
 
-    it "parses 'docs-dark'" do
-      Hwaro::Config::Options::ScaffoldType.from_string("docs-dark").should eq(Hwaro::Config::Options::ScaffoldType::DocsDark)
+    it "parses 'book'" do
+      Hwaro::Config::Options::ScaffoldType.from_string("book").should eq(Hwaro::Config::Options::ScaffoldType::Book)
     end
 
     it "is case insensitive" do
@@ -48,17 +48,56 @@ describe Hwaro::Config::Options::ScaffoldType do
       Hwaro::Config::Options::ScaffoldType::Docs.to_s.should eq("docs")
     end
 
-    it "converts BlogDark to 'blog-dark'" do
-      Hwaro::Config::Options::ScaffoldType::BlogDark.to_s.should eq("blog-dark")
+    it "converts Bare to 'bare'" do
+      Hwaro::Config::Options::ScaffoldType::Bare.to_s.should eq("bare")
     end
 
-    it "converts DocsDark to 'docs-dark'" do
-      Hwaro::Config::Options::ScaffoldType::DocsDark.to_s.should eq("docs-dark")
+    it "converts Book to 'book'" do
+      Hwaro::Config::Options::ScaffoldType::Book.to_s.should eq("book")
     end
 
     it "round-trips through from_string and to_s" do
-      ["simple", "blog", "docs", "blog-dark", "docs-dark"].each do |name|
+      ["simple", "bare", "blog", "docs", "book"].each do |name|
         Hwaro::Config::Options::ScaffoldType.from_string(name).to_s.should eq(name)
+      end
+    end
+  end
+end
+
+describe Hwaro::Config::Options::AgentsMode do
+  describe ".from_string" do
+    it "parses 'remote'" do
+      Hwaro::Config::Options::AgentsMode.from_string("remote").should eq(Hwaro::Config::Options::AgentsMode::Remote)
+    end
+
+    it "parses 'local'" do
+      Hwaro::Config::Options::AgentsMode.from_string("local").should eq(Hwaro::Config::Options::AgentsMode::Local)
+    end
+
+    it "is case insensitive" do
+      Hwaro::Config::Options::AgentsMode.from_string("REMOTE").should eq(Hwaro::Config::Options::AgentsMode::Remote)
+      Hwaro::Config::Options::AgentsMode.from_string("Local").should eq(Hwaro::Config::Options::AgentsMode::Local)
+    end
+
+    it "raises on unknown mode" do
+      expect_raises(ArgumentError, /Unknown agents mode/) do
+        Hwaro::Config::Options::AgentsMode.from_string("unknown")
+      end
+    end
+  end
+
+  describe "#to_s" do
+    it "converts Remote to 'remote'" do
+      Hwaro::Config::Options::AgentsMode::Remote.to_s.should eq("remote")
+    end
+
+    it "converts Local to 'local'" do
+      Hwaro::Config::Options::AgentsMode::Local.to_s.should eq("local")
+    end
+
+    it "round-trips through from_string and to_s" do
+      ["remote", "local"].each do |name|
+        Hwaro::Config::Options::AgentsMode.from_string(name).to_s.should eq(name)
       end
     end
   end
@@ -70,12 +109,14 @@ describe Hwaro::Config::Options::InitOptions do
       opts = Hwaro::Config::Options::InitOptions.new
       opts.path.should eq(".")
       opts.force.should be_false
+      opts.clean.should be_false
       opts.skip_agents_md.should be_false
       opts.skip_sample_content.should be_false
       opts.skip_taxonomies.should be_false
       opts.multilingual_languages.should be_empty
       opts.scaffold.should eq(Hwaro::Config::Options::ScaffoldType::Simple)
       opts.scaffold_remote.should be_nil
+      opts.agents_mode.should eq(Hwaro::Config::Options::AgentsMode::Remote)
     end
   end
 
@@ -93,6 +134,50 @@ describe Hwaro::Config::Options::InitOptions do
     it "returns true when two or more languages" do
       opts = Hwaro::Config::Options::InitOptions.new(multilingual_languages: ["en", "ko"])
       opts.multilingual?.should be_true
+    end
+  end
+
+  describe ".validate_language_code!" do
+    it "accepts ISO 639 primary subtags" do
+      %w[en ko ja fr de EN Ko].each do |code|
+        Hwaro::Config::Options::InitOptions.validate_language_code!(code)
+      end
+    end
+
+    it "accepts language-region tags" do
+      %w[en-US pt-BR zh-CN].each do |code|
+        Hwaro::Config::Options::InitOptions.validate_language_code!(code)
+      end
+    end
+
+    it "accepts language-script and language-script-region tags" do
+      %w[zh-Hant sr-Latn zh-Hant-TW].each do |code|
+        Hwaro::Config::Options::InitOptions.validate_language_code!(code)
+      end
+    end
+
+    it "rejects non-alphabetic primary subtag" do
+      expect_raises(ArgumentError, /Invalid language code/) do
+        Hwaro::Config::Options::InitOptions.validate_language_code!("@@@")
+      end
+      expect_raises(ArgumentError, /Invalid language code/) do
+        Hwaro::Config::Options::InitOptions.validate_language_code!("123")
+      end
+    end
+
+    it "rejects empty string" do
+      expect_raises(ArgumentError, /Invalid language code/) do
+        Hwaro::Config::Options::InitOptions.validate_language_code!("")
+      end
+    end
+
+    it "rejects tags with spaces or punctuation" do
+      expect_raises(ArgumentError, /Invalid language code/) do
+        Hwaro::Config::Options::InitOptions.validate_language_code!("en_US")
+      end
+      expect_raises(ArgumentError, /Invalid language code/) do
+        Hwaro::Config::Options::InitOptions.validate_language_code!("en US")
+      end
     end
   end
 end
