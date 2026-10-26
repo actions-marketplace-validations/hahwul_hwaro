@@ -32,7 +32,7 @@ hwaro tool platform vercel --stdout
 |----------|-------------|-------------|
 | netlify | `netlify.toml` | Build settings, redirects, headers |
 | vercel | `vercel.json` | Build command, routing, cache headers |
-| cloudflare | `wrangler.toml` | Workers/Pages site config |
+| cloudflare | `wrangler.toml` | Cloudflare Pages config (`pages_build_output_dir`) |
 | github-pages | `.github/workflows/deploy.yml` | GitHub Actions build + deploy workflow |
 | gitlab-ci | `.gitlab-ci.yml` | GitLab CI/CD pipeline |
 | codeberg-pages | `.forgejo/workflows/deploy.yml` | Codeberg Pages (Forgejo Actions) deploy workflow |
@@ -46,16 +46,22 @@ hwaro tool platform vercel --stdout
 | -f, --force | Overwrite existing file without warning |
 | -h, --help | Show help |
 
-If the output file already exists, use `--force` to overwrite.
+If the output file already exists, use `--force` to overwrite. A destination
+inside the project that is a symlink (or sits under a symlinked directory)
+resolving outside the project is refused, `--force` or not; pass `-o` with the
+real path to write there deliberately.
 
 ## Generated Config
 
 Each config includes:
 
 - **Build command**: `hwaro build`
-- **Output directory**: `public/`
+- **Output directory**: your `[build] output_dir` (`public/` by default).
+  A customized value is carried into every generated config, so the host
+  publishes the directory `hwaro build` actually writes. For `gitlab-ci` a
+  non-default directory also adds `publish:` to the `pages` job.
 - **Redirects**: 301 redirects from page [`aliases`](/writing/pages/) defined in frontmatter (e.g., `aliases: ["/old-url/"]`)
-- **Cache headers**: Long-lived caching for static assets
+- **Cache headers**: a year-long `immutable` rule for the `[assets]` output directory, emitted only when every file there is content-hashed: the asset pipeline is enabled with `fingerprint = true` and at least one `[[assets.bundles]]`, and no `static/<output_dir>/` directory is copied into the same URLs unhashed
 
 ### Netlify Output
 
@@ -66,11 +72,13 @@ Each config includes:
 
 [build.environment]
   # Add environment variables here
+  # HWARO_VERSION = "0.21.0"
 
 [[redirects]]
   from = "/old-url/"
   to = "/posts/new-post/"
   status = 301
+  force = true
 
 [[headers]]
   for = "/assets/*"

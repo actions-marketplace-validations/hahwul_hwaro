@@ -1,0 +1,710 @@
+require "../../../../spec_helper"
+require "../../../../../src/core/build/builder"
+require "../../../../support/build_helper"
+
+# Reopen Builder to expose private Write helpers for testing.
+module Hwaro::Core::Build
+  class Builder
+    def test_generate_404_page(site, templates, output_dir, minify, verbose)
+      generate_404_page(site, templates, output_dir, minify, verbose)
+    end
+
+    def test_process_raw_files(raw_files, output_dir, minify, verbose, written = Set(String).new) : Int32
+      process_raw_files(raw_files, output_dir, minify, verbose, written, Set(String).new)
+    end
+
+    def test_process_assets(pages, output_dir, verbose, already_written = Set(String).new)
+      process_assets(pages, output_dir, verbose, already_written)
+    end
+
+    def test_ensure_dir(dir : String)
+      ensure_dir(dir)
+    end
+  end
+end
+
+describe Hwaro::Core::Build::Phases::Write do
+  describe "#generate_404_page" do
+    it "writes 404.html when a 404 template exists" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          templates = {"404" => "<h1>404 - {{ page_title }}</h1>"}
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_generate_404_page(site, templates, "public", false, false)
+
+          File.exists?("public/404.html").should be_true
+          File.read("public/404.html").should contain("404")
+        end
+      end
+    end
+
+    it "is a no-op when no 404 template exists" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          templates = {} of String => String
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_generate_404_page(site, templates, "public", false, false)
+
+          File.exists?("public/404.html").should be_false
+        end
+      end
+    end
+
+    it "raises HWARO_E_TEMPLATE when the 404 template is malformed" do
+      # A broken templates/404.html must abort the Write phase (fail loud)
+      # rather than ship a green build. apply_template wraps the Crinja parse
+      # error as HWARO_E_TEMPLATE; generate_404_page has no rescue around it.
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          templates = {"404" => "{{ unclosed"}
+
+          builder = Hwaro::Core::Build::Builder.new
+          err = expect_raises(Hwaro::HwaroError) do
+            builder.test_generate_404_page(site, templates, "public", false, false)
+          end
+          err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+        end
+      end
+    end
+  end
+
+  describe "#process_raw_files" do
+    it "copies raw files to the output directory" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/data.json", "{}")
+          FileUtils.mkdir_p("public")
+
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/data.json", "data.json")
+          builder = Hwaro::Core::Build::Builder.new
+
+          count = builder.test_process_raw_files([raw], "public", false, false)
+
+          count.should eq(1)
+          File.exists?("public/data.json").should be_true
+          File.read("public/data.json").should eq("{}")
+        end
+      end
+    end
+
+    it "creates intermediate directories for nested raw paths" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/data")
+          File.write("content/data/feed.xml", "<rss/>")
+          FileUtils.mkdir_p("public")
+
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/data/feed.xml", "data/feed.xml")
+          builder = Hwaro::Core::Build::Builder.new
+
+          builder.test_process_raw_files([raw], "public", false, false)
+          File.exists?("public/data/feed.xml").should be_true
+        end
+      end
+    end
+
+    it "skips a raw-file symlink pointing outside the project" do
+      # Mirrors the bundle-asset guard in process_assets: FileUtils.cp
+      # follows symlinks, so a `content/leak.json -> /outside/secret.json`
+      # link would publish a file from outside the site.
+      Dir.mktmpdir do |dir|
+        outside = File.join(dir, "outside.json")
+        File.write(outside, %({"secret": true}))
+        project = File.join(dir, "proj")
+        FileUtils.mkdir_p(File.join(project, "content"))
+        FileUtils.mkdir_p(File.join(project, "public"))
+        Dir.cd(project) do
+          File.symlink(outside, "content/leak.json")
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/leak.json", "leak.json")
+          builder = Hwaro::Core::Build::Builder.new
+
+          log = with_captured_log do
+            builder.test_process_raw_files([raw], "public", false, false).should eq(0)
+          end
+
+          File.exists?("public/leak.json").should be_false
+          log.should contain("symlink")
+        end
+      end
+    end
+
+    it "still copies an in-project raw-file symlink" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          FileUtils.mkdir_p("public")
+          File.write("content/real.json", "{}")
+          File.symlink(File.expand_path("content/real.json"), "content/link.json")
+
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/link.json", "link.json")
+          builder = Hwaro::Core::Build::Builder.new
+
+          builder.test_process_raw_files([raw], "public", false, false).should eq(1)
+          File.exists?("public/link.json").should be_true
+        end
+      end
+    end
+
+    # Regression: the copy-as-is branch used FileUtils.cp, which truncates the
+    # destination and then streams it. `hwaro serve` re-runs the Write phase on
+    # every rebuild while HTTP fibers stream those same files to the browser, so
+    # a request landing mid-copy was answered with a zero-length or partial body
+    # that nothing retried. The window is not deterministic in a spec, so assert
+    # the property behind it: a reader holding the destination open across a
+    # re-copy must keep seeing one complete revision. Both revisions have the
+    # same length, so only atomicity can satisfy it.
+    it "replaces a raw file atomically instead of truncating it in place" do
+      posix_only!("Windows can't rename over a file that is open")
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          FileUtils.mkdir_p("public")
+          old_bytes = %({"a":"#{"x" * 4000}"})
+          new_bytes = %({"a":"#{"y" * 4000}"})
+          File.write("content/data.json", old_bytes)
+
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/data.json", "data.json")
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_raw_files([raw], "public", false, false)
+
+          reader = File.open("public/data.json")
+          begin
+            File.write("content/data.json", new_bytes)
+            builder.test_process_raw_files([raw], "public", false, false)
+
+            reader.gets_to_end.should eq(old_bytes)
+          ensure
+            reader.close
+          end
+
+          File.read("public/data.json").should eq(new_bytes)
+          Dir.glob("public/*.tmp").should be_empty
+        end
+      end
+    end
+
+    it "returns zero when no raw files are provided" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_raw_files([] of Hwaro::Core::Lifecycle::RawFile, "public", false, false).should eq(0)
+        end
+      end
+    end
+
+    it "minifies JSON and XML, passes HTML through, and copies a file that fails to minify" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          FileUtils.mkdir_p("public")
+          File.write("content/data.JSON", %({\n  "a": 1,\n  "b": [true, null]\n}\n))
+          File.write("content/feed.xml", "<root>\n  <item>x</item>\n</root>\n")
+          File.write("content/page.html", "<p>\n  keep   me\n</p>\n")
+          File.write("content/broken.json", "{ nope")
+          raws = {"data.JSON", "feed.xml", "page.html", "broken.json"}.map do |name|
+            Hwaro::Core::Lifecycle::RawFile.new("content/#{name}", name)
+          end
+
+          log = with_captured_log do
+            Hwaro::Core::Build::Builder.new.test_process_raw_files(raws.to_a, "public", true, false).should eq(4)
+          end
+
+          File.read("public/data.JSON").should eq(%({"a":1,"b":[true,null]}))
+          File.read("public/feed.xml").should eq("<root><item>x</item></root>")
+          File.read("public/page.html").should eq("<p>\n  keep   me\n</p>\n")
+          File.read("public/broken.json").should eq("{ nope")
+          log.should contain("Failed to process broken.json: JSON parsing failed:")
+        end
+      end
+    end
+
+    # Regression: a `.json`/`.xml` file inside a page bundle that
+    # `[content.files]` also publishes is written twice — minified here, then
+    # copied verbatim by process_assets. The asset copy ran last and silently
+    # undid `--minify` for that file.
+    it "keeps its minified output when the same path is also a bundle asset" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/post")
+          File.write("content/post/index.md", "+++\ntitle = \"P\"\n+++\n")
+          File.write("content/post/data.json", "{\n    \"a\": 1\n}\n")
+          FileUtils.mkdir_p("public")
+
+          raw = Hwaro::Core::Lifecycle::RawFile.new("content/post/data.json", "post/data.json")
+          page = Hwaro::Models::Page.new("post/index.md")
+          page.url = "/post/"
+          page.assets = ["post/data.json"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          written = Set(String).new
+          builder.test_process_raw_files([raw], "public", true, false, written)
+          builder.test_process_assets([page], "public", false, written)
+
+          File.read("public/post/data.json").should eq(%({"a":1}))
+        end
+      end
+    end
+  end
+
+  describe "#process_assets" do
+    # The page's own sink refuses a traversing URL (see get_output_path); the
+    # asset copy used to `mkdir_p` the raw `output_dir/<url>` FIRST, so the
+    # build created a directory NEXT TO the output directory — outside it —
+    # before the per-file guard refused every asset in it.
+    it "creates no directory outside the output directory for a traversing url" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/bund")
+          File.write("content/bund/index.md", "---\ntitle: B\n---\n")
+          File.write("content/bund/pic.png", "image-bytes")
+          FileUtils.mkdir_p("public")
+
+          page = Hwaro::Models::Page.new("bund/index.md")
+          page.url = "/../outside/"
+          page.assets = ["bund/pic.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+
+          Dir.exists?(File.join(dir, "outside")).should be_false
+          Dir.exists?("public/outside").should be_false
+        end
+      end
+    end
+
+    # Nothing is created until an asset is actually copied, so a page whose
+    # every asset is skipped leaves no empty directory behind either.
+    it "creates no destination directory when the source asset is missing" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog/post")
+          File.write("content/blog/post/index.md", "---\ntitle: Post\n---\n")
+          FileUtils.mkdir_p("public")
+
+          page = Hwaro::Models::Page.new("blog/post/index.md")
+          page.url = "/blog/post/"
+          page.assets = ["blog/post/missing.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+
+          Dir.exists?("public/blog/post").should be_false
+        end
+      end
+    end
+
+    it "copies a page's collected assets next to the page output" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog/post")
+          File.write("content/blog/post/index.md", "---\ntitle: Post\n---\n")
+          File.write("content/blog/post/cover.png", "image-bytes")
+          FileUtils.mkdir_p("public")
+
+          page = Hwaro::Models::Page.new("blog/post/index.md")
+          page.url = "/blog/post/"
+          page.assets = ["blog/post/cover.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+
+          File.exists?("public/blog/post/cover.png").should be_true
+          File.read("public/blog/post/cover.png").should eq("image-bytes")
+        end
+      end
+    end
+
+    # Same atomicity invariant as the raw-file copy above: bundle assets are
+    # re-copied on every serve rebuild while the browser streams them, and
+    # FileUtils.cp truncated the live destination before streaming into it.
+    it "replaces a changed bundle asset atomically instead of truncating it" do
+      posix_only!("Windows can't rename over a file that is open")
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog/post")
+          File.write("content/blog/post/index.md", "---\ntitle: Post\n---\n")
+          old_bytes = "old-image-bytes" * 500
+          new_bytes = "new-image-bytes" * 500
+          File.write("content/blog/post/cover.png", old_bytes)
+          FileUtils.mkdir_p("public")
+
+          page = Hwaro::Models::Page.new("blog/post/index.md")
+          page.url = "/blog/post/"
+          page.assets = ["blog/post/cover.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+
+          reader = File.open("public/blog/post/cover.png")
+          begin
+            File.write("content/blog/post/cover.png", new_bytes)
+            # Both revisions are the same size, so the skip-unchanged check
+            # would compare mtimes that could land in the same filesystem tick.
+            # Backdate the source to make "changed" unambiguous and keep the
+            # test about atomicity rather than timing.
+            File.utime(Time.utc, Time.utc - 1.hour, "content/blog/post/cover.png")
+            builder.test_process_assets([page], "public", false)
+
+            reader.gets_to_end.should eq(old_bytes)
+          ensure
+            reader.close
+          end
+
+          File.read("public/blog/post/cover.png").should eq(new_bytes)
+          Dir.glob("public/blog/post/*.tmp").should be_empty
+        end
+      end
+    end
+
+    # Racy-git (#857): the copy stamps the destination with the source
+    # mtime, so a same-size rewrite inside the source's timestamp tick kept
+    # that mtime and the exact match skipped it. A future mtime is never
+    # safely old, so the pinned rewrite is clock-independent.
+    it "re-copies a same-size bundle asset rewritten inside its mtime tick" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog/post")
+          File.write("content/blog/post/index.md", "---\ntitle: Post\n---\n")
+          tick = Time.utc + 1.hour
+          File.write("content/blog/post/cover.png", "old-bytes")
+          File.touch("content/blog/post/cover.png", tick)
+          FileUtils.mkdir_p("public")
+
+          page = Hwaro::Models::Page.new("blog/post/index.md")
+          page.url = "/blog/post/"
+          page.assets = ["blog/post/cover.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+          File.write("content/blog/post/cover.png", "new-bytes")
+          File.touch("content/blog/post/cover.png", tick)
+          builder.test_process_assets([page], "public", false)
+
+          File.read("public/blog/post/cover.png").should eq("new-bytes")
+        end
+      end
+    end
+
+    it "skips a bundle asset symlink whose target escapes the project" do
+      Dir.mktmpdir do |outside|
+        secret = File.join(outside, "secret.txt")
+        File.write(secret, "leak")
+
+        Dir.mktmpdir do |dir|
+          Dir.cd(dir) do
+            FileUtils.mkdir_p("content/blog/post")
+            File.write("content/blog/post/index.md", "---\ntitle: Post\n---\n")
+            File.symlink(secret, "content/blog/post/leak.txt")
+            FileUtils.mkdir_p("public")
+
+            page = Hwaro::Models::Page.new("blog/post/index.md")
+            page.url = "/blog/post/"
+            page.assets = ["blog/post/leak.txt"]
+
+            builder = Hwaro::Core::Build::Builder.new
+            builder.test_process_assets([page], "public", false)
+
+            File.exists?("public/blog/post/leak.txt").should be_false
+          end
+        end
+      end
+    end
+
+    it "skips pages with no assets" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          page = Hwaro::Models::Page.new("about.md")
+          page.url = "/about/"
+          page.assets = [] of String
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_process_assets([page], "public", false)
+          # No public/about/ should be created when there are no assets
+          Dir.exists?("public/about").should be_false
+        end
+      end
+    end
+
+    it "is a no-op when the source asset is missing" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          page = Hwaro::Models::Page.new("blog/post/index.md")
+          page.url = "/blog/post/"
+          page.assets = ["blog/post/missing.png"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          # Must not raise even though the source file doesn't exist
+          builder.test_process_assets([page], "public", false)
+          File.exists?("public/blog/post/missing.png").should be_false
+        end
+      end
+    end
+  end
+
+  describe "#ensure_dir" do
+    it "creates the directory once" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          target = File.join(dir, "ensured")
+          builder.test_ensure_dir(target)
+          Dir.exists?(target).should be_true
+
+          # Calling again should be a no-op (idempotent)
+          builder.test_ensure_dir(target)
+          Dir.exists?(target).should be_true
+        end
+      end
+    end
+  end
+end
+
+WITHHELD_BUNDLE_CONFIG = <<-TOML
+  title = "T"
+  base_url = "http://localhost"
+
+  [content.files]
+  allow_extensions = ["jpg", "png"]
+  TOML
+
+describe "Phases::Write withheld bundle files" do
+  it "does not publish [content.files] / raw files of draft or future-dated bundles" do
+    build_site(
+      WITHHELD_BUNDLE_CONFIG,
+      content_files: {
+        "posts/_index.md"              => "+++\ntitle = \"Posts\"\n+++\n",
+        "posts/secret/index.md"        => "+++\ntitle = \"S\"\ndraft = true\n+++\n![x](product.jpg)\n",
+        "posts/secret/product.jpg"     => "J",
+        "posts/secret/data.json"       => "{\"a\":1}",
+        "posts/secret/sub/deep.png"    => "D",
+        "posts/teaser/index.md"        => "+++\ntitle = \"T\"\ndate = 2099-01-01\n+++\nhi\n",
+        "posts/teaser/teaser.png"      => "P",
+        "posts/live/index.md"          => "+++\ntitle = \"L\"\n+++\nok\n",
+        "posts/live/photo.jpg"         => "L",
+        "posts/secret/nested/index.md" => "+++\ntitle = \"N\"\n+++\nok\n",
+        "posts/secret/nested/n.jpg"    => "N",
+        "posts/shared.png"             => "S",
+        "feed.json"                    => "{}",
+      },
+      template_files: {"page.html" => "{{ content }}", "section.html" => "{{ content }}"},
+    ) do
+      File.exists?("public/posts/secret/product.jpg").should be_false
+      File.exists?("public/posts/secret/data.json").should be_false
+      File.exists?("public/posts/secret/sub/deep.png").should be_false
+      File.exists?("public/posts/teaser/teaser.png").should be_false
+      # Live bundles, a live bundle nested in a withheld one, section-level
+      # files and root raw files are unaffected.
+      File.exists?("public/posts/live/photo.jpg").should be_true
+      File.exists?("public/posts/secret/nested/n.jpg").should be_true
+      File.exists?("public/posts/shared.png").should be_true
+      File.exists?("public/feed.json").should be_true
+    end
+  end
+
+  it "keeps a collision loser's bundle files out of the winner's directory" do
+    # posts/a (slug = "x") and posts/x both publish /posts/x/; posts/a wins
+    # by path order, so /posts/x/cover.png must be posts/a's file.
+    {WITHHELD_BUNDLE_CONFIG, "title = \"T\"\nbase_url = \"http://localhost\"\n"}.each do |config|
+      build_site(
+        config,
+        content_files: {
+          "posts/a/index.md"  => "+++\ntitle = \"A\"\nslug = \"x\"\n+++\nA\n",
+          "posts/a/cover.png" => "A-cover",
+          "posts/x/index.md"  => "+++\ntitle = \"X\"\n+++\nX\n",
+          "posts/x/cover.png" => "X-cover",
+        },
+        template_files: {"page.html" => "{{ page.title }}"},
+      ) do
+        File.read("public/posts/x/index.html").should eq("A")
+        File.read("public/posts/x/cover.png").should eq("A-cover")
+      end
+    end
+  end
+
+  it "publishes a draft bundle's files under --drafts" do
+    build_site(
+      WITHHELD_BUNDLE_CONFIG,
+      content_files: {
+        "posts/secret/index.md"    => "+++\ntitle = \"S\"\ndraft = true\n+++\nx\n",
+        "posts/secret/product.jpg" => "J",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+      drafts: true,
+    ) do
+      File.exists?("public/posts/secret/product.jpg").should be_true
+    end
+  end
+
+  it "keeps a bundle published when any language variant of its index survives" do
+    build_site(
+      WITHHELD_BUNDLE_CONFIG + "\n\n[languages.ko]\ntitle = \"K\"\n",
+      content_files: {
+        "photos/index.md"    => "+++\ntitle = \"P\"\ndraft = true\n+++\nx\n",
+        "photos/index.ko.md" => "+++\ntitle = \"P\"\n+++\nx\n",
+        "photos/a.jpg"       => "A",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.exists?("public/photos/a.jpg").should be_true
+    end
+  end
+
+  it "applies [content.files] deny rules to raw .json/.xml files" do
+    build_site(
+      "title = \"T\"\nbase_url = \"http://localhost\"\n\n[content.files]\nallow_extensions = [\"png\"]\ndisallow_extensions = [\"xml\"]\ndisallow_paths = [\"drafts/**\"]\n",
+      content_files: {
+        "drafts/secrets.json" => "{\"s\":1}",
+        "feed.xml"            => "<a/>",
+        "public.json"         => "{}",
+      },
+    ) do
+      File.exists?("public/drafts/secrets.json").should be_false
+      File.exists?("public/feed.xml").should be_false
+      File.exists?("public/public.json").should be_true
+    end
+  end
+end
+
+describe "Phases::Write content copies vs pages and generated outputs" do
+  config = <<-TOML
+    title = "T"
+    base_url = "http://localhost"
+    [content.files]
+    allow_extensions = ["html", "txt"]
+    [sitemap]
+    enabled = true
+    TOML
+  content = {
+    "about.md"            => "+++\ntitle = \"About\"\n+++\n",
+    "about/index.html"    => "RAW",
+    "sitemap.xml"         => "<raw/>",
+    "post/index.md"       => "+++\ntitle = \"Post\"\naliases = [\"/post/old/\"]\n+++\n",
+    "post/index.html"     => "RAW",
+    "post/old/index.html" => "RAW",
+    "post/data.json"      => "{}",
+    "notes.txt"           => "kept",
+  }
+  templates = {"page.html" => "{{ page.title }}", "section.html" => "{{ section.title }}"}
+
+  it "keeps the rendered page, alias stub and sitemap over a same-path content file" do
+    build_site(config, content_files: content, template_files: templates) do
+      File.read("public/about/index.html").should eq("About")
+      File.read("public/post/index.html").should eq("Post")
+      File.read("public/post/old/index.html").should contain("url=/post/")
+      File.read("public/sitemap.xml").should contain("<urlset")
+      File.read("public/post/data.json").should eq("{}")
+      File.read("public/notes.txt").should eq("kept")
+    end
+  end
+
+  it "keeps them on a warm --cache build too" do
+    build_site(config, content_files: content, template_files: templates, cache: true) do
+      # Every page is a cache hit: the alias stub is on record only in the
+      # page's cache entry.
+      builder = Hwaro::Core::Build::Builder.new
+      Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+      builder.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false))
+      File.read("public/about/index.html").should eq("About")
+      File.read("public/post/index.html").should eq("Post")
+      File.read("public/post/old/index.html").should contain("url=/post/")
+      File.read("public/sitemap.xml").should contain("<urlset")
+    end
+  end
+end
+
+# Counts the O(pages) shadowed-output scans; a subclass so the count stays
+# out of every other spec's builder.
+private class ShadowScanCountingBuilder < Hwaro::Core::Build::Builder
+  getter shadow_scans = 0
+
+  def content_copy_shadowed_outputs(output_dir : String) : Set(String)
+    @shadow_scans += 1
+    super
+  end
+end
+
+describe "Phases::Write shadowed-output scan cost" do
+  # The scan costs O(pages) (owned outputs plus, on --cache, every cached
+  # page's derived paths): 6,300 pages took the Write phase from 0.4ms to
+  # 125ms+ with nothing to copy.
+  it "skips the scan when the build has no content copies" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", %(title = "T"\nbase_url = "http://localhost"))
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("templates/page.html", "{{ page.title }}")
+        File.write("content/a.md", "+++\ntitle = \"A\"\n+++\n")
+        builder = ShadowScanCountingBuilder.new
+        builder.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, highlight: false)).should be_true
+        builder.shadow_scans.should eq(0)
+      end
+    end
+  end
+
+  it "scans once for a serve batch of content files" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", %(title = "T"\nbase_url = "http://localhost"\n[content.files]\nallow_extensions = ["txt"]))
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        File.write("templates/page.html", "{{ page.title }}")
+        File.write("content/a.md", "+++\ntitle = \"A\"\n+++\n")
+        files = (1..3).map { |i| "content/f#{i}.txt" }
+        files.each { |path| File.write(path, "x") }
+        builder = ShadowScanCountingBuilder.new
+        builder.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, highlight: false)).should be_true
+        before = builder.shadow_scans
+
+        builder.copy_changed_content_files(files, "public")
+        (builder.shadow_scans - before).should eq(1)
+        File.read("public/f3.txt").should eq("x")
+      end
+    end
+  end
+end
+
+# Plays the other render worker: between this worker's failed mkdir and its
+# walk for the stale file, the rival deletes the file and makes its own
+# directory under the freed path.
+private class RivalWorkerBuilder < Hwaro::Core::Build::Builder
+  def initialize(kept_output_dir : String)
+    super()
+    @kept_output_dir = kept_output_dir
+  end
+
+  def test_mkdir_output(dir : String)
+    mkdir_output(dir)
+  end
+
+  private def remove_stale_file_in_the_way(dir : String) : Bool
+    File.delete("public/blog")
+    Hwaro::Utils::FileSafe.mkdir_p("public/blog/b")
+    super
+  end
+end
+
+describe "Phases::Write mkdir_output under parallel render" do
+  it "creates the directory when a rival worker already removed the stale file" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        FileUtils.mkdir_p("public")
+        File.write("public/blog", "previous build's file")
+        RivalWorkerBuilder.new("public").test_mkdir_output("public/blog/a")
+        Dir.exists?("public/blog/a").should be_true
+      end
+    end
+  end
+end

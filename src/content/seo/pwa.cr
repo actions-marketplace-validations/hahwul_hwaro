@@ -3,16 +3,26 @@ require "digest/sha1"
 require "../../models/config"
 require "../../models/site"
 require "../../utils/logger"
+require "../processors/image_processor"
 
 module Hwaro
   module Content
     module Seo
       class Pwa
-        def self.generate(site : Models::Site, output_dir : String, verbose : Bool = false)
+        # The files `generate` writes under the current config (none when
+        # disabled).
+        def self.published_outputs(config : Models::Config, output_dir : String) : Array(String)
+          return [] of String unless config.pwa.enabled
+          [File.join(output_dir, "manifest.json"), File.join(output_dir, "sw.js")]
+        end
+
+        # `localize` maps an external precache URL to its `[privacy]` local
+        # copy (nil = keep it external).
+        def self.generate(site : Models::Site, output_dir : String, verbose : Bool = false, localize : (String -> String?)? = nil)
           return unless site.config.pwa.enabled
 
           generate_manifest(site, output_dir, verbose)
-          generate_service_worker(site, output_dir, verbose)
+          generate_service_worker(site, output_dir, verbose, localize)
         end
 
         private def self.generate_manifest(site : Models::Site, output_dir : String, verbose : Bool)
@@ -61,7 +71,7 @@ module Hwaro
           Logger.info "  Generated manifest.json"
         end
 
-        private def self.generate_service_worker(site : Models::Site, output_dir : String, verbose : Bool)
+        private def self.generate_service_worker(site : Models::Site, output_dir : String, verbose : Bool, localize : (String -> String?)? = nil)
           config = site.config
           pwa = config.pwa
 
@@ -73,7 +83,7 @@ module Hwaro
           # Build precache URL list (each entry is a site-internal root-relative
           # path that must carry the subpath prefix, same as start_url).
           base_path = config.base_path
-          precache_urls = pwa.precache_urls.map { |u| config.with_base_path(u) }
+          precache_urls = pwa.precache_urls.map { |u| localize.try(&.call(u)) || config.with_base_path(u) }
           precache_urls << resolved_start unless precache_urls.includes?(resolved_start)
           if offline = pwa.offline_page
             resolved_offline = config.with_base_path(offline)
@@ -129,14 +139,24 @@ module Hwaro
           # edit to any precached page/asset changes the hash and busts the
           # cache on deploy (correct invalidation). The PWA hook runs after the
           # render/write phase, so the precached output files already exist.
+          #
+          # `[csp]` injects its `<meta>` (every page in meta mode, a page no
+          # `_headers` rule can match in headers mode) after this runs, so a
+          # `--cache` hit's page still carries the previous build's: hash the
+          # pages without it, and fold the policy config in instead so a
+          # directive change still busts the cache.
+          csp = config.csp.enabled
           cache_hash = Digest::SHA1.hexdigest do |ctx|
             ctx.update(pwa.cache_strategy)
+            ctx.update("\ncsp:#{config.csp.directives.to_a}") if csp
             precache_urls.each do |u|
               ctx.update("\n")
               ctx.update(u)
               next if external_url?(u)
               fpath = precache_file_path(u, output_dir, base_path)
-              ctx.update(File.read(fpath)) if File.file?(fpath)
+              next unless File.file?(fpath)
+              bytes = File.read(fpath)
+              ctx.update(csp ? Core::Build::Csp.strip_meta(bytes) : bytes)
             end
           end
           cache_version = cache_hash[0, 12]
@@ -231,9 +251,20 @@ module Hwaro
             JS
         end
 
+        # Navigations go to the network first, like the cache-first handler:
+        # serving them stale-while-revalidate showed every precached (or
+        # previously visited) page from the old cache after a deploy.
         private def self.stale_while_revalidate_handler(offline_url : String, root_url : String) : String
           <<-JS
             self.addEventListener('fetch', event => {
+              if (event.request.mode === 'navigate') {
+                event.respondWith(
+                  fetch(event.request).catch(() =>
+                    caches.match(#{offline_url}).then(cached => cached || caches.match(#{root_url}))
+                  )
+                );
+                return;
+              }
               event.respondWith(
                 caches.match(event.request).then(cached => {
                   const fetchPromise = fetch(event.request).then(response => {
@@ -242,12 +273,7 @@ module Hwaro
                       caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
                     }
                     return response;
-                  }).catch(() => {
-                    if (event.request.mode === 'navigate') {
-                      return caches.match(#{offline_url}).then(cached => cached || caches.match(#{root_url}));
-                    }
-                    return undefined;
-                  });
+                  }).catch(() => undefined);
                   return cached || fetchPromise;
                 })
               );
@@ -278,18 +304,32 @@ module Hwaro
           File.file?(precache_file_path(url, output_dir, base_path))
         end
 
+        # Extensions whose intrinsic size can be read from the file header.
+        MEASURABLE_ICON_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+
         # Resolve an icon's declared `sizes`. Prefer the real pixel dimensions
-        # read from the PNG header so a 200x60 logo isn't mislabeled "512x512";
-        # fall back to the filename heuristic for non-PNG icons or unparsable
-        # bytes.
+        # read from the image header so a 200x60 logo isn't mislabeled
+        # "512x512"; fall back to the filename heuristic only when the bytes
+        # cannot be measured.
+        #
+        # The measurement used to be PNG-only, so a JPEG icon fell through to
+        # the filename heuristic: `tiny.jpg` (100x100) was published as
+        # `"sizes": "512x512"` and `logo-2024.jpg` as `"2024x2024"`. Browsers
+        # pick the install icon by the declared `sizes`, so the lie is what
+        # ships to the home screen.
         private def self.icon_size(icon_path : String, output_dir : String) : String
+          ext = File.extname(icon_path).downcase
+          # A scalable icon has no pixel size; `any` is the manifest spec's
+          # spelling for it and is what makes it eligible at every size. That
+          # holds for a remote SVG too — no bytes are needed to know it.
+          return "any" if ext == ".svg"
           # A remote icon (http(s)://) has no local file to read — use the
           # filename heuristic directly instead of warning on every build.
-          if File.extname(icon_path).downcase == ".png" && !external_url?(icon_path)
-            if dims = png_dimensions(resolve_icon_file(icon_path, output_dir))
+          if MEASURABLE_ICON_EXTS.includes?(ext) && !external_url?(icon_path)
+            if dims = Processors::ImageProcessor.dimensions(resolve_icon_file(icon_path, output_dir))
               return "#{dims[0]}x#{dims[1]}"
             end
-            Logger.warn "PWA: could not read PNG dimensions for icon #{icon_path.inspect}; falling back to filename-derived size #{extract_icon_size(icon_path).inspect}"
+            Logger.warn "PWA: could not read image dimensions for icon #{icon_path.inspect}; falling back to filename-derived size #{extract_icon_size(icon_path).inspect}"
           end
           extract_icon_size(icon_path)
         end
@@ -299,27 +339,6 @@ module Hwaro
         private def self.resolve_icon_file(icon_path : String, output_dir : String) : String
           rel = normalize_icon_path(icon_path).lchop('/')
           File.join(output_dir, rel)
-        end
-
-        # Read width/height from a PNG's IHDR chunk. Verifies the 8-byte PNG
-        # signature, then reads two big-endian UInt32s at offsets 16 (width)
-        # and 20 (height). Returns nil when the file is missing, too short, or
-        # not a PNG so the caller can fall back to the filename heuristic.
-        PNG_SIGNATURE = Bytes[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
-
-        private def self.png_dimensions(path : String) : {UInt32, UInt32}?
-          return unless File.file?(path)
-          header = Bytes.new(24)
-          read = File.open(path, &.read(header))
-          return if read < 24
-          return unless header[0, 8] == PNG_SIGNATURE
-          width = IO::ByteFormat::BigEndian.decode(UInt32, header[16, 4])
-          height = IO::ByteFormat::BigEndian.decode(UInt32, header[20, 4])
-          return if width.zero? || height.zero?
-          {width, height}
-        rescue ex : IO::Error | File::Error
-          Logger.debug "PWA: failed reading PNG header for #{path}: #{ex.message}"
-          nil
         end
 
         # Normalize icon path to a URL path.
@@ -350,6 +369,7 @@ module Hwaro
           when ".jpg", ".jpeg" then "image/jpeg"
           when ".svg"          then "image/svg+xml"
           when ".webp"         then "image/webp"
+          when ".gif"          then "image/gif"
           when ".ico"          then "image/x-icon"
           else                      "image/png"
           end

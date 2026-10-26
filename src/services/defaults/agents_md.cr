@@ -2,6 +2,13 @@ module Hwaro
   module Services
     module Defaults
       class AgentsMd
+        # Heading of the user-owned tail section in both generated variants.
+        # `AgentsMdCommand#merge_site_section` carries everything from this
+        # marker onward across a regenerating `--write`, so the command and
+        # the templates must agree on the exact text — the templates below
+        # interpolate this constant rather than spelling it out.
+        SITE_SECTION_MARKER = "## Site-Specific Instructions"
+
         def self.remote_content : String
           <<-CONTENT
             # AGENTS.md - AI Agent Instructions for Hwaro Site
@@ -70,7 +77,7 @@ module Hwaro
             hwaro tool agents-md --local --write
             ```
 
-            ## Site-Specific Instructions
+            #{SITE_SECTION_MARKER}
 
             <!-- Add your site-specific rules and conventions below -->
             CONTENT
@@ -180,7 +187,7 @@ module Hwaro
 
             | Field | Type | Description |
             |-------|------|-------------|
-            | sort_by | string | Sort by: `date`, `weight`, `title` |
+            | sort_by | string | Sort by: `date`, `published`, `weight`, `title` |
             | paginate | int | Pages per page |
             | transparent | bool | Pass pages to parent section |
             | generate_feeds | bool | Generate RSS feed for this section |
@@ -336,7 +343,7 @@ module Hwaro
             6. **Use `{{ base_url }}` prefix** for URLs in templates.
             7. **Escape user content** with `{{ value | e }}` (or `| escape`) in templates.
 
-            ## Site-Specific Instructions
+            #{SITE_SECTION_MARKER}
 
             <!-- Add your site-specific rules and conventions below -->
             CONTENT

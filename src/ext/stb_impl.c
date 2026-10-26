@@ -9,9 +9,84 @@
  * Source: https://github.com/nothings/stb
  */
 
+/* Windows: Crystal passes UTF-8 paths; without these stb opens them with
+ * fopen in the ANSI code page, so a Korean slug or a non-ASCII user profile
+ * can't be read or written. No effect elsewhere. */
+#define STBI_WINDOWS_UTF8
+#define STBIW_WINDOWS_UTF8
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+/* PNG deflate through zlib instead of stb's built-in compressor.
+ *
+ * stb_image_write ships a small hash-chain deflate that is both slower and
+ * markedly weaker than zlib's. Measured on a 1200x630 RGBA OG image
+ * (-O2, Apple M-series), encoding the whole PNG:
+ *
+ *   stb's compressor (level 8)   15.3 ms   203,152 bytes
+ *   zlib level 3                  6.6 ms   174,733 bytes
+ *   zlib level 4                  9.4 ms   144,187 bytes
+ *   zlib level 6                 14.6 ms   128,976 bytes
+ *
+ * Level 4 is faster AND smaller than what stb produced, which is why it is
+ * the default here: OG image generation dominates a real site's build (567 ms
+ * of a 943 ms docs build), and the images it emits also ship to every social
+ * crawler that fetches them.
+ *
+ * libz is already a hard dependency of every hwaro build — Crystal's
+ * `compress/deflate`, required by src/core/build/remote_data.cr, links it —
+ * so this adds no new library. The encoded pixels are unchanged: PNG is
+ * lossless and only the IDAT deflate stream differs, so cached OG images
+ * stay valid and RENDER_REVISION deliberately does NOT move.
+ */
+#include <stdlib.h>
+/* Windows: Crystal's toolchain ships zlib's library but not its header.
+ * (Nested: a preprocessor without __has_include can't parse it in an
+ * `&&` with the defined() test.) */
+#if defined(_WIN32) && defined(__has_include)
+#if !__has_include(<zlib.h>)
+#define HWARO_NO_ZLIB_H 1
+#endif
+#endif
+#ifdef HWARO_NO_ZLIB_H
+/* The two zlib 1.x entry points used below, verbatim. */
+typedef unsigned long uLong;
+typedef uLong uLongf;
+typedef unsigned char Bytef;
+#define Z_OK 0
+extern uLong compressBound(uLong sourceLen);
+extern int compress2(Bytef *dest, uLongf *destLen, const Bytef *source,
+                     uLong sourceLen, int level);
+#else
+#include <zlib.h>
+#endif
+
+#define HWARO_PNG_ZLIB_LEVEL 4
+
+/* stb passes `stbi_write_png_compression_level` (its own default, 8) as
+ * `quality`. That number indexes stb's compressor, not zlib's — the two
+ * scales are unrelated, and zlib's 8 costs 40 ms for 5 KB less than level 4 —
+ * so it is deliberately ignored. hwaro never sets that global.
+ *
+ * Returns a buffer stb frees with STBIW_FREE (plain free), or NULL, which
+ * stb propagates as a failed write. */
+static unsigned char *hwaro_png_zlib_compress(unsigned char *data, int data_len,
+                                              int *out_len, int quality) {
+    (void)quality;
+    if (data_len < 0) return NULL;
+    uLongf bound = compressBound((uLong)data_len);
+    unsigned char *out = (unsigned char *)malloc(bound ? bound : 1);
+    if (!out) return NULL;
+    if (compress2(out, &bound, data, (uLong)data_len, HWARO_PNG_ZLIB_LEVEL) != Z_OK) {
+        free(out);
+        return NULL;
+    }
+    *out_len = (int)bound;
+    return out;
+}
+
+#define STBIW_ZLIB_COMPRESS hwaro_png_zlib_compress
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -58,22 +133,6 @@ float hwaro_font_scale_for_pixel_height(const stbtt_fontinfo *info, float pixels
 
 void hwaro_font_get_vmetrics(const stbtt_fontinfo *info, int *ascent, int *descent, int *line_gap) {
     stbtt_GetFontVMetrics(info, ascent, descent, line_gap);
-}
-
-void hwaro_font_get_codepoint_hmetrics(const stbtt_fontinfo *info, int codepoint, int *advance_width, int *left_side_bearing) {
-    stbtt_GetCodepointHMetrics(info, codepoint, advance_width, left_side_bearing);
-}
-
-int hwaro_font_get_codepoint_kern_advance(const stbtt_fontinfo *info, int ch1, int ch2) {
-    return stbtt_GetCodepointKernAdvance(info, ch1, ch2);
-}
-
-unsigned char *hwaro_font_get_codepoint_bitmap(const stbtt_fontinfo *info, float scale_x, float scale_y, int codepoint, int *width, int *height, int *xoff, int *yoff) {
-    return stbtt_GetCodepointBitmap(info, scale_x, scale_y, codepoint, width, height, xoff, yoff);
-}
-
-void hwaro_font_free_bitmap(unsigned char *bitmap) {
-    stbtt_FreeBitmap(bitmap, NULL);
 }
 
 /* Decode one UTF-8 sequence at `p` (NUL-terminated), storing the codepoint in

@@ -34,7 +34,8 @@ mermaid = true
 | sub | bool | false | Subscript (`~text~` → `<sub>text</sub>`) |
 | sup | bool | false | Superscript (`^text^` → `<sup>text</sup>`) |
 | attributes | bool | false | Generalized `{#id .class key=val}` blocks on headings and inline images |
-| safe | bool | false | Strip raw HTML from output (replaced with comments) |
+| wikilinks | bool | false | `[[wikilinks]]`, `![[image]]` embeds, `![[note]]` transclusion and foldable `> [!TIP]-` callouts (see [Wikilinks & Backlinks](/writing/obsidian/)) |
+| safe | bool | false | Strip the author's raw HTML from output (replaced with comments); shortcode output and the extensions' own markup (tables, footnotes, math, …) are kept |
 | lazy_loading | bool | false | Add `loading="lazy"` to `<img>` tags |
 | emoji | bool | false | Convert emoji shortcodes (e.g. `:smile:`) to emoji characters |
 | smart_punctuation | bool | false | Typographic quotes/dashes/ellipses |
@@ -56,6 +57,8 @@ Render checkboxes in lists.
 - [ ] Incomplete task
 - [X] Also completed (case-insensitive)
 ```
+
+Task markers are also converted in ordered lists (`1. [ ] First step`) and inside blockquotes, such as `> - [ ] A quoted task`.
 
 ### Output
 
@@ -156,6 +159,11 @@ $$
 
 ### Client-Side Setup
 
+The built-in scaffolds' headers (all but `bare`) include `{{ math_tags }}`, which emits the
+KaTeX or MathJax tags for the configured `math_engine` (and renders
+nothing when `math = false`). Put it in your own `<head>`, or load the
+library yourself:
+
 #### KaTeX
 
 ```html
@@ -198,15 +206,17 @@ graph TD
 ### Output
 
 ```html
-<div class="mermaid">
-graph TD
-    A[Start] --> B{Decision}
-    B -->|Yes| C[OK]
-    B -->|No| D[Cancel]
+<div class="mermaid">graph TD
+    A[Start] --&gt; B{Decision}
+    B --&gt;|Yes| C[OK]
+    B --&gt;|No| D[Cancel]
 </div>
 ```
 
 ### Client-Side Setup
+
+`{{ mermaid_tags }}` does the same for Mermaid (empty when `mermaid = false`).
+The manual equivalent:
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
@@ -215,7 +225,7 @@ graph TD
 
 ## Inline Markup (ins, mark, sub, sup)
 
-Four opt-in inline styles, each behind its own flag — off by default, so
+Four opt-in inline styles, each behind its own flag. All are off by default, so
 turning one on never affects the others.
 
 ### Syntax
@@ -244,7 +254,7 @@ Formula: x<sub>2</sub> + y<sup>2</sup> = z<sub>n</sub></p>
 
 - **No backslash escape.** None of the four delimiters supports
   CommonMark-style `\`-escaping to suppress the transform, and results
-  from trying are inconsistent — a backslash can leave broken, escaped-tag
+  from trying are inconsistent: a backslash can leave broken, escaped-tag
   output behind instead of either the literal delimiter or the styled
   result. Use a code span (`` `++literal++` ``) whenever you need the
   syntax to show up as text.
@@ -252,7 +262,7 @@ Formula: x<sub>2</sub> + y<sup>2</sup> = z<sub>n</sub></p>
   both sides of the content to activate, so arithmetic-like text (`a ~ b`,
   `x ^ y`, `a == b` with spaces) is left alone. A single `~` and `^` are
   deliberately disjoint from strikethrough's `~~` and normal `**`/`__`
-  emphasis, so `~~del~~` and `~sub~` on the same line both work — but a
+  emphasis, so `~~del~~` and `~sub~` on the same line both work. But a
   page with lots of literal `~`/`^`/`==`/`++` (shell prompts, C/C++
   snippets, XOR-heavy code) should keep those in code spans or fenced code
   blocks either way, since sub/sup/ins/mark only ever apply outside them.
@@ -261,10 +271,10 @@ Formula: x<sub>2</sub> + y<sup>2</sup> = z<sub>n</sub></p>
 
 ## Attributes (`{#id .class key=val}`)
 
-A pandoc-style attribute block on a heading or inline image — a
+A pandoc-style attribute block on a heading or inline image, a
 generalization of the [custom heading ID](/writing/pages/#custom-heading-ids)
 shorthand that also sets classes and arbitrary attributes, and extends to
-images.
+images. Heading attributes also work on headings inside blockquotes.
 
 ### Syntax
 
@@ -290,7 +300,9 @@ attributes = true
 Tokens are whitespace-separated (commas are not separators): `#id` sets
 the id, `.class` adds a class (repeatable), and `key=value` / `key="quoted
 value"` sets any other attribute. `id=value` and `class=value` are
-accepted as aliases for `#value` / `.value`. Any single invalid token
+accepted as aliases for `#value` / `.value`. An id may start with a digit
+(`{#1-intro}`), the same charset the [custom heading ID](/writing/pages/#custom-heading-ids)
+shorthand accepts; a class name may not. Any single invalid token
 invalidates the whole block, leaving the source `{...}` untouched.
 
 ### Limitations
@@ -302,7 +314,7 @@ invalidates the whole block, leaving the source `{...}` untouched.
   narrower `heading_ids` mechanism even when `attributes` is also on, so
   turning `attributes` on doesn't change existing `{#id}`-only headings.
 - **Safe mode drops the block**: with `markdown.safe = true`, `{...}`
-  attribute blocks are stripped from the output (like `heading_ids`) —
+  attribute blocks are stripped from the output (like `heading_ids`), so
   no attributes are applied.
 
 ## Smart Punctuation
@@ -318,6 +330,9 @@ and three dots become their typographic forms:
 | `...` | … (ellipsis) |
 
 Code spans, code blocks, raw HTML, and math bodies are never rewritten.
+Raw HTML code blocks such as `<pre>`, `<script>`, `<style>`, and `<textarea>`
+also keep their contents literal during markdown extension processing
+(shortcodes inside them still expand).
 Table cells, definition bodies, and footnote bodies are pre-rendered
 HTML, so smart punctuation does not apply inside them. The `markdownify`
 template filter follows the site's setting.
@@ -333,11 +348,10 @@ Any **markdown** body — code fences and task lists included.
 :::
 ```
 
-The title defaults to the capitalized type. Longer runs nest
+The title is rendered as inline markdown (`:::tip *Heads up*`) and defaults to the capitalized type. Longer runs nest
 (`::::outer` … `:::inner` … `:::` … `::::`), a bare `:::` closes the
 innermost open container, and unclosed containers auto-close at the end
-of the page. `:::` lines inside code fences stay literal. Not supported
-with `safe = true` (the raw wrapper would be stripped).
+of the page. `:::` lines inside code fences stay literal.
 
 ## Task List Classes
 
@@ -350,7 +364,7 @@ task item. Off by default so existing sites keep byte-identical output.
 ## Heading Anchor Links
 
 `insert_anchor_links = "left"` (or `"right"`) adds a `🔗` anchor link
-to every heading site-wide — before or after the heading text. Page
+to every heading site-wide, before or after the heading text. Page
 front matter `insert_anchor_links = true/false` overrides the site
 setting per page. Customize the markup entirely with a
 [render-heading hook](/templates/render-hooks/).
@@ -368,9 +382,11 @@ external_links_no_referrer = true  # rel="noreferrer"
 ```
 
 Links that already carry a `target=` keep it, and `rel` tokens merge
-into an existing `rel` attribute without duplicating — so a
+into an existing `rel` attribute without duplicating, so a
 render-link hook's explicit choices win. The policy applies to every
 absolute http(s) link, including ones pointing at your own domain.
+Raw HTML anchors are covered regardless of attribute-name case or whether
+their attributes use single or double quotes.
 
 ## Multi-line Footnotes and Definitions
 

@@ -14,10 +14,6 @@ module Hwaro
         def run(options : Config::Options::ImportOptions) : ImportResult
           path = options.path
           output_dir = options.output_dir
-          imported = 0
-          skipped = 0
-          errors = 0
-          wrapped = 0
 
           reset_written_paths
 
@@ -34,38 +30,13 @@ module Hwaro
             return ImportResult.new(
               success: true,
               message: "No Hexo posts found in #{path}",
+              skipped_count: outside_source_skips,
             )
           end
 
-          files.each do |file_info|
-            result = import_file(file_info, output_dir, options.verbose, options.force)
-            case result
-            when :imported
-              imported += 1
-            when :imported_wrapped
-              imported += 1
-              wrapped += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error importing #{file_info[:path]}: #{ex.message}"
+          import_each(files, "Hexo", wrapped_note: "contained Hexo tag plugins. Imports kept the raw syntax — each will render as literal text until you hand-convert them.") do |file_info|
+            import_file(file_info, output_dir, options.verbose, options.force)
           end
-
-          if wrapped > 0
-            Logger.warn "#{wrapped} file(s) contained Hexo tag plugins. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
-          end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Hexo import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors,
-          )
         end
 
         private def collect_files(path : String, include_drafts : Bool) : Array(NamedTuple(path: String, draft: Bool))
@@ -74,7 +45,7 @@ module Hwaro
           # Hexo stores posts in source/_posts/
           posts_dir = File.join(path, "source", "_posts")
           if Dir.exists?(posts_dir)
-            scan_markdown(posts_dir).each do |file|
+            scan_markdown(posts_dir, path).each do |file|
               files << {path: file, draft: false}
             end
           end
@@ -82,7 +53,7 @@ module Hwaro
           if include_drafts
             drafts_dir = File.join(path, "source", "_drafts")
             if Dir.exists?(drafts_dir)
-              scan_markdown(drafts_dir).each do |file|
+              scan_markdown(drafts_dir, path).each do |file|
                 files << {path: file, draft: true}
               end
             end
@@ -91,8 +62,8 @@ module Hwaro
           files
         end
 
-        private def scan_markdown(dir : String) : Array(String)
-          walk_files(dir)
+        private def scan_markdown(dir : String, source_root : String) : Array(String)
+          walk_files(dir, source_root: source_root)
         end
 
         private def import_file(
@@ -117,8 +88,8 @@ module Hwaro
 
           if yaml
             # Title
-            if title = yaml["title"]?
-              fields["title"] = yaml_string(title)
+            if (title = yaml["title"]?) && (title_text = yaml_title(title))
+              fields["title"] = title_text
             end
 
             # Date
@@ -166,17 +137,14 @@ module Hwaro
             categories = categories.uniq
             fields["categories"] = categories unless categories.empty?
 
-            # Description
-            if desc = yaml["description"]?
+            # Description. `first_present`, not `if/elsif` on `[]?`: a
+            # present-but-null `description:` would discard the excerpt.
+            if desc = first_present(yaml, "description", "excerpt")
               fields["description"] = yaml_string(desc)
-            elsif excerpt = yaml["excerpt"]?
-              fields["description"] = yaml_string(excerpt)
             end
 
             # Image / thumbnail
-            if image = yaml["cover"]?
-              fields["image"] = yaml_string(image)
-            elsif image = yaml["thumbnail"]?
+            if image = first_present(yaml, "cover", "thumbnail")
               fields["image"] = yaml_string(image)
             end
 
@@ -187,7 +155,11 @@ module Hwaro
                   # Strip leading/trailing slashes and extensions, take last segment
                   normalized = ps.strip("/").sub(/\.\w+$/, "")
                   parts = normalized.split("/")
-                  slug = slugify(parts.last) unless parts.empty?
+                  slug = Utils::TextUtils.slugify(parts.last) unless parts.empty?
+                  # The permalink is the post's published address; the slug
+                  # alone moved `hello/world/` to /posts/world/, breaking
+                  # every inbound link. Kept as `path`, as Jekyll's is.
+                  apply_source_url(fields, ps, file_info[:path])
                 end
               end
             end
@@ -199,13 +171,23 @@ module Hwaro
             fields["date"] = format_date(filename_date)
           end
 
-          # Mark drafts
-          if file_info[:draft]
+          # Mark drafts. Hexo also withholds a `_posts` file marked
+          # `published: false` (as the Jekyll importer maps it); dropping the
+          # key published it.
+          if file_info[:draft] || yaml.try { |y| y["published"]?.try(&.raw) == false }
             fields["draft"] = true
           end
 
-          # Handle Hexo's <!-- more --> excerpt separator.
-          body = body.gsub(/<!--\s*more\s*-->/, "")
+          # Hexo's `title` defaults to the file name; without this every
+          # title-less post built as "Untitled".
+          unless fields.has_key?("title")
+            stem = filename_stem(filename)
+            fields["title"] = stem unless stem.blank?
+          end
+
+          # Hexo's `<!-- more -->` excerpt separator is kept verbatim: hwaro
+          # reads the same marker as the page summary, so deleting it threw
+          # away the excerpt the author chose.
 
           # Track files with Hexo tag plugins; the `run` method emits a
           # single summary so the user knows how many files need manual
@@ -217,7 +199,7 @@ module Hwaro
 
           if slug.empty?
             if title = fields["title"]?.as?(String)
-              slug = slugify(title)
+              slug = file_slug(title)
             else
               slug = "untitled"
             end
@@ -230,18 +212,24 @@ module Hwaro
           has_hexo_tags ? :imported_wrapped : :imported
         end
 
-        private def extract_slug(filename : String) : String
+        # The filename without its extension and `YYYY-MM-DD-` prefix.
+        private def filename_stem(filename : String) : String
           if match = FILENAME_PATTERN.match(filename)
             match[2]
           else
-            name = File.basename(filename, File.extname(filename))
-            slugify(name)
+            File.basename(filename, File.extname(filename))
           end
+        end
+
+        # URL-safe slug of the filename (the date-prefixed branch used to
+        # return the raw name: spaces, `%`, `#`, `?` ended up in the URL).
+        private def extract_slug(filename : String) : String
+          Utils::TextUtils.slugify(filename_stem(filename))
         end
 
         private def extract_date_from_filename(filename : String) : Time?
           if match = FILENAME_PATTERN.match(filename)
-            parse_date(match[1])
+            Utils::DateUtils.parse_import(match[1])
           end
         end
       end

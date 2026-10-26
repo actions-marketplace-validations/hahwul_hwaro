@@ -4,10 +4,13 @@
 # templates, and configuration based on the selected scaffold.
 
 require "file_utils"
+require "toml"
 require "../config/options/init_options"
 require "../utils/errors"
 require "../utils/file_safe"
+require "../utils/frontmatter_writer"
 require "../utils/logger"
+require "../utils/path_utils"
 require "../services/scaffolds/registry"
 require "../services/scaffolds/remote"
 require "./defaults/agents_md"
@@ -26,9 +29,26 @@ module Hwaro
 
       # Counts files/directories actually created so the closing receipt can
       # report "N files" (existing entries left in place are not counted).
-      @created_count = 0
+      # Exposed so `hwaro init --json` can report the same number the human
+      # receipt prints instead of maintaining a second tally.
+      getter created_count = 0
 
       @entries = [] of ScaffoldEntry
+      @target_path : String? = nil
+
+      # One planned scaffold write (`content` nil for a directory). Every
+      # `create_file`/`create_directory` call is queued here and only
+      # performed by `commit_scaffold!` once all destinations have been
+      # checked, so a refused destination leaves the target untouched instead
+      # of half-scaffolded.
+      private record PlannedWrite, path : String, content : String?
+
+      @planned = [] of PlannedWrite
+
+      # Directories the plan will create (and their ancestors), so
+      # `write_files` skips re-planning a parent exactly as it skipped
+      # `create_directory` when the parent already existed on disk.
+      @planned_dirs = Set(String).new
 
       def run(options : Config::Options::InitOptions)
         scaffold = if remote = options.scaffold_remote
@@ -54,23 +74,6 @@ module Hwaro
         )
       end
 
-      def run(
-        target_path : String,
-        force : Bool = false,
-        skip_agents_md : Bool = false,
-        skip_sample_content : Bool = false,
-        skip_taxonomies : Bool = false,
-        multilingual_languages : Array(String) = [] of String,
-        scaffold_type : Config::Options::ScaffoldType = Config::Options::ScaffoldType::Simple,
-        agents_mode : Config::Options::AgentsMode = Config::Options::AgentsMode::Remote,
-        minimal_config : Bool = false,
-        full_config : Bool = false,
-        clean : Bool = false,
-      )
-        scaffold = Scaffolds::Registry.get(scaffold_type)
-        run_with_scaffold(target_path, force, skip_agents_md, skip_sample_content, skip_taxonomies, multilingual_languages, scaffold, agents_mode, minimal_config, full_config, clean)
-      end
-
       private def run_with_scaffold(
         target_path : String,
         force : Bool,
@@ -86,6 +89,14 @@ module Hwaro
         site_title : String? = nil,
         from_wizard : Bool = false,
       )
+        @target_path = target_path
+        @planned.clear
+        @planned_dirs.clear
+        # Per-run state: `config_created` below reads @entries, so a reused
+        # instance must not see the previous run's `:create` entries.
+        @entries.clear
+        @created_count = 0
+
         if clean && Dir.exists?(target_path) && !Dir.empty?(target_path)
           clean_target(target_path)
         end
@@ -138,12 +149,15 @@ module Hwaro
         # Create content structure
         create_directory(File.join(target_path, "content"))
 
-        unless skip_sample_content
-          if is_multilingual
-            create_multilingual_content(target_path, multilingual_languages, skip_taxonomies, scaffold)
-          else
-            create_scaffold_content(target_path, scaffold, skip_taxonomies)
-          end
+        if skip_sample_content
+          # Still write the pages the scaffold's menus and templates link to
+          # (front matter only), or the homepage and every nav link 404.
+          languages = is_multilingual ? multilingual_languages : [] of String
+          write_files(File.join(target_path, "content"), scaffold.skeleton_content_files(languages, skip_taxonomies))
+        elsif is_multilingual
+          create_multilingual_content(target_path, multilingual_languages, skip_taxonomies, scaffold)
+        else
+          create_scaffold_content(target_path, scaffold, skip_taxonomies)
         end
 
         # Create templates
@@ -159,6 +173,9 @@ module Hwaro
         # against and the archetype convention is discoverable.
         create_scaffold_archetypes(target_path, scaffold)
 
+        # Root-relative extras (a remote scaffold's data/ and i18n/).
+        write_files(target_path, scaffold.extra_files)
+
         # Create config.toml
         # Hybrid philosophy (C):
         # - minimal_config : bare essentials, no comments
@@ -170,15 +187,13 @@ module Hwaro
             # Remote scaffold had no config.toml (allowed for content/templates-only remotes).
             # Fall back to normal generation logic so we don't write an empty config.toml.
             Logger.warn "Remote scaffold did not include a config.toml; generating a default one."
-            if minimal_config
-              config_content = scaffold.minimal_config_content(skip_taxonomies, multilingual_languages)
-            elsif full_config
-              # For --full-config without upstream config, use the balanced discoverable default
-              # (we can't easily reconstruct a "full" from a non-remote scaffold here).
-              config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
-            else
-              config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
-            end
+            # --full-config without an upstream config also gets the balanced
+            # default (a "full" config can't be reconstructed for a remote).
+            config_content = if minimal_config
+                               scaffold.minimal_config_content(skip_taxonomies, multilingual_languages)
+                             else
+                               build_balanced_default_config(scaffold, skip_taxonomies, multilingual_languages)
+                             end
           else
             # Use the remote's config as-is (respecting its custom settings), ignore --min/--full.
             config_content = remote_config
@@ -188,18 +203,29 @@ module Hwaro
         elsif full_config
           config_content = scaffold.config_content(skip_taxonomies, multilingual_languages)
         else
-          config_content = build_balanced_default_config(scaffold, skip_taxonomies, is_multilingual, multilingual_languages)
+          config_content = build_balanced_default_config(scaffold, skip_taxonomies, multilingual_languages)
         end
 
         # Wizard-collected site title: substitute the first `title = "…"` line
         # of the generated config. Built-in scaffolds only — a remote
         # scaffold's config is used verbatim.
         if (title = site_title) && !title.empty? && !scaffold.is_a?(Scaffolds::Remote)
-          escaped = title.gsub("\\", "\\\\").gsub("\"", "\\\"")
-          config_content = config_content.sub(/^title\s*=\s*"[^"\n]*"/m, "title = \"#{escaped}\"")
+          # Block form: a String replacement is itself parsed for back-references
+          # (`\0`, `\\`), which collapsed the escaped `C:\\Users` back into the
+          # invalid TOML escape `C:\Users`.
+          escaped = Hwaro::Utils::FrontmatterWriter.escape_toml_string(title)
+          config_content = config_content.sub(/^title\s*=\s*"[^"\n]*"/m) { "title = \"#{escaped}\"" }
         end
 
         create_file(File.join(target_path, "config.toml"), config_content)
+
+        # Keep generated artifacts out of version control from the first
+        # commit: `git init && hwaro init .` is the canonical first-site
+        # workflow (see occupied_entries), so the ignore list ships with the
+        # scaffold instead of living only in the docs. `create_file` never
+        # overwrites, so an existing .gitignore (user's own, or one a remote
+        # scaffold shipped) always wins.
+        create_file(File.join(target_path, ".gitignore"), gitignore_content(config_content))
 
         # Create AGENTS.md unless skipped
         unless skip_agents_md
@@ -214,10 +240,16 @@ module Hwaro
           create_file(File.join(target_path, "AGENTS.md"), agents_content)
         end
 
+        commit_scaffold!
+
         # Auto-add missing optional config sections (commented out).
         # Only for built-in scaffolds + full_config (remote provides its own config).
-        if full_config && !scaffold.is_a?(Scaffolds::Remote)
-          config_path = File.join(target_path, "config.toml")
+        # Only into a config.toml this run created: `--force` keeps an
+        # existing one as-is, and appending ~300 lines to it (or failing on
+        # it when it does not parse) broke that promise.
+        config_path = File.join(target_path, "config.toml")
+        config_created = @entries.any? { |entry| entry.action == :create && entry.path == config_path }
+        if full_config && config_created && !scaffold.is_a?(Scaffolds::Remote)
           doctor = Services::Doctor.new(
             content_dir: File.join(target_path, "content"),
             config_path: config_path
@@ -331,7 +363,7 @@ module Hwaro
         files.each do |relative_path, content|
           full_path = File.join(base_dir, relative_path)
           dir_path = File.dirname(full_path)
-          create_directory(dir_path) unless Dir.exists?(dir_path)
+          create_directory(dir_path) unless Dir.exists?(dir_path) || @planned_dirs.includes?(dir_path)
           create_file(full_path, content)
         end
       end
@@ -421,11 +453,22 @@ module Hwaro
       end
 
       private def clean_target(target_path : String)
-        if Dir.exists?(File.join(target_path, ".git"))
+        # Any `.git` entry, not only a directory: a git worktree or submodule
+        # checkout has a `.git` FILE (a gitlink), and wiping one destroyed
+        # the uncommitted work and the checkout's link to its repository.
+        if File.info?(File.join(target_path, ".git"), follow_symlinks: false)
           raise Hwaro::HwaroError.new(
             code: Hwaro::Errors::HWARO_E_USAGE,
-            message: "Refusing to --clean '#{target_path}': target contains a .git directory.",
+            message: "Refusing to --clean '#{target_path}': target contains a .git entry (repository, worktree or submodule).",
             hint: "Delete .git manually if you really want to wipe this directory.",
+          )
+        end
+
+        if protected_clean_root?(target_path)
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: "Refusing to --clean '#{target_path}': it is the filesystem root or your home directory.",
+            hint: "Point hwaro init at a dedicated project directory, e.g. hwaro init my-site --clean.",
           )
         end
 
@@ -440,24 +483,125 @@ module Hwaro
         end
       end
 
+      # `/` and `$HOME` are never a project directory; `hwaro init --clean`
+      # typed in the wrong terminal tab would otherwise empty them.
+      private def protected_clean_root?(target_path : String) : Bool
+        real = File.realpath(target_path)
+        # `anchor`, not `root`: on Windows the root of `C:/` is `/`.
+        return true if Path[real].anchor == Path[real]
+        home = ENV[{{ flag?(:windows) ? "USERPROFILE" : "HOME" }}]?
+        !!(home && !home.empty? && Dir.exists?(home) && File.realpath(home) == real)
+      rescue File::Error
+        false
+      end
+
       private def create_directory(path : String)
-        if Dir.exists?(path)
-          @entries << ScaffoldEntry.new(:exist, path, dir: true)
-        else
-          Hwaro::Utils::FileSafe.mkdir_p(path)
-          @created_count += 1
-          @entries << ScaffoldEntry.new(:create, path, dir: true)
+        @planned << PlannedWrite.new(path, nil)
+        dir = path
+        while @planned_dirs.add?(dir)
+          parent = File.dirname(dir)
+          break if parent == dir
+          dir = parent
         end
       end
 
       private def create_file(path : String, content : String)
-        if File.exists?(path)
-          @entries << ScaffoldEntry.new(:exist, path, dir: false)
-        else
-          File.write(path, content)
-          @created_count += 1
-          @entries << ScaffoldEntry.new(:create, path, dir: false)
+        @planned << PlannedWrite.new(path, content)
+      end
+
+      # Check every planned destination, then perform the writes. Something
+      # already present is kept as-is (never overwritten), so it needs no
+      # boundary check: `init --force` on a project whose `templates/` links
+      # to a shared theme elsewhere must still succeed when nothing new would
+      # be written through that link. Only destinations that would be created
+      # must resolve within the target.
+      private def commit_scaffold! : Nil
+        @planned.each do |write|
+          present = write.content ? File.exists?(write.path) : Dir.exists?(write.path)
+          ensure_scaffold_path_within_target!(write.path) unless present
         end
+
+        @planned.each do |write|
+          if content = write.content
+            if File.exists?(write.path)
+              @entries << ScaffoldEntry.new(:exist, write.path, dir: false)
+            else
+              File.write(write.path, content)
+              @created_count += 1
+              @entries << ScaffoldEntry.new(:create, write.path, dir: false)
+            end
+          elsif Dir.exists?(write.path)
+            @entries << ScaffoldEntry.new(:exist, write.path, dir: true)
+          else
+            Hwaro::Utils::FileSafe.mkdir_p(write.path)
+            @created_count += 1
+            @entries << ScaffoldEntry.new(:create, write.path, dir: true)
+          end
+        end
+        @planned.clear
+      end
+
+      private def ensure_scaffold_path_within_target!(path : String) : Nil
+        target_path = @target_path
+        return unless target_path
+
+        target_root = Hwaro::Utils::PathUtils.resolved_real_path(target_path)
+        resolved_path = Hwaro::Utils::PathUtils.resolved_real_path(path)
+        within_target = Hwaro::Utils::PathUtils.within?(resolved_path, target_root)
+        dangling_link = File.symlink?(path) && !File.exists?(path)
+        return if within_target && !dangling_link
+
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_IO,
+          message: "Cannot scaffold #{path}: destination cannot be safely resolved within the project.",
+          hint: "Remove the symlink or choose a project directory without paths that resolve outside it.",
+        )
+      end
+
+      # The scaffolded .gitignore: the build output tree, hwaro's `.hwaro/`
+      # workspace (serve output and remote-data cache — also self-ignoring
+      # via Utils::HwaroDir, so pre-existing repos are covered too), and the
+      # incremental-build cache, which lives at the root NEXT TO `.hwaro/`.
+      #
+      # Every pattern is root-anchored (leading `/`): git matches a
+      # slash-free pattern at ANY depth, so a bare `public/` also ignored a
+      # `content/public/` section and `.hwaro_cache.json` any nested file of
+      # that name.
+      private def gitignore_content(config_content : String) : String
+        String.build do |io|
+          if output_dir = scaffold_output_dir(config_content)
+            io << "# Build output (`hwaro build`)\n"
+            io << '/' << output_dir << "/\n\n"
+          end
+          io << "# Hwaro workspace (`hwaro serve` output, remote-data cache) and build cache\n"
+          io << "/.hwaro/\n"
+          io << "/.hwaro_cache.json\n"
+        end
+      end
+
+      # The output_dir the generated config will build into, for the
+      # .gitignore. Built-in scaffolds never set `[build] output_dir`, but a
+      # remote scaffold's config is used verbatim and may — honor it so the
+      # ignore matches what `hwaro build` will actually write. Returns nil
+      # (omit the entry) for a path .gitignore cannot express safely:
+      # absolute, escaping, or the project root itself.
+      private def scaffold_output_dir(config_content : String) : String?
+        dir = TOML.parse(config_content)["build"]?
+          .try(&.as_h?)
+          .try(&.["output_dir"]?)
+          .try(&.as_s?) || "public"
+        dir = dir.strip.rstrip('/')
+        return if dir.empty? || dir == "." || dir.starts_with?('\\') || Utils::PathUtils.absolute?(dir)
+        return if dir.split('/').includes?("..")
+        # git does not normalize `./`: a `./public/` pattern matches nothing.
+        dir = dir.lchop("./")
+        return if dir.empty? || dir == "."
+        dir
+      rescue
+        # A config.toml that does not parse (possible for a remote scaffold's
+        # verbatim config) fails the build later with a proper error; the
+        # .gitignore just falls back to the default output tree.
+        "public"
       end
 
       # Builds a balanced default config for Hybrid C.
@@ -466,7 +610,6 @@ module Hwaro
       private def build_balanced_default_config(
         scaffold : Scaffolds::Base,
         skip_taxonomies : Bool,
-        is_multilingual : Bool,
         multilingual_languages : Array(String),
       ) : String
         # Start with the clean minimal content (which now includes multilingual

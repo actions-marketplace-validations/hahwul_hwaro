@@ -5,7 +5,7 @@ weight = 2
 toc = true
 +++
 
-Hwaro's template system centers on three core types: **Site**, **Section**, and **Page**. This page is a **template-side reference** — all properties and variables you can use when building templates. For how to write content and set front matter fields, see [Writing](/writing/).
+Hwaro's template system centers on three core types: **Site**, **Section**, and **Page**. This page is a **template-side reference** for all properties and variables you can use when building templates. For how to write content and set front matter fields, see [Writing](/writing/).
 
 ## Hierarchy
 
@@ -115,6 +115,46 @@ Directories nest arbitrarily: `data/users/admins/root.yml` → `site.data.users.
 
 **Conflicts.** If a directory and a file share the same stem (e.g. `data/users.yml` alongside `data/users/`), the **directory wins** and the file is ignored. Hwaro emits a warning during the build so the shadowed file is not silently dropped.
 
+### Remote Data Sources
+
+`site.data` can also be fed from HTTP(S) endpoints, declared in `config.toml`. Each source is fetched **once per build, before anything renders**. Templates never trigger network requests, and every endpoint the build talks to is visible in one place.
+
+For the standalone configuration guide, including cache behavior, offline error
+policies, timeouts, and security boundaries, see [Remote Data Sources](/features/remote-data/).
+
+```toml
+[[data.remote]]
+key = "team"                # exposed as site.data.team
+url = "https://api.example.com/team"
+format = "json"             # json | toml | yaml | csv (optional, see inference below)
+headers = { Authorization = "Bearer ${API_TOKEN}" }
+cache = "1h"                # skip the request while the cached copy is younger than this
+on_error = "fail"           # fail | warn-and-use-cache | warn-and-skip
+```
+
+Templates consume the result exactly like a local data file (`site.data.team`), so a key can move between `data/team.json` and a remote source without touching any template. To turn the records themselves into pages instead of feeding templates, see [Content Generation](/features/content-generation/).
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `key` | yes | Name under `site.data`. Letters, digits, `_`, `-` only; each key may be declared once. Keys are compared case-insensitively, because `Team` and `team` would share one cache file on macOS and Windows, so they are rejected as duplicates. |
+| `url` | yes | Absolute `http://` or `https://` URL. Other schemes are rejected at config load. |
+| `format` | no | `json`, `toml`, `yaml`, or `csv`. When omitted, inferred from the response `Content-Type`, then from the file extension of the URL the request finally landed on (after any redirects). If neither identifies a format, the fetch fails with a hint to set `format` explicitly. |
+| `headers` | no | Extra request headers. Treated as credentials: never logged, and dropped when a redirect leaves the original origin. |
+| `cache` | no | Disk-cache TTL such as `"90s"`, `"30m"`, `"1h"`, `"7d"` (units combine: `"1h30m"`). While the cached copy is fresh, the build skips the request entirely. Without `cache`, every build refetches, but the last payload is still saved for `warn-and-use-cache`. |
+| `on_error` | no | What to do when the fetch or parse fails. `fail` (default) aborts the build; `warn-and-use-cache` warns and builds from the last successfully fetched payload (any age); `warn-and-skip` warns and leaves `site.data.<key>` unset for this build. |
+
+CSV payloads parse to an array of rows, each an array of stripped string cells, the same shape `load_data()` produces for `.csv` files.
+
+**Environment variables.** `${VAR}` in `url` and `headers` values is replaced from the environment. A referenced variable that is not set fails the build with an error naming the variable (elsewhere in `config.toml` this is only a warning); write `${VAR:-default}` to provide a fallback instead. The error is raised when the source is actually fetched, so commands that never fetch (`hwaro deploy`, `hwaro new`, `hwaro tool ...`) keep working without the variable exported.
+
+**Caching.** Payloads are cached under `.hwaro/remote_data/`, outside `data/` and every other directory `hwaro serve` watches, so serve rebuilds within the TTL reuse the cache instead of re-hitting the API, and cache writes never trigger a rebuild. The cache also survives `hwaro build --full` (only the page cache is cleared), and it is what lets an offline build succeed with `on_error = "warn-and-use-cache"`. `.hwaro/` is self-ignoring (hwaro writes `.hwaro/.gitignore` when creating it), so the cache never appears in `git status`. During a long `hwaro serve` session each source is fetched once and then reused in memory: an entry with a `cache` TTL is re-fetched on the first full rebuild after that TTL expires, and an entry without one is fetched once for the whole session rather than on every save. If a re-fetch fails while the session already holds a payload, serve warns and keeps using it, whatever `on_error` says, so an editor keeps working offline. `hwaro build` is unaffected: it is one process per build and always follows `cache`/`on_error` exactly. A changed payload invalidates cached pages the same way an edited `data/` file does.
+
+**Timeouts.** Each source gets 10s to connect, 30s per read, and 120s overall. The last one spans every redirect hop and the whole body, so a source that trickles bytes just inside the read timeout can't stall the build. Exceeding any of them is a fetch failure, handled by `on_error` like any other.
+
+**Collisions.** A remote `key` that also exists on disk (`data/team.json` next to `key = "team"`) is a config error naming both sources, since a key must have exactly one source, so `site.data.team` never silently depends on which one wins.
+
+Remote sources are deliberately config-only: `load_data()` and shortcodes cannot take a URL. If you need more than a GET request per source (pagination, POST bodies, reshaping), fetch with a [pre-build hook](/features/build-hooks/#fetching-data-from-an-api) into `data/` instead.
+
 ### Site Authors
 
 Hwaro automatically aggregates all authors defined in the `authors` front matter field (`authors = ["id"]`) into `site.authors`.
@@ -188,7 +228,7 @@ A directory with `_index.md` that groups related content.
 | section.pages | Array<Page> | Pages in this section |
 | section.pages_count | Int | Number of pages |
 | section.list | String | Pre-rendered HTML list (`section_list`) |
-| section.subsections | Array<Section> | Child sections |
+| section.subsections | Array<Section> | Child sections, ordered by `weight` then path |
 | section.assets | Array<String> | Static files in section |
 | section.page_template | String? | Default template for pages |
 | section.paginate_path | String | Pagination URL pattern |
@@ -208,7 +248,7 @@ For the current section URL in `section.html`, use `page.url`.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| sort_by | String? | "date" | Sort by: date (newest first), weight (lowest first), title (A→Z) |
+| sort_by | String? | "date" | Sort by: date (newest first), published (newest first, ignoring `updated`), weight (lowest first), title (A→Z) |
 | reverse | Bool? | false | Flip the natural sort order — see [Writing › Sections › Sort direction](/writing/sections/#sort-direction) |
 | paginate | Int? | — | Pages per page |
 | transparent | Bool | false | Pass pages to parent |
@@ -279,6 +319,8 @@ An individual content file (`.md`).
 | page.updated | String? | Last updated date |
 | page.language | String | Effective language code |
 | page.translations | Array<TranslationLink> | Language variants |
+| page.version | Object? | Documentation version (`nil` when unversioned) — see [page.version](#pageversion) |
+| page.version_links | Array<VersionLink> | Version switcher rows (empty when unversioned) |
 
 Rendered HTML content is available as the top-level `content` variable.
 
@@ -290,6 +332,7 @@ Rendered HTML content is available as the top-level `content` variable.
 | page.weight | Int | Sort weight |
 | page.image | String? | Featured image path |
 | page.authors | Array<String> | Author names |
+| page.tags | Array<String> | Tags from front matter |
 | page.taxonomies | Object | This page's taxonomy terms (`page.taxonomies.tags`, `page.taxonomies.<name>`) |
 | page.extra | Object | Custom front matter fields |
 
@@ -297,14 +340,17 @@ Rendered HTML content is available as the top-level `content` variable.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| page.word_count | Int | Word count |
-| page.reading_time | Int | Reading time (minutes) |
-| page.summary | String? | Rendered HTML for the chunk before `<!-- more -->`, falling back to `page.description` when no marker is present. Use with `\| safe` to embed (e.g. `{{ page.summary \| safe }}`); for `<meta name="description">` use `page.description` directly. |
+| page.word_count | Int | Word count, including text pulled in by `include_md`, `include_code` and `![[note]]`. Each Chinese/Japanese (Han, Hiragana, Katakana) character counts as one word; other scripts, Korean included, count space-separated words |
+| page.reading_time | Int | Reading time in minutes, rounded up: ~200 words per minute, plus ~500 Chinese/Japanese characters per minute |
+| page.summary | String? | Summary HTML: the chunk before `<!-- more -->`, else `page.description`, else an automatic excerpt of the rendered body (`[content] summary_length`, one escaped `<p>`). Use with `\| safe` to embed (e.g. `{{ page.summary \| safe }}`); for `<meta name="description">` use `page.description` directly. |
+| page.summary_truncated | Bool | `true` only when `page.summary` is an automatic excerpt that was cut short (useful for a "Read more" link). |
 | page.assets | Array<String> | Static files in page bundle |
 | page.series | String | Series name from front matter (empty if none) |
 | page.series_index | Int | 1-based position within the series (requires `[series]` enabled) |
 | page.series_pages | Array<Page> | All pages in the same series, sorted by `series_weight` |
 | page.related_posts | Array<Page> | Pages sharing taxonomy terms (requires `[related]` enabled) |
+| page.backlinks | Array<Page> | Published pages in the same language linking here, newest first (requires `[content] backlinks = true`; see [Backlinks](/writing/obsidian/#backlinks)) |
+| page.git | Object? | Commit metadata for the source file (requires `[git]` enabled; `nil` for uncommitted or generated pages). Fields: `hash`, `short_hash`, `lastmod` (Time), `first_commit` (Time), `author_name`, `author_email` — see [Git Metadata](/features/git-info/) |
 
 ### Boolean Flags
 
@@ -312,8 +358,10 @@ Rendered HTML content is available as the top-level `content` variable.
 |----------|------|---------|-------------|
 | page.toc | Bool | false | Show table of contents |
 | page.render | Bool | true | Should render |
-| page.is_index | Bool | — | Is index file |
+| page.is_index | Bool | — | Is an index file: a section's `_index.md`, the home page, or a page bundle's `index.md` |
+| page.is_section | Bool | — | Is a section's `_index.md`. Use `rejectattr("is_section")` to drop subsection entries from `section.pages` while keeping page bundles |
 | page.generated | Bool | false | Auto-generated page |
+| page.synthesized | Bool | false | Page created by [`[[content.generate]]`](/features/content-generation/) |
 | page.in_sitemap | Bool | true | Include in sitemap |
 | page.in_search_index | Bool | true | Include in search |
 
@@ -323,7 +371,7 @@ Rendered HTML content is available as the top-level `content` variable.
 |----------|------|-------------|
 | page.lower | Page? | Previous page in reading order |
 | page.higher | Page? | Next page in reading order |
-| page.ancestors | Array<Page> | Parent section chain |
+| page.ancestors | Array<Object> | Parent section chain (each entry has `title` and `url`) |
 | page.translations | Array<TranslationLink> | Language variants |
 
 ### Custom Metadata
@@ -337,19 +385,21 @@ Rendered HTML content is available as the top-level `content` variable.
 | Variable | Equivalent |
 |----------|------------|
 | page_title | page.title |
-| page_description | page.description |
+| page_description | page.description, else site.description |
 | page_url | page.url |
 | page_section | page.section |
 | page_date | page.date |
-| page_image | page.image |
+| page_image | page.image, else `[og] default_image` |
 | page_summary | page.summary |
 | page_word_count | page.word_count |
 | page_reading_time | page.reading_time |
 | page_permalink | page.permalink |
 | page_authors | page.authors |
+| page_tags | page.tags |
 | page_weight | page.weight |
 | page_language | page.language |
 | page_translations | page.translations |
+| lang_prefix | `""` for the default language, `"/<code>"` for other languages (e.g. `{{ base_url }}{{ lang_prefix }}/posts/`) |
 | taxonomy_name | Current taxonomy name (taxonomy pages) |
 | taxonomy_term | Current taxonomy term (taxonomy term pages) |
 | content | Rendered HTML content |
@@ -360,7 +410,7 @@ Rendered HTML content is available as the top-level `content` variable.
 
 ### page.lower / page.higher
 
-Navigation follows the flat reading order across the entire site, similar to mdBook or Docusaurus. Pages are ordered depth-first through the section tree: **section index → section pages → subsections (recursive)**. Within each section, pages are sorted by the section's `sort_by` setting (weight, date, or title).
+Navigation follows the flat reading order across the entire site, similar to mdBook or Docusaurus. Pages are ordered depth-first through the section tree: **section index → section pages → subsections (recursive)**. Within each section, pages are sorted by the section's `sort_by` setting (weight, date, or title). Pages in a directory with no `_index.md` come after the section tree, grouped by directory and sorted like a section's pages (by date, then path). The site root `index.md` always comes first.
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -383,7 +433,9 @@ Navigation follows the flat reading order across the entire site, similar to mdB
 
 ### page.ancestors
 
-Parent sections for breadcrumbs:
+Parent sections for breadcrumbs. An ancestor section without a `title`
+(such as a `transparent` year folder) uses its directory name (`2022`),
+here and in the JSON-LD `BreadcrumbList`:
 
 ```jinja
 <nav class="breadcrumbs">
@@ -394,6 +446,38 @@ Parent sections for breadcrumbs:
   / <span>{{ page.title }}</span>
 </nav>
 ```
+
+### page.version
+
+Only on sites with `[[versions.list]]` (see [Versioned Docs](/features/versioned-docs/)). `nil` for pages outside every version directory.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| .name | String | Version name (URL segment, e.g. "v2") |
+| .label | String | Display label |
+| .latest | Bool | Is the latest version |
+| .url | String | Root URL of the version in the page's language |
+
+### page.version_links
+
+One row per configured version, in config order.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| .name | String | Version name |
+| .label | String | Display label |
+| .latest | Bool | Is the latest version |
+| .url | String | Same page in that version if it exists, else that version's root |
+| .exists | Bool | Counterpart page exists |
+| .current | Bool | Row is the page's own version |
+
+```jinja
+{% for v in page.version_links %}
+<a href="{{ base_url }}{{ v.url }}"{% if v.current %} aria-current="page"{% endif %}>{{ v.label }}</a>
+{% endfor %}
+```
+
+The global `versions` list (`{% for v in versions %}`, `versions.latest`, `versions.all`) exposes every version's root URL in the current page's language.
 
 ### page.translations
 
@@ -451,7 +535,7 @@ pros = ["Fast", "Reliable"]
 ```
 
 A top-level `outputs = ["json"]` in front matter is likewise an ordinary
-unknown key that lands in `page.extra.outputs` — it overrides the
+unknown key that lands in `page.extra.outputs`, and it overrides the
 `[outputs]` config default for that one page/section. See
 [Output Formats](/features/output-formats/).
 
@@ -483,6 +567,8 @@ unknown key that lands in `page.extra.outputs` — it overrides the
 | canonical_tag | Canonical link tag |
 | hreflang_tags | Hreflang alternate link tags (multilingual) |
 | pagination_seo_links | `<link rel="prev/next">` tags |
+| alternate_output_tags | `<link rel="alternate">` tags for the page's enabled [output formats](/features/output-formats/) |
+| jsonld | JSON-LD structured data (`jsonld_article`, `jsonld_breadcrumb`, `jsonld_website`, … also available; see [Structured Data](/features/structured-data/)) |
 
 ```jinja
 <head>
@@ -541,6 +627,10 @@ Pre-rendered `<link>` and `<script>` tags for convenience. These are generated f
 | auto_includes_css | Auto-included CSS `<link>` tags |
 | auto_includes_js | Auto-included JS `<script>` tags |
 | auto_includes | All auto-include tags |
+| math_tags | KaTeX/MathJax tags for `[markdown] math` (empty when math is off) |
+| mermaid_tags | Mermaid script tags (empty when `[markdown] mermaid` is off) |
+| pwa_tags | PWA manifest link, theme-color meta, and service-worker registration (empty unless `[pwa]` is enabled) |
+| search_tags | Stylesheet and script tags of the [built-in search UI](/features/search/#built-in-ui) (empty unless `[search] ui = true`) |
 
 ```jinja
 <head>
@@ -583,7 +673,7 @@ Only available when `toc = true` in front matter.
 | toc_obj.headers[].level | Int | Heading level (2-6) |
 | toc_obj.headers[].id | String | Anchor ID |
 | toc_obj.headers[].title | String | Heading text |
-| toc_obj.headers[].permalink | String | Full anchor permalink |
+| toc_obj.headers[].permalink | String | Fragment link to the heading (`#id`) |
 | toc_obj.headers[].children | Array | Nested child headers (same structure) |
 
 ```jinja
@@ -650,13 +740,13 @@ Available in taxonomy templates:
 | taxonomy_term | String | Current term name (empty on the index page) |
 | content | String | Pre-rendered listing HTML (terms or pages) |
 
-For custom listings, use `get_taxonomy()` — see [Taxonomies](/writing/taxonomies/).
+For custom listings, use `get_taxonomy()`. See [Taxonomies](/writing/taxonomies/).
 
 ---
 
 ## Menus
 
-`site.menus` exposes the **default language's** named menus (config `[[menus.*]]` + front-matter `menus`/`menu` registrations). Inside a template, prefer `get_menu(name="...")` over `site.menus.<name>` — it resolves against the **current page's** language instead, falling back to the default language:
+`site.menus` exposes the **default language's** named menus (config `[[menus.*]]` + front-matter `menus`/`menu` registrations). Inside a template, prefer `get_menu(name="...")` over `site.menus.<name>`, since it resolves against the **current page's** language instead, falling back to the default language:
 
 ```jinja
 {% for item in get_menu(name="main") %}

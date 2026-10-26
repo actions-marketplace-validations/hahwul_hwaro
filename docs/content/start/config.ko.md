@@ -7,6 +7,8 @@ toc = true
 
 모든 사이트 설정은 프로젝트 루트의 `config.toml`에 있습니다.
 
+문자열 목록으로 문서화된 옵션에는 문자열 하나를 써도 되며, 항목이 하나인 목록으로 읽습니다. `sections = "posts"`는 `sections = ["posts"]`와 같습니다. 변수가 없을 때의 `exclude = "${SITEMAP_EXCLUDE:-}"`처럼 빈 문자열은 설정하지 않은 것으로 보고 기본값을 유지합니다. 문자열도 목록도 아닌 값(`fields = true`)은 경고와 함께 무시합니다. 불리언 옵션에 `true`나 `false`가 아닌 값(따옴표로 감싼 `safe = "true"` 등)을 쓴 경우도 경고와 함께 기본값을 유지합니다.
+
 최상위 키에 오타가 있으면 조용히 무시하지 않고 경고합니다. `[markdonw]`나
 `titel = "…"` 같은 오타는 아무 안내 없이 기능을 꺼버리기 때문입니다. 실제
 키와 비슷하면 다음처럼 후보를 함께 알려줍니다.
@@ -15,8 +17,13 @@ toc = true
 Unknown key 'markdonw' in config.toml — hwaro does not read it. Did you mean 'markdown'?
 ```
 
-이 검사는 최상위 키만 대상으로 하며, 섹션 안에 중첩된 키는 각 섹션의
-로더가 검증합니다.
+이 검사는 최상위 키만 대상으로 합니다. 섹션 안에 중첩된 키의 오타
+(`[markdown] emoij = true`)는 보고되지 않으므로 아래 표와 대조해 확인하세요. `[highlight]` 테이블 대신 `highlight = false`를 쓰거나
+`[[taxonomies]]` 항목 대신 `taxonomies = ["tags"]`를 쓰는 것처럼 알려진
+섹션의 형태가 틀린 경우에도 경고와 함께 무시합니다. 예외적으로
+`sitemap = true`는 `[sitemap] enabled = true`와 같은 뜻으로 계속 받아들입니다.
+섹션 안의 테이블 목록을 `[[robots.rules]]`나 `[[menus.main]]` 대신
+`[robots.rules]`, `[menus.main]`처럼 대괄호 하나로 쓴 경우도 경고와 함께 무시합니다.
 
 ## 사이트 설정
 
@@ -31,6 +38,7 @@ base_url = "https://example.com"
 | title | string | 사이트 제목 |
 | description | string | 사이트 설명 |
 | base_url | string | 프로덕션 URL (끝 슬래시 없음) |
+| default_language | string | 언어 접미사가 없는 콘텐츠 파일의 언어 코드 (기본값 `"en"`). [다국어](/ko/features/multilingual/) 참고 |
 
 ## 환경 변수
 
@@ -48,7 +56,7 @@ description = "${SITE_DESC:-My awesome site}"
 | `$VAR` | 위와 동일 (축약형) |
 | `${VAR:-default}` | `VAR`가 없거나 비어 있으면 `default` 사용 |
 
-기본값 없이 누락된 변수는 그대로 남고 빌드 경고가 발생합니다. 템플릿에서의 사용법은 [환경 변수](/ko/features/env-variables/)를 참고합니다.
+기본값 없이 누락된 변수는 그대로 남고 빌드 경고가 발생합니다. `base_url`에 쓴 변수가 없으면 `--base-url`을 주지 않는 한 `hwaro build`가 그 변수 이름을 알리며 중단됩니다. 자체 로컬 URL을 쓰는 `hwaro serve`와 다른 명령은 그대로 동작합니다. 템플릿에서의 사용법은 [환경 변수](/ko/features/env-variables/)를 참고합니다.
 
 ## 빌드 옵션
 
@@ -68,8 +76,22 @@ hooks.post = ["npm run minify"]
 | drafts | bool | false | 초안 콘텐츠 포함 |
 | parallel | bool | true | 병렬 처리 |
 | cache | bool | false | 빌드 캐시 사용 |
+| template_deps | bool | true | 템플릿 의존성을 추적해 템플릿 편집 시 해당 템플릿을 렌더링하는 페이지만 재빌드 |
+| write_stats | bool | false | 렌더링된 페이지가 쓰는 태그·클래스·id를 담은 `hwaro_stats.json`을 프로젝트 루트에 기록(Tailwind 등에서 사용). [에셋 파이프라인](/ko/features/asset-pipeline/#used-selector-manifest-tailwind) 참고 |
 | hooks.pre | array | [] | 빌드 전에 실행할 명령 |
 | hooks.post | array | [] | 빌드 후에 실행할 명령 |
+
+`output_dir`, `drafts`, `parallel`, `cache`는 각각 `hwaro build` 플래그에 대응하며, 플래그가 우선합니다.
+
+```
+명령줄 플래그  >  config.toml  >  기본값
+```
+
+즉 `hwaro build -o dist`는 config의 `output_dir`를 덮어쓰고, `drafts = false`여도 `hwaro build --drafts`를 쓰면 초안이 포함됩니다. 반대 방향은 없습니다. config 값을 다시 끄는 `--no-drafts`나 `--no-cache`는 존재하지 않으므로, 모든 빌드에 항상 적용할 때만 이 키들을 켜세요. `--no-parallel`만 예외로, `parallel = true`를 덮어씁니다.
+
+`drafts`, `parallel`, `cache`는 `hwaro serve`에도 적용됩니다. `output_dir`는 예외입니다. serve는 항상 전용 디렉터리 `.hwaro/serve/`에 빌드하고 `output_dir`는 건드리지 않습니다([serve 명령](/ko/start/cli/#serve) 참고). 반면 `hwaro deploy`는 `output_dir`를 따릅니다. `[deployment] source_dir`가 설정되지 않았다면 `public`을 가정하지 않고 `output_dir`를 배포합니다.
+
+`output_dir`에는 프로젝트 상대 경로와 절대 경로를 모두 쓸 수 있습니다. 프로젝트 밖으로 벗어나는 상대 경로(`../out`)나 빈 값은 경고와 함께 무시되고 기본값 `public`이 대신 쓰입니다.
 
 오류 처리와 활용 사례는 [빌드 훅](/ko/features/build-hooks/)을 참고합니다.
 
@@ -78,8 +100,8 @@ hooks.post = ["npm run minify"]
 ```toml
 [markdown]
 safe = false
-lazy_loading = true
-emoji = true
+lazy_loading = false
+emoji = false
 footnotes = true
 task_lists = true
 definition_lists = true
@@ -100,14 +122,39 @@ math_engine = "katex"
 | mermaid | bool | false | ` ```mermaid ` 블록을 `<div class="mermaid">`로 렌더링 |
 | math | bool | false | 수식 문법(`$...$`, `$$...$$`) 사용 |
 | math_engine | string | "katex" | 수식 렌더링 엔진 (`"katex"` 또는 `"mathjax"`) |
+| admonitions | bool | true | GitHub 스타일 `> [!NOTE]` 인용문을 admonition 블록으로 변환 |
+| heading_ids | bool | true | 커스텀 헤딩 ID(`## Heading {#custom-id}`) 사용 |
+| ins | bool | false | 삽입 텍스트(`++text++` → `<ins>text</ins>`) |
+| mark | bool | false | 강조 표시 텍스트(`==text==` → `<mark>text</mark>`) |
+| sub | bool | false | 아래 첨자(`~text~` → `<sub>text</sub>`) |
+| sup | bool | false | 위 첨자(`^text^` → `<sup>text</sup>`) |
+| attributes | bool | false | 헤딩과 인라인 이미지에 붙는 일반화된 `{#id .class key=val}` 블록 |
 | smart_punctuation | bool | false | 타이포그래피용 인용부호/대시/줄임표 (`"x"` → “x”, `--` → –, `...` → …) |
 | containers | bool | false | `:::note Title` … `:::` 커스텀 컨테이너 (admonition 마크업) |
+| wikilinks | bool | false | Obsidian 문법: `[[위키링크]]`, `![[이미지]]` 임베드, `![[노트]]` 트랜스클루전, 접을 수 있는 `> [!type]-` 콜아웃 ([위키링크와 백링크](/ko/writing/obsidian/) 참고) |
 | insert_anchor_links | string | "none" | 사이트 전역 헤딩 앵커 링크: `"none"`, `"left"`, `"right"` (페이지 프론트 매터가 우선) |
 | external_links_target_blank | bool | false | 절대 http(s) 링크에 `target="_blank" rel="noopener"` 추가 |
 | external_links_no_follow | bool | false | 절대 http(s) 링크에 `rel="nofollow"` 추가 |
 | external_links_no_referrer | bool | false | 절대 http(s) 링크에 `rel="noreferrer"` 추가 |
 
 문법 상세와 예시는 [마크다운 확장](/ko/features/markdown-extensions/)을 참고합니다.
+
+## 콘텐츠
+
+```toml
+[content]
+summary_length = 70
+summary_ellipsis = "…"
+backlinks = false
+```
+
+| 키 | 타입 | 기본값 | 설명 |
+|-----|------|---------|-------------|
+| summary_length | int | 70 | `<!-- more -->`도 `description`도 없는 페이지의 자동 요약 길이. 공백으로 구분되는 텍스트는 단어 수, CJK 위주 텍스트는 글자 수 ×2. `0`이면 자동 요약 비활성화 |
+| summary_ellipsis | string | "…" | 자동 요약이 잘린 경우에만 끝에 추가되는 문자열 |
+| backlinks | bool | false | 각 페이지로 링크하는 페이지를 `page.backlinks`에 채움 ([위키링크와 백링크](/ko/writing/obsidian/#백링크) 참고) |
+
+`page.summary`가 선택되는 방식은 [콘텐츠 요약](/ko/writing/pages/#콘텐츠-요약)을 참고하세요. `[content.files]`, `[content.new]`, `[[content.generate]]`, `[[content.schema]]`는 아래 기능 설정 레퍼런스에 있습니다.
 
 ## 퍼머링크
 
@@ -123,7 +170,7 @@ math_engine = "katex"
 |-------------------|-------------------|----------------|
 | `content/old/posts/a.md` | `posts/` | `/old/posts/a/` -> `/posts/a/` |
 
-규칙은 선언 순서대로 평가되고, 페이지의 디렉터리와 (정확히 또는 상위 접두사로) **처음** 일치하는 원본이 선택됩니다 — 그 페이지에 대해 이후 규칙은 아예 확인하지 않습니다. 구체적인 접두사를 넓은 접두사보다 먼저 선언합니다(`"posts/tech"`를 `"posts"`보다 앞에). 그러지 않으면 넓은 규칙이 구체적인 규칙을 가립니다. 토큰 패턴에도 똑같이 적용되며, 특히 `""` catch-all 규칙은 다른 모든 규칙 **뒤에**, 맨 마지막에 둡니다.
+규칙은 선언 순서대로 평가되고, 페이지의 디렉터리와 (정확히 또는 상위 접두사로) **처음** 일치하는 원본이 선택됩니다. 그 페이지에 대해 이후 규칙은 아예 확인하지 않습니다. 구체적인 접두사를 넓은 접두사보다 먼저 선언합니다(`"posts/tech"`를 `"posts"`보다 앞에). 그러지 않으면 넓은 규칙이 구체적인 규칙을 가립니다. 토큰 패턴에도 똑같이 적용되며, 특히 `""` catch-all 규칙은 다른 모든 규칙 **뒤에**, 맨 마지막에 둡니다.
 
 ### 토큰 패턴
 
@@ -150,9 +197,9 @@ math_engine = "katex"
 
 - 토큰은 경로 세그먼트 전체여야 하며, 알 수 없는 토큰은 설정 로드를 실패시킵니다.
 - 패턴은 리프 페이지에만 적용됩니다. 섹션 `_index`와 번들 `index` 페이지는 패턴 규칙을 건너뜁니다(디렉터리 URL을 유지하거나, 뒤에 오는 일반 재매핑 규칙을 따릅니다).
-- `date`가 없는 페이지가 `:year`/`:month`/`:day`를 쓰는 패턴에 걸리면 빌드가 실패합니다 — 날짜를 넣거나, 프론트 매터에 명시적 `path`를 설정하거나, 날짜 토큰을 뺍니다. 게시되지 않는 페이지는 예외입니다: 초안(`--drafts` 없이), 만료/미래 날짜 페이지, 헤드리스 `render: false` 페이지는 빌드를 막지 않습니다.
+- `date`가 없는 페이지가 `:year`/`:month`/`:day`를 쓰는 패턴에 걸리면 빌드가 실패합니다. 날짜를 넣거나, 프론트 매터에 명시적 `path`를 설정하거나, 날짜 토큰을 뺍니다. 게시되지 않는 페이지는 예외입니다: 초안(`--drafts` 없이), 만료/미래 날짜 페이지, 헤드리스 `render: false` 페이지는 빌드를 막지 않습니다.
 - 프론트 매터의 명시적 `path`는 어떤 퍼머링크 규칙보다 항상 우선합니다.
-- 원본 키가 비어 있으면(`""` 또는 `"/"`) 패턴 규칙이 모든 페이지의 catch-all이 됩니다 — 처음 일치하는 규칙이 이기는 순서 규칙상 뒤의 규칙을 전부 가리므로 반드시 마지막에 선언합니다.
+- 원본 키가 비어 있으면(`""` 또는 `"/"`) 패턴 규칙이 모든 페이지의 catch-all이 됩니다. 처음 일치하는 규칙이 이기므로 뒤의 규칙을 전부 가리게 되니 반드시 마지막에 선언합니다.
 - 기본 언어가 아닌 언어에서는 `/lang/` 접두사가 먼저 옵니다: `/ko/2026/03/05/hello/`.
 
 ## 링크
@@ -162,13 +209,17 @@ math_engine = "katex"
 ```toml
 [links]
 broken_internal = "error"
+broken_anchors = "warn"
 ```
 
 | 키 | 타입 | 기본값 | 설명 |
 |-----|------|---------|-------------|
 | broken_internal | string | "warn" | `"warn"`은 해석되지 않은 `@/` 링크를 하나씩 로그로 남기고 원본 마크업을 유지; `"error"`는 위반 전체를 하나의 목록으로 모아 빌드를 실패시킴 (종료 코드 5) |
+| broken_anchors | string | "ignore" | `"warn"` 또는 `"error"`는 페이지 본문의 `@/page.md#id` 및 같은 페이지 `#id` 링크를 대상 페이지의 렌더링된 HTML에 있는 `id`/`name` 속성(제목, `{#id}`, 숏코드, 템플릿, 각주)과 대조; `"error"`는 `source → link → missing id` 목록으로 빌드를 실패시킴. `"ignore"`는 검사하지 않음 |
 
-`@/` 링크 문법과 strict 모드의 `--cache` 주의 사항은 [페이지](/ko/writing/pages/)를 참고합니다.
+`@/` 링크 문법과 strict 모드의 `--cache` 주의 사항은 [페이지](/ko/writing/pages/#내부-링크)를 참고합니다.
+
+앵커 검사는 렌더 단계가 끝난 뒤 대상 페이지의 출력 파일을 읽으므로, `--cache` 빌드나 `serve` 재빌드에서 다시 렌더링되지 않은 대상도 마지막으로 쓰인 내용으로 검사됩니다 (오탐 없음). 해당 패스에서 렌더링된 페이지의 링크만 검사하므로 CI에서는 캐시 없는 빌드로 전체를 검사하세요.
 
 ## 택소노미
 
@@ -189,7 +240,7 @@ feed = true
 | feed | bool | false | 택소노미 항목마다 RSS 피드 생성 |
 | sitemap | bool | true | 택소노미 페이지를 사이트맵에 포함 |
 | paginate_by | int | — | 택소노미 항목 페이지의 페이지당 글 수 |
-| sort_by | string | "date" | 항목 안 페이지 정렬 기준: `"date"`(최신순), `"title"`, `"weight"` |
+| sort_by | string | "date" | 항목 안 페이지 정렬 기준: `"date"`(최신순), `"published"`(최신순, `updated` 무시), `"title"`, `"weight"` |
 | reverse | bool | false | `sort_by`가 만든 순서를 뒤집음 |
 | terms_sort_by | string | "name" | 택소노미 인덱스의 항목 목록 정렬: `"name"` 또는 `"count"` |
 
@@ -222,9 +273,20 @@ weight = 2
 
 페이지/섹션은 이 파일을 건드리지 않고도 자기 프론트 매터(`menus = ["main"]`)로 메뉴에 참여할 수 있습니다. 메뉴 테이블이 없는 `[languages.<code>]` 블록은 이 전역 메뉴를 상속하고, `[[languages.<code>.menus.<name>]]`을 선언하면 그 언어에서는 전역 메뉴를 대체합니다. 전체 레퍼런스(계층 구조, 언어별 동작, `active_path` 스타일링)는 [메뉴](/ko/features/menus/)를 참고합니다.
 
+최상위 섹션으로 메뉴를 자동으로 채우려면(Hugo의 `sectionPagesMenu`) `[menus]` 아래에 메뉴 이름을 지정합니다.
+
+```toml
+[menus]
+auto_sections = "main"
+```
+
+| 키 | 타입 | 기본값 | 설명 |
+|-----|------|---------|-------------|
+| auto_sections | string | 없음(꺼짐) | 모든 최상위 섹션이 들어갈 메뉴(`identifier` = 디렉터리 이름, `name` = 제목, `url`, `weight`). 초안, 게시 전, 헤드리스, `transparent`, 외부 `redirect_to` 섹션과 `_index.md`가 없는 디렉터리는 제외하며, `identifier`가 같은 명시적 엔트리가 우선합니다. 예약된 키이므로 문자열이 아니거나 빈 값이면 설정 오류입니다. [섹션 메뉴 자동 생성](/ko/features/menus/#섹션-메뉴-자동-생성)을 참고합니다. |
+
 ## 정적 파일
 
-`static/` 아래의 모든 것은 디렉터리 구조를 유지한 채 사이트 루트로 그대로 복사됩니다 — `static/css/app.css`는 `/css/app.css`로 서빙됩니다. 숨김 항목도 포함되므로 `static/.well-known/security.txt`는 `/.well-known/security.txt`로 게시됩니다. 기본적으로 Hwaro는 흔한 OS·에디터·VCS 잔여 파일을 걸러내 프로덕션에 실려 가지 않게 합니다.
+`static/` 아래의 모든 것은 디렉터리 구조를 유지한 채 사이트 루트로 그대로 복사되므로 `static/css/app.css`는 `/css/app.css`로 서빙됩니다. 숨김 항목도 포함되므로 `static/.well-known/security.txt`는 `/.well-known/security.txt`로 게시됩니다. 기본적으로 Hwaro는 흔한 OS·에디터·VCS 잔여 파일을 걸러내 프로덕션에 실려 가지 않게 합니다.
 
 ```toml
 [static]
@@ -237,11 +299,11 @@ exclude = ["*.bak", "drafts/**"]         # 추가로 건너뛸 패턴
 | use_default_excludes | bool | true | 내장 잔여 파일 차단 목록 필터링 (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `.git`, vim 스왑 파일, …) |
 | exclude | array | [] | 추가로 건너뛸 패턴. `*.bak` 같은 글롭은 모든 깊이에서 매칭, `drafts/**`는 하위 트리로 한정, 리터럴 이름은 정확한 파일이나 디렉터리에 고정 (`drafts`는 `drafts/…`를 제외) |
 
-내장 차단 목록은 잔여 파일만 제거합니다 — `.well-known/`, `.domains` 같은 정상적인 점(dot) 경로는 **절대** 걸러지지 않고 항상 게시되며, 콜드 빌드와 `--cache`/증분 빌드에서 동일하게 동작합니다. 내장 필터링을 완전히 끄려면 `use_default_excludes = false`로 설정합니다.
+내장 차단 목록은 잔여 파일만 제거합니다. `.well-known/`, `.domains` 같은 정상적인 점(dot) 경로는 **절대** 걸러지지 않고 항상 게시되며, 콜드 빌드와 `--cache`/증분 빌드에서 동일하게 동작합니다. 내장 필터링을 완전히 끄려면 `use_default_excludes = false`로 설정합니다.
 
 ## 개발 서버
 
-`hwaro serve`에만 적용되는 옵션입니다 — `hwaro build` 출력에는 영향을 주지 않습니다.
+`hwaro serve`에만 적용되는 옵션입니다. `hwaro build` 출력에는 영향을 주지 않습니다.
 
 ```toml
 [serve]
@@ -257,7 +319,7 @@ Cache-Control = "no-store"
 | fast | bool | false | `--fast`를 준 것처럼 서빙 (OG 이미지 생성과 이미지 처리 생략); 명시적 CLI skip 플래그는 그대로 적용 |
 | headers | table | {} | 모든 개발 서버 응답에 추가하는 커스텀 HTTP 응답 헤더; 키가 겹치면 CLI `--header` 값이 우선 |
 
-대응하는 CLI 플래그는 [CLI](/ko/start/cli/)의 serve 명령을 참고합니다.
+대응하는 CLI 플래그는 [CLI](/ko/start/cli/#serve)의 serve 명령을 참고합니다.
 
 ## 기능 설정 레퍼런스
 
@@ -265,31 +327,40 @@ Cache-Control = "no-store"
 
 | 설정 섹션 | 문서 | 설명 |
 |----------------|---------------|-------------|
-| `[feeds]` | [SEO](/ko/features/seo/) | RSS/Atom 피드 생성 |
+| `[feeds]` | [SEO](/ko/features/seo/) | RSS/Atom/JSON Feed 생성 |
 | `[sitemap]` | [SEO](/ko/features/seo/) | 사이트맵 XML 생성 |
-| `[robots]` | [SEO](/ko/features/seo/) | robots.txt 생성 |
+| `[robots]` | [SEO](/ko/features/seo/) | robots.txt 생성 (Content-Signal 줄 포함) |
 | `[og]` | [SEO](/ko/features/seo/) | OpenGraph & Twitter Card 메타 태그 |
 | `[og.auto_image]` | [자동 OG 이미지](/ko/features/og-images/) | OG 미리보기 이미지 자동 생성 (빠른 개발 서버용 `lazy_generate` 포함) |
 | `[search]` | [검색](/ko/features/search/) | 클라이언트 사이드 검색 인덱스 |
 | `[highlight]` | [구문 강조](/ko/features/syntax-highlighting/) | 코드 구문 강조 |
 | `[pagination]` | [페이지네이션](/ko/features/pagination/) | 섹션 페이지네이션 |
 | `[auto_includes]` | [자동 인클루드](/ko/features/auto-includes/) | CSS/JS 파일 자동 인클루드 |
-| `[assets]` | [에셋 파이프라인](/ko/features/asset-pipeline/) | CSS/JS 압축(minify) & 핑거프린팅 |
+| `[assets]` | [에셋 파이프라인](/ko/features/asset-pipeline/) | CSS/JS 압축(minify) & 핑거프린팅, 하위 리소스 무결성(`sri`) |
 | `[sass]` | [Sass/SCSS](/ko/features/sass/) | 내장 SCSS 컴파일 (순수 Crystal) |
 | `[image_processing]` | [이미지 처리](/ko/features/image-processing/) | 이미지 리사이즈 & LQIP |
-| `[image_processing.lqip]` | [이미지 처리](/ko/features/image-processing/) | Base64 블러업 플레이스홀더 |
+| `[image_processing.lqip]` | [이미지 처리](/ko/features/image-processing/#lqip-저화질-이미지-플레이스홀더) | Base64 블러업 플레이스홀더 |
 | `[content.files]` | [콘텐츠 파일](/ko/features/content-files/) | 마크다운이 아닌 파일 게시 |
+| `[content.new]` | [아키타입](/ko/writing/archetypes/) | `hwaro new`의 기본 프론트 매터와 번들 방식 |
+| `[[content.generate]]` | [콘텐츠 생성](/ko/features/content-generation/) | `site.data` 레코드를 페이지로 구체화 |
+| `[[content.schema]]` | [프론트 매터 스키마](/ko/writing/schema/) | 섹션별 프론트 매터 타입, 필수 필드, enum, 범위, 기본값 |
+| `[[data.remote]]` | [원격 데이터 소스](/ko/features/remote-data/) | 빌드 시 원격 데이터를 `site.data`로 가져오기 |
+| `[outputs]` | [출력 포맷](/ko/features/output-formats/) | 페이지/섹션별 추가 출력 포맷(JSON, XML, TXT, CSV) |
+| `[privacy]` | [프라이버시 모드](/ko/features/privacy/) | 외부 폰트, 스크립트, 이미지를 빌드 시 직접 호스팅하기 |
+| `[csp]` | [콘텐츠 보안 정책(CSP)](/ko/features/csp/) | 인라인 스크립트/스타일 해시로 Content-Security-Policy 생성(`_headers` 또는 `<meta>`) |
 | `[static]` | [정적 파일](#정적-파일) | `static/` 복사에서 잔여 파일 필터링 / 경로 제외 |
 | `[serve]` | [개발 서버](#개발-서버) | 개발 서버 응답 헤더 & 빠른 모드 |
 | `[links]` | [링크](#링크) | 깨진 내부 `@/` 링크 처리 (경고 또는 빌드 실패) |
 | `[series]` | [시리즈](/ko/features/series/) | 글을 순서 있는 시리즈로 묶기 |
 | `[related]` | [관련 글](/ko/features/related-posts/) | 관련 콘텐츠 추천 |
+| `[git]` | [Git 메타데이터](/ko/features/git-info/) | `page.git` 커밋 정보와 이력 기반 `updated`/`date` 폴백 |
 | `[llms]` | [LLMs.txt](/ko/features/llms-txt/) | AI/LLM 크롤러 안내 |
 | `[pwa]` | [PWA](/ko/features/pwa/) | 프로그레시브 웹 앱 지원 |
 | `[amp]` | [AMP](/ko/features/amp/) | Accelerated Mobile Pages |
 | `[deployment]` | [배포](/ko/deploy/) | 배포 대상 설정 |
 | `[doctor]` | [doctor](/ko/start/tools/doctor/) | 알려진 진단 이슈 숨기기 |
 | `languages.*` | [다국어](/ko/features/multilingual/) | 다국어 지원 |
+| `[versions]` / `[[versions.list]]` | [버전별 문서](/ko/features/versioned-docs/) | 여러 문서 버전을 나란히 게시 |
 | `[[menus.*]]` | [메뉴](/ko/features/menus/) | 이름을 붙인 내비게이션 메뉴 |
 
 ## 플러그인
@@ -345,7 +416,7 @@ url = "/posts/"
 # 기능 섹션 — 위 기능 설정 레퍼런스 참고
 # [feeds], [sitemap], [robots], [og], [search], [highlight],
 # [pagination], [auto_includes], [assets], [sass], [image_processing],
-# [series], [related], [llms], [pwa], [amp], [deployment], etc.
+# [series], [related], [git], [llms], [pwa], [amp], [deployment], etc.
 ```
 
 ## 함께 보기

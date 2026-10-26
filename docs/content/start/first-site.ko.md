@@ -25,14 +25,13 @@ cd my-site
 | `book` | 챕터, 이전/다음 이동, 키보드 단축키가 있는 책 |
 
 모든 스캐폴드는 CSS `light-dark()` 쌍 위에 만든 하나의 디자인 토큰 시스템을
-공유하므로, 별도 설정 없이 읽는 사람의 OS 색상 모드를 그대로 따라갑니다 —
-라이트면 라이트, 다크면 다크. 스타일이 있는 스캐폴드에는 헤더에 테마 전환
+공유하므로, 별도 설정 없이 읽는 사람의 OS 색상 모드(라이트/다크)를 그대로 따라갑니다. 스타일이 있는 스캐폴드에는 헤더에 테마 전환
 버튼도 들어 있습니다. auto → light → dark 순으로 순환하고, 선택을
 `localStorage`에 저장하며, 첫 페인트 전에 적용하기 때문에 화면이 번쩍이지
 않습니다. 한 가지 모드로 고정하려면(다크 전용 사이트 등) 생성된
 `css/style.css` 끝에 `:root { color-scheme: dark; }`를 추가합니다.
 
-스캐폴드에는 절제된 모던 레이어도 들어 있습니다. 반투명 고정 헤더, 페이지
+스캐폴드에는 몇 가지 모던한 요소도 들어 있습니다. 반투명 고정 헤더, 페이지
 사이의 네이티브 크로스 문서 뷰 전환, 그리고 (블로그 글과 책 페이지의) CSS
 전용 읽기 진행 표시선입니다. 모두 구형 브라우저에서는 자연스럽게 꺼지고,
 모든 애니메이션은 `prefers-reduced-motion`을 존중합니다.
@@ -62,12 +61,44 @@ my-site/
 ├── config.toml      # Site configuration
 ├── content/         # Markdown content
 │   ├── index.md     # Homepage
-│   └── blog/        # Blog section
+│   ├── about.md
+│   └── posts/       # Blog section
 │       ├── _index.md
-│       └── hello.md
+│       └── hello-world.md
 ├── templates/       # Jinja2 templates
 ├── static/          # Static files (CSS, JS, images)
+├── archetypes/      # Front matter templates for hwaro new
+├── data/            # 선택: site.data로 노출되는 JSON/YAML/TOML (CSV는 load_data()로)
 └── public/          # Generated output
+```
+
+### 파일을 어디에 둘까
+
+두 가지만 기억하면 됩니다.
+
+**`data/`는 프로젝트 루트에 둡니다.** `content/` 안이 아니라 `config.toml` 옆입니다. 이 디렉터리의 파일은 자동으로 로드되고 파일 이름이 키가 되므로, `data/team.json`은 어느 템플릿에서든 `site.data.team`으로 쓸 수 있습니다.
+
+```jinja
+{% for member in site.data.team %}
+  <li>{{ member.name }}</li>
+{% endfor %}
+```
+
+하위 디렉터리는 중첩됩니다(`data/users/alice.yml` → `site.data.users.alice`). `hwaro init`은 이 디렉터리를 만들지 않으니 필요할 때 직접 추가하세요. 자세한 규칙은 [데이터 모델](/ko/templates/data-model/)을 참고하세요.
+
+**이미지 같은 정적 파일은 `static/`에 둡니다.** `static/images/photo.jpg`는 출력물에서 `/images/photo.jpg`로 복사되므로, 앞에 슬래시를 붙여 참조합니다.
+
+```
+{{ figure(src="/images/photo.jpg", caption="A photo") }}
+```
+
+`example.com/my-site/`처럼 하위 경로에 배포할 때도 앞의 `/`를 그대로 두세요. Hwaro가 빌드 시점에 루트 상대 `src`와 `href`에 `base_url`의 하위 경로를 붙여 주기 때문에, 같은 콘텐츠가 양쪽에서 모두 동작합니다.
+
+에셋을 그 파일을 쓰는 페이지 옆, 즉 `content/` 안에 두는 것도 가능하지만 이는 선택 기능입니다. 먼저 [콘텐츠 파일](/ko/features/content-files/)을 활성화하세요.
+
+```toml
+[content.files]
+allow_extensions = ["jpg", "png", "svg", "pdf"]
 ```
 
 ## 4. 설정 수정
@@ -83,23 +114,23 @@ base_url = "https://example.com"
 ## 5. 페이지 만들기
 
 ```bash
-hwaro new content/about.md
+hwaro new content/contact.md
 ```
 
 > **팁:** 인자 없이 `hwaro new`를 실행하면 대화형 위저드가 열립니다.
 > 경로를 추천해 주고 제목, 설명, 태그 등을 대신 받아 줍니다.
 
-`content/about.md`를 수정합니다:
+`content/contact.md`를 수정합니다:
 
 ```markdown
 +++
-title = "About"
+title = "Contact"
 +++
 
-Welcome to my site!
+Reach me at hello@example.com.
 ```
 
-`http://localhost:3000/about/`에서 확인합니다.
+`http://localhost:3000/contact/`에서 확인합니다.
 
 ## 6. 섹션 만들기
 
@@ -150,8 +181,8 @@ Claude Code, Cursor, Codex 같은 스킬 지원 에이전트를 쓴다면, Hwaro
 
 | 스킬 | 하는 일 |
 |-------|--------------|
-| `hwaro` | CLI를 제대로 실행 — 텍스트 출력을 추측하는 대신 `--json` 출력 규약과 `HWARO_E_*` 종료 코드를 사용해 `init`, `new`, `serve`, `build`, `doctor`와 콘텐츠 도구를 다룸 |
-| `hwaro-design` | Hwaro의 Crinja 템플릿과 `light-dark()` 디자인 토큰 안에서 사이트를 디자인하고 리테마 — 전형적인 AI 느낌의 레이아웃을 피하는 안티슬롭 원칙 적용 |
+| `hwaro` | `init`, `new`, `serve`, `build`, `doctor`와 콘텐츠 도구를 제대로 실행합니다. 텍스트 출력을 추측하는 대신 `--json` 출력 규약과 `HWARO_E_*` 종료 코드를 사용합니다. |
+| `hwaro-design` | Hwaro의 Crinja 템플릿과 `light-dark()` 디자인 토큰 안에서 사이트를 디자인하고 리테마합니다. 전형적인 AI 느낌의 레이아웃을 피하는 안티슬롭 원칙을 따릅니다. |
 
 명령 하나로 둘 다 설치합니다:
 
@@ -163,7 +194,7 @@ npx skills add hahwul/hwaro
 다크 팔레트로 리테마해 줘"* 처럼 요청하면 에이전트가 알아서 맞는 스킬을
 불러옵니다. 수동 설치 경로와 에이전트별 디렉터리는
 [에이전트 스킬](/ko/integrations/skills/)을, 에이전트가 먼저 따라야 할
-프로젝트별 규칙을 기록해 두려면 [agents-md](/ko/start/tools/agents-md/)를
+프로젝트별 규칙을 기록해 두려면 [AGENTS.md](/ko/start/tools/agents-md/)를
 참고합니다.
 
 ## 다음 단계

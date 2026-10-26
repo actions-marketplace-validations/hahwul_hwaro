@@ -1,6 +1,7 @@
 require "toml"
 require "../models/config"
 require "../utils/logger"
+require "../utils/text_utils"
 
 module Hwaro
   module Content
@@ -20,10 +21,11 @@ module Hwaro
         codes = [config.default_language] + config.languages.keys
         codes.uniq.each do |code|
           path = File.join(i18n_dir, "#{code}.toml")
-          next unless File.exists?(path)
+          # `File.file?`: a FIFO here would block `File.read` forever.
+          next unless File.file?(path)
 
           begin
-            data = TOML.parse(File.read(path))
+            data = TOML.parse(Utils::TextUtils.strip_bom(File.read(path)))
             flat = {} of String => String
             flatten_toml(data, "", flat)
             translations[code] = flat

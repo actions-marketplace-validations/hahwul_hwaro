@@ -1,0 +1,384 @@
+require "../../../../spec_helper"
+require "../../../../../src/core/build/builder"
+require "../../../../support/build_helper"
+
+# Reopen Builder to expose private ReadContent helpers for testing.
+module Hwaro::Core::Build
+  class Builder
+    def test_collect_content_paths(ctx : Lifecycle::BuildContext, include_drafts : Bool = false)
+      collect_content_paths(ctx, include_drafts)
+    end
+
+    def test_extract_language_from_filename(basename : String, config : Models::Config?)
+      extract_language_from_filename(basename, config)
+    end
+
+    def test_run_read_content(ctx : Lifecycle::BuildContext, profiler : Profiler)
+      execute_read_content_phase(ctx, profiler)
+    end
+  end
+end
+
+private def make_ctx(config : Hwaro::Models::Config? = nil) : Hwaro::Core::Lifecycle::BuildContext
+  options = Hwaro::Config::Options::BuildOptions.new(output_dir: "public")
+  ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
+  ctx.config = config
+  ctx
+end
+
+describe Hwaro::Core::Build::Phases::ReadContent do
+  describe "#extract_language_from_filename" do
+    it "returns nil for non-multilingual config" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      builder.test_extract_language_from_filename("about.ko.md", config).should be_nil
+    end
+
+    it "returns nil for nil config" do
+      builder = Hwaro::Core::Build::Builder.new
+      builder.test_extract_language_from_filename("about.ko.md", nil).should be_nil
+    end
+
+    it "extracts a registered language code" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+      config.languages["en"] = Hwaro::Models::LanguageConfig.new(code: "en")
+      builder.test_extract_language_from_filename("about.ko.md", config).should eq("ko")
+    end
+
+    it "ignores unknown language codes" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+      builder.test_extract_language_from_filename("about.zz.md", config).should be_nil
+    end
+
+    it "matches the default language too" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+      builder.test_extract_language_from_filename("about.en.md", config).should eq("en")
+    end
+
+    it "returns nil for plain filenames without a language token" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+      builder.test_extract_language_from_filename("about.md", config).should be_nil
+    end
+
+    it "matches declared language keys outside the 2-3 lowercase alphabet (zh-tw)" do
+      # Language suffixes are matched against DECLARED codes, not a fixed
+      # [a-z]{2,3} pattern — a declared `zh-tw` must produce a translation
+      # instead of a regular page published at /about.zh-tw/.
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["zh-tw"] = Hwaro::Models::LanguageConfig.new(code: "zh-tw")
+      builder.test_extract_language_from_filename("about.zh-tw.md", config).should eq("zh-tw")
+      builder.test_extract_language_from_filename("_index.zh-tw.md", config).should eq("zh-tw")
+    end
+
+    it "keeps an undeclared long suffix as no language (regular page)" do
+      builder = Hwaro::Core::Build::Builder.new
+      config = Hwaro::Models::Config.new
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+      builder.test_extract_language_from_filename("about.zh-tw.md", config).should be_nil
+    end
+  end
+
+  describe "#collect_content_paths" do
+    it "collects markdown pages and sections" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog")
+          File.write("content/about.md", "---\ntitle: About\n---\nbody")
+          File.write("content/blog/_index.md", "---\ntitle: Blog\n---\n")
+          File.write("content/blog/post.md", "---\ntitle: Post\n---\nbody")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.pages.size.should eq(2)
+          ctx.sections.size.should eq(1)
+          ctx.sections.first.section.should eq("blog")
+        end
+      end
+    end
+
+    # The glob does not descend into a linked directory, so a symlinked
+    # section disappeared from the site without a warning.
+    it "warns about a symlinked content directory it does not read" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p(["content", "shared/notes"])
+          File.write("shared/notes/a.md", "---\ntitle: A\n---\nbody")
+          File.symlink(File.expand_path("shared/notes"), "content/notes")
+
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          log = with_captured_log { Hwaro::Core::Build::Builder.new.test_collect_content_paths(ctx) }
+          log.should contain("Skipping content directory symlink (directory symlinks are not followed): content/notes")
+        end
+      end
+    end
+
+    it "discovers pages and sections in byte order, whatever the directory order" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          # APFS returns these in hash order (b z m q a ...), ext4 in another.
+          %w[b z m q a x c y k].each do |name|
+            FileUtils.mkdir_p("content/#{name}")
+            File.write("content/#{name}.md", "---\ntitle: #{name}\n---\nbody")
+            File.write("content/#{name}/_index.md", "---\ntitle: #{name}\n---\n")
+          end
+
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          Hwaro::Core::Build::Builder.new.test_collect_content_paths(ctx)
+
+          ctx.pages.map(&.path).should eq(ctx.pages.map(&.path).sort!)
+          ctx.sections.map(&.path).should eq(ctx.sections.map(&.path).sort!)
+        end
+      end
+    end
+
+    it "marks index pages with is_index" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog/post")
+          File.write("content/blog/_index.md", "---\ntitle: Blog\n---\n")
+          File.write("content/blog/post/index.md", "---\ntitle: Post\n---\nbody")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.sections.any?(&.is_index).should be_true
+          ctx.pages.any?(&.is_index).should be_true
+        end
+      end
+    end
+
+    it "computes the correct section path for nested pages" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/docs/guide")
+          File.write("content/docs/guide/topic.md", "---\ntitle: T\n---\nbody")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.pages.first.section.should eq("docs/guide")
+        end
+      end
+    end
+
+    it "collects raw JSON and XML files" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/data.json", "{}")
+          File.write("content/feed.xml", "<rss/>")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.raw_files.map(&.relative_path).sort!.should eq(["data.json", "feed.xml"])
+        end
+      end
+    end
+
+    it "extracts language code for multilingual filenames" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/about.ko.md", "---\ntitle: 소개\n---\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          config = Hwaro::Models::Config.new
+          config.default_language = "en"
+          config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+          ctx = make_ctx(config)
+
+          builder.test_collect_content_paths(ctx)
+          page = ctx.pages.first
+          page.language.should eq("ko")
+        end
+      end
+    end
+
+    # Regression: `about.en.md` on an `en`-default site got language "en"
+    # while unsuffixed default-language content gets nil, and listings
+    # compare the two exactly — the page vanished from its section's pages.
+    it "normalizes an explicit default-language suffix to nil" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/about.en.md", "---\ntitle: About\n---\n")
+          File.write("content/_index.en.md", "---\ntitle: Home\n---\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          config = Hwaro::Models::Config.new
+          config.default_language = "en"
+          config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+          ctx = make_ctx(config)
+
+          builder.test_collect_content_paths(ctx)
+          ctx.pages.first.language.should be_nil
+          ctx.sections.first.language.should be_nil
+          ctx.sections.first.is_index.should be_true
+        end
+      end
+    end
+
+    it "collects .markdown files as pages, sections, and bundles" do
+      # The markdown processor declares [".md", ".markdown"]; read_content
+      # must agree, or `.markdown` sources silently vanish from the build.
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content/blog")
+          FileUtils.mkdir_p("content/bundle")
+          File.write("content/notes.markdown", "---\ntitle: Notes\n---\nbody")
+          File.write("content/blog/_index.markdown", "---\ntitle: Blog\n---\n")
+          File.write("content/bundle/index.markdown", "---\ntitle: B\n---\nbody")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.pages.map(&.path).sort!.should eq(["bundle/index.markdown", "notes.markdown"])
+          ctx.sections.map(&.path).should eq(["blog/_index.markdown"])
+          ctx.sections.first.is_index.should be_true
+          ctx.pages.find! { |p| p.path == "bundle/index.markdown" }.is_index.should be_true
+          ctx.pages.find! { |p| p.path == "notes.markdown" }.is_index.should be_false
+          # .markdown sources are pages, never raw files
+          ctx.raw_files.should be_empty
+        end
+      end
+    end
+
+    it "strips the language suffix from .markdown files too" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/about.ko.markdown", "---\ntitle: 소개\n---\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          config = Hwaro::Models::Config.new
+          config.default_language = "en"
+          config.languages["ko"] = Hwaro::Models::LanguageConfig.new(code: "ko")
+          ctx = make_ctx(config)
+
+          builder.test_collect_content_paths(ctx)
+          ctx.pages.first.language.should eq("ko")
+        end
+      end
+    end
+
+    it "routes a declared hyphenated language code (zh-tw) as a translation" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/about.zh-tw.md", "---\ntitle: TW\n---\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          config = Hwaro::Models::Config.new
+          config.default_language = "en"
+          config.languages["zh-tw"] = Hwaro::Models::LanguageConfig.new(code: "zh-tw")
+          ctx = make_ctx(config)
+
+          builder.test_collect_content_paths(ctx)
+          ctx.pages.first.language.should eq("zh-tw")
+        end
+      end
+    end
+
+    it "handles empty content directory gracefully" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          builder.test_collect_content_paths(ctx)
+
+          ctx.pages.should be_empty
+          ctx.sections.should be_empty
+          ctx.raw_files.should be_empty
+        end
+      end
+    end
+  end
+
+  describe "#execute_read_content_phase" do
+    it "returns Continue and populates the context" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("content")
+          File.write("content/index.md", "---\ntitle: Home\n---\nhome")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ctx = make_ctx(Hwaro::Models::Config.new)
+          profiler = Hwaro::Profiler.new(enabled: false)
+
+          result = builder.test_run_read_content(ctx, profiler)
+          result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
+          ctx.all_pages.size.should eq(1)
+        end
+      end
+    end
+  end
+
+  describe "page file extension case" do
+    # `.MD` is accepted as a page, but `_index`, `index` bundles and `.ko`
+    # suffixes are only recognised in lowercase (dozens of consumers compare
+    # against `_index.md`), so the file silently became an ordinary page. It
+    # now says so.
+    it "warns that a non-lowercase page extension loses its section/bundle/language role" do
+      log = with_captured_log do
+        build_site(
+          BASIC_CONFIG,
+          content_files: {"blog/_index.MD" => "idx", "blog/ok.md" => "ok"},
+          template_files: {"page.html" => "{{ content }}", "section.html" => "{{ content }}"},
+        ) { |_dir| }
+      end
+      log.should contain("content/blog/_index.MD")
+      log.should contain("lowercase")
+      log.should_not contain("content/blog/ok.md")
+    end
+  end
+end
+
+describe "collect_content_paths ordering" do
+  it "collects pages and raw files in path order whatever the filesystem's readdir order" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        FileUtils.mkdir_p("content/blog")
+        FileUtils.mkdir_p("content/docs")
+        (1..30).to_a.reverse!.each do |i|
+          File.write("content/blog/p#{i}.md", "---\ntitle: P#{i}\n---\nbody")
+          File.write("content/docs/d#{i}.md", "---\ntitle: D#{i}\n---\nbody")
+          File.write("content/blog/r#{i}.json", "{}")
+        end
+
+        ctx = make_ctx(Hwaro::Models::Config.new)
+        Hwaro::Core::Build::Builder.new.test_collect_content_paths(ctx)
+
+        paths = ctx.pages.map(&.path)
+        paths.size.should eq(60)
+        paths.should eq(paths.sort)
+        raw = ctx.raw_files.map(&.relative_path)
+        raw.size.should eq(30)
+        raw.should eq(raw.sort)
+      end
+    end
+  end
+end

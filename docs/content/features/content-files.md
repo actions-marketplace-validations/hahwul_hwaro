@@ -47,6 +47,18 @@ content/
 
 Files are copied directly to the matching output path. The `content/` prefix is stripped automatically.
 
+### Unpublished bundles
+
+Files inside a page bundle whose page is not published are not copied either: a draft (unless you build with `--drafts`), a future-dated page (unless `--include-future`) or an expired page (unless `--include-expired`). In the example above, setting `draft = true` in `blog/my-post/index.md` also withholds `diagram.svg` and `screenshot.png`. A published bundle nested inside an unpublished one still publishes its own files.
+
+### JSON and XML files
+
+`.json` and `.xml` files under `content/` are published as raw files even without an `allow_extensions` entry (and minified with `--minify`). The deny rules below — `disallow_extensions` and `disallow_paths` — and the unpublished-bundle rule above still apply to them.
+
+### Output path conflicts
+
+A content file never replaces a page or a generated file. When one would land on the same output path as a rendered page (`content/about/index.html` beside `content/about.md`), an alias redirect, the feed, the sitemap, `robots.txt` or another generated file, the generated output is kept and the build warns `Not publishing content/…`. Files in `static/` follow the same rule.
+
 ## Extension Matching
 
 ### Allow List
@@ -58,7 +70,7 @@ Only files with extensions in `allow_extensions` are published:
 allow_extensions = ["jpg", "jpeg", "png", "gif", "svg", "webp"]
 ```
 
-Extensions are normalized — both `"jpg"` and `".jpg"` are accepted.
+Extensions are normalized, so both `"jpg"` and `".jpg"` are accepted.
 
 ### Deny List
 
@@ -87,7 +99,7 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 | `**/_*` | Any file starting with underscore |
 | `private/**` | All files under `content/private/` |
 
-Paths are matched relative to the `content/` directory.
+Paths are matched relative to the `content/` directory. The deny rules (`disallow_extensions` and `disallow_paths`) also keep files out of page bundles, with or without `allow_extensions`.
 
 ## Referencing Content Files
 
@@ -125,11 +137,11 @@ For page bundles, colocated assets are also available via `page.assets`:
 | Path filtering | ✅ Yes (`disallow_paths`) | ✅ Yes (`[static]` `exclude`) |
 | Best for | Per-page assets | Site-wide assets |
 
-Use **content files** for assets that belong to specific pages (screenshots, diagrams, attachments). Use **static files** for site-wide assets (CSS, JS, logos, favicons) — see [`[static]`](/start/config/#static-files) to exclude cruft or specific paths.
+Use **content files** for assets that belong to specific pages (screenshots, diagrams, attachments). Use **static files** for site-wide assets (CSS, JS, logos, favicons). See [`[static]`](/start/config/#static-files) to exclude cruft or specific paths.
 
 ## Tips
 
-- **Page Bundles**: For the best organization, use [page bundles](/writing/pages/#asset-colocation) — place `index.md` and its assets in a directory together.
+- **Page Bundles**: For the best organization, use [page bundles](/writing/pages/#asset-colocation) and place `index.md` and its assets in a directory together.
 - **Image formats**: Include common web image formats: `["jpg", "jpeg", "png", "gif", "svg", "webp"]`.
 - **Security**: Use `disallow_paths` to prevent publishing source files or drafts.
 - **Keep it lean**: Only allow extensions you actually need. This prevents accidentally publishing large source files.

@@ -25,14 +25,13 @@ Built-in scaffolds:
 | `book` | Book with chapters, prev/next navigation, keyboard shortcuts |
 
 Every scaffold shares one design-token system built on CSS `light-dark()` pairs,
-so each site automatically follows the reader's OS color scheme — light for
-light, dark for dark, with no extra setup. The styled scaffolds also ship a
+so each site automatically follows the reader's OS color scheme, light or dark, with no extra setup. The styled scaffolds also ship a
 theme switcher in the header: it cycles auto → light → dark, persists the
 choice in `localStorage`, and applies it before first paint so there is no
 flash. To force one scheme permanently (a dark-only site), add
 `:root { color-scheme: dark; }` at the end of the generated `css/style.css`.
 
-The scaffolds also carry a quiet modern layer: a sticky glass header, native
+The scaffolds also include a few modern touches: a sticky glass header, native
 cross-document view transitions between pages, and (on blog posts and book
 pages) a CSS-only reading-progress thread. All of it degrades gracefully on
 older browsers and every animation respects `prefers-reduced-motion`.
@@ -62,12 +61,44 @@ my-site/
 ├── config.toml      # Site configuration
 ├── content/         # Markdown content
 │   ├── index.md     # Homepage
-│   └── blog/        # Blog section
+│   ├── about.md
+│   └── posts/       # Blog section
 │       ├── _index.md
-│       └── hello.md
+│       └── hello-world.md
 ├── templates/       # Jinja2 templates
 ├── static/          # Static files (CSS, JS, images)
+├── archetypes/      # Front matter templates for hwaro new
+├── data/            # Optional: JSON/YAML/TOML exposed as site.data (CSV via load_data())
 └── public/          # Generated output
+```
+
+### Where files go
+
+Two rules cover most of it.
+
+**`data/` sits at the project root**, next to `config.toml`, not under `content/`. Every file in it is loaded automatically and keyed by its filename, so `data/team.json` is available in any template as `site.data.team`:
+
+```jinja
+{% for member in site.data.team %}
+  <li>{{ member.name }}</li>
+{% endfor %}
+```
+
+Subdirectories nest (`data/users/alice.yml` → `site.data.users.alice`). `hwaro init` does not create this directory; add it when you need it. See [Data Model](/templates/data-model/) for the full rules.
+
+**Assets go in `static/`.** `static/images/photo.jpg` is copied to the output as `/images/photo.jpg`, so you reference it with a leading slash:
+
+```
+{{ figure(src="/images/photo.jpg", caption="A photo") }}
+```
+
+Keep the leading `/` even when you deploy to a sub-path such as `example.com/my-site/`. Hwaro rewrites root-relative `src` and `href` values to include the `base_url` sub-path at build time, so the same content works in both places.
+
+You can also keep an asset next to the page that uses it, inside `content/`, but that is opt-in. Enable [Content Files](/features/content-files/) first:
+
+```toml
+[content.files]
+allow_extensions = ["jpg", "png", "svg", "pdf"]
 ```
 
 ## 4. Edit Configuration
@@ -83,23 +114,23 @@ base_url = "https://example.com"
 ## 5. Create a Page
 
 ```bash
-hwaro new content/about.md
+hwaro new content/contact.md
 ```
 
 > **Tip:** run `hwaro new` with no arguments to open an interactive wizard that
 > suggests a path and collects the title, description, tags, and more for you.
 
-Edit `content/about.md`:
+Edit `content/contact.md`:
 
 ```markdown
 +++
-title = "About"
+title = "Contact"
 +++
 
-Welcome to my site!
+Reach me at hello@example.com.
 ```
 
-Visit `http://localhost:3000/about/`.
+Visit `http://localhost:3000/contact/`.
 
 ## 6. Create a Section
 
@@ -150,7 +181,7 @@ project you just created:
 
 | Skill | What it does |
 |-------|--------------|
-| `hwaro` | Runs the CLI properly — `init`, `new`, `serve`, `build`, `doctor`, and the content tools — using the `--json` output contract and `HWARO_E_*` exit codes instead of guessing from text. |
+| `hwaro` | Runs the CLI properly (`init`, `new`, `serve`, `build`, `doctor`, and the content tools) using the `--json` output contract and `HWARO_E_*` exit codes instead of guessing from text. |
 | `hwaro-design` | Designs and rethemes the site inside Hwaro's Crinja templates and `light-dark()` design tokens, under an anti-slop discipline that avoids generic AI-looking layouts. |
 
 Install both with one command:
@@ -160,7 +191,7 @@ npx skills add hahwul/hwaro
 ```
 
 Then ask the agent something like *"add a projects section to this Hwaro site"*
-or *"retheme this blog to a warm dark palette"* — it loads the matching skill on
+or *"retheme this blog to a warm dark palette"*, and it loads the matching skill on
 its own. See [Agent Skills](/integrations/skills/) for manual install paths and
 per-agent directories, and [AGENTS.md](/start/tools/agents-md/) to record
 project-specific conventions the agent should follow first.

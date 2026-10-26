@@ -39,13 +39,14 @@ Welcome to my blog.
 | description | string | — | Section description |
 | template | string | "section" | Template to use |
 | page_template | string | — | Default template for pages |
-| sort_by | string | "date" | Sort by: date, weight, title (see [Sort direction](#sort-direction)) |
+| sort_by | string | "date" | Sort by: date, published, weight, title (see [Sort direction](#sort-direction)) |
 | reverse | bool | false | Flip the natural sort order (see [Sort direction](#sort-direction)) |
-| paginate | int | — | Pages per page |
+| paginate | int | — | Items per page (`paginate_by` is accepted as an alias); `0` disables pagination for the section |
+| pagination_enabled | bool | — | Turn pagination on or off for this section, overriding `paginate` and the site-wide `[pagination]` setting |
 | paginate_path | string | "page" | Path segment for pager URLs (default produces `/blog/page/2/`) |
 | transparent | bool | false | Pass pages to parent |
 | generate_feeds | bool | false | Generate RSS feed |
-| redirect_to | string | — | Write an HTML redirect page to this URL instead of rendering the section |
+| redirect_to | string | — | Write an HTML redirect page to this URL (or an `@/` content path such as `@/blog/post.md`) instead of rendering the section |
 | draft | bool | false | Exclude from production |
 | weight | int | 0 | Section sort order |
 | cascade | table | — | Defaults inherited by descendants (see [Cascade](#cascade)) |
@@ -70,7 +71,7 @@ banner = "default-banner.png"
 ```
 
 Every page under the section now renders with the `post` template, carries the
-`blog` tag, and exposes `page.extra.banner` — unless it sets those fields
+`blog` tag, and exposes `page.extra.banner`, unless it sets those fields
 itself. `extra` and `taxonomies` merge per key: the page's own keys win,
 cascaded keys fill the gaps.
 
@@ -79,7 +80,7 @@ Cascadable keys: `template`, `draft`, `render`, `toc`, `insert_anchor_links`,
 URL-affecting keys (`slug`, `path`, `aliases`) cannot cascade and are ignored
 with a warning.
 
-On multilingual sites, a cascade only applies within its own language tree —
+On multilingual sites, a cascade only applies within its own language tree:
 `_index.ko.md` cascades to `.ko` pages, `_index.md` to default-language pages.
 
 ## Sort direction
@@ -89,8 +90,11 @@ Each `sort_by` value has a different natural direction, chosen to match what aut
 | `sort_by` | Default order | With `reverse = true` |
 |-----------|---------------|------------------------|
 | `date`    | Newest first (descending) | Oldest first |
+| `published` | Newest first (descending) | Oldest first |
 | `weight`  | Lowest weight first (ascending) | Highest weight first |
 | `title`   | A → Z (ascending) | Z → A |
+
+A page's `date` order uses its `updated` date when it has one, so a revised post moves up the list; `published` orders by `date` alone and ignores `updated`, which keeps a chronological archive stable when an old post is revised; pages without any date sort last (first with `reverse = true`, which flips the whole list), after pages dated before 1970 too. `title` compares titles byte by byte, so uppercase letters sort before lowercase ones and accented letters come after `z`.
 
 `reverse` flips whichever direction is natural for the chosen `sort_by`. For example, a blog index sorted by `date` is newest-first by default; setting `reverse = true` switches it to oldest-first.
 
@@ -118,7 +122,7 @@ paginate_path = "p"
 
 Generates: `/blog/`, `/blog/p/2/`, `/blog/p/3/`
 
-With the default `paginate_path = "page"`, the URLs are `/blog/page/2/`, `/blog/page/3/`, … — page 1 always stays at the section URL.
+With the default `paginate_path = "page"`, the URLs are `/blog/page/2/`, `/blog/page/3/`, and so on, while page 1 always stays at the section URL.
 
 ### Documentation
 
@@ -156,6 +160,7 @@ page_template = "custom-page"
 sort_by = "date"
 reverse = false
 paginate = 10
+pagination_enabled = true
 paginate_path = "page"
 transparent = false
 generate_feeds = true
@@ -201,7 +206,7 @@ When rendering a section page (`_index.md`), these variables are available:
 | section.pages | Array<Page> | Pages shown in the current section list |
 | section.pages_count | Int | Number of items in `section.pages` |
 | section.list | String | Pre-rendered HTML list (same value as `section_list`) |
-| section.subsections | Array<Section> | Direct child sections (`title`, `description`, `url`, `pages_count`) |
+| section.subsections | Array<Section> | Direct child sections (`title`, `description`, `url`, `pages_count`), ordered by `weight` then path. On the root `_index.md` these are the top-level sections |
 | section.assets | Array<String> | Colocated section assets |
 | section.page_template | String | Default template name for child pages |
 | section.paginate_path | String | Pagination path segment |

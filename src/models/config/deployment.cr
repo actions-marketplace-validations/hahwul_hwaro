@@ -1,0 +1,129 @@
+# Config section — [deployment] loaders (the model lives in models/deployment.cr).
+#
+# One file per config.toml table family: the nested config class(es) plus the
+# `Config.load_*` loader(s) that read them. To add a section: create a file
+# like this one, then add its property + default in config.cr, its loader to
+# `SECTION_LOADERS` there, and its TOML snippet to services/config_snippets.cr.
+# Parts only reopen Models / Config: no requires, no load-time statements.
+module Hwaro
+  module Models
+    class Config
+      # Point `hwaro deploy` at whatever `[build] output_dir` made the build
+      # write, unless the user named a source explicitly. `[build] output_dir`
+      # and `[deployment] source_dir` default to "public" independently, so
+      # without this a site that builds to `dist/` would have deploy reading a
+      # stale (or absent) `public/` — uploading nothing, or deleting the
+      # remote's files when max_deletes allows it.
+      #
+      # Runs at the call site rather than inside `load_deployment` because the
+      # common shape is a `[build] output_dir` with no `[deployment]` section
+      # at all, which `load_deployment` returns early on.
+      private def self.resolve_deployment_source_dir(config : Config)
+        return unless build_output = config.build.output_dir
+        explicit = config.raw["deployment"]?.try(&.as_h?).try { |s| s["source_dir"]? || s["source"]? }
+        return if explicit.try(&.as_s?)
+        config.deployment.source_dir = build_output
+      end
+
+      private def self.load_deployment(config : Config)
+        return unless s = config.raw["deployment"]?.try(&.as_h?)
+
+        config.deployment.target = s["target"]?.try(&.as_s?)
+        config.deployment.confirm = bool_value(s["confirm"]?, config.deployment.confirm)
+
+        config.deployment.dry_run = bool_value(s["dryRun"]? || s["dry_run"]?, config.deployment.dry_run)
+        config.deployment.force = bool_value(s["force"]?, config.deployment.force)
+
+        max_deletes_any = s["maxDeletes"]? || s["max_deletes"]?
+        if max_deletes_val = max_deletes_any.try { |v| int_or_nil(v) }
+          config.deployment.max_deletes = max_deletes_val
+        end
+
+        if workers_val = s["workers"]?.try { |v| int_or_nil(v) }
+          config.deployment.workers = workers_val
+        end
+
+        source_any = s["source_dir"]? || s["source"]?
+        if source_val = source_any.try(&.as_s?)
+          config.deployment.source_dir = source_val
+        end
+
+        load_deployment_targets(config, s)
+        load_deployment_matchers(config, s)
+      end
+
+      private def self.load_deployment_targets(config : Config, s : Hash(String, TOML::Any))
+        return unless targets_any = table_array?(s["targets"]?, "deployment.targets")
+
+        config.deployment.targets = targets_any.each_with_index.to_a.compact_map do |(target_any, idx)|
+          next unless target_h = target_any.as_h?
+
+          name = target_h["name"]?.try(&.as_s?)
+          unless name
+            # Targets are selected by name, so a nameless one can never be
+            # deployed — say so instead of letting it vanish and surfacing as
+            # "No deployment targets configured."
+            Logger.warn "Ignoring [[deployment.targets]] entry ##{idx + 1}: it has no string 'name'."
+            next
+          end
+
+          target = DeploymentTarget.new
+          target.name = name
+          # `path = "/tmp/out"` is the obvious shape for the
+          # local-filesystem case and matches what Hugo / Jekyll users
+          # try first. Treat it as an alias for `url`; the deployer
+          # already routes bare local paths to its native copy
+          # implementation (gh#529).
+          target.url = target_h["URL"]?.try(&.as_s?) || target_h["url"]?.try(&.as_s?) || target_h["path"]?.try(&.as_s?) || ""
+          target.command = target_h["command"]?.try(&.as_s?)
+          target.include = target_glob(target_h, name, "include")
+          target.exclude = target_glob(target_h, name, "exclude")
+
+          strip_any = target_h["stripIndexHTML"]? || target_h["strip_index_html"]?
+          if strip_any
+            # `as_bool?` is nil only for a non-boolean: an explicit `false`
+            # must not read as "not a boolean" (it used to warn).
+            strip_val = strip_any.as_bool?
+            if strip_val.nil?
+              # Fail-open default applies; say so rather than ignore silently.
+              Logger.warn "[[deployment.targets]] #{name}: 'stripIndexHTML' must be a boolean; ignoring #{strip_any.raw.inspect}."
+            else
+              target.strip_index_html = strip_val
+            end
+          end
+
+          target
+        end
+      end
+
+      # A target's include/exclude glob. A present but non-string value (e.g.
+      # an array) used to read as "no filter" — deploying files the author
+      # meant to exclude — so warn that it is ignored.
+      private def self.target_glob(target_h : Hash(String, TOML::Any), name : String, key : String) : String?
+        return unless raw = target_h[key]?
+        glob = raw.as_s?
+        Logger.warn "[[deployment.targets]] #{name}: '#{key}' must be a string glob; ignoring #{raw.raw.inspect}." unless glob
+        glob
+      end
+
+      private def self.load_deployment_matchers(config : Config, s : Hash(String, TOML::Any))
+        return unless matchers_any = table_array?(s["matchers"]?, "deployment.matchers")
+
+        config.deployment.matchers = matchers_any.compact_map do |matcher_any|
+          next unless matcher_h = matcher_any.as_h?
+
+          pattern = matcher_h["pattern"]?.try(&.as_s?)
+          next unless pattern
+
+          matcher = DeploymentMatcher.new
+          matcher.pattern = pattern
+          matcher.cache_control = matcher_h["cacheControl"]?.try(&.as_s?) || matcher_h["cache_control"]?.try(&.as_s?)
+          matcher.content_type = matcher_h["contentType"]?.try(&.as_s?) || matcher_h["content_type"]?.try(&.as_s?)
+          matcher.gzip = matcher_h["gzip"]?.try(&.as_bool?)
+          matcher.force = bool_value(matcher_h["force"]?, matcher.force)
+          matcher
+        end
+      end
+    end
+  end
+end

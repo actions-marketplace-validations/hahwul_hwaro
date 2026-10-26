@@ -40,20 +40,12 @@ module Hwaro
           IMAGE_EXTENSIONS.includes?(ext)
         end
 
-        # Generate a resized filename: photo.jpg -> photo_800w.jpg
-        def resized_filename(original : String, width : Int32) : String
-          ext = File.extname(original)
-          base = File.basename(original, ext)
-          dir = File.dirname(original)
-          name = "#{base}_#{width}w#{ext}"
-          dir == "." ? name : File.join(dir, name)
-        end
-
         # Read the intrinsic {width, height} of an image from its file header
         # without decoding pixel data (pure Crystal, no stb round-trip).
-        # Supports the formats `image?` accepts (PNG/JPEG/BMP); returns nil
-        # for anything unreadable so callers can fall back to other
-        # heuristics. Used by the warm-build variant-reuse check: inferring
+        # Supports the formats `image?` accepts (PNG/JPEG/BMP) plus GIF, WebP
+        # and SVG (read-only formats, measured for content `<img>` sizes);
+        # returns nil for anything unreadable so callers can fall back to
+        # other heuristics. Used by the warm-build variant-reuse check: inferring
         # the source width from the largest on-disk variant silently ignored
         # newly configured LARGER widths (the variant set "matched" after
         # clamping to the stale inferred width).
@@ -63,142 +55,88 @@ module Hwaro
           when ".png"          then png_dimensions(path)
           when ".jpg", ".jpeg" then jpeg_dimensions(path)
           when ".bmp"          then bmp_dimensions(path)
+          when ".gif"          then gif_dimensions(path)
+          when ".webp"         then webp_dimensions(path)
+          when ".svg"          then svg_dimensions(path)
           end
-        rescue IO::Error | File::Error
+        rescue ex
+          # A best-effort probe: a hostile or truncated header must never
+          # fail the page that asked (callers fall back to no size).
+          Logger.debug "image dimensions: #{path}: #{ex.message}"
           nil
         end
 
-        # Resize a single image to the given width, preserving aspect ratio.
-        # Returns the output path on success, nil on failure.
-        def resize(source : String, dest : String, width : Int32, height : Int32 = 0, quality : Int32 = 85) : String?
-          return unless File.exists?(source)
+        # `resize_image(op=…)` operations and crop anchors.
+        RESIZE_OPS = {"fit", "fill", "crop"}
+        ANCHORS    = {"center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right"}
 
-          # Clamp quality to valid range for stb_image_write (1-100)
-          quality = quality.clamp(1, 100)
-
-          # Load source image
+        # One `fill` / `crop` variant of `source` written to `dest`.
+        #   fill: scale to cover width×height, then crop to exactly that box
+        #         around `anchor` (may upscale — the box is the contract).
+        #   crop: no scaling; cut a width×height region at `anchor`, clamped
+        #         to the source size.
+        # Returns the written {width, height}, or nil when the source cannot
+        # be decoded or the variant cannot be written.
+        def transform(source : String, dest : String, width : Int32, height : Int32,
+                      op : String, anchor : String, quality : Int32 = 85) : {Int32, Int32}?
+          return unless width > 0 && height > 0
           src_w = uninitialized LibC::Int
           src_h = uninitialized LibC::Int
           channels = uninitialized LibC::Int
           pixels = LibStb.stbi_load(source, pointerof(src_w), pointerof(src_h), pointerof(channels), 0)
-
-          if pixels.null?
-            reason = String.new(LibStb.stbi_failure_reason)
-            Logger.debug "Image load failed '#{source}': #{reason}"
-            return
-          end
+          return if pixels.null?
 
           begin
-            # Guard against degenerate images (0 or negative dimensions)
-            if src_w <= 0 || src_h <= 0 || channels <= 0
-              Logger.debug "Image has invalid dimensions '#{source}': #{src_w}x#{src_h}x#{channels}"
-              return
+            return if src_w <= 0 || src_h <= 0 || channels <= 0
+            # Cut from the picture as it is DISPLAYED (EXIF-oriented).
+            return unless upright = reorient(pixels, src_w, src_h, channels, orientation(source))
+            pixels, src_w, src_h = upright
+            # Source region to read, and the output size it maps onto.
+            if op == "fill"
+              scale = Math.max(width / src_w, height / src_h)
+              region_w = (width / scale).round.to_i32.clamp(1, src_w)
+              region_h = (height / scale).round.to_i32.clamp(1, src_h)
+              out_w, out_h = width, height
+            else
+              region_w = out_w = Math.min(width, src_w.to_i32)
+              region_h = out_h = Math.min(height, src_h.to_i32)
             end
+            return if out_w.to_i64 * out_h.to_i64 > MAX_PIXELS
 
-            # Calculate output dimensions (preserve aspect ratio)
-            out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width, height)
-            if out_w <= 0 || out_h <= 0
-              Logger.debug "Calculated invalid output dimensions for '#{source}': #{out_w}x#{out_h}"
-              return
-            end
-
-            # Skip resize if output would be larger than source
-            if out_w >= src_w && out_h >= src_h
-              Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest))
-              # Atomic copy: variants are regenerated on serve rebuilds while
-              # HTTP fibers stream the same `_640w.jpg` to the browser, and a
-              # truncate-and-stream copy would answer those requests with a
-              # zero-length or half-written image that nothing retries.
-              Hwaro::Utils::FileSafe.atomic_copy(source, dest)
-              return dest
-            end
-
-            # Guard against excessive memory allocation
-            # Check pixel count before multiplying by channels to prevent Int64 overflow
-            pixel_count = out_w.to_i64 * out_h.to_i64
-            if pixel_count > MAX_PIXELS
-              Logger.debug "Output image too large '#{source}': #{out_w}x#{out_h} = #{pixel_count} pixels"
-              return
-            end
-            buf_size = pixel_count * channels.to_i64
-
-            # Allocate output buffer with LibC.malloc for deterministic C interop
-            out_pixels = LibC.malloc(buf_size).as(UInt8*)
-            if out_pixels.null?
-              Logger.debug "Failed to allocate #{buf_size} bytes for resize of '#{source}'"
-              return
-            end
+            x, y = anchor_offset(anchor, src_w - region_w, src_h - region_h)
+            stride = src_w * channels
+            region = pixels + (y.to_i64 * stride + x.to_i64 * channels)
+            out_pixels = LibC.malloc(out_w.to_i64 * out_h * channels).as(UInt8*)
+            return if out_pixels.null?
 
             begin
-              result = LibStb.stbir_resize_uint8_srgb(
-                pixels, src_w, src_h, 0,
-                out_pixels, out_w, out_h, 0,
-                stbir_layout(channels)
-              )
-
-              if result.null?
-                Logger.debug "Resize failed for '#{source}'"
-                return
+              if region_w == out_w && region_h == out_h
+                row = out_w * channels
+                out_h.times { |r| (out_pixels + r.to_i64 * row).copy_from(region + r.to_i64 * stride, row) }
+              else
+                resized = LibStb.stbir_resize_uint8_srgb(
+                  region, region_w, region_h, stride,
+                  out_pixels, out_w, out_h, 0,
+                  stbir_layout(channels)
+                )
+                return if resized.null?
               end
-
-              # Write output
               Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest))
-              ext = File.extname(dest).downcase
-              ok = write_image(dest, ext, out_w, out_h, channels.to_i32, out_pixels, quality)
-              unless ok
-                Logger.debug "Failed to write resized image '#{dest}'"
-              end
-              ok ? dest : nil
+              return unless write_image(dest, File.extname(source).downcase, out_w, out_h, channels.to_i32, out_pixels, quality.clamp(1, 100))
+              {out_w, out_h}
             ensure
-              LibC.free(out_pixels.as(Void*)) unless out_pixels.null?
+              LibC.free(out_pixels.as(Void*))
             end
           ensure
-            LibStb.stbi_image_free(pixels.as(Void*)) unless pixels.null?
+            LibStb.stbi_image_free(pixels.as(Void*))
           end
         end
 
-        # Process all images for configured widths.
-        # Returns array of {original_url, width, resized_url} tuples.
-        def process_configured_widths(
-          source_path : String,
-          output_base : String,
-          url_prefix : String,
-          widths : Array(Int32),
-          quality : Int32 = 85,
-        ) : Array({String, Int32, String})
-          results = [] of {String, Int32, String}
-          return results unless File.exists?(source_path)
-
-          widths.each do |width|
-            resized_name = resized_filename(File.basename(source_path), width)
-            dest_path = File.join(output_base, resized_name)
-            if resize(source_path, dest_path, width, 0, quality)
-              resized_url = url_prefix.rstrip("/") + "/" + resized_name
-              results << {source_path, width, resized_url}
-            end
-          end
-
-          results
-        end
-
-        # Resize a single source image to multiple widths with one decode pass.
-        # Returns a Hash mapping width => dest_path for successful resizes.
-        def resize_multi_widths(
-          source : String,
-          dest_dir : String,
-          widths : Array(Int32),
-          quality : Int32 = 85,
-        ) : Hash(Int32, String)
-          result_map, _, _ = resize_and_lqip(source, dest_dir, widths, quality, 0, 20)
-          result_map
-        end
-
-        # Generate a low-quality image placeholder as a base64 data URI.
-        # Operates on already-decoded pixel data (avoids a second stbi_load).
-        def generate_lqip(pixels : UInt8*, src_w : Int32, src_h : Int32, channels : Int32,
-                          lqip_width : Int32 = 32, quality : Int32 = 20) : String?
-          result = generate_lqip_with_color(pixels, src_w, src_h, channels, lqip_width, quality)
-          result.try(&.[0])
+        # Top-left corner of a region inside `slack_x`×`slack_y` spare pixels.
+        private def anchor_offset(anchor : String, slack_x : Int32, slack_y : Int32) : {Int32, Int32}
+          x = anchor.ends_with?("left") ? 0 : anchor.ends_with?("right") ? slack_x : slack_x // 2
+          y = anchor.starts_with?("top") ? 0 : anchor.starts_with?("bottom") ? slack_y : slack_y // 2
+          {x, y}
         end
 
         # Generate LQIP data URI and dominant color from the thumbnail in one pass.
@@ -210,7 +148,7 @@ module Hwaro
 
           # Don't upscale — cap thumbnail width to source width
           effective_width = Math.min(lqip_width, src_w)
-          out_w, out_h = calculate_dimensions(src_w, src_h, effective_width, 0)
+          out_w, out_h = calculate_dimensions(src_w, src_h, effective_width)
           return if out_w <= 0 || out_h <= 0
 
           pixel_count = out_w.to_i64 * out_h.to_i64
@@ -230,6 +168,7 @@ module Hwaro
 
             # Compute dominant color from the tiny thumbnail (cheap)
             dom_color = dominant_color(thumb_pixels, out_w, out_h, channels)
+            flatten_onto_white(thumb_pixels, pixel_count, channels)
 
             jpg_buf = Pointer(UInt8).null
             jpg_len = 0_i32
@@ -253,6 +192,11 @@ module Hwaro
 
         # Compute dominant color as a hex string (e.g., "#a3b2c1").
         # Channels: 1=gray, 2=gray+alpha, 3=RGB, 4=RGBA
+        #
+        # Pixels are weighted by alpha: a transparent pixel's color bytes are
+        # invisible (usually black), so averaging them in darkened every logo
+        # on a transparent background. A fully transparent image has no color
+        # and gets the white its LQIP is flattened onto.
         def dominant_color(pixels : UInt8*, w : Int32, h : Int32, channels : Int32) : String
           return "#000000" if w <= 0 || h <= 0 || channels <= 0
 
@@ -262,27 +206,56 @@ module Hwaro
           sum_r = 0_i64
           sum_g = 0_i64
           sum_b = 0_i64
+          weight = 0_i64
 
           is_rgb = channels >= 3 # 3=RGB, 4=RGBA
+          has_alpha = channels == 2 || channels == 4
 
           total.times do |i|
             offset = i * channels
-            sum_r += pixels[offset]
+            a = has_alpha ? pixels[offset + channels - 1].to_i64 : 1_i64
+            weight += a
+            sum_r += pixels[offset].to_i64 * a
             if is_rgb
-              sum_g += pixels[offset + 1]
-              sum_b += pixels[offset + 2]
+              sum_g += pixels[offset + 1].to_i64 * a
+              sum_b += pixels[offset + 2].to_i64 * a
             end
           end
+          return "#ffffff" if weight == 0
 
-          r = (sum_r // total).clamp(0, 255)
-          g = is_rgb ? (sum_g // total).clamp(0, 255) : r
-          b = is_rgb ? (sum_b // total).clamp(0, 255) : r
+          r = (sum_r // weight).clamp(0, 255)
+          g = is_rgb ? (sum_g // weight).clamp(0, 255) : r
+          b = is_rgb ? (sum_b // weight).clamp(0, 255) : r
 
           "#%02x%02x%02x" % {r, g, b}
         end
 
+        # Composite gray+alpha / RGBA pixels onto white in place. JPEG has no
+        # alpha, so the LQIP kept the (usually black) color bytes under
+        # transparent pixels. White, not the dominant color: the documented
+        # blur-up keeps the LQIP as the <img> background, so it shows through
+        # the loaded image's transparent areas, and a flat dominant-color fill
+        # would swallow a one-color logo drawn over it. Opaque pixels are
+        # left untouched.
+        private def flatten_onto_white(pixels : UInt8*, count : Int64, channels : Int32) : Nil
+          return unless channels == 2 || channels == 4
+          alpha_at = channels - 1
+          count.times do |i|
+            px = pixels + i * channels
+            a = px[alpha_at].to_i32
+            next if a == 255
+            alpha_at.times do |c|
+              px[c] = ((px[c].to_i32 * a + 255 * (255 - a) + 127) // 255).to_u8
+            end
+          end
+        end
+
         # Combined resize + LQIP in a single decode pass.
         # Returns {width_map, lqip_data_uri_or_nil, dominant_color_hex}
+        #
+        # `authored` (when given) is asked about each `<name>_<w>w.<ext>` this
+        # would write: true means a file the site itself publishes under that
+        # name, which is left alone — that width is simply not generated.
         def resize_and_lqip(
           source : String,
           dest_dir : String,
@@ -290,6 +263,7 @@ module Hwaro
           quality : Int32 = 85,
           lqip_width : Int32 = 32,
           lqip_quality : Int32 = 20,
+          authored : Proc(String, Bool)? = nil,
         ) : {Hash(Int32, String), String?, String}
           result_map = {} of Int32 => String
           lqip_uri = nil
@@ -315,6 +289,11 @@ module Hwaro
 
           begin
             return {result_map, lqip_uri, dom_color} if src_w <= 0 || src_h <= 0 || channels <= 0
+            # Variants are cut from the picture as it is DISPLAYED (EXIF-oriented).
+            unless upright = reorient(pixels, src_w, src_h, channels, orientation(source))
+              return {result_map, lqip_uri, dom_color}
+            end
+            pixels, src_w, src_h = upright
 
             ext = File.extname(source).downcase
             basename = File.basename(source, File.extname(source))
@@ -323,7 +302,7 @@ module Hwaro
             # Resize variants (sorted ascending so smallest is processed first)
             sorted_widths = widths.sort
             sorted_widths.each do |width|
-              out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width, 0)
+              out_w, out_h = calculate_dimensions(src_w.to_i32, src_h.to_i32, width)
               next if out_w <= 0 || out_h <= 0
 
               if out_w >= src_w && out_h >= src_h
@@ -333,17 +312,17 @@ module Hwaro
                 # srcset descriptor is honest (never a "1280w" pointing at a
                 # 500px file) and no byte-identical duplicates are emitted.
                 actual = src_w.to_i32
-                unless result_map.has_key?(actual)
+                unless result_map.has_key?(actual) || authored.try(&.call("#{basename}_#{actual}w#{ext}"))
                   dest = File.join(dest_dir, "#{basename}_#{actual}w#{ext}")
-                  # Atomic for the same reason as `resize`: a serve rebuild
-                  # must never expose a truncated variant to an in-flight
-                  # request for that path.
+                  # Atomic: a serve rebuild must never expose a truncated
+                  # variant to an in-flight request for that path.
                   Hwaro::Utils::FileSafe.atomic_copy(source, dest)
                   result_map[actual] = dest
                 end
                 next
               end
 
+              next if authored.try(&.call("#{basename}_#{width}w#{ext}"))
               dest = File.join(dest_dir, "#{basename}_#{width}w#{ext}")
               pixel_count = out_w.to_i64 * out_h.to_i64
               next if pixel_count > MAX_PIXELS
@@ -413,10 +392,33 @@ module Hwaro
           {width.to_i32, height.to_i32}
         end
 
-        # JPEG: scan the marker stream for the first SOF frame header
-        # (C0–CF, excluding the non-frame C4/C8/CC markers); height/width are
-        # big-endian UInt16s at offsets 3/5 of its payload.
+        # JPEG: the DISPLAYED size. The SOF frame header holds the stored
+        # pixel size; an EXIF Orientation of 5-8 (a phone photo held upright)
+        # turns the picture a quarter turn, so the stored width is the shown
+        # height — the size a browser lays the original out at and the one
+        # the rotated variants (see `reorient`) come out at.
         private def jpeg_dimensions(path : String) : {Int32, Int32}?
+          return unless frame = jpeg_frame(path)
+          width, height, orientation = frame
+          orientation >= 5 ? {height, width} : {width, height}
+        end
+
+        # EXIF Orientation (1-8) of the picture a decoder returns for `path`:
+        # 1 (upright, or no tag) for everything but a JPEG that carries one.
+        def orientation(path : String) : Int32
+          return 1 unless {".jpg", ".jpeg"}.includes?(File.extname(path).downcase)
+          jpeg_frame(path).try(&.[2]) || 1
+        rescue
+          1
+        end
+
+        # Scan the marker stream for the first SOF frame header (C0–CF,
+        # excluding the non-frame C4/C8/CC markers; height/width are
+        # big-endian UInt16s at offsets 3/5 of its payload), noting the EXIF
+        # Orientation of an APP1 segment on the way. {stored width, stored
+        # height, orientation}.
+        private def jpeg_frame(path : String) : {Int32, Int32, Int32}?
+          orientation = 1
           File.open(path) do |io|
             return unless io.read_byte == 0xFF && io.read_byte == 0xD8
             loop do
@@ -436,27 +438,189 @@ module Hwaro
                 height = io.read_bytes(UInt16, IO::ByteFormat::BigEndian)
                 width = io.read_bytes(UInt16, IO::ByteFormat::BigEndian)
                 return if width == 0 || height == 0
-                return {width.to_i32, height.to_i32}
+                return {width.to_i32, height.to_i32, orientation}
+              elsif marker == 0xE1 && length >= 16
+                payload = Bytes.new(length - 2)
+                io.read_fully(payload)
+                orientation = exif_orientation(payload) || orientation
+                next
               end
               io.skip(length - 2)
             end
           end
         end
 
-        # BMP: signature "BM"; width/height are little-endian Int32s at
-        # offsets 18/22 (BITMAPINFOHEADER). Height may be negative
-        # (top-down rows) — the magnitude is the pixel height.
+        # The Orientation (1-8) in an APP1 payload ("Exif\0\0" + TIFF), or
+        # nil when it is not Exif, has no such tag or is malformed.
+        private def exif_orientation(payload : Bytes) : Int32?
+          return unless payload.size >= 14 && payload[0, 6] == "Exif\0\0".to_slice
+          tiff = payload + 6
+          format = case String.new(tiff[0, 2])
+                   when "II" then IO::ByteFormat::LittleEndian
+                   when "MM" then IO::ByteFormat::BigEndian
+                   else           return
+                   end
+          return unless format.decode(UInt16, tiff[2, 2]) == 42
+          ifd = format.decode(UInt32, tiff[4, 4]).to_i64
+          return unless ifd + 2 <= tiff.size
+          count = format.decode(UInt16, tiff[ifd, 2]).to_i32
+          count.times do |i|
+            entry = ifd + 2 + i.to_i64 * 12
+            return unless entry + 12 <= tiff.size
+            next unless format.decode(UInt16, tiff[entry, 2]) == 0x0112
+            # type SHORT, one value, stored in the entry's value field
+            return unless format.decode(UInt16, tiff[entry + 2, 2]) == 3 && format.decode(UInt32, tiff[entry + 4, 4]) == 1
+            value = format.decode(UInt16, tiff[entry + 8, 2]).to_i32
+            return value if value.in?(1..8)
+            return
+          end
+          nil
+        end
+
+        # Turn decoded `pixels` (w×h, `channels` interleaved) upright for
+        # EXIF `orientation` 2-8, into a freshly allocated buffer, and free
+        # the input. stb decodes the stored pixels and the encoders write no
+        # EXIF, so a variant cut from them would show a phone photo on its
+        # side. Orientation 1 (and anything unknown) hands the input back.
+        # Returns {pixels, width, height}; nil if the new buffer cannot be
+        # allocated (the input is then untouched).
+        def reorient(pixels : UInt8*, w : Int32, h : Int32, channels : Int32, orientation : Int32) : {UInt8*, Int32, Int32}?
+          return {pixels, w, h} unless orientation.in?(2..8)
+          dw, dh = orientation >= 5 ? {h, w} : {w, h}
+          out_pixels = LibC.malloc(dw.to_i64 * dh * channels).as(UInt8*)
+          return if out_pixels.null?
+          dh.times do |y|
+            dw.times do |x|
+              sx, sy = case orientation
+                       when 2 then {w - 1 - x, y}
+                       when 3 then {w - 1 - x, h - 1 - y}
+                       when 4 then {x, h - 1 - y}
+                       when 5 then {y, x}
+                       when 6 then {y, h - 1 - x}
+                       when 7 then {w - 1 - y, h - 1 - x}
+                       else        {w - 1 - y, x}
+                       end
+              (out_pixels + (y.to_i64 * dw + x) * channels).copy_from(pixels + (sy.to_i64 * w + sx) * channels, channels)
+            end
+          end
+          LibStb.stbi_image_free(pixels.as(Void*))
+          {out_pixels, dw, dh}
+        end
+
+        # BMP: signature "BM"; the DIB header size at offset 14 decides the
+        # layout. BITMAPCOREHEADER (12, OS/2): width/height are little-endian
+        # UInt16s at 18/20. BITMAPINFOHEADER and its larger V4/V5 kin (>= 40):
+        # little-endian Int32s at 18/22, where the height may be negative
+        # (top-down rows) — the magnitude is the pixel height. Any other
+        # header size is not measured.
         private def bmp_dimensions(path : String) : {Int32, Int32}?
           header = Bytes.new(26)
           read = File.open(path, &.read(header))
           return if read < 26
           return unless header[0] == 0x42 && header[1] == 0x4D
-          width = IO::ByteFormat::LittleEndian.decode(Int32, header[18, 4])
-          height = IO::ByteFormat::LittleEndian.decode(Int32, header[22, 4])
-          return if height == Int32::MIN # .abs would overflow
-          height = height.abs
+          dib_size = IO::ByteFormat::LittleEndian.decode(UInt32, header[14, 4])
+          if dib_size == 12
+            width = IO::ByteFormat::LittleEndian.decode(UInt16, header[18, 2]).to_i32
+            height = IO::ByteFormat::LittleEndian.decode(UInt16, header[20, 2]).to_i32
+          elsif dib_size >= 40
+            width = IO::ByteFormat::LittleEndian.decode(Int32, header[18, 4])
+            height = IO::ByteFormat::LittleEndian.decode(Int32, header[22, 4])
+            return if height == Int32::MIN # .abs would overflow
+            height = height.abs
+          else
+            return
+          end
           return if width <= 0 || height == 0
           {width, height}
+        end
+
+        # GIF: "GIF87a"/"GIF89a"; logical screen width/height are
+        # little-endian UInt16s at offsets 6/8.
+        private def gif_dimensions(path : String) : {Int32, Int32}?
+          header = Bytes.new(10)
+          return if File.open(path, &.read(header)) < 10
+          return unless String.new(header[0, 6]).in?("GIF87a", "GIF89a")
+          width = IO::ByteFormat::LittleEndian.decode(UInt16, header[6, 2]).to_i32
+          height = IO::ByteFormat::LittleEndian.decode(UInt16, header[8, 2]).to_i32
+          return if width == 0 || height == 0
+          {width, height}
+        end
+
+        # WebP: "RIFF"…"WEBP", then the first chunk decides the layout —
+        #   VP8  (lossy):    14-bit LE width/height at 26/28;
+        #   VP8L (lossless): 14-bit (value - 1) fields packed from offset 21;
+        #   VP8X (extended): 24-bit LE (value - 1) canvas size at 24/27.
+        private def webp_dimensions(path : String) : {Int32, Int32}?
+          header = Bytes.new(30)
+          return if File.open(path, &.read(header)) < 30
+          return unless String.new(header[0, 4]) == "RIFF" && String.new(header[8, 4]) == "WEBP"
+          width, height = case String.new(header[12, 4])
+                          when "VP8 "
+                            return unless header[23] == 0x9D && header[24] == 0x01 && header[25] == 0x2A
+                            {IO::ByteFormat::LittleEndian.decode(UInt16, header[26, 2]).to_i32 & 0x3FFF,
+                             IO::ByteFormat::LittleEndian.decode(UInt16, header[28, 2]).to_i32 & 0x3FFF}
+                          when "VP8L"
+                            return unless header[20] == 0x2F
+                            bits = IO::ByteFormat::LittleEndian.decode(UInt32, header[21, 4])
+                            {(bits & 0x3FFF).to_i32 + 1, ((bits >> 14) & 0x3FFF).to_i32 + 1}
+                          when "VP8X"
+                            {(header[24].to_i32 | header[25].to_i32 << 8 | header[26].to_i32 << 16) + 1,
+                             (header[27].to_i32 | header[28].to_i32 << 8 | header[29].to_i32 << 16) + 1}
+                          else
+                            return
+                          end
+          return if width == 0 || height == 0
+          {width, height}
+        end
+
+        SVG_TAG_RE = /<svg\b[^>]*>/i
+        # `(?:px\s*)?` rather than `(?:px)?\s*`: the two `\s*` runs must not
+        # be able to split the same whitespace, or a long run backtracks
+        # quadratically into PCRE's match limit.
+        SVG_WIDTH_RE   = /\swidth\s*=\s*["']\s*(\d+(?:\.\d+)?)\s*(?:px\s*)?["']/i
+        SVG_HEIGHT_RE  = /\sheight\s*=\s*["']\s*(\d+(?:\.\d+)?)\s*(?:px\s*)?["']/i
+        SVG_VIEWBOX_RE = /\sviewBox\s*=\s*["']\s*-?[\d.]+[\s,]+-?[\d.]+[\s,]+(\d+(?:\.\d+)?)[\s,]+(\d+(?:\.\d+)?)\s*["']/i
+
+        # SVG: the root element's unitless/px `width`/`height`; a missing one
+        # follows the `viewBox` aspect ratio, and with neither the viewBox
+        # size itself is used. Percentages, ems and other units are skipped.
+        # Only the first 64 KiB are read — the root tag sits at the top.
+        private def svg_dimensions(path : String) : {Int32, Int32}?
+          buf = Bytes.new(65_536)
+          read = File.open(path, &.read(buf))
+          text = strip_xml_comments(String.new(buf[0, read]).scrub)
+          return unless text && (tag = text.match(SVG_TAG_RE).try(&.[0]))
+          w = tag.match(SVG_WIDTH_RE).try(&.[1].to_f?)
+          h = tag.match(SVG_HEIGHT_RE).try(&.[1].to_f?)
+          if vb = tag.match(SVG_VIEWBOX_RE)
+            vb_w, vb_h = vb[1].to_f?, vb[2].to_f?
+            if vb_w && vb_h && vb_w > 0 && vb_h > 0
+              w ||= h ? h * vb_w / vb_h : vb_w
+              h ||= w * vb_h / vb_w
+            end
+          end
+          return unless w && h
+          width, height = w.round, h.round
+          return unless width.in?(1.0..Int32::MAX.to_f) && height.in?(1.0..Int32::MAX.to_f)
+          {width.to_i32, height.to_i32}
+        end
+
+        # `text` without its `<!-- … -->` comments, so a commented-out `<svg>`
+        # tag is not mistaken for the root. nil when a comment never closes:
+        # everything after it is comment (or cut off by the read limit), so
+        # there is no root to measure. Linear scan — no backtracking regex.
+        private def strip_xml_comments(text : String) : String?
+          return text unless text.includes?("<!--")
+          String.build do |io|
+            pos = 0
+            while start = text.index("<!--", pos)
+              io << text[pos, start - pos]
+              stop = text.index("-->", start + 4)
+              return unless stop
+              pos = stop + 3
+            end
+            io << text[pos..]
+          end
         end
 
         # Calculate output dimensions preserving aspect ratio.
@@ -471,27 +635,14 @@ module Hwaro
           channels == 2 ? 9 : channels
         end
 
-        private def calculate_dimensions(src_w : Int32, src_h : Int32, target_w : Int32, target_h : Int32) : {Int32, Int32}
+        # Width-only proportional scaling (every caller passes a target width).
+        private def calculate_dimensions(src_w : Int32, src_h : Int32, target_w : Int32) : {Int32, Int32}
           # Guard against zero source dimensions (prevents division by zero)
           return {0, 0} if src_w <= 0 || src_h <= 0
+          return {src_w, src_h} unless target_w > 0
 
-          if target_w > 0 && target_h > 0
-            # Both specified: fit within the box
-            scale_w = target_w.to_f / src_w
-            scale_h = target_h.to_f / src_h
-            scale = Math.min(scale_w, scale_h)
-            {saturating_i32(src_w * scale), saturating_i32(src_h * scale)}
-          elsif target_w > 0
-            # Width only: scale proportionally
-            scale = target_w.to_f / src_w
-            {target_w, saturating_i32(src_h * scale)}
-          elsif target_h > 0
-            # Height only: scale proportionally
-            scale = target_h.to_f / src_h
-            {saturating_i32(src_w * scale), target_h}
-          else
-            {src_w, src_h}
-          end
+          scale = target_w.to_f / src_w
+          {target_w, saturating_i32(src_h * scale)}
         end
 
         # Round a scaled dimension to at least 1, SATURATING at Int32::MAX.
@@ -522,7 +673,7 @@ module Hwaro
         # half-written file. The output format still comes from `ext`, never
         # from the temp file's name, so the `.tmp` suffix changes nothing.
         private def write_image(path : String, ext : String, w : Int32, h : Int32, channels : Int32, data : UInt8*, quality : Int32) : Bool
-          tmp = "#{path}.#{Process.pid}.#{Fiber.current.object_id}.tmp"
+          tmp = Utils::FileSafe.temp_path(path)
           begin
             ok = case ext
                  when ".png"

@@ -3,11 +3,13 @@
 # This service provides functionality to convert frontmatter between
 # YAML, TOML, and JSON formats in content files.
 
+require "base64"
 require "json"
 require "yaml"
 require "toml"
 require "./content_lister"
 require "../utils/frontmatter_scanner"
+require "../utils/file_safe"
 require "../utils/frontmatter_writer"
 require "../utils/logger"
 require "../utils/text_utils"
@@ -31,6 +33,14 @@ module Hwaro
       property converted_count : Int32
       property skipped_count : Int32
       property error_count : Int32
+      # True when the run only previewed: `converted_count` then means
+      # "would be converted" and no file was touched.
+      property dry_run : Bool
+      # The part of `error_count` caused by unparseable front matter (a run
+      # that failed only on those is a content error, not an IO one). Not
+      # part of the `--json` payload.
+      @[JSON::Field(ignore: true)]
+      property content_error_count : Int32
 
       def initialize(
         @success : Bool = true,
@@ -38,6 +48,8 @@ module Hwaro
         @converted_count : Int32 = 0,
         @skipped_count : Int32 = 0,
         @error_count : Int32 = 0,
+        @dry_run : Bool = false,
+        @content_error_count : Int32 = 0,
       )
       end
     end
@@ -63,10 +75,44 @@ module Hwaro
         Error
       end
 
+      # Why a file was left alone. A bulk run reported only a bare
+      # "N skipped", so an author whose whole tree was passed over had no way
+      # to learn whether the files were already in the target format, carried
+      # no front matter at all, or opened with a `---` pair the converter
+      # REFUSED to touch because rewriting it would have deleted their prose.
+      private enum SkipReason
+        AlreadyTarget
+        NoFrontmatter
+        NotFrontmatter
+      end
+
+      # Top-level front-matter keys whose null is written to TOML by OMITTING
+      # the key. TOML has no null and the default spelling, `""`, is a SET
+      # value for these: the build reads a null `title`/`slug`/`image` as
+      # unset ("Untitled", slug from the filename, no og:image) but `slug =
+      # ""` collapsed the page onto its section index URL and dropped it.
+      # It is `Processors::Markdown::KNOWN_FRONT_MATTER_KEYS` minus the
+      # build's `ParseContent::CASCADABLE_KEYS`: for a cascadable key a null
+      # still DECLARES the key and blocks a section's `[cascade]` (`draft:
+      # ~` keeps a page out of a cascaded draft), which `""` preserves and
+      # omission would not. Custom/extra keys and nested members keep `""`
+      # too — the build turns their null into `""` with the key present.
+      # Pinned against both lists by frontmatter_converter_spec.
+      NULL_OMITTED_KEYS = Set{
+        "title", "description", "image", "date", "updated", "expires", "slug",
+        "path", "aliases", "transparent", "generate_feeds", "paginate",
+        "paginate_by", "pagination_enabled", "sort_by", "reverse",
+        "page_template", "paginate_path", "redirect_to", "weight", "categories",
+        "series", "series_weight", "cascade", "menus", "menu",
+      }
+
       # Content directory path
       @content_dir : String
 
-      def initialize(@content_dir : String = "content")
+      # A dry run performs the full detection/conversion pipeline — including
+      # the dropped-comment warnings, which are the main reason to preview an
+      # in-place bulk rewrite — but never writes a file back.
+      def initialize(@content_dir : String = "content", @dry_run : Bool = false)
       end
 
       # Convert all content files to YAML format
@@ -84,11 +130,18 @@ module Hwaro
         convert_files(FrontmatterFormat::JSON)
       end
 
+      # Opening delimiter matchers. The build parser accepts trailing
+      # horizontal whitespace after the delimiter (`\A---\s*\n` in
+      # FrontmatterScanner), so detection must too — a `--- \n` file used to
+      # be skipped as "no frontmatter" while `hwaro build` parsed it fine.
+      TOML_OPENER_RE = /\A\+\+\+[ \t]*\r?\n/
+      YAML_OPENER_RE = /\A---[ \t]*\r?\n/
+
       # Detect the frontmatter format of a file
       def detect_format(content : String) : FrontmatterFormat
-        if content.starts_with?("#{TOML_DELIMITER}\n") || content.starts_with?("#{TOML_DELIMITER}\r\n")
+        if content.matches?(TOML_OPENER_RE)
           FrontmatterFormat::TOML
-        elsif content.starts_with?("#{YAML_DELIMITER}\n") || content.starts_with?("#{YAML_DELIMITER}\r\n")
+        elsif content.matches?(YAML_OPENER_RE)
           FrontmatterFormat::YAML
         elsif content.starts_with?('{') && json_frontmatter_object?(content)
           FrontmatterFormat::JSON
@@ -107,13 +160,18 @@ module Hwaro
         false
       end
 
-      # Convert a single file's frontmatter
-      def convert_file(file_path : String, target_format : FrontmatterFormat) : Bool
-        status = convert_file_with_status(file_path, target_format, log_skipped: true)
-        status == ConversionStatus::Converted
-      end
+      # Convert one file's frontmatter, tallying skips by reason.
+      private def convert_file_with_status(
+        file_path : String,
+        target_format : FrontmatterFormat,
+        skips : Hash(SkipReason, Int32),
+      ) : ConversionStatus
+        project_root = Utils::PathUtils.find_project_root(@content_dir)
+        if File.symlink?(file_path) && !Utils::PathUtils.resolves_within?(file_path, project_root)
+          Logger.warn "Skipped symlink outside project directory: #{file_path}"
+          return ConversionStatus::Skipped
+        end
 
-      private def convert_file_with_status(file_path : String, target_format : FrontmatterFormat, log_skipped : Bool = true) : ConversionStatus
         # Strip a BOM before detection so a BOM'd file isn't misread as
         # "no frontmatter" and skipped. The rewrite below drops the BOM too.
         content = Utils::TextUtils.strip_bom(File.read(file_path))
@@ -121,12 +179,12 @@ module Hwaro
 
         # Skip if already in target format or unknown format
         if current_format == target_format
-          Logger.item("skipped (already #{target_format}): #{file_path}", glyph: :bullet) if log_skipped
+          skips[SkipReason::AlreadyTarget] = (skips[SkipReason::AlreadyTarget]? || 0) + 1
           return ConversionStatus::Skipped
         end
 
         if current_format == FrontmatterFormat::Unknown
-          Logger.item("skipped (no frontmatter): #{file_path}", glyph: :warn) if log_skipped
+          skips[SkipReason::NoFrontmatter] = (skips[SkipReason::NoFrontmatter]? || 0) + 1
           return ConversionStatus::Skipped
         end
 
@@ -136,7 +194,11 @@ module Hwaro
         # empty frontmatter, silently deleting the author's content — skip
         # such files instead of writing anything.
         unless frontmatter_mapping?(content, current_format)
-          Logger.item("skipped (leading #{format_label(current_format)} block is not frontmatter): #{file_path}", glyph: :warn) if log_skipped
+          # Named, unlike the other skips: this is the skip that protects the
+          # author's body text, and staying quiet about it reads as "nothing
+          # to do here" for a file that may well have broken front matter.
+          Logger.warn "#{file_path}: leading #{format_label(current_format)} block is not front matter — left unchanged."
+          skips[SkipReason::NotFrontmatter] = (skips[SkipReason::NotFrontmatter]? || 0) + 1
           return ConversionStatus::Skipped
         end
 
@@ -153,11 +215,18 @@ module Hwaro
         converted_content = convert_content(content, current_format, target_format)
 
         if converted_content
-          write_in_place(file_path, converted_content)
-          Logger.item(file_path, glyph: :ok)
+          if @dry_run
+            Logger.item("would convert: #{file_path}", glyph: :ok)
+          else
+            # An unwritable target (e.g. the path stopped resolving mid-run)
+            # must surface as an error, not a false "converted".
+            return ConversionStatus::Error unless write_in_place(file_path, converted_content)
+            Logger.item(file_path, glyph: :ok)
+          end
           ConversionStatus::Converted
         else
-          Logger.error "  Failed to convert: #{file_path}"
+          reason = @last_error
+          Logger.error "  Failed to convert: #{file_path}#{reason ? " — #{reason}" : ""}"
           ConversionStatus::Failed
         end
       rescue ex
@@ -176,57 +245,75 @@ module Hwaro
         converted = 0
         skipped = 0
         errors = 0
+        content_errors = 0
+        skips = {} of SkipReason => Int32
 
         format_name = format_label(target_format)
 
         find_content_files.each do |file_path|
-          status = convert_file_with_status(file_path, target_format, log_skipped: false)
+          status = convert_file_with_status(file_path, target_format, skips)
 
           case status
           when ConversionStatus::Converted
             converted += 1
           when ConversionStatus::Skipped
             skipped += 1
-          when ConversionStatus::Failed, ConversionStatus::Error
+          when ConversionStatus::Failed
+            errors += 1
+            content_errors += 1
+          when ConversionStatus::Error
             errors += 1
           end
         end
 
         summary = "#{converted} files · #{skipped} skipped"
+        summary += " (#{skip_breakdown(skips, target_format)})" if skipped > 0
         summary += " · #{errors} errors" if errors > 0
         Logger.info "" if Logger.color_enabled?
-        Logger.outcome("converted", summary, glyph: errors > 0 ? :err : :result)
+        Logger.outcome(@dry_run ? "would convert" : "converted", summary, glyph: errors > 0 ? :err : :result)
 
         ConversionResult.new(
           success: errors == 0,
           # On failure `message` is what the CLI surfaces as the error, so it
           # has to describe the failure — not the (partial) success.
-          message: errors > 0 ? "#{errors} file(s) could not be converted to #{format_name}" : "Converted #{converted} files to #{format_name}",
+          message: errors > 0 ? "#{errors} file(s) could not be converted to #{format_name}" : "#{@dry_run ? "Would convert" : "Converted"} #{converted} files to #{format_name}",
           converted_count: converted,
           skipped_count: skipped,
-          error_count: errors
+          error_count: errors,
+          dry_run: @dry_run,
+          content_error_count: content_errors
         )
       end
 
-      private def find_content_files : Array(String)
-        files = [] of String
-
-        # Unfollowable symlinks are dropped here (see `ContentWalk`). There is
-        # no frontmatter to rewrite in a link that resolves to nothing, and
-        # counting one as a conversion *error* made `hwaro tool convert` report
-        # failure — and exit non-zero — on a tree `hwaro build` publishes fine.
-        Dir.glob(File.join(@content_dir, "**", "*.md")) do |file|
-          files << file if ContentWalk.readable_file?(file)
+      # Human breakdown of the skip tally, in the order a reader cares about.
+      private def skip_breakdown(skips : Hash(SkipReason, Int32), target_format : FrontmatterFormat) : String
+        parts = [] of String
+        if n = skips[SkipReason::AlreadyTarget]?
+          parts << "#{n} already #{format_label(target_format)}"
         end
-
-        Dir.glob(File.join(@content_dir, "**", "*.markdown")) do |file|
-          files << file if ContentWalk.readable_file?(file)
+        if n = skips[SkipReason::NoFrontmatter]?
+          parts << "#{n} without front matter"
         end
-
-        files.sort
+        if n = skips[SkipReason::NotFrontmatter]?
+          parts << "#{n} not front matter"
+        end
+        parts.join(", ")
       end
 
+      private def find_content_files : Array(String)
+        ContentWalk.find_content_files(@content_dir)
+      end
+
+      # Why the last `convert_content` returned nil. The per-format converters
+      # rescue their own parse errors (a malformed block must not abort a bulk
+      # run), which used to swallow the reason entirely: the command printed a
+      # bare "Failed to convert: <file>" while `hwaro build` and
+      # `hwaro tool validate` both named the same parse error. Set on every
+      # failure path, cleared at the start of each conversion.
+      @last_error : String? = nil
+
       private def convert_content(content : String, from : FrontmatterFormat, to : FrontmatterFormat) : String?
+        @last_error = nil
         case {from, to}
         when {FrontmatterFormat::YAML, FrontmatterFormat::TOML}
           yaml_to_toml(content)
@@ -243,6 +330,15 @@ module Hwaro
         end
       end
 
+      # Remember a converter's parse error and signal failure (nil) to the
+      # caller in one step, so every rescue arm stays a single line.
+      private def record_error(ex : Exception) : Nil
+        message = ex.message
+        @last_error = message.presence
+        Logger.debug "Front matter parse error: #{message}"
+        nil
+      end
+
       # True when the file's leading delimiter block both closes properly and
       # parses as a key/value mapping. Parse *errors* return true so they
       # surface as Failed (with a message) in the convert path rather than
@@ -251,11 +347,14 @@ module Hwaro
         case format
         when FrontmatterFormat::YAML
           return false unless match = content.match(YAML_FRONTMATTER_RE)
-          begin
-            YAML.parse(match[1]).as_h? ? true : false
-          rescue YAML::ParseException
-            true
-          end
+          # The build's own decision: a mapping or an empty/comment-only
+          # block is front matter (an empty one must convert, not be skipped
+          # as "not front matter"); a block that fails to parse is front
+          # matter only when it carries a `key:` line. Prose between two
+          # thematic breaks that is not valid YAML (`*Note*: …`) used to be
+          # reported as a conversion failure — failing the whole run — for
+          # a page the build renders fine.
+          Utils::FrontmatterScanner.yaml_front_matter?(match[1])
         when FrontmatterFormat::TOML
           # TOML.parse always yields a table; just require a closing delimiter.
           content.matches?(TOML_FRONTMATTER_RE)
@@ -270,16 +369,28 @@ module Hwaro
       # rename(2) only needs directory permission, so check the file itself
       # first — a read-only file must fail instead of being silently replaced
       # — and carry its permissions onto the replacement.
-      private def write_in_place(file_path : String, content : String) : Nil
-        unless File::Info.writable?(file_path)
-          raise File::Error.new("File not writable", file: file_path)
+      # The rename must land on the RESOLVED path: renaming over a symlink
+      # replaces the symlink itself with a regular file, leaving the real
+      # target unconverted and a diverging copy in its place.
+      private def write_in_place(file_path : String, content : String) : Bool
+        target = begin
+          File.realpath(file_path)
+        rescue File::Error
+          Logger.warn "#{file_path}: could not resolve real path — left unchanged."
+          return false
         end
 
-        permissions = File.info(file_path).permissions
-        tmp_path = "#{file_path}.hwaro-convert.tmp"
+        unless File::Info.writable?(target)
+          raise File::Error.new("File not writable", file: target)
+        end
+
+        permissions = File.info(target).permissions
+        # Not "<target>.suffix": a 233..255-byte file name would overflow NAME_MAX.
+        tmp_path = Utils::FileSafe.temp_path(target)
         File.write(tmp_path, content)
         File.chmod(tmp_path, permissions)
-        File.rename(tmp_path, file_path)
+        File.rename(tmp_path, target)
+        true
       rescue ex
         File.delete(tmp_path) if tmp_path && File.exists?(tmp_path)
         raise ex
@@ -335,8 +446,7 @@ module Hwaro
 
             "#{TOML_DELIMITER}\n#{toml_str}#{TOML_DELIMITER}\n#{body}"
           rescue ex
-            Logger.debug "YAML parse error: #{ex.message}"
-            nil
+            record_error(ex)
           end
         end
       end
@@ -353,8 +463,7 @@ module Hwaro
 
             "#{YAML_DELIMITER}\n#{yaml_str}#{YAML_DELIMITER}\n#{body}"
           rescue ex
-            Logger.debug "TOML parse error: #{ex.message}"
-            nil
+            record_error(ex)
           end
         end
       end
@@ -368,8 +477,7 @@ module Hwaro
             json_str = yaml_to_json_string(yaml_data)
             "#{json_str}\n#{body}"
           rescue ex
-            Logger.debug "YAML parse error: #{ex.message}"
-            nil
+            record_error(ex)
           end
         end
       end
@@ -383,8 +491,7 @@ module Hwaro
             json_str = toml_to_json_string(toml_data)
             "#{json_str}\n#{body}"
           rescue ex
-            Logger.debug "TOML parse error: #{ex.message}"
-            nil
+            record_error(ex)
           end
         end
       end
@@ -397,8 +504,7 @@ module Hwaro
           yaml_body = convert_json_to_yaml_string(json_data)
           "#{YAML_DELIMITER}\n#{yaml_body}#{YAML_DELIMITER}\n#{body}"
         rescue ex
-          Logger.debug "JSON parse error: #{ex.message}"
-          nil
+          record_error(ex)
         end
       end
 
@@ -409,11 +515,10 @@ module Hwaro
           json_data = JSON.parse(json_str)
           # Reuse the YAML→TOML builder by going through YAML::Any.
           yaml_any = json_to_yaml_any(json_data)
-          toml_body = Utils::FrontmatterWriter::TomlBuilder.new.build(yaml_any)
+          toml_body = Utils::FrontmatterWriter::TomlBuilder.new(NULL_OMITTED_KEYS).build(yaml_any)
           "#{TOML_DELIMITER}\n#{toml_body}#{TOML_DELIMITER}\n#{body}"
         rescue ex
-          Logger.debug "JSON parse error: #{ex.message}"
-          nil
+          record_error(ex)
         end
       end
 
@@ -461,6 +566,7 @@ module Hwaro
         when String  then JSON::Any.new(raw)
         when Time    then JSON::Any.new(FrontmatterConverter.serialize_time(raw))
         when Nil     then JSON::Any.new(nil)
+        when Bytes   then JSON::Any.new(Base64.strict_encode(raw))
         when Array
           arr = yaml.as_a.map { |v| yaml_any_to_json_any(v, depth + 1) }
           JSON::Any.new(arr)
@@ -541,15 +647,20 @@ module Hwaro
             hash[key_str] = v
           end
         end
+        # An empty mapping serializes as `--- {}`, which would end up
+        # embedded verbatim inside the new fences; emit an empty block.
+        return "" if hash.empty?
         hash.to_yaml.lchop("---\n")
       end
 
       private def convert_yaml_to_toml_string(yaml : YAML::Any, indent : Int32 = 0) : String
-        Utils::FrontmatterWriter::TomlBuilder.new.build(yaml)
+        Utils::FrontmatterWriter::TomlBuilder.new(NULL_OMITTED_KEYS).build(yaml)
       end
 
       private def convert_toml_to_yaml_string(toml : TOML::Table) : String
         yaml_hash = toml_to_hash(toml)
+        # See convert_json_to_yaml_string: `{}` must not leak into the fences.
+        return "" if yaml_hash.empty?
         yaml_hash.to_yaml.lchop("---\n")
       end
 

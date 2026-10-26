@@ -20,6 +20,7 @@ module Hwaro
         # Flags defined here are used both for OptionParser and completion generation
         FLAGS = [
           FlagInfo.new(short: "-s", long: "--source", description: "Source directory to deploy (default: deployment.source_dir or public)", takes_value: true, value_hint: "DIR"),
+          FlagInfo.new(short: "-t", long: "--target", description: "Deploy target name (repeatable; equivalent to a positional target)", takes_value: true, value_hint: "NAME"),
           FlagInfo.new(short: nil, long: "--dry-run", description: "Show planned changes without writing"),
           FlagInfo.new(short: nil, long: "--confirm", description: "Ask for confirmation before deploying"),
           FlagInfo.new(short: nil, long: "--force", description: "Force upload/copy (ignore file comparisons)"),
@@ -59,8 +60,7 @@ module Hwaro
             config = begin
               Models::Config.load(env: options.env)
             rescue ex : Hwaro::HwaroError
-              STDOUT.puts ex.to_error_payload.to_json
-              exit(ex.exit_code)
+              Runner.exit_with_error_payload(ex)
             end
 
             # Effective dry-run (the --dry-run flag OR deployment.dryRun in
@@ -76,11 +76,9 @@ module Hwaro
                 ops = Services::Deployer.new.plan(options, config)
                 STDOUT.puts ops.to_json
               rescue ex : Hwaro::HwaroError
-                STDOUT.puts ex.to_error_payload.to_json
-                exit(ex.exit_code)
+                Runner.exit_with_error_payload(ex)
               rescue ex
-                STDOUT.puts({"status" => "error", "error" => {"message" => ex.message || "deploy plan failed"}}.to_json)
-                exit(1)
+                Runner.exit_with_error_payload(unexpected_error(ex, "deploy plan failed"))
               end
               return
             end
@@ -93,11 +91,9 @@ module Hwaro
             results = begin
               Services::Deployer.new.deploy_structured(options, config)
             rescue ex : Hwaro::HwaroError
-              STDOUT.puts ex.to_error_payload.to_json
-              exit(ex.exit_code)
+              Runner.exit_with_error_payload(ex)
             rescue ex
-              STDOUT.puts({"status" => "error", "error" => {"message" => ex.message || "deploy failed"}}.to_json)
-              exit(1)
+              Runner.exit_with_error_payload(unexpected_error(ex, "deploy failed"))
             end
 
             overall = results.all? { |r| r.status == "ok" } ? "ok" : "error"
@@ -111,6 +107,16 @@ module Hwaro
           # line with the right exit code. A successful return is a
           # no-op — the Runner exits 0 at the end of `run` automatically.
           Services::Deployer.new.run(options)
+        end
+
+        # An exception that escaped classification still goes out as the
+        # standard error payload (`code`/`category`/`message`/`hint`), not a
+        # bare `{"message"}` object agents could not branch on.
+        private def unexpected_error(ex : Exception, fallback : String) : Hwaro::HwaroError
+          Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_INTERNAL,
+            message: ex.message || fallback,
+          )
         end
 
         # Pick the most severe exit code across failing targets so CI can
@@ -133,17 +139,22 @@ module Hwaro
 
         def parse_options(args : Array(String)) : {Config::Options::DeployOptions, Bool, Bool}
           source_dir = nil.as(String?)
+          flag_targets = [] of String
           dry_run = nil.as(Bool?)
           confirm = nil.as(Bool?)
           force = nil.as(Bool?)
           max_deletes = nil.as(Int32?)
           list_targets = false
           json_output = false
-          env_name = ENV["HWARO_ENV"]? || nil
+          env_name = ENV["HWARO_ENV"]?.presence
 
           OptionParser.parse(args) do |parser|
             parser.banner = "Usage: hwaro deploy [options] [target ...]"
             parser.on("-s DIR", "--source DIR", "Source directory to deploy (default: deployment.source_dir or public)") { |dir| source_dir = dir }
+            # Positional targets are the primary form, but `--target` is what
+            # Hugo users (and hwaro's own docs) reach for, and hitting
+            # "Invalid option: --target" for a documented flag is a dead end.
+            parser.on("-t NAME", "--target NAME", "Deploy target name (repeatable; equivalent to a positional target)") { |name| flag_targets << name }
             parser.on("--dry-run", "Show planned changes without writing") { dry_run = true }
             parser.on("--confirm", "Ask for confirmation before deploying") { confirm = true }
             parser.on("--force", "Force upload/copy (ignore file comparisons)") { force = true }
@@ -181,7 +192,9 @@ module Hwaro
             end
           end
 
-          targets = args.dup
+          # Flag-supplied targets come first so `--target` and positional
+          # names compose; `Deployer#resolve_target_names` collapses repeats.
+          targets = flag_targets + args
 
           {
             Config::Options::DeployOptions.new(
@@ -202,11 +215,8 @@ module Hwaro
           config = begin
             Models::Config.load(env: env)
           rescue ex : Hwaro::HwaroError
-            if json
-              STDOUT.puts ex.to_error_payload.to_json
-            else
-              Logger.error "Error [#{ex.code}]: #{ex.message}"
-            end
+            Runner.exit_with_error_payload(ex) if json
+            Logger.error "Error [#{ex.code}]: #{ex.message}"
             exit(ex.exit_code)
           end
 

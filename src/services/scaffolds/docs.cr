@@ -17,7 +17,7 @@ module Hwaro
           "Documentation-focused structure with organized sections and sidebar"
         end
 
-        protected def config_title : String
+        def config_title : String
           # Distinct from the homepage `title = "Documentation"` so the
           # rendered <title> and the `{{ site.title }} <span>Documentation</span>`
           # logo don't collapse into "Documentation - Documentation".
@@ -90,6 +90,11 @@ module Hwaro
             MD
         end
 
+        # Pages the menus/nav link to (kept as stubs by --skip-sample-content).
+        protected def skeleton_page_paths : Array(String)
+          ["index.md", "getting-started/_index.md", "guide/_index.md", "reference/_index.md"]
+        end
+
         # Docs templates share nav, search, and sidebar across page,
         # section, taxonomy, and 404 — extracting those into `partials/`
         # makes "edit the nav" a one-file change and keeps 404/taxonomy
@@ -115,46 +120,6 @@ module Hwaro
           files
         end
 
-        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
-          config = String.build do |str|
-            # Site basics
-            str << base_config(config_title, config_description)
-
-            # Content & Processing
-            str << multilingual_config(multilingual_languages)
-            str << plugins_config
-            str << content_files_config
-            str << highlight_config
-            str << og_config
-            str << search_config
-            str << pagination_config
-            str << series_config
-            str << related_config
-            str << taxonomies_config unless skip_taxonomies
-
-            # SEO & Feeds
-            str << sitemap_config
-            str << robots_config
-            str << llms_config
-            str << feeds_config(feed_sections)
-
-            # Optional features (commented out by default)
-            str << permalinks_config
-            str << auto_includes_config
-            str << assets_config
-            str << markdown_config
-            str << content_new_config
-            str << image_processing_config
-            str << build_hooks_config
-            str << pwa_config
-            str << amp_config
-            str << og_auto_image_config
-            str << doctor_config
-            str << deployment_config
-          end
-          config
-        end
-
         # Override header for docs - minimal header integrated with layout
         # (Jinja2 syntax). `page.title` and `page.description` are guarded
         # so untitled pages don't render `<title> - Site</title>` or an
@@ -175,6 +140,7 @@ module Hwaro
               {{ jsonld }}
               {{ hreflang_tags }}
               {{ pagination_seo_links }}
+              {{ pwa_tags }}
               #{styles}
               {# The syntax theme is inlined in css/style.css, so no highlight theme
                  stylesheet link is emitted here (sub-path safe). Highlight.js itself
@@ -428,7 +394,7 @@ module Hwaro
               left: 0;
               bottom: 0;
               width: 2.75rem;
-              height: 3px;
+              height: 4px;
               border-radius: 999px;
               background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
             }
@@ -930,40 +896,7 @@ module Hwaro
               display: flex;
             }
 
-            .search-modal {
-              width: 560px;
-              max-width: 90vw;
-              max-height: 70vh;
-              background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
-              backdrop-filter: saturate(180%) blur(24px);
-              -webkit-backdrop-filter: saturate(180%) blur(24px);
-              border: 1px solid var(--border-subtle);
-              border-radius: var(--radius);
-              box-shadow: var(--shadow-lg);
-              display: flex;
-              flex-direction: column;
-              overflow: hidden;
-              align-self: flex-start;
-            }
-            @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .search-modal { background: var(--bg-raised); } }
-
-            /* The palette settles into place when it opens. */
-            @media (prefers-reduced-motion: no-preference) {
-              .search-overlay.active { transition: opacity 0.15s var(--ease-out); }
-              .search-overlay.active .search-modal { transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out); }
-              @starting-style {
-                .search-overlay.active { opacity: 0; }
-                .search-overlay.active .search-modal { opacity: 0; transform: translateY(-8px) scale(0.985); }
-              }
-            }
-
-            .search-input-wrap {
-              display: flex;
-              align-items: center;
-              gap: 0.6rem;
-              padding: 0.75rem 1rem;
-              border-bottom: 1px solid var(--border-subtle);
-            }
+            #{search_modal_css}
 
             .search-input-wrap svg {
               flex-shrink: 0;
@@ -1052,26 +985,7 @@ module Hwaro
               font-size: 0.9rem;
             }
 
-            .search-hint {
-              padding: 0.5rem 0.75rem;
-              display: flex;
-              gap: 1rem;
-              justify-content: center;
-              border-top: 1px solid var(--border-subtle);
-              color: var(--text-muted);
-              font-size: 0.7rem;
-            }
-
-            .search-hint kbd {
-              font-size: 0.65rem;
-              padding: 0 0.3rem;
-              border: 1px solid var(--border);
-              border-radius: 3px;
-              background: var(--bg-raised);
-              box-shadow: 0 1px 0 var(--border);
-              font-family: inherit;
-              line-height: 1.4;
-            }
+            #{search_hint_css}
 
             /* Search trigger press feedback */
             .search-trigger:active {
@@ -1197,7 +1111,7 @@ module Hwaro
                   {% endfor %}
                 </nav>
                 {% endif %}
-                <button class="search-trigger" onclick="openSearch()" title="Search">
+                <button class="search-trigger" data-search-open title="Search">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                   <span>Search</span>
                   <kbd>&#8984;K</kbd>
@@ -1230,7 +1144,7 @@ module Hwaro
                 <div class="sidebar-title">{{ sec.title | e }}</div>
                 <ul class="sidebar-links">
                   <li><a href="{{ base_url }}{{ sec.url }}"{% if sec.url | active_path %} class="active" aria-current="page"{% endif %}>Overview</a></li>
-                  {% for p in sec.pages | sort(attribute="path") | sort(attribute="weight") %}{% if not p.is_index %}
+                  {% for p in sec.pages | sort(attribute="path") | sort(attribute="weight") %}{% if not p.is_section %}
                   <li><a href="{{ base_url }}{{ p.url }}"{% if p.url | active_path %} class="active" aria-current="page"{% endif %}>{{ p.title | e }}</a></li>
                   {% endif %}{% endfor %}
                 </ul>
@@ -1414,7 +1328,7 @@ module Hwaro
 
             ## Prerequisites
 
-            - [Crystal](https://crystal-lang.org/) 1.0 or later
+            - [Crystal](https://crystal-lang.org/) 1.21 or later
             - Git (optional, for cloning)
 
             ## Install from Source
@@ -1591,7 +1505,10 @@ module Hwaro
             description = "Page description for SEO"
             +++
 
-            # Your Content Here
+            ## Your first section
+
+            The templates already render `title` as the page's `<h1>`, so
+            the body starts at heading level 2.
             ```
 
             ## Sections
@@ -1628,15 +1545,19 @@ module Hwaro
 
             ## Template Directory
 
-            Templates are stored in `templates/`:
+            Templates are stored in `templates/`. This site ships:
 
             ```
             templates/
-            ├── base.html       # Base template with common structure
+            ├── header.html     # <head> + opening chrome, included everywhere
+            ├── footer.html     # Closing chrome + scripts
             ├── page.html       # Regular pages
             ├── section.html    # Section indexes
-            ├── partials/       # Partial templates
-            │   └── nav.html
+            ├── 404.html        # Not-found page
+            ├── partials/       # Shared fragments ({% include %})
+            │   ├── nav.html
+            │   ├── search.html
+            │   └── sidebar.html
             └── shortcodes/     # Shortcode templates
             ```
 
@@ -1653,7 +1574,9 @@ module Hwaro
 
             ## Template Inheritance
 
-            Extend base templates:
+            This site composes pages with `{% include %}` (header/footer/partials),
+            but Crinja also supports `{% extends %}` if you prefer a base layout —
+            create a `templates/base.html` and extend it:
 
             ```jinja
             {% extends "base.html" %}
@@ -1789,8 +1712,9 @@ module Hwaro
             | Option | Description |
             |--------|-------------|
             | `--scaffold TYPE` | Scaffold type: simple, bare, blog, docs, book (default: simple) |
-            | `--force` | Overwrite existing files |
-            | `--skip-sample-content` | Don't create sample content |
+            | `--force` | Allow a non-empty directory (keeps existing files, adds only missing ones) |
+            | `--clean` | Remove the target directory's contents first (refuses if it contains `.git`) |
+            | `--skip-sample-content` | Skip sample content (keeps front-matter-only stubs for the pages the navigation links to) |
 
             **Examples:**
 
@@ -1813,8 +1737,10 @@ module Hwaro
 
             | Option | Description |
             |--------|-------------|
-            | `--config FILE` | Use a custom config file |
-            | `--output DIR` | Output directory (default: public) |
+            | `-i`, `--input DIR` | Project directory (default: current directory) |
+            | `-o`, `--output DIR` | Output directory (default: public) |
+            | `-e`, `--env ENV` | Also load `config.<env>.toml` |
+            | `-d`, `--drafts` | Include draft content |
 
             ## hwaro serve
 
@@ -1828,15 +1754,16 @@ module Hwaro
 
             | Option | Description |
             |--------|-------------|
-            | `--port PORT` | Server port (default: 3000) |
-            | `--host HOST` | Server host (default: localhost) |
+            | `-p`, `--port PORT` | Server port (default: 3000) |
+            | `-b`, `--bind HOST` | Bind address (default: 127.0.0.1) |
+            | `--open` | Open the browser after starting |
 
             ## hwaro new
 
             Create a new content file.
 
             ```bash
-            hwaro new [path]
+            hwaro new <path> [options]
             ```
 
             Creates a new Markdown file with front matter template.
@@ -1881,7 +1808,7 @@ module Hwaro
             |-----|------|---------|-------------|
             | `enabled` | bool | false | Enable search index |
             | `format` | string | "fuse_json" | Index format |
-            | `fields` | array | ["title"] | Fields to index |
+            | `fields` | array | ["title", "content"] | Fields to index |
 
             ## Sitemap
 

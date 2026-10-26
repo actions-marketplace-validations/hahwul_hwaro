@@ -10,6 +10,7 @@
 # - Static-only copy when only static files change
 
 require "http/server"
+require "digest/md5"
 require "json"
 require "mime"
 require "socket"
@@ -20,802 +21,33 @@ require "../../utils/logger"
 require "../../config/options/serve_options"
 require "../../config/options/build_options"
 require "../../utils/command_runner"
+require "../../utils/dev_marker"
+require "../../utils/hwaro_dir"
 require "./dev_path"
 require "./live_reload_handler"
 
+require "./handlers"
+require "./dev_http_server"
+require "./change_set"
+require "./watch"
+require "./rebuild"
+
 module Hwaro
   module Services
-    class IndexRewriteHandler
-      include HTTP::Handler
-
-      def initialize(@public_dir : String)
-      end
-
-      def call(context)
-        path = context.request.path
-
-        if path.ends_with?("/")
-          context.request.path += "index.html"
-        else
-          # No extname pre-filter here: deciding by extension 404'd every
-          # directory with a dot in its last segment (/docs/v1.2, /node.js)
-          # because stdlib's StaticFileHandler only appends the trailing
-          # slash when directory_listing is on. What's on disk decides.
-          #
-          # Resolve strictly (see DevPath) to prevent directory traversal and
-          # separator smuggling before filesystem access. A nil result is a
-          # path we refuse to route; an empty one is the output root itself,
-          # which must not produce `Location: //`.
-          sanitized = DevPath.safe_relative(path)
-          if sanitized.nil? || sanitized.empty?
-            call_next(context)
-            return
-          end
-          fs_path = Path[@public_dir, sanitized]
-
-          # Verify resolved path is within public_dir.
-          # Only attempt realpath if the path exists on disk; otherwise skip
-          # the redirect entirely so non-existent traversal paths cannot
-          # bypass the boundary check (realpath returns nil for missing paths).
-          public_real = begin
-            File.realpath(@public_dir)
-          rescue File::Error
-            @public_dir
-          end
-          resolved = if File.exists?(fs_path.to_s)
-                       begin
-                         File.realpath(fs_path)
-                       rescue File::Error
-                         nil
-                       end
-                     end
-          if resolved && (resolved == public_real || resolved.starts_with?(public_real + "/")) && Dir.exists?(resolved)
-            # 302, not 301: browsers cache permanent redirects per URL, so a
-            # 301 would keep redirecting to a section long after a rebuild
-            # removed or renamed it (or after a different project reuses the
-            # port) until the user clears their browser cache.
-            context.response.status_code = 302
-            # Build the Location from the already-resolved path to prevent
-            # CRLF injection and path traversal in the redirect target, then
-            # re-encode it: resolution decodes, so `/my page` would otherwise
-            # emit a raw space (and `/한글` raw UTF-8) into the header, which
-            # is not a valid URI reference. Keep the query string — /search?q=term
-            # must land on /search/?q=term, not an empty-query page. (A
-            # request-line query can't contain CR/LF.)
-            location = "/" + DevPath.encode_relative(sanitized) + "/"
-            if (query = context.request.query) && !query.empty?
-              location += "?#{query}"
-            end
-            context.response.headers["Location"] = location
-            return
-          end
-        end
-
-        call_next(context)
-      end
-    end
-
-    class NotFoundHandler
-      include HTTP::Handler
-
-      # With live reload on, 404 responses embed the reload script too: a
-      # tab parked on a not-yet-rendered URL (a page still building, a
-      # --fast-start deferred page) then refreshes itself the moment its
-      # HTML lands on disk, and build-error overlays reach 404 tabs as well.
-      # Without the script those tabs sat on the 404 forever.
-      # Methods the dev server actually answers. Anything else gets a 405 with
-      # an Allow header instead of a 404: `StaticFileHandler` is built with
-      # `fallthrough: true`, so a POST used to fall through to here and be
-      # reported as "no such page", which reads as a routing bug to anyone
-      # pointing a form or API mock at the dev server.
-      #
-      # OPTIONS is advertised because the server does answer it — just further
-      # up, where `DevCorsHandler` returns its 204 preflight without calling
-      # down the chain. It therefore never reaches the branch below, but the
-      # advertised `Allow` value has to tell the truth about the server.
-      ALLOWED_METHODS = "GET, HEAD, OPTIONS"
-
-      def initialize(@public_dir : String, @injector : LiveReloadInjectHandler? = nil)
-      end
-
-      def call(context)
-        method = context.request.method
-        unless method == "GET" || method == "HEAD" || method == "OPTIONS"
-          # No HEAD guard needed here: HEAD is in the allowed set above, so it
-          # can never reach this branch.
-          context.response.status_code = 405
-          context.response.headers["Allow"] = ALLOWED_METHODS
-          context.response.content_type = "text/plain; charset=utf-8"
-          context.response.print "405 Method Not Allowed"
-          return
-        end
-
-        context.response.status_code = 404
-        context.response.content_type = "text/html; charset=utf-8"
-
-        path_404 = File.join(@public_dir, "404.html")
-        body = File.exists?(path_404) ? File.read(path_404) : "404 Not Found"
-        if injector = @injector
-          body = injector.inject_script(body)
-        end
-        # HEAD must carry the headers of the matching GET but no body. Crystal
-        # never suppresses a handler-written body, so printing here desynced
-        # every keep-alive client: it read the 404 page as the start of the
-        # next response. Set the length explicitly and return.
-        context.response.content_length = body.bytesize
-        return if method == "HEAD"
-        context.response.print body
-      end
-    end
-
-    # Dev responses must never be cached by the browser: watch rebuilds
-    # rewrite files whose Etag/Last-Modified derive from second-granularity
-    # mtimes, so two quick saves inside one second produce a "new" version
-    # whose validators match the cached one — the browser then 304s onto the
-    # stale copy until a hard refresh. `no-store` matches what other SSG dev
-    # servers ship. The header is set BEFORE call_next so it also reaches
-    # responses that flush their headers mid-body (static files larger than
-    # the response's output buffer — `IO::DEFAULT_BUFFER_SIZE`, 32 KiB).
-    # Skipped entirely when the user supplies their own Cache-Control via
-    # [serve.headers]/--header.
-    class NoCacheHandler
-      include HTTP::Handler
-
-      def call(context)
-        context.response.headers["Cache-Control"] = "no-store"
-        call_next(context)
-      end
-    end
-
-    # Emits `Access-Control-Allow-Origin: *` on every dev-server response so
-    # a site loaded via one local hostname can still `fetch()` resources
-    # served under another — the canonical example being `localhost:3000`
-    # in the address bar while `{{ base_url }}` was baked as
-    # `http://127.0.0.1:3000` (the default bind). Same-origin policy treats
-    # those as different origins and would otherwise block the fetch.
-    #
-    # Dev-only: the built output is untouched. Matches what other SSG dev
-    # servers do (Zola, Hugo).
-    class DevCorsHandler
-      include HTTP::Handler
-
-      # Allowed CORS origin hosts: loopback literals plus the host the server
-      # was bound to (when it's concrete, not a 0.0.0.0/:: wildcard).
-      def initialize(@allowed_hosts : Set(String) = Set{"localhost", "127.0.0.1", "::1"})
-      end
-
-      def call(context)
-        allowed_origin = allowed_cors_origin(context.request.headers["Origin"]?)
-        if allowed_origin
-          context.response.headers["Access-Control-Allow-Origin"] = allowed_origin
-          context.response.headers["Vary"] = "Origin"
-        end
-
-        if context.request.method == "OPTIONS"
-          if allowed_origin
-            requested_headers = context.request.headers["Access-Control-Request-Headers"]?
-            context.response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
-            context.response.headers["Access-Control-Allow-Headers"] = requested_headers || "*"
-            context.response.headers["Access-Control-Max-Age"] = "86400"
-          end
-          context.response.status_code = 204
-          return
-        end
-
-        call_next(context)
-      end
-
-      # Reflect the request Origin only when its host is a loopback literal or
-      # the exact host the dev server was bound to. Returns nil for any other
-      # origin so the browser's default same-origin policy applies — an
-      # arbitrary website the developer visits can no longer cross-origin read
-      # served content (e.g. `--drafts`). This keeps the legitimate
-      # localhost-vs-127.0.0.1 fetch() ergonomic while denying internet/LAN
-      # origins the blanket `*` previously granted.
-      private def allowed_cors_origin(origin : String?) : String?
-        return unless origin
-        host = begin
-          URI.parse(origin).host
-        rescue
-          nil
-        end
-        return unless host
-        host = host[1..-2] if host.starts_with?('[') && host.ends_with?(']')
-        @allowed_hosts.includes?(host) ? origin : nil
-      end
-    end
-
-    # `HTTP::StaticFileHandler` derives `Content-Type` from the file
-    # extension via `MIME.from_extension` and writes it without a
-    # charset parameter — so `robots.txt` / `llms.txt` / sitemap and
-    # search index responses all advertise no charset, leaving UTF-8
-    # bytes (e.g. Korean LLM-instructions) at the mercy of client-side
-    # heuristics.
-    #
-    # The primary fix is `Server.register_utf8_mime_types`, which teaches the
-    # MIME table the charset up front so `StaticFileHandler` writes the right
-    # value at any response size. This handler stays as the safety net for
-    # types we don't enumerate there and for handlers that set a bare
-    # text-shaped Content-Type themselves — but note it can only work below
-    # the response output buffer (`IO::DEFAULT_BUFFER_SIZE`, 32 KiB): past
-    # that the headers are already on the wire when `call_next` returns.
-    #
-    # We only touch types we know are text. Binary types (image/png,
-    # font/woff2, etc.) are left alone — adding a charset there would
-    # be wrong, not just useless. `image/svg+xml` is treated as text
-    # because it's XML.
-    class CharsetHandler
-      include HTTP::Handler
-
-      TEXT_PREFIXES = ["text/"]
-      TEXT_SUFFIXES = ["+xml", "+json"]
-      TEXT_TYPES    = Set{
-        "application/xml",
-        "application/json",
-        "application/javascript",
-        "application/rss+xml",
-        "application/atom+xml",
-        "image/svg+xml",
-      }
-
-      def call(context)
-        call_next(context)
-
-        existing = context.response.headers["Content-Type"]?
-        return unless existing
-        return if existing.includes?("charset=")
-
-        base = existing.split(';', 2).first.strip.downcase
-        return unless text_like?(base)
-
-        context.response.headers["Content-Type"] = "#{existing}; charset=utf-8"
-      end
-
-      private def text_like?(base : String) : Bool
-        TEXT_TYPES.includes?(base) ||
-          TEXT_PREFIXES.any? { |p| base.starts_with?(p) } ||
-          TEXT_SUFFIXES.any? { |s| base.ends_with?(s) }
-      end
-    end
-
-    # Injects user-provided custom response headers on every dev-server response.
-    #
-    # Runs *after* `call_next` so the configured headers always win over any
-    # headers set by built-in handlers (DevCorsHandler, CharsetHandler, 404
-    # handler, redirect Location from IndexRewriteHandler, etc.). This gives
-    # predictable "what I put in [serve.headers] is what the browser receives"
-    # behaviour — exactly what users need when reproducing production server
-    # configuration locally.
-    class CustomHeadersHandler
-      include HTTP::Handler
-
-      def initialize(@headers : Hash(String, String))
-      end
-
-      def call(context)
-        # Pre-set BEFORE call_next so the values survive responses that
-        # flush their headers mid-body: files larger than the response's
-        # output buffer (`IO::DEFAULT_BUFFER_SIZE`, 32 KiB) serialize
-        # headers at first flush, and post-call_next edits never reach the
-        # wire for those.
-        apply_headers(context)
-        call_next(context)
-        # Re-assert after so user values still win over anything a
-        # downstream handler set in between (Content-Type charset, CORS)
-        # for the buffered small-response case. Only headers the static
-        # handler itself overwrites (Content-Type, validators) remain
-        # theirs on responses past the output buffer.
-        apply_headers(context)
-      end
-
-      private def apply_headers(context)
-        @headers.each do |name, value|
-          # Final guard: never emit control characters in headers even if they
-          # somehow made it through config/CLI validation.
-          next if name.each_char.any?(&.ascii_control?) || value.each_char.any?(&.ascii_control?)
-          context.response.headers[name] = value
-        end
-      end
-    end
-
-    # Answers 404 for the request shapes no static host serves (see
-    # `DevPath.unservable?`): an encoded `/` or `\`, a literal backslash, or a
-    # NUL in any form.
-    #
-    # Having our own handlers decline them was not enough — the request just
-    # fell through to `HTTP::StaticFileHandler`, which decodes once as well and
-    # resolved `/%2Fguide%2Findex.html` to the real page via a 302. That is the
-    # exact dev/prod divergence this module exists to remove: a link that works
-    # locally and 404s once deployed. Delegating to `NotFoundHandler` keeps the
-    # 404 body (and its live-reload script) identical to every other 404.
-    class UnservablePathHandler
-      include HTTP::Handler
-
-      def initialize(@not_found : NotFoundHandler)
-      end
-
-      def call(context)
-        # Only the path — a query string may legitimately carry `%2F`.
-        if DevPath.unservable?(context.request.path)
-          @not_found.call(context)
-          return
-        end
-
-        call_next(context)
-      end
-    end
-
-    # Mounts the built output under `base_url`'s path component.
-    #
-    # `hwaro serve --base-url http://localhost:3000/myblog/` builds a site
-    # whose every link, stylesheet and script is `/myblog/…`, but the dev
-    # server used to answer only at `/` — so the homepage loaded unstyled and
-    # every internal link 404'd. Requests carrying the prefix now have it
-    # stripped before routing, and `Location` headers produced downstream get
-    # it added back so the address bar stays coherent.
-    #
-    # Deliberately lenient: an unprefixed request is passed through untouched
-    # rather than 404'd, so `/css/style.css` typed by hand (or requested by an
-    # older cached page) still resolves. Only the bare root is redirected, so
-    # `--open` and manual browsing land on the prefixed site.
-    #
-    # A no-op when `base_path` is "" — the default, since serve derives
-    # `base_url` from host:port unless `--base-url` says otherwise.
-    class BasePathHandler
-      include HTTP::Handler
-
-      # Normalised here rather than assumed: a trailing slash made every
-      # `starts_with?("#{@base_path}/")` test unmatchable and produced
-      # `Location: /myblog//`, so the documented contract is now enforced.
-      def initialize(base_path : String)
-        @base_path = base_path.rstrip("/")
-      end
-
-      def call(context)
-        return call_next(context) if @base_path.empty?
-
-        path = context.request.path
-
-        if path == "/"
-          redirect(context, "#{@base_path}/")
-          return
-        end
-
-        if path == @base_path
-          redirect(context, "#{@base_path}/")
-          return
-        end
-
-        stripped = path.starts_with?("#{@base_path}/")
-        if stripped
-          context.request.path = path[@base_path.size..]
-
-          # `HTTP::StaticFileHandler` answers a non-canonical path (`//x`,
-          # `/./x`, `/a/../x`) with its own canonicalising redirect, emitted
-          # through `Response#redirect` — which CLOSES the response and flushes
-          # the headers. A post-`call_next` edit therefore never reaches the
-          # wire for those, so the mount point was silently dropped from the
-          # Location. (`//` is a routine artifact of `{{ base_url }}/…`
-          # concatenation, so this is reachable in ordinary use.) Issue the
-          # same redirect ourselves, prefixed, before it can.
-          if target = noncanonical_target(context.request.path)
-            redirect(context, "#{@base_path}#{target}")
-            return
-          end
-        end
-
-        call_next(context)
-
-        # Put the request back the way it arrived. `HTTP::LogHandler` sits
-        # outermost and reads `request.resource` AFTER call_next, so leaving it
-        # stripped made `--access-log` report `/posts/` for a request to
-        # `/myblog/posts/` — the access log was useless for debugging exactly
-        # the mount-point problems this handler can cause.
-        context.request.path = path if stripped
-
-        # Re-prefix a downstream redirect (e.g. IndexRewriteHandler's
-        # trailing-slash 302) so following it doesn't silently drop the mount
-        # point from the URL.
-        #
-        # Keyed on whether we actually stripped, NOT on what the outgoing
-        # Location looks like: a site with a top-level section named after the
-        # mount point (`content/myblog/` under `--base-url http://host/myblog/`)
-        # legitimately produces a downstream `/myblog/x` in stripped space, and
-        # an "already prefixed?" string test would read that as done and emit a
-        # Location that had lost the mount point. An unprefixed pass-through
-        # request keeps its unprefixed redirect, matching how it was routed.
-        return unless stripped
-
-        location = context.response.headers["Location"]?
-        if location && location.starts_with?("/") && !location.starts_with?("//")
-          context.response.headers["Location"] = "#{@base_path}#{location}"
-        end
-      end
-
-      # The path `HTTP::StaticFileHandler` would redirect to, or nil when it
-      # would not redirect at all. Mirrors its own logic exactly — decode once,
-      # `Path.posix(...).expand("/")`, compare as `Path` — so this fires when
-      # and only when stdlib would have.
-      private def noncanonical_target(path : String) : String?
-        # Never canonicalise a path the server refuses to serve. Independently
-        # of handler order this keeps two promises: an unservable path is
-        # 404'd by UnservablePathHandler rather than redirected, and nothing
-        # here raises — `Path.posix` throws on a NUL and the decode below can
-        # yield invalid UTF-8, either of which would escape as a 500.
-        return if DevPath.unservable?(path)
-
-        decoded = URI.decode(path)
-        return unless decoded.valid_encoding?
-
-        request_path = Path.posix(decoded)
-        expanded = request_path.expand("/")
-        return if request_path == expanded
-        URI.encode_path(expanded.to_s)
-      end
-
-      private def redirect(context, location : String)
-        # 302, matching IndexRewriteHandler: a permanent redirect would stick
-        # in the browser cache long after the prefix changes.
-        context.response.status_code = 302
-        if (query = context.request.query) && !query.empty?
-          location = "#{location}?#{query}"
-        end
-        context.response.headers["Location"] = location
-      end
-    end
-
-    # Dev-only on-demand OG image generation for `[og.auto_image]
-    # lazy_generate = true` under `hwaro serve`.
-    #
-    # Lazy serve builds assign each eligible page its predicted og:image URL
-    # without rendering the file (OgImage.assign_lazy_urls) — this handler
-    # fulfills the promised "generated on first request" contract that
-    # previously didn't exist (the URLs 404'd all session). A request for a
-    # path under the OG output directory generates the owning page's image,
-    # then falls through to the static file handler to serve it from disk.
-    #
-    # Only ever mounted in the dev handler chain; a no-op unless the current
-    # config enables auto-OG with lazy_generate.
-    class OgLazyImageHandler
-      include HTTP::Handler
-
-      def initialize(@builder : Core::Build::Builder, @output_dir : String)
-        @mutex = Mutex.new
-      end
-
-      def call(context)
-        method = context.request.method
-        return call_next(context) unless method == "GET" || method == "HEAD"
-
-        config = @builder.config
-        site = @builder.site
-        return call_next(context) unless config && site
-        ai = config.og.auto_image
-        return call_next(context) unless ai.enabled && ai.lazy_generate
-
-        sanitized = DevPath.safe_relative(context.request.path)
-        return call_next(context) if sanitized.nil? || sanitized.empty?
-        return call_next(context) unless sanitized.starts_with?("#{ai.output_dir.strip("/")}/")
-        return call_next(context) unless sanitized.ends_with?(".png") || sanitized.ends_with?(".svg")
-
-        url_path = "/#{sanitized}"
-        page = site.pages.find { |p| p.image == url_path } ||
-               site.sections.find { |s| s.image == url_path }
-        return call_next(context) unless page
-
-        # Serialize generation: the og:image and twitter:image fetches of one
-        # link preview land together and must not render the file twice.
-        # generate() is manifest-cached — when the file exists and the page
-        # hash matches, a repeat request costs a hash + stat, so no extra
-        # freshness bookkeeping is needed here. `partial: true`: a
-        # single-page call must not truncate every other page's manifest
-        # entry.
-        # The advertised URL carries the collision-disambiguated slug that
-        # assign_lazy_urls computed against the FULL page set — pass it
-        # through, because a single-page generate() call would recompute
-        # the slug with fresh collision state and collapse colliding pages
-        # (/posts/foo/ vs /posts-foo/) onto the same unsuffixed file.
-        slug = File.basename(sanitized, File.extname(sanitized))
-        @mutex.synchronize do
-          Content::Seo::OgImage.generate([page], config, @output_dir, partial: true, parallel: false, forced_slug: slug)
-        rescue ex
-          Logger.warn "On-demand OG image generation failed for #{url_path}: #{ex.message}"
-        end
-
-        # PNG rendering can fall back to SVG (no usable font). The advertised
-        # .png path then has no backing file, but the page's updated image
-        # URL does — serve those bytes under the requested path (dev-only
-        # pragmatism: the preview still shows an image).
-        requested = File.join(@output_dir, sanitized)
-        if !File.exists?(requested) && (fallback = page.image) && fallback != url_path
-          fallback_path = File.join(@output_dir, fallback.lchop('/'))
-          if File.exists?(fallback_path) && Utils::OutputGuard.within_output_dir?(fallback_path, @output_dir)
-            data = File.read(fallback_path)
-            context.response.content_type = fallback.ends_with?(".svg") ? "image/svg+xml" : "image/png"
-            context.response.content_length = data.bytesize
-            context.response.print(data) unless method == "HEAD"
-            return
-          end
-        end
-
-        call_next(context)
-      end
-    end
-
-    # The dev server's `HTTP::Server`, hardened against requests the stdlib
-    # refuses to parse.
-    #
-    # `HTTP::Request.from_io` runs at the very top of
-    # `HTTP::Server::RequestProcessor#process` — outside that method's
-    # `rescue IO::Error` and outside the per-handler 500 rescue — and it parses
-    # `Content-Length` eagerly and strictly. So `Content-Length: abc`, `0x5`, a
-    # value past UInt64, or two Content-Length headers that disagree raise
-    # `ArgumentError` straight out of the fiber `HTTP::Server#dispatch` spawned:
-    # the client received zero bytes (not even a status line) and the
-    # developer's terminal was repainted with an "Unhandled exception in spawn"
-    # backtrace for every such request. No handler in hwaro's chain runs early
-    # enough to catch it — the request object does not exist yet — so the only
-    # place to intervene is around the processor itself.
-    class DevHTTPServer < HTTP::Server
-      BAD_REQUEST_BODY = "400 Bad Request\n"
-
-      # Mirrors `HTTP::Server#handle_client` minus its TLS branch (the dev
-      # server only ever binds plain TCP) plus the ArgumentError rescue.
-      # Wrapping `super` instead would not work: the parent's `ensure` closes
-      # the connection before the rescue could answer on it.
-      private def handle_client(io : IO)
-        if io.is_a?(IO::Buffered)
-          io.sync = false
-        end
-
-        begin
-          @processor.process(io, io)
-        rescue ex : ArgumentError
-          # Only the request parser can raise out here — an exception from a
-          # handler is already turned into a 500 inside the processor — so this
-          # is a malformed request, not an internal error. Debug level: the
-          # console belongs to the build output.
-          Logger.debug "Malformed request answered with 400: #{ex.message}"
-          respond_bad_request(io)
-        end
-      ensure
-        begin
-          io.close
-        rescue IO::Error
-        end
-      end
-
-      # Written by hand because the connection never produced an
-      # `HTTP::Server::Response` to write through.
-      private def respond_bad_request(io : IO)
-        io << "HTTP/1.1 400 Bad Request\r\n"
-        io << "Content-Type: text/plain; charset=utf-8\r\n"
-        io << "Content-Length: #{BAD_REQUEST_BODY.bytesize}\r\n"
-        io << "Connection: close\r\n"
-        io << "\r\n"
-        io << BAD_REQUEST_BODY
-        io.flush
-      rescue IO::Error
-        # Peer hung up first; nothing to report.
-      end
-    end
-
-    # Categorised set of file-system changes detected by the watcher.
-    #
-    # Changes are split into five buckets so the server can pick the
-    # cheapest rebuild strategy.
-    struct ChangeSet
-      # Content files (.md under content/) that were *modified* (not added/deleted)
-      getter modified_content : Array(String)
-      # Non-Markdown files under content/ (images and other assets published
-      # via `[content.files] allow_extensions`) that were *modified*. These
-      # are not pages — they're copied 1:1 to the output dir on rebuild, so
-      # they can't ride the incremental page pipeline.
-      getter modified_content_files : Array(String)
-      # Template files that were *modified*
-      getter modified_templates : Array(String)
-      # Static files that were *modified*
-      getter modified_static : Array(String)
-      # Data / i18n files (data/**, i18n/**) that were *modified*. Templates
-      # read `site.data` and translations feed every localized string, so any
-      # page may depend on these — a change here forces a full rebuild.
-      getter modified_data : Array(String)
-      # Files that were added (new) – present in current scan but not previous
-      getter added_files : Array(String)
-      # Files that were removed – present in previous scan but not current
-      getter removed_files : Array(String)
-      # Whether config.toml itself changed
-      getter config_changed : Bool
-
-      def initialize(
-        @modified_content : Array(String),
-        @modified_templates : Array(String),
-        @modified_static : Array(String),
-        @added_files : Array(String),
-        @removed_files : Array(String),
-        @config_changed : Bool,
-        @modified_content_files : Array(String) = [] of String,
-        @modified_data : Array(String) = [] of String,
-      )
-      end
-
-      # True when the change set is empty (nothing actually changed)
-      def empty? : Bool
-        @modified_content.empty? &&
-          @modified_content_files.empty? &&
-          @modified_templates.empty? &&
-          @modified_static.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # True when a full rebuild is unavoidable:
-      # config changed, data/i18n changed (any page may read them), or files
-      # were added / deleted (which affects section lists, navigation,
-      # taxonomy indices, etc.)
-      def needs_full_rebuild? : Bool
-        @config_changed || !@added_files.empty? || !@removed_files.empty? ||
-          !@modified_data.empty?
-      end
-
-      # True when only template files were modified (no content / static / structural changes)
-      def templates_only? : Bool
-        !@modified_templates.empty? &&
-          @modified_content.empty? &&
-          @modified_content_files.empty? &&
-          @modified_static.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # True when only static files were modified
-      def static_only? : Bool
-        !@modified_static.empty? &&
-          @modified_content.empty? &&
-          @modified_content_files.empty? &&
-          @modified_templates.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # True when only non-Markdown content files were modified — just
-      # republish them, no markdown re-parsing, no template re-render.
-      def content_files_only? : Bool
-        !@modified_content_files.empty? &&
-          @modified_content.empty? &&
-          @modified_templates.empty? &&
-          @modified_static.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # True when content and templates changed together (no structural changes)
-      def content_and_template_only? : Bool
-        !@modified_content.empty? &&
-          !@modified_templates.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # True when content was modified (possibly alongside static changes)
-      # but no structural / config / template changes occurred.
-      def content_incremental? : Bool
-        !@modified_content.empty? &&
-          @modified_templates.empty? &&
-          @modified_data.empty? &&
-          @added_files.empty? &&
-          @removed_files.empty? &&
-          !@config_changed
-      end
-
-      # Merge another ChangeSet into this one, combining all buckets.
-      # Used during debounce to batch rapid successive changes.
-      #
-      # Order-aware semantics (self happens first, then other):
-      # - add→remove cancels out (file created then deleted = no-op)
-      # - remove→add keeps the add (file deleted then recreated = net add,
-      #   e.g. atomic save via delete+move)
-      def merge(other : ChangeSet) : ChangeSet
-        self_only_added = @added_files - other.removed_files
-        self_only_removed = @removed_files - other.added_files
-        other_only_added = other.added_files - @removed_files
-        other_only_removed = other.removed_files - @added_files
-
-        # remove→add: file existed, was removed in self, re-added in other.
-        # Treat as net add so we don't skip a rebuild.
-        revived = @removed_files & other.added_files
-
-        net_added = (self_only_added + other_only_added + revived).uniq
-        net_removed = (self_only_removed + other_only_removed).uniq
-
-        ChangeSet.new(
-          modified_content: (@modified_content + other.modified_content).uniq,
-          modified_content_files: (@modified_content_files + other.modified_content_files).uniq,
-          modified_templates: (@modified_templates + other.modified_templates).uniq,
-          modified_static: (@modified_static + other.modified_static).uniq,
-          modified_data: (@modified_data + other.modified_data).uniq,
-          added_files: net_added,
-          removed_files: net_removed,
-          config_changed: @config_changed || other.config_changed,
-        )
-      end
-
-      # Determine the optimal rebuild strategy for this changeset.
-      def rebuild_strategy : Symbol
-        if needs_full_rebuild?
-          :full
-        elsif templates_only?
-          :templates
-        elsif content_and_template_only?
-          :content_and_template
-        elsif content_incremental?
-          :incremental
-        elsif static_only?
-          :static
-        elsif content_files_only?
-          :content_files
-        else
-          :full
-        end
-      end
-
-      # Human-readable description of the change for logging. The trailing
-      # noun is pluralized by the total file count; a config change is named
-      # separately since it is one specific file, not a category count.
-      def description : String
-        parts = [] of String
-        total = 0
-        {
-          "content"       => @modified_content,
-          "content-asset" => @modified_content_files,
-          "template"      => @modified_templates,
-          "static"        => @modified_static,
-          "data"          => @modified_data,
-          "added"         => @added_files,
-          "removed"       => @removed_files,
-        }.each do |label, list|
-          next if list.empty?
-          parts << "#{list.size} #{label}"
-          total += list.size
-        end
-        desc = parts.empty? ? "" : "#{parts.join(", ")} #{total == 1 ? "file" : "files"}"
-        if @config_changed
-          desc = desc.empty? ? "config" : "#{desc}, config"
-        end
-        desc
-      end
-
-      # What the watch timeline prints: the path itself when exactly one file
-      # changed (the common save-one-file loop), the category summary above
-      # otherwise.
-      def display : String
-        return "config.toml" if @config_changed && all_changed_files.empty?
-        files = all_changed_files
-        files.size == 1 && !@config_changed ? files.first : description
-      end
-
-      private def all_changed_files : Array(String)
-        @modified_content + @modified_content_files + @modified_templates +
-          @modified_static + @modified_data + @added_files + @removed_files
-      end
-    end
-
     class Server
       # What the watcher records per file: mtime plus size. Size catches
       # same-tick rewrites on coarse-mtime filesystems (Docker bind mounts,
       # NFS/SMB shares, exFAT) where two quick saves can share a timestamp —
       # an mtime-only comparison would permanently miss the second save.
-      alias FileStamp = {Time, Int64}
+      #
+      # The third slot is a content digest, carried ONLY for the full-rebuild
+      # buckets (data/**, i18n/** — nil everywhere else). Those buckets force
+      # a full rebuild, and a full rebuild re-runs `build.hooks.pre` — so a
+      # hook that rewrites an identical payload into data/ (the pattern #752
+      # documents) retriggered itself forever under a stamp-only comparison
+      # (#755). The digest lets detect_changes drop stamp movement whose
+      # bytes are unchanged. See watch_digest for when it is (re)computed.
+      alias FileStamp = {Time, Int64, String?}
 
       @builder : Core::Build::Builder
       @live_reload_handler : LiveReloadHandler?
@@ -843,6 +75,38 @@ module Hwaro
       # during that window was absorbed into the baseline and never rebuilt.
       # Consumed once by the watch loop; nil afterwards.
       @watch_baseline : Hash(String, FileStamp)? = nil
+      # Paths whose mtime was still inside its timestamp tick (racy-git) at
+      # the last scan: the next scan re-hashes them once more even when the
+      # stamp has since settled, since a same-size save between the two scans
+      # can keep the stamped mtime (see watch_digest).
+      @racy_watch_paths = Set(String).new
+      # Watch roots beyond WATCH_ROOTS, resolved from config at startup: the
+      # `[assets] source_dir` when it points outside `static/`. The asset
+      # pipeline reads bundle sources from there on every build, but the
+      # watcher scanned only the fixed roots — so editing one during serve
+      # produced no event at all and the fingerprinted bundle kept serving its
+      # pre-edit bytes for the whole session.
+      @extra_watch_roots : Array(String) = [] of String
+      # The config `serve_build_options` loaded, kept so the watcher's root
+      # resolution doesn't pay (and re-warn through) another load.
+      @startup_config : Models::Config? = nil
+
+      # Held for the whole session: an exclusive lock on `<output_dir>.lock`
+      # (see `acquire_output_lock`). Every serve of a project builds into the
+      # same `ServeOptions::DEV_OUTPUT_DIR`, so a second session would wipe and
+      # rewrite the first one's tree with its own base_url and flags.
+      @output_lock : File? = nil
+      # The stamps our own most recent hook-running build left on the watched
+      # config files it rewrote WITHOUT changing a byte. Empty for the
+      # overwhelmingly common build that touches no config at all. See
+      # built_config_rewrite? for what it buys and what it deliberately does
+      # not swallow.
+      @config_rewritten_by_build = {} of String => FileStamp
+      # Set by `copy_static` when a static save escalated to a rebuild that
+      # moves page HTML (a bundle fingerprint, a `load_data()` source, a
+      # static file shadowing a page). The live-reload push must then be a
+      # full `reload`, never an in-place stylesheet swap.
+      @static_changed_pages : Bool = false
 
       # Extensions whose served bytes are UTF-8 text, each with the base type to
       # assume when the platform's MIME database has no opinion.
@@ -908,6 +172,11 @@ module Hwaro
       # Polling interval for the file watcher.
       POLL_INTERVAL = 500.milliseconds
 
+      # The project directories the watcher always scans, in the order the
+      # serve receipt lists them. `[assets] source_dir` can add one more —
+      # see @extra_watch_roots.
+      WATCH_ROOTS = ["content", "templates", "static", "data", "i18n"]
+
       # Cap on the build-failure text that reaches the terminal and the browser
       # overlay. Crinja quotes the offending source lines in its message, so a
       # single very long line near a syntax error (a minified vendor bundle
@@ -929,9 +198,38 @@ module Hwaro
       end
 
       def run(options : Config::Options::ServeOptions)
+        if options.base_url.nil? && Config::Options::ServeOptions.wildcard_host?(options.host)
+          Logger.info "Listening on all interfaces; links use localhost. To preview from another device, pass --base-url http://<this-machine's-ip>:#{options.port}"
+        end
+        run_with_options(options.host, options.port, options.open_browser, options.access_log, options.live_reload, serve_build_options(options), options.json, options.headers)
+      end
+
+      # The effective BuildOptions a serve session runs with. Extracted so
+      # specs can assert the serve/build output split (issue #756) without
+      # binding a socket.
+      #
+      # `[build]` is merged here as well as in the Builder: BuildOptions is a
+      # struct, and the copy the Builder mutates is not this one — without the
+      # merge, `[build] drafts`/`cache` would apply to rebuilds but not to the
+      # options the server derives its document root and mount point from.
+      # `output_dir` is the exception: serve always builds into its own
+      # `ServeOptions::DEV_OUTPUT_DIR` (never the configured output_dir, which
+      # stays untouched for deploys), enforced by `output_dir_explicit` in
+      # `to_build_options`.
+      #
+      # A missing or invalid config is not fatal here — serve deliberately
+      # starts on a broken site, and the Builder reports the error on the
+      # initial build.
+      protected def serve_build_options(options : Config::Options::ServeOptions) : Config::Options::BuildOptions
         build_options = options.to_build_options
         build_options.serve_mode = true
-        run_with_options(options.host, options.port, options.open_browser, options.access_log, options.live_reload, build_options, options.json, options.headers)
+        # Kept for the watcher (see @startup_config): loading config.toml
+        # emits its env-substitution warnings every time, so a third load at
+        # startup would print each `${VAR} is not set` line three times.
+        config = load_config_or_nil(build_options.env)
+        @startup_config = config
+        config.try { |cfg| build_options.apply_build_config!(cfg.build) }
+        build_options
       end
 
       private def run_with_options(host : String, port : Int32, open_browser : Bool, access_log : Bool, live_reload : Bool, build_options : Config::Options::BuildOptions, json_output : Bool = false, headers : Hash(String, String) = {} of String => String)
@@ -940,9 +238,54 @@ module Hwaro
         # — scan_mtimes stats it alongside config.toml.
         @env_config_file = build_options.env.try { |e| "config.#{e}.toml" }
         @error_overlay = build_options.error_overlay
+        # Resolved BEFORE capture_watch_baseline: a root added to the scan
+        # after the baseline was taken reports every file under it as new on
+        # the first poll, which is a spurious full rebuild seconds after
+        # startup. Reuses the config serve_build_options already loaded; the
+        # fallback is for callers that reach run_with_options directly.
+        @extra_watch_roots = resolve_extra_watch_roots(
+          @startup_config || load_config_or_nil(build_options.env),
+          sanitize_output_dir(build_options.output_dir),
+        )
         # Must happen before any handler is built so StaticFileHandler picks
         # the charset-bearing types up.
         Server.register_utf8_mime_types
+
+        output_dir = sanitize_output_dir(build_options.output_dir)
+        # Lock, then bind, and only THEN build. The initial build is a cold
+        # one that wipes the output dir: when it ran first, a serve that was
+        # about to fail on a taken port (or a second session on another port)
+        # had already replaced the running session's pages with its own
+        # base_url and flags before it exited.
+        acquire_output_lock(output_dir)
+
+        # The static handler needs an existing root even when the initial
+        # build fails before creating one.
+        Hwaro::Utils::FileSafe.mkdir_p(output_dir)
+
+        # Path component of base_url, when the user pointed --base-url at a
+        # subpath. "" for the normal host:port-derived base_url.
+        #
+        # Derived from the options, NOT from `@builder.config`: a startup build
+        # that fails to load config (a TOML syntax error, say) leaves config
+        # nil, and the handler chain is assembled exactly once — so reading it
+        # there dropped the mount point for the whole session, and a later
+        # successful rebuild emitting `/prefix/`-linked pages could never get it
+        # back without a restart.
+        base_path = base_path_for(build_options.base_url)
+
+        handlers = build_handlers(output_dir, host, access_log, live_reload, headers, base_path)
+
+        # DevHTTPServer, not HTTP::Server: see the class comment — a malformed
+        # Content-Length must answer 400 instead of killing the connection
+        # fiber with a raw backtrace on the developer's terminal.
+        server = DevHTTPServer.new(handlers)
+
+        # Bind BEFORE the initial build and before any "Serving site at …" /
+        # "Live reload enabled" / "Watching for changes …" banner. Connections
+        # that arrive while the build runs wait in the OS backlog until
+        # `listen` starts accepting below.
+        bind_dev_server(server, host, port)
 
         # The initial build prints its own receipt; no preamble needed.
         #
@@ -960,7 +303,7 @@ module Hwaro
 
         initial_error : String? = nil
         begin
-          unless @builder.run(build_options)
+          unless run_full_build(build_options)
             initial_error = "Initial build failed — check the terminal, fix the error, and save to rebuild."
           end
         rescue ex : Hwaro::HwaroError
@@ -985,56 +328,27 @@ module Hwaro
         # optimisation.
         watch_options.fast_start = false
 
-        output_dir = sanitize_output_dir(build_options.output_dir)
-        # The static handler needs an existing root even when the initial
-        # build failed before creating one.
+        # A failed initial build may have wiped the root without recreating it.
         Hwaro::Utils::FileSafe.mkdir_p(output_dir)
+        # Stamp the served root as dev output no matter how the initial build
+        # went — a build that failed before its Initialize phase completed
+        # (bad config.toml) never reached the builder-side stamp, and the
+        # directory may still hold a previous session's dev pages.
+        Hwaro::Utils::DevMarker.write(output_dir)
+        # Keep the freshly created `.hwaro/` workspace out of `git status`
+        # (the dev pages under it carry dev base_urls and must never be
+        # committed). No-op when the guard sees anything but `.hwaro` itself.
+        Hwaro::Utils::HwaroDir.ensure_self_ignore(File.dirname(output_dir))
 
         # Baseline for the restart-only [serve.*] warning after config edits.
         # Nil when the initial build never loaded a config; established lazily
         # by the first successful config-changed rebuild in that case.
         @startup_serve_config = @builder.config.try(&.serve)
 
-        # Path component of base_url, when the user pointed --base-url at a
-        # subpath. "" for the normal host:port-derived base_url.
-        #
-        # Derived from the options, NOT from `@builder.config`: a startup build
-        # that fails to load config (a TOML syntax error, say) leaves config
-        # nil, and the handler chain is assembled exactly once — so reading it
-        # there dropped the mount point for the whole session, and a later
-        # successful rebuild emitting `/prefix/`-linked pages could never get it
-        # back without a restart.
-        base_path = base_path_for(build_options.base_url)
-
-        handlers = build_handlers(output_dir, host, access_log, live_reload, headers, base_path)
-
         # Replay a startup failure to the first live-reload client(s) so the
         # browser shows the overlay instead of a bare 404/stale page.
         if msg = initial_error
           push_build_error(msg)
-        end
-
-        # DevHTTPServer, not HTTP::Server: see the class comment — a malformed
-        # Content-Length must answer 400 instead of killing the connection
-        # fiber with a raw backtrace on the developer's terminal.
-        server = DevHTTPServer.new(handlers)
-
-        # Bind BEFORE emitting any "Serving site at …" / "Live reload
-        # enabled" / "Watching for changes …" banners. Previously those
-        # lines printed first and the watcher fiber was already spawned,
-        # so a port-conflict error produced misleading output that looked
-        # like the server was running before the final `Error: Could not
-        # bind …` line.
-        begin
-          server.bind_tcp host, port
-        rescue ex : Socket::BindError
-          # Socket::BindError#message already includes the address, so
-          # use it verbatim rather than re-prefixing.
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_IO,
-            message: ex.message || "Could not bind to '#{host}:#{port}'",
-            hint: "Is another process already listening on this port? Try -p/--port with a different value.",
-          )
         end
 
         url = serve_url(host, port, base_path)
@@ -1045,7 +359,8 @@ module Hwaro
         serve_receipt = Logger::Receipt.new("serve")
         serve_receipt.row("url", url, Logger::Role::Accent)
         serve_receipt.row("reload", live_reload ? "enabled" : "disabled")
-        serve_receipt.row("watch", "content · templates · static · data · i18n · config")
+        watched = WATCH_ROOTS + @extra_watch_roots + ["config"]
+        serve_receipt.row("watch", watched.join(" · "))
         serve_receipt.outcome("ready", "Ctrl+C to stop")
         # Blank line separates the serve block from the initial build's
         # receipt above it (TTY rhythm only; plain output stays byte-stable).
@@ -1141,6 +456,18 @@ module Hwaro
           # `nil` without blocking.
           deferred_done.receive?
           watch_for_changes(watch_options)
+        rescue error
+          # `watch_for_changes` rescues every iteration of its poll loop, but
+          # its one-time setup (`initial_watch_mtimes`, a full stat sweep of
+          # the watched roots) runs before that loop and outside any handler.
+          # An exception there does not kill the process — Crystal's
+          # `Fiber#run` prints `Unhandled exception in spawn` and the server
+          # keeps serving — which is precisely the bad outcome: a raw
+          # backtrace scrolls past, and from then on saves silently stop
+          # rebuilding for the rest of the session with nothing to say why.
+          # Report it as what it is, and name the way out.
+          Logger.error "[Watch] Watcher could not start: #{error.message}. File changes will not trigger rebuilds; restart 'hwaro serve' to retry."
+          Logger.debug "[Watch] Backtrace: #{error.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
         end
 
         emit_ready_signal(host, port, json_output, base_path)
@@ -1159,6 +486,115 @@ module Hwaro
           )
           raise classified
         end
+      ensure
+        release_output_lock
+      end
+
+      # Take the session's exclusive lock on `<output_dir>.lock`, refusing to
+      # start when another serve of the same project holds it. The lock file
+      # sits beside the output dir, not inside it: the cold build wipes the
+      # dir. The OS drops the lock when the process dies, so a crashed or
+      # SIGKILLed session never leaves a stale one behind.
+      protected def acquire_output_lock(output_dir : String) : Nil
+        lock_path = "#{output_dir}.lock"
+        Hwaro::Utils::FileSafe.mkdir_p(File.dirname(lock_path))
+        # "a", not "w": truncating a file another process holds locked fails
+        # on Windows before the lock is even tried.
+        file = File.open(lock_path, "a")
+        begin
+          file.flock_exclusive(blocking: false)
+        rescue ex : IO::Error
+          file.close
+          # Only contention means another session. A filesystem without
+          # locking (NFS without lockd, some FUSE/shared-folder mounts) must
+          # not stop serve from starting — it just runs unguarded.
+          contended = {% if flag?(:windows) %}
+                        ex.os_error == WinError::ERROR_LOCK_VIOLATION
+                      {% else %}
+                        ex.os_error.in?(Errno::EAGAIN, Errno::EWOULDBLOCK)
+                      {% end %}
+          unless contended
+            Logger.warn "Could not lock #{lock_path} (#{ex.message}); running without the one-session guard."
+            return
+          end
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_IO,
+            message: "Another 'hwaro serve' is already running for this project (it builds into #{output_dir})",
+            hint: "Stop the other session first, or open the site it is already serving.",
+          )
+        end
+        @output_lock = file
+      end
+
+      protected def release_output_lock : Nil
+        @output_lock.try(&.close)
+        @output_lock = nil
+      end
+
+      # Socket errors arrive as WSA codes on Windows, errnos elsewhere.
+      {% if flag?(:windows) %}
+        private BIND_ADDR_NOT_AVAILABLE = WinError::WSAEADDRNOTAVAIL
+        private BIND_ACCESS_DENIED      = WinError::WSAEACCES
+        # No privileged ports on Windows; WSAEACCES there is an excluded port
+        # range (Hyper-V/WSL2/Docker often reserve 3000) or an exclusive bind.
+        private BIND_ACCESS_DENIED_HINT = "Port %d is reserved or held exclusively on this system (see `netsh int ipv4 show excludedportrange protocol=tcp`). Try -p/--port with a different value."
+      {% else %}
+        private BIND_ADDR_NOT_AVAILABLE = Errno::EADDRNOTAVAIL
+        private BIND_ACCESS_DENIED      = Errno::EACCES
+        private BIND_ACCESS_DENIED_HINT = "Port %d needs elevated privileges on this system. Try -p/--port with a value above 1023."
+      {% end %}
+
+      # Bind the dev server's listening socket, classifying every way that can
+      # fail. Extracted from `run_with_options` so specs can drive the real
+      # bind without standing up a whole serve session.
+      #
+      # `bind_tcp` does TWO things: it resolves `host`, then binds. Only the
+      # second half raises `Socket::BindError` — a `-b/--bind` value the
+      # resolver cannot answer for (a typo'd hostname, `-b 300.1.1.1`) raises
+      # `Socket::Addrinfo::Error`, which fell straight through the old
+      # BindError-only rescue and reached the user as a bare, code-less
+      # `Error: Hostname lookup for 300.1.1.1 failed: No address found` with no
+      # hint and nothing naming the flag that produced it.
+      #
+      # Resolution is not the only `-b` mistake: an address that resolves but
+      # this machine does not hold (`-b 10.255.255.1`) fails INSIDE bind with
+      # EADDRNOTAVAIL, and a privileged port (`-p 80`) with EACCES — both
+      # arrive as `Socket::BindError`, so both used to get the "another
+      # process is listening, try -p/--port" hint, which is wrong for each.
+      protected def bind_dev_server(server : HTTP::Server, host : String, port : Int32)
+        server.bind_tcp host, port
+      rescue ex : Socket::BindError
+        # Socket::BindError#message already includes the address, so
+        # use it verbatim rather than re-prefixing.
+        message = ex.message || "Could not bind to '#{host}:#{port}'"
+        case ex.os_error
+        when BIND_ADDR_NOT_AVAILABLE
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_USAGE,
+            message: message,
+            hint: "Check -b/--bind: #{host} is not an address this machine holds. Use 127.0.0.1, 0.0.0.0, ::1, or one of its interface addresses.",
+          )
+        when BIND_ACCESS_DENIED
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_IO,
+            message: message,
+            hint: BIND_ACCESS_DENIED_HINT % port,
+          )
+        else
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_IO,
+            message: message,
+            hint: "Is another process already listening on this port? Try -p/--port with a different value.",
+          )
+        end
+      rescue ex : Socket::Error
+        # Resolution failures and anything else the socket layer reports.
+        # `host` is only ever the `-b/--bind` value, so the hint can name it.
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_USAGE,
+          message: "Could not bind to '#{host}:#{port}': #{ex.message}",
+          hint: "Check -b/--bind: pass an address this machine holds (127.0.0.1, 0.0.0.0, ::1) or a hostname it can resolve.",
+        )
       end
 
       # Path component of `base_url`, mirroring `Models::Config#base_path`
@@ -1176,8 +612,28 @@ module Hwaro
         # that would break every route, so only "/"-rooted paths count.
         return "" unless path.starts_with?("/")
         path = path.rstrip("/")
-        path == "/" ? "" : path
+        return "" if path.empty?
+        # Percent-encoded the way browsers put it on the request line, which
+        # is what BasePathHandler compares against and what the Location /
+        # ready URLs must carry. `URI.parse` keeps the path exactly as
+        # written, so a `--base-url http://host/문서/` mount matched no
+        # request at all and redirected `/` to raw UTF-8 bytes. RFC 3986
+        # path characters stay as they are — browsers send `/c++/` raw, and
+        # encoding the `+` would 404 that mount. Decoding first keeps an
+        # already-encoded `/my%20blog` unchanged.
+        String.build do |io|
+          URI.decode(path).each_byte do |byte|
+            if byte < 0x80 && (byte.unsafe_chr.ascii_alphanumeric? || MOUNT_PATH_CHARS.includes?(byte.unsafe_chr))
+              io << byte.unsafe_chr
+            else
+              io << '%' << byte.to_s(16, upcase: true).rjust(2, '0')
+            end
+          end
+        end
       end
+
+      # RFC 3986 `pchar`s besides ALPHA / DIGIT, plus the segment separator.
+      MOUNT_PATH_CHARS = "-._~!$&'()*+,;=:@/"
 
       # Assemble the dev server's handler chain. Extracted from
       # `run_with_options` so specs can drive the real chain over a fixture
@@ -1207,7 +663,14 @@ module Hwaro
         cors_hosts << host unless host.empty? || host == "0.0.0.0" || host == "::"
 
         handlers = [] of HTTP::Handler
-        handlers << HTTP::LogHandler.new if access_log
+        if access_log
+          # Same stdout and format as stdlib's default backend, but through
+          # Logger's guarded stream: written straight to STDOUT, every request
+          # after the reader went away printed an "Unhandled exception in
+          # spawn … Broken pipe" backtrace.
+          backend = ::Log::IOBackend.new(Logger::GuardedIO.new(STDOUT))
+          handlers << HTTP::LogHandler.new(::Log.new("http.server", backend, :info))
+        end
         # Dev cache-busting (see NoCacheHandler). A user-supplied
         # Cache-Control from [serve.headers]/--header wins outright.
         handlers << NoCacheHandler.new unless headers.keys.any? { |k| k.downcase == "cache-control" }
@@ -1238,12 +701,16 @@ module Hwaro
           @live_reload_handler = lr_handler
           handlers << lr_handler
         end
+        # Before IndexRewriteHandler, so `/About` 404s instead of being
+        # redirected to `/About/` first.
+        handlers << CaseMismatchHandler.new(output_dir, not_found)
         handlers << IndexRewriteHandler.new(output_dir)
         handlers << inject_handler if inject_handler
         # Just above the static handler: generates a lazily-deferred OG image
         # on first request, then lets StaticFileHandler serve it from disk.
         # A no-op unless [og.auto_image] lazy_generate is enabled.
         handlers << OgLazyImageHandler.new(@builder, output_dir)
+        handlers << HeadBodyHandler.new
         handlers << HTTP::StaticFileHandler.new(output_dir, directory_listing: false, fallthrough: true)
         handlers << not_found
         handlers
@@ -1324,407 +791,20 @@ module Hwaro
         }.to_json
       end
 
+      # An absolute path is allowed: `hwaro build -o /srv/site` and
+      # `[build] output_dir = "/srv/site"` both write there, and rejecting it
+      # here would leave serve building into that directory while serving an
+      # empty `public/` — every request a 404 for the whole session. The build's
+      # own `guard_output_dir!` is what refuses the genuinely dangerous roots.
+      # A `..` path still falls back, and config-loaded values never reach here
+      # with one (`Config::Loader.build_output_dir_value` drops those).
       private def sanitize_output_dir(dir : String) : String
         normalized = Path[dir].normalize.to_s
-        if normalized.starts_with?("..") || normalized.starts_with?("/")
+        if Utils::PathUtils.escapes_parent?(normalized)
           Logger.warn "Invalid output directory: #{dir}. Using 'public' instead."
           return "public"
         end
         normalized
-      end
-
-      # Snapshot the watcher baseline. Called by run_with_options BEFORE the
-      # initial build so files edited while it runs still diff as changed.
-      private def capture_watch_baseline
-        @watch_baseline = scan_mtimes
-      end
-
-      # The mtime snapshot the watch loop starts from: the pre-build baseline
-      # when one was captured (consumed here — it is only valid once), a
-      # fresh scan otherwise.
-      private def initial_watch_mtimes : Hash(String, FileStamp)
-        baseline = @watch_baseline
-        @watch_baseline = nil
-        baseline || scan_mtimes
-      end
-
-      private def watch_for_changes(build_options : Config::Options::BuildOptions)
-        # Watched roots are shown in the serve receipt's "watch" row.
-        last_mtimes = initial_watch_mtimes
-
-        loop do
-          sleep POLL_INTERVAL
-
-          # The scan/diff/debounce steps run outside the build rescue below;
-          # an exception there (filesystem churn, permission flips, …) would
-          # otherwise kill this fiber and silently stop rebuilds for the rest
-          # of the serve session while the HTTP server keeps running.
-          begin
-            current_mtimes = scan_mtimes
-            if current_mtimes != last_mtimes
-              changeset = detect_changes(last_mtimes, current_mtimes)
-              last_mtimes = current_mtimes
-
-              # Debounce: wait for changes to settle before rebuilding.
-              # This batches rapid successive saves (e.g. multi-file save,
-              # IDE format-on-save) into a single rebuild.
-              unless changeset.empty?
-                changeset, last_mtimes = debounce_changes(changeset, last_mtimes)
-
-                begin
-                  # apply_changeset owns the @rebuild_failed reset: it clears
-                  # the flag only after a SUCCESSFUL rebuild. Resetting here
-                  # unconditionally used to clobber the flag apply_changeset
-                  # had just set for a Bool-failure build (pre-hook failure /
-                  # phase abort return false without raising), breaking the
-                  # full-rebuild-recovery contract for that path.
-                  apply_changeset(changeset, build_options)
-                rescue ex
-                  # Surface the failure both in the terminal and the
-                  # browser. Without the WS push the developer sees the
-                  # stale page and keeps editing on top of a broken
-                  # build until they happen to glance at the terminal.
-                  @rebuild_failed = true
-                  Logger.error "[Watch] Build failed: #{truncate_build_error(ex.message || "")}"
-                  Logger.debug "[Watch] Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
-                  push_build_error(ex.message || "Build failed")
-                end
-              end
-            end
-          rescue ex
-            Logger.error "[Watch] Watcher iteration failed: #{ex.message} (retrying)"
-            Logger.debug "[Watch] Backtrace: #{ex.backtrace?.try(&.first(5).join("\n    ")) || "unavailable"}"
-          end
-        end
-      end
-
-      # Wait for rapid successive changes to settle, merging all detected
-      # changesets into one.  Returns the merged changeset.
-      private def debounce_changes(initial : ChangeSet, last_mtimes : Hash(String, FileStamp)) : {ChangeSet, Hash(String, FileStamp)}
-        merged = initial
-        current_mtimes = last_mtimes
-        iterations = 0
-
-        loop do
-          sleep DEBOUNCE_INTERVAL
-          iterations += 1
-
-          new_mtimes = scan_mtimes
-          if new_mtimes != current_mtimes
-            additional = detect_changes(current_mtimes, new_mtimes)
-            current_mtimes = new_mtimes
-            merged = merged.merge(additional) unless additional.empty?
-
-            if iterations >= MAX_DEBOUNCE_ITERATIONS
-              Logger.debug "[Watch] Debounce cap reached (#{MAX_DEBOUNCE_ITERATIONS} iterations). Proceeding with rebuild."
-              break
-            end
-          else
-            # No more changes — settled
-            break
-          end
-        end
-
-        {merged, current_mtimes}
-      end
-
-      # Diff two mtime snapshots and return a categorised ChangeSet.
-      private def detect_changes(
-        old_mtimes : Hash(String, FileStamp),
-        new_mtimes : Hash(String, FileStamp),
-      ) : ChangeSet
-        modified_content = [] of String
-        modified_content_files = [] of String
-        modified_templates = [] of String
-        modified_static = [] of String
-        modified_data = [] of String
-        added_files = [] of String
-        removed_files = [] of String
-        config_changed = false
-
-        # --- Files that exist in both snapshots but with different mtime ---
-        new_mtimes.each do |path, new_mtime|
-          if old_mtime = old_mtimes[path]?
-            next if old_mtime == new_mtime # unchanged
-
-            if path == "config.toml" || path == @env_config_file
-              config_changed = true
-            else
-              classify_modified(path, modified_content, modified_content_files, modified_templates, modified_static, modified_data)
-            end
-          else
-            # New file (exists now, didn't before)
-            added_files << path
-          end
-        end
-
-        # --- Files that existed before but are now gone ---
-        old_mtimes.each_key do |path|
-          unless new_mtimes.has_key?(path)
-            removed_files << path
-          end
-        end
-
-        ChangeSet.new(
-          modified_content: modified_content,
-          modified_content_files: modified_content_files,
-          modified_templates: modified_templates,
-          modified_static: modified_static,
-          modified_data: modified_data,
-          added_files: added_files,
-          removed_files: removed_files,
-          config_changed: config_changed,
-        )
-      end
-
-      # Put a modified path into the right bucket.
-      #
-      # Non-Markdown files under `content/` (images, PDFs, anything copied via
-      # `[content.files] allow_extensions`) used to land in `content` and then
-      # get silently dropped by `run_incremental` because they have no `Page`
-      # entry. They now go into their own bucket and are republished verbatim.
-      private def classify_modified(
-        path : String,
-        content : Array(String),
-        content_files : Array(String),
-        templates : Array(String),
-        static : Array(String),
-        data : Array(String),
-      )
-        if path.starts_with?("content/")
-          if path.downcase.ends_with?(".md")
-            content << path
-          else
-            content_files << path
-          end
-        elsif path.starts_with?("templates/")
-          templates << path
-        elsif path.starts_with?("static/")
-          static << path
-        elsif path.starts_with?("data/") || path.starts_with?("i18n/")
-          data << path
-        end
-      end
-
-      # The strategy the watcher will actually run: the changeset's own choice,
-      # escalated to a full rebuild when the cheap paths can't be trusted.
-      #
-      # - Missing output root: `rm -rf public` (or a stray `hwaro build -o …`)
-      #   mid-session used to poison the next save — the incremental
-      #   strategies only rewrite the pages that changed and never recreate
-      #   the directory tree around them, so every page raised "No such file
-      #   or directory" on its temp file and only the @rebuild_failed-forced
-      #   rebuild on the save AFTER that recovered.
-      # - Previous failure: the pages a failed rebuild left stale are not
-      #   re-selected when the next event touches an unrelated file.
-      private def effective_strategy(changeset : ChangeSet, output_dir : String) : Symbol
-        strategy = changeset.rebuild_strategy
-        return strategy if strategy == :full
-
-        unless Dir.exists?(output_dir)
-          Logger.info "  Output directory was missing — running a full rebuild to recover."
-          return :full
-        end
-
-        if @rebuild_failed
-          Logger.info "  Previous rebuild failed — running a full rebuild to recover."
-          return :full
-        end
-
-        strategy
-      end
-
-      # Choose the cheapest rebuild strategy for a given ChangeSet and execute it.
-      private def apply_changeset(changeset : ChangeSet, build_options : Config::Options::BuildOptions)
-        output_dir = sanitize_output_dir(build_options.output_dir)
-        strategy = effective_strategy(changeset, output_dir)
-        # Recreate a vanished output root before anything writes into it.
-        Hwaro::Utils::FileSafe.mkdir_p(output_dir) unless Dir.exists?(output_dir)
-        # Calm watch timeline: one "↻ <what> · time" event at column 0 (the ↻
-        # glyph carries "changed"), then the rebuild's own spark "rebuilt …"
-        # outcome line below it. The strategy is implied by that outcome
-        # (incremental N/M, re-render, full).
-        timestamp = Time.local.to_s("%H:%M:%S")
-        if Logger.color_enabled?
-          Logger.info "\n#{Logger.glyph(:watch)} #{changeset.display}" \
-                      "#{Logger.paint(" · ", Logger::Role::Dim)}#{Logger.paint(timestamp, Logger::Role::Dim)}"
-        else
-          Logger.info "\n~ #{timestamp}  changed  #{changeset.display}"
-        end
-
-        # Resolve removed sources to their output files BEFORE the rebuild
-        # swaps in a site that no longer knows the deleted page's URL.
-        stale_outputs = if changeset.removed_files.empty?
-                          [] of String
-                        else
-                          @builder.stale_outputs_for_removed(changeset.removed_files, output_dir)
-                        end
-
-        success = case strategy
-                  when :full
-                    @builder.run(build_options)
-                  when :templates
-                    @builder.run_rerender(build_options)
-                  when :incremental
-                    @builder.run_incremental(changeset.modified_content, build_options)
-                  when :content_and_template
-                    @builder.run_incremental_then_rerender(changeset.modified_content, build_options)
-                  when :static
-                    copy_static(changeset, build_options)
-                  when :content_files
-                    copy_content_files(changeset, build_options)
-                    true
-                  else
-                    true
-                  end
-
-        # A build can fail WITHOUT raising: pre-hook failures and phase
-        # aborts (non-classified exceptions become HookResult::Abort) return
-        # false. Treat that exactly like the rescue path in the caller —
-        # flag it so the next changeset escalates to a full rebuild, push
-        # the overlay, and skip the reload so the browser doesn't refresh
-        # onto a half-built site with no visible error.
-        unless success
-          @rebuild_failed = true
-          push_build_error("Build failed — check the terminal for details.")
-          return
-        end
-
-        # Clear the failure escalation HERE, where success is actually known.
-        # The watch loop must not reset it — apply_changeset returns normally
-        # after a Bool-failure build too (see the `unless success` guard).
-        @rebuild_failed = false
-
-        # A config edit rebuilt the site with the new values, but [serve.*]
-        # keys were consumed at startup — warn instead of silently looking
-        # like they applied.
-        warn_restart_only_serve_settings if changeset.config_changed
-
-        # Copy static files if they changed alongside content/template changes
-        if strategy != :static && strategy != :full && !changeset.modified_static.empty?
-          unless copy_static(changeset, build_options)
-            @rebuild_failed = true
-            push_build_error("Build failed — check the terminal for details.")
-            return
-          end
-        end
-
-        # Republish non-Markdown content assets whenever they accompany any
-        # rebuild that wasn't a full one. A full build already re-copies them
-        # via the ReadContent → Write raw-files path; for incremental,
-        # templates-only, and static-only strategies, the watcher has to do
-        # it explicitly or the served bytes stay stale (issue #530).
-        if strategy != :content_files && strategy != :full && !changeset.modified_content_files.empty?
-          copy_content_files(changeset, build_options)
-        end
-
-        # The stale list was mapped through the PRE-rebuild site, but a
-        # single changeset can delete one source and re-create the same URL
-        # from another (foo.md removed + foo/index.md added). The rebuild
-        # just wrote that output for the NEW owner — deleting it here would
-        # 404 the page until an unrelated rebuild. Skip anything the rebuilt
-        # site still claims.
-        unless stale_outputs.empty?
-          owned = @builder.owned_output_paths(output_dir)
-          stale_outputs = stale_outputs.reject { |path| owned.includes?(path) }
-        end
-        remove_stale_outputs(stale_outputs, output_dir)
-
-        @live_reload_handler.try(&.notify_reload)
-      end
-
-      # [serve.*] keys are consumed once at startup (headers baked into the
-      # handler chain, fast → skip flags in the frozen watch options). A
-      # config edit triggers a full rebuild that LOOKS like it applied them —
-      # say so instead of leaving the user chasing a phantom.
-      private def warn_restart_only_serve_settings
-        current = @builder.config.try(&.serve)
-        return unless current
-        unless startup = @startup_serve_config
-          # Initial build never loaded a config (it failed) — this rebuild's
-          # values become the baseline.
-          @startup_serve_config = current
-          return
-        end
-        if startup.headers != current.headers || startup.fast != current.fast
-          Logger.warn "  [serve] settings changed in config — restart `hwaro serve` to apply them."
-        end
-      end
-
-      # Delete output files orphaned by removed sources, pruning any
-      # directories the deletion leaves empty (e.g. `public/guide/old-page/`).
-      private def remove_stale_outputs(paths : Array(String), output_dir : String)
-        paths.each do |path|
-          next unless File.exists?(path)
-          next unless Utils::OutputGuard.within_output_dir?(path, output_dir)
-          File.delete(path)
-          Logger.info "  Removed stale output: #{path}"
-
-          dir = File.dirname(path)
-          while dir != output_dir && Utils::OutputGuard.within_output_dir?(dir, output_dir) && Dir.exists?(dir) && Dir.empty?(dir)
-            Dir.delete(dir)
-            dir = File.dirname(dir)
-          end
-        rescue ex
-          Logger.debug "  Could not remove stale output #{path}: #{ex.message}"
-        end
-      end
-
-      # Returns false when an escalated re-render failed (bundle fingerprint
-      # moved and the page re-render below reported failure); true otherwise.
-      private def copy_static(changeset : ChangeSet, build_options : Config::Options::BuildOptions) : Bool
-        output_dir = sanitize_output_dir(build_options.output_dir)
-        @builder.copy_changed_static(changeset.modified_static, output_dir, build_options.verbose)
-        # Changed image BYTES need their resized variants/LQIP regenerated
-        # too — the resize hook only runs on full builds, so the copy above
-        # alone left variants stale for the whole serve session (A12).
-        unless build_options.skip_image_processing
-          if config = @builder.config
-            Hwaro::Content::Hooks::ImageHooks.reprocess_changed_images(changeset.modified_static, config, output_dir)
-          end
-        end
-        # SCSS sources never publish verbatim — when one changed, recompile
-        # the entries instead. A partial edit must rebuild every entry that
-        # imports it, and there is no dependency graph, so the whole tree
-        # recompiles (cheap at static-site scale). Compile errors raise and
-        # reach the watcher rescue → browser overlay. The predicate is the
-        # same one the copy paths use, so the gate can't drift.
-        bundles_changed = false
-        if (config = @builder.config) && changeset.modified_static.any? { |p| config.sass_source?(p) }
-          bundles_changed = @builder.recompile_sass(output_dir)
-        elsif changeset.modified_static.any? { |p| @builder.asset_bundle_source?(p) }
-          # Plain (non-Sass) CSS/JS bundle sources only ever rebuilt inside
-          # the full-build asset pipeline — a static-only save left the
-          # fingerprinted bundle stale for the whole serve session.
-          bundles_changed = @builder.reprocess_asset_bundles(output_dir)
-        end
-
-        # A changed fingerprint means every page referencing the bundle via
-        # `asset()` still points at the OLD hash — rebuild so the HTML on
-        # disk picks the new path up (covers the Sass path too). A full
-        # rebuild, not run_rerender: templates are byte-identical here, so
-        # the rerender's selective path would (correctly, by its own
-        # contract) re-render nothing. Correctness over cleverness — the
-        # rebuild reuses the same options the watcher's :full strategy runs.
-        if bundles_changed
-          Logger.info "  Asset bundle fingerprints changed — rebuilding pages to update references."
-          return @builder.run(build_options)
-        end
-        true
-      end
-
-      private def copy_content_files(changeset : ChangeSet, build_options : Config::Options::BuildOptions)
-        output_dir = sanitize_output_dir(build_options.output_dir)
-        @builder.copy_changed_content_files(changeset.modified_content_files, output_dir, build_options.verbose)
-        # Mirror copy_static: modified image bytes under content/ (published
-        # via [content.files] or as page-bundle assets) must refresh their
-        # resized variants/LQIP too (A12).
-        unless build_options.skip_image_processing
-          if config = @builder.config
-            pages = @builder.site.try { |s| (s.pages + s.sections).as(Array(Models::Page)) }
-            Hwaro::Content::Hooks::ImageHooks.reprocess_changed_images(changeset.modified_content_files, config, output_dir, pages: pages)
-          end
-        end
       end
 
       # Allowlist for URLs handed to the OS opener. Serve's own URLs can
@@ -1753,122 +833,6 @@ module Hwaro
         {% end %}
       rescue ex
         Logger.debug "Failed to open browser: #{ex.message}"
-      end
-
-      # Paths matching these regexes are treated as editor byproducts
-      # (backups, swap files, autosaves, OS metadata) and are excluded
-      # from the watcher. Editors using `rename`-based atomic save or
-      # keep-a-backup patterns (vim's default, `sed -i.bak`, emacs,
-      # JetBrains, …) used to double-trigger rebuilds — once for the
-      # real edit and once for the byproduct — and each event forced a
-      # full rebuild (see server.cr `:full` strategy fallback).
-      WATCHER_IGNORE_PATTERNS = [
-        /\.bak$/,
-        /~$/,
-        /\.swp$/, /\.swo$/, /\.swx$/,
-        /\.DS_Store$/,
-        # emacs lock file:   .#filename
-        # emacs autosave:    #filename#
-        /(?:\A|\/)\.#[^\/]+$/,
-        /(?:\A|\/)#[^\/]+#$/,
-        # Atomic-save temp files: write-to-temp-then-rename editors create
-        # these next to the target for a moment. Watching them turned every
-        # such save into an add+remove pair — a needless FULL rebuild — and,
-        # worse, could trigger a rebuild while the real file was still being
-        # swapped in.
-        /\.tmp$/,
-        /\.crswap$/,                        # VS Code safe-write swap
-        /___jb_tmp___$/,                    # JetBrains safe write
-        /___jb_old___$/,                    # JetBrains safe-write backup
-        /(?:\A|\/)\.goutputstream-[^\/]+$/, # GNOME (gedit) atomic save
-        /(?:\A|\/)4913$/,                   # vim's write-permission probe
-        # Hidden state directories editors/VCS maintain inside watched roots
-        # (Obsidian vaults under content/ are common). The scan includes
-        # dotfiles — publishable ones like static/.well-known/* must be
-        # watched — so this churn has to be filtered by name.
-        /(?:\A|\/)\.(?:git|obsidian|idea|vscode)\//,
-      ]
-
-      protected def self.watcher_ignored?(path : String) : Bool
-        basename = File.basename(path)
-        WATCHER_IGNORE_PATTERNS.any? { |re| re.matches?(path) || re.matches?(basename) }
-      end
-
-      # Is this watch root a directory we can actually walk?
-      #
-      # `Dir.exists?` answers `false` only for ENOENT/ENOTDIR — every other
-      # stat failure raises. A root that is itself an unresolvable symlink
-      # (a cycle, or a link whose target sits behind a directory we may not
-      # traverse) therefore threw out of scan_mtimes and wedged the watcher
-      # exactly as the per-file case below did. A root we cannot stat has
-      # nothing watchable under it, so treat it like a missing one.
-      private def watchable_root?(dir : String) : Bool
-        Dir.exists?(dir)
-      rescue ex : File::Error
-        Logger.debug "Skipping unwatchable directory #{dir}: #{ex.message}"
-        false
-      end
-
-      private def scan_mtimes : Hash(String, FileStamp)
-        mtimes = {} of String => FileStamp
-        dirs_to_watch = ["content", "templates", "static", "data", "i18n"]
-
-        dirs_to_watch.each do |dir|
-          next unless watchable_root?(dir)
-          # DotFiles: the build publishes hidden files (static/.well-known/*,
-          # see the equivalent build-side fix), so the watcher must see their
-          # edits too — a default glob never descends into dot-directories,
-          # leaving those files permanently stale during serve. Editor/VCS
-          # noise stays filtered by watcher_ignored?.
-          Dir.glob(File.join(dir, "**", "*"), match: File::MatchOptions.glob_default | File::MatchOptions::DotFiles) do |file|
-            next if Server.watcher_ignored?(file)
-            begin
-              # Deciding whether an entry is watchable must NOT raise, and it
-              # must happen inside this rescue. `File.directory?` used to stand
-              # ahead of it: that call follows symlinks, and `File.info?` only
-              # swallows ENOENT/ENOTDIR, so a symlink cycle under a watched
-              # root (`ln -s a b; ln -s b a` in static/) threw ELOOP straight
-              # out of scan_mtimes. One bad link then broke every scan for the
-              # rest of the session — `hwaro serve` died at startup in
-              # capture_watch_baseline, or, once watching, logged "[Watch]
-              # Watcher iteration failed … (retrying)" on every poll with no
-              # rebuild ever running again.
-              #
-              # lstat first, the same shape collect_static_files uses on the
-              # build side so both agree on what a file is: it never follows,
-              # so a cycle is just a symlink here, and only real symlinks pay
-              # the extra target stat. Only regular files get stamped —
-              # directories, dangling links and non-regular entries (FIFO,
-              # socket, device node) carry nothing the build can read, and the
-              # build skips them too. Failures stay at debug: this loop runs
-              # every POLL_INTERVAL, so a warn would repeat forever.
-              info = File.info?(file, follow_symlinks: false)
-              next if info.nil?
-              info = File.info?(file, follow_symlinks: true) if info.symlink?
-              next if info.nil? || !info.type.file?
-              mtimes[file] = {info.modification_time, info.size.to_i64}
-            rescue ex
-              Logger.debug "Failed to read file info for #{file}: #{ex.message}"
-            end
-          end
-        end
-
-        config_files = ["config.toml"]
-        # The env overlay feeds every rebuild through Models::Config.load —
-        # its edits were invisible to the watcher (silently ignored for the
-        # whole session) before it was stat'ed here.
-        @env_config_file.try { |ec| config_files << ec }
-        config_files.each do |cfg|
-          next unless File.exists?(cfg)
-          begin
-            info = File.info(cfg)
-            mtimes[cfg] = {info.modification_time, info.size.to_i64}
-          rescue ex
-            Logger.debug "Failed to read #{cfg} info: #{ex.message}"
-          end
-        end
-
-        mtimes
       end
     end
   end

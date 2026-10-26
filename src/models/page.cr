@@ -1,6 +1,11 @@
 require "html"
+require "crinja"
 require "../utils/text_utils"
+require "../utils/path_utils"
+require "../utils/byte_scan"
 require "../content/processors/fence_tracker"
+require "./git_info"
+require "./config"
 
 module Hwaro
   module Models
@@ -23,6 +28,29 @@ module Hwaro
         @title : String,
         @is_current : Bool = false,
         @is_default : Bool = false,
+      )
+      end
+    end
+
+    # One entry of `page.version_links` — the version switcher row for a
+    # versioned page. `url` is the SAME page in that version when it exists
+    # (matched by path relative to the version root, same language), else
+    # that version's root URL with `exists = false`.
+    struct VersionLink
+      property name : String
+      property label : String
+      property latest : Bool
+      property url : String
+      property exists : Bool
+      property current : Bool
+
+      def initialize(
+        @name : String,
+        @label : String,
+        @latest : Bool,
+        @url : String,
+        @exists : Bool,
+        @current : Bool = false,
       )
       end
     end
@@ -71,6 +99,35 @@ module Hwaro
       property generated : Bool
       property image : String?
 
+      # Provenance of a page materialized from `[[content.generate]]` (see
+      # Core::Build::ContentGenerate). Unlike `generated` — which marks the
+      # SYNTHETIC taxonomy listing pages that every content surface (feeds,
+      # search, related, OG, AMP, output formats) deliberately excludes —
+      # a synthesized page is first-class content: it enters the build in
+      # the ReadContent phase and flows through parse/transform/render like
+      # an authored file. The parse phase reads `markdown` instead of a
+      # disk file, and re-exposes `item` (the source record) under
+      # `page.extra.item` after front matter parsing.
+      class Synthesis
+        # Full synthetic markdown document (TOML front matter + body).
+        getter markdown : String
+        # The source record, bound to `item` in body_template renders and
+        # published to templates as `page.extra.item`.
+        getter item : Crinja::Value
+        # Human-readable origin for logs/tooling, e.g. "data.products".
+        getter origin : String
+
+        def initialize(@markdown : String, @item : Crinja::Value, @origin : String)
+        end
+      end
+
+      property synthesis : Synthesis?
+
+      # True for pages materialized from `[[content.generate]]`.
+      def synthesized? : Bool
+        !@synthesis.nil?
+      end
+
       # New: Assets - static files in this page directory
       property assets : Array(String)
 
@@ -84,6 +141,15 @@ module Hwaro
 
       # New: Summary - content before <!-- more --> marker or auto-generated
       property summary : String?
+
+      # Automatic summary: plain text cut from the rendered body when the
+      # page has neither a `<!-- more -->` marker nor a `description`
+      # (`[content] summary_length`). Populated by
+      # ParseContent#render_page_summaries; nil when the fallback is
+      # disabled, when a higher-precedence source exists, or when the body
+      # has no prose. `summary_truncated` is true only when the text was cut.
+      property auto_summary : String?
+      property summary_truncated : Bool
 
       # New: In search index - whether to include in search index
       property in_search_index : Bool
@@ -101,6 +167,11 @@ module Hwaro
 
       # Build warnings collected during rendering (used for error overlay in serve mode)
       property build_warnings : Array(String)
+
+      # Warnings already logged for this page by its summary pass and body
+      # render (see `Logger.dedupe_warnings`); cleared when the summary pass
+      # starts and when the body render ends.
+      getter warned_messages = Set(String).new
 
       # Whether parsing (front-matter / markdown) failed for this page
       property parse_failed : Bool
@@ -123,7 +194,8 @@ module Hwaro
       property unpublished : Bool
 
       # True when the render phase resolved an output-path collision AGAINST
-      # this page, so no file was written for its URL (see
+      # this page, or found its URL unpublishable (a segment traverses out of
+      # the output directory), so no file was written for its URL (see
       # compute_output_url_winners). Recomputed from scratch on every build and
       # rerender — a collision introduced or resolved during a serve session
       # must not leave a stale verdict behind.
@@ -138,16 +210,30 @@ module Hwaro
       # Runtime / Computed Properties
       property content : String
       property raw_content : String
+      # Stamp of the source file as parse read it: {mtime ms, size, digest}.
+      # The digest is only taken when the mtime was still inside its
+      # timestamp tick (racy-git); see Cache#update. Nil for pages without a
+      # disk file.
+      property source_read : {Int64, Int64, String?}? = nil
       property path : String      # Relative path from content/ (e.g. "projects/a.md")
       property section : String   # Parent directory path (e.g. "blog/news"), not just the first component
       getter url : String         # Calculated relative URL (e.g. "/projects/a/"), written through #url=
       property is_index : Bool    # Is this an index file?
       property language : String? # Language code (e.g. "en", "ko", nil for default)
       property translations : Array(TranslationLink)
+      # Documentation version this page belongs to (`[[versions.list]]`),
+      # resolved from its content directory in ReadContent; nil for
+      # unversioned content. See Content::Versions.
+      property version : VersionConfig?
+      # Switcher rows, one per configured version (see VersionLink); empty
+      # for unversioned pages. Filled by Content::Versions.link!.
+      property version_links : Array(VersionLink)
 
       # New: Word count and reading time (computed)
       property word_count : Int32
       property reading_time : Int32 # in minutes
+      # How many of `word_count`'s words are single Han/Kana characters.
+      @cjk_word_count : Int32 = 0
 
       # New: Permalink (absolute URL with base_url)
       property permalink : String?
@@ -168,8 +254,17 @@ module Hwaro
       # New: Related posts (computed by taxonomy similarity)
       property related_posts : Array(Page)
 
+      # Published pages in the same language linking here (`[content]
+      # backlinks = true`); see Transform#compute_backlinks.
+      property backlinks : Array(Page)
+
       # New: Redirect to - URL to redirect this page to
       property redirect_to : String?
+
+      # Commit metadata for this page's source file (`[git] enabled = true`).
+      # Nil when the feature is off, the file is uncommitted, the site is not
+      # a git checkout, or the page is synthesized/generated.
+      property git : GitInfo?
 
       def initialize(@path : String)
         @title = "Untitled"
@@ -195,6 +290,8 @@ module Hwaro
         @toc = false
         @language = nil
         @translations = [] of TranslationLink
+        @version = nil
+        @version_links = [] of VersionLink
         @assets = [] of String
 
         # New field defaults
@@ -202,6 +299,8 @@ module Hwaro
         @extra = {} of String => ExtraValue
         @summary = nil
         @summary_html = nil
+        @auto_summary = nil
+        @summary_truncated = false
         @in_search_index = true
         @insert_anchor_links = nil
         @word_count = 0
@@ -215,10 +314,54 @@ module Hwaro
         @series_index = 0
         @series_pages = [] of Page
         @related_posts = [] of Page
+        @backlinks = [] of Page
         @redirect_to = nil
+        @git = nil
         @cascade_fingerprint = ""
         @build_warnings = [] of String
         @parse_failed = false
+      end
+
+      # `image` as the social / structured-data surfaces must resolve it. A
+      # relative value naming one of this page's own bundle assets
+      # (`image = "cover.png"` beside `index.md`) is published under the
+      # page's URL, like a relative `![](cover.png)` in its body — resolving
+      # it against the site root (`/cover.png`) advertised a 404 og:image.
+      # Anything else is returned as written (root-relative, external, or a
+      # relative path meant from the site root, e.g. a `static/` file).
+      def social_image : String?
+        img = @image
+        return img unless img
+        return img if img.starts_with?('/') || img.matches?(/\A[a-zA-Z][a-zA-Z0-9+.\-]*:/)
+        own = Path.posix(Path.posix(@path).dirname, img).normalize.to_s
+        return img unless @assets.includes?(own)
+        base = @url.ends_with?('/') ? @url : "#{@url}/"
+        "#{base}#{img}"
+      end
+
+      # Is this the site (or per-language) homepage — the root `index.md` /
+      # `_index.md`? Its source sits directly under `content/`, so `path` has
+      # no `/` (`index.md`, `index.ko.md`, `_index.md`, …). Not
+      # `is_index && section.empty?`: a one-level page bundle like
+      # `content/about/index.md` also has an empty section (gh#601).
+      def home? : Bool
+        @is_index && !@path.includes?('/')
+      end
+
+      # No authored title: front matter left it unset (the "Untitled"
+      # placeholder) or blank.
+      def untitled? : Bool
+        @title.empty? || @title == "Untitled"
+      end
+
+      # Name for a breadcrumb crumb (`page.ancestors`, JSON-LD
+      # BreadcrumbList). A title-less section or bundle index — typically a
+      # `transparent` year folder — falls back to its directory name ("2022")
+      # instead of publishing the placeholder (gh#863).
+      def breadcrumb_title : String
+        return @title unless untitled? && @is_index
+        dir = File.dirname(@path)
+        dir == "." ? @title : File.basename(dir)
       end
 
       # Check if page has redirect
@@ -228,16 +371,26 @@ module Hwaro
 
       # True when a page should be omitted from generated listings (taxonomy
       # indexes, related posts, …): drafts, preview-only unpublished pages,
-      # and synthetic generated pages.
+      # headless (`render = false`) pages that are never written, and
+      # synthetic generated pages.
       def excluded_from_listings? : Bool
-        draft || unpublished || generated
+        draft || unpublished || !render || generated
       end
 
       # True when a page is eligible for the search index / llms.txt: it emits
       # HTML, isn't a draft or preview-only unpublished page, opts into the
-      # search index, and isn't a synthetic generated listing page.
+      # search index, isn't a synthetic generated listing page, and isn't a
+      # `redirect_to` stub (a meta-refresh bounce whose canonical is elsewhere).
       def search_index_eligible? : Bool
-        render && !draft && !unpublished && in_search_index && !generated && !output_suppressed
+        render && !draft && !unpublished && in_search_index && !generated && !output_suppressed && !has_redirect?
+      end
+
+      # True when the page's own HTML is published as content: rendered, not
+      # a draft / preview-only unpublished page, not suppressed by an output
+      # collision, and not a `redirect_to` stub. The sitemap and feeds
+      # advertise only such URLs.
+      def published_content? : Bool
+        render && !draft && !unpublished && !output_suppressed && !has_redirect?
       end
 
       # Recompute `unpublished` from the publication window (`date` in the
@@ -273,8 +426,8 @@ module Hwaro
       # root `_index.md` turns the whole `content/` tree into one recursive
       # bundle and republishes arbitrary non-markdown files (e.g.
       # `content/public/robots.txt`) to the output regardless of
-      # `allow_extensions`. When `[content.files]` is not configured, every
-      # non-markdown file is collected (unchanged behavior).
+      # `allow_extensions`. Without an allowlist every non-markdown file the
+      # deny rules leave is collected.
       #
       # Two structural limits keep the recursion inside the bundle it belongs
       # to (both hold regardless of `[content.files]`, which many hand-written
@@ -304,15 +457,24 @@ module Hwaro
         return [] of String unless Dir.exists?(page_dir)
         return [] of String if Path[page_dir].normalize == Path[content_dir].normalize
 
-        @assets = Dir.glob(File.join(page_dir, "**", "*")).compact_map do |file|
+        @assets = Dir.glob(File.join(Utils::PathUtils.glob_escape(page_dir), "**", "*")).sort!.compact_map do |file|
           next unless File.file?(file)
-          next if file.ends_with?(".md") || file.ends_with?(".markdown")
+          next if Core::Build::Phases::ReadContent::PAGE_EXTENSIONS.includes?(File.extname(file).downcase)
           next if nested_bundle?(page_dir, file, content_dir, bundle_dirs)
 
           relative = Path[file].relative_to(content_dir).to_s
-          # Honor [content.files] allow/disallow rules when configured so the
-          # bundle path can't bypass the user's publishing allowlist.
-          next if content_files && content_files.enabled? && !content_files.publish?(relative)
+          # Honor [content.files] so the bundle path can't bypass the user's
+          # publishing rules. The deny rules (`disallow_extensions` /
+          # `disallow_paths`) always apply, like they do to raw JSON/XML; the
+          # allowlist only when set. Like the raw lane
+          # (ReadContent#publishes_content_file?), `.json`/`.xml` need no
+          # allowlist entry — dropping them here left a slugged bundle's
+          # `data.json` at its source path only, 404ing from the page.
+          if content_files
+            next if content_files.denied?(relative)
+            ext = File.extname(relative).downcase
+            next if content_files.enabled? && ext != ".json" && ext != ".xml" && !content_files.publish?(relative)
+          end
 
           relative
         end
@@ -345,20 +507,19 @@ module Hwaro
       # Calculate word count from raw content
       # Note: @raw_content already has front matter stripped during parsing,
       # so we only need to remove HTML tags and markdown syntax.
-      def calculate_word_count : Int32
+      def calculate_word_count(text : String = @raw_content) : Int32
         # Shared with `hwaro tool stats` via TextUtils so the CLI report and
-        # the published `page.word_count` can never drift apart.
-        @word_count = Utils::TextUtils.count_words(@raw_content)
+        # the published `page.word_count` can never drift apart. `text` is
+        # the include-expanded body once the build has expanded it.
+        @word_count, @cjk_word_count = Utils::TextUtils.count_words_and_cjk(text)
         @word_count
       end
 
-      # Calculate reading time in minutes (assuming ~200 words per minute)
-      def calculate_reading_time(words_per_minute : Int32 = 200) : Int32
-        calculate_word_count if @word_count == 0
-        wpm = words_per_minute < 1 ? 200 : words_per_minute
-        @reading_time = (@word_count.to_f / wpm).ceil.to_i
-        @reading_time = 1 if @reading_time < 1 && @word_count > 0
-        @reading_time
+      # Reading time in minutes from the counts `calculate_word_count` set:
+      # ~200 words per minute, and ~500 per minute for Chinese/Japanese
+      # characters (each counted as a word, but read much faster).
+      def calculate_reading_time : Int32
+        @reading_time = ((@word_count - @cjk_word_count) / 200.0 + @cjk_word_count / 500.0).ceil.to_i
       end
 
       # Extract summary from content using <!-- more --> marker
@@ -372,12 +533,15 @@ module Hwaro
       MORE_MARKER_REGEX = /<!--\s*more\s*-->/i
 
       def extract_summary : String?
-        return @summary unless @raw_content.includes?("<!--")
+        return @summary unless Utils::ByteScan.includes?(@raw_content, "<!--")
 
         offset = 0
         tracker = Content::Processors::FenceTracker.new
         @raw_content.each_line(chomp: false) do |line|
-          if !tracker.fence_line?(line) && (match = line.match(MORE_MARKER_REGEX))
+          # A marker inside an inline code span (`` `<!-- more -->` ``) is
+          # literal text too: blank the spans out, keeping byte offsets.
+          probe = line.includes?('`') ? line.gsub(Content::Processors::InlineMarkdown::INLINE_CODE_SPAN_RE) { |span| " " * span.bytesize } : line
+          if !tracker.fence_line?(line) && (match = probe.match(MORE_MARKER_REGEX))
             summary_md = @raw_content.byte_slice(0, offset + match.byte_begin(0)).strip
             @summary = summary_md unless summary_md.empty?
             return @summary
@@ -396,19 +560,37 @@ module Hwaro
       # place a page's URL is assigned, so templates that use `page.url`
       # directly are right too and not just the permalink.
       #
-      # Nothing else is escaped. The output path is derived from this string
+      # Little else is escaped. The output path is derived from this string
       # by decoding it again (`PathUtils.split_safe_segments`), so `%23` still
       # lands in the directory named `a#b` that the URL now addresses —
       # whereas encoding more (a non-ASCII slug, say) would rename the
-      # directory every existing site already publishes to. Leaving `%` itself
-      # alone also keeps this idempotent when a URL is assigned twice.
+      # directory every existing site already publishes to. A valid `%XX`
+      # escape is kept as is, which also keeps this idempotent when a URL is
+      # assigned twice.
+      #
+      # `"` is escaped for the same reason from the HTML side: templates print
+      # `page.url` into double-quoted attributes unescaped (autoescape is
+      # off), so `with"quote.md` cut its own `href` short and linked a 404.
+      #
+      # A `%` that starts no escape (`100%.md`) is escaped: `/posts/100%/` is
+      # not a valid URL, and servers that reject it answer 400. So is every
+      # `%` when the name's `%XX` runs do not decode to UTF-8 (`100%deal.md`):
+      # the output path decodes them and scrubs the invalid bytes, so
+      # `/posts/100%deal/` was written to a `100<U+FFFD>al/` directory no
+      # request for that URL reaches. Either way the URL then names the
+      # literal file name.
       def url=(value : String)
-        @url = if value.includes?('#') || value.includes?('?')
-                 value.gsub('#', "%23").gsub('?', "%3F")
+        if value.includes?('%')
+          value = URI.decode(value).valid_encoding? ? value.gsub(/%(?![0-9A-Fa-f]{2})/, "%25") : value.gsub('%', "%25")
+        end
+        @url = if value.includes?('#') || value.includes?('?') || value.includes?('"')
+                 value.gsub(URL_DELIMITER_ESCAPES)
                else
                  value
                end
       end
+
+      private URL_DELIMITER_ESCAPES = {'#' => "%23", '?' => "%3F", '"' => "%22"}
 
       # Generate permalink (absolute URL)
       def generate_permalink(base_url : String) : String
@@ -419,14 +601,18 @@ module Hwaro
         permalink
       end
 
-      # Check if page has summary (either from <!-- more --> or description)
-      def has_summary? : Bool
-        !@summary.nil? || !@description.nil?
+      # Get effective summary: `<!-- more -->` chunk > description > automatic
+      # excerpt. The excerpt is returned as a single escaped `<p>` so
+      # `{{ page.summary | safe }}` keeps working for every source.
+      def effective_summary : String?
+        @summary || @description || auto_summary_html
       end
 
-      # Get effective summary (summary or description fallback)
-      def effective_summary : String?
-        @summary || @description
+      # The automatic excerpt as HTML: text is escaped (it was decoded from
+      # the rendered body, so `<`/`&` are literal characters) and wrapped in
+      # one paragraph. Nil when there is no automatic summary.
+      def auto_summary_html : String?
+        @auto_summary.try { |text| "<p>#{HTML.escape(text)}</p>" }
       end
 
       # plain_summary memo — see the method below. `@plain_summary_for`
@@ -441,13 +627,14 @@ module Hwaro
       # (`##` headings, code fences, math, literal newlines) never leaks
       # into meta tags — see https://github.com/hahwul/hwaro/issues/491.
       # Returns nil when the page has no summary. Soft-truncates to `limit`
-      # characters on a word boundary.
+      # characters on a word boundary. Falls back to the automatic body
+      # excerpt (already plain text) when no marker summary exists.
       def plain_summary(limit : Int32 = 200) : String?
         # Prefer the rendered summary HTML (populated during parsing); fall
         # back to the raw markdown chunk only if render hasn't run yet —
         # strip_html still removes any inline HTML there.
         source = @summary_html || @summary
-        return unless source
+        return soft_truncate_summary(@auto_summary, limit) unless source
         # Memoize the strip/unescape (it runs per page for og:description
         # AND again per feed item). Keyed on the source string's identity:
         # any reassignment of summary_html/summary swaps in a different
@@ -459,11 +646,15 @@ module Hwaro
           # Strip tags, then decode entities so escaped chars from rendered
           # HTML (e.g. `&gt;` inside code blocks) become real characters —
           # the meta-tag layer re-escapes them, avoiding `&amp;gt;` artifacts.
-          stripped = HTML.unescape(Hwaro::Utils::TextUtils.strip_html(source)).strip
+          stripped = Hwaro::Utils::TextUtils.html_to_plain_text(source)
           text = stripped.empty? ? nil : stripped
           @plain_summary_text = text
           @plain_summary_for = source
         end
+        soft_truncate_summary(text, limit)
+      end
+
+      private def soft_truncate_summary(text : String?, limit : Int32) : String?
         return unless text
         return text if text.size <= limit
 

@@ -5,6 +5,21 @@ module Hwaro
     module Processors
       module Filters
         module CollectionFilters
+          # Empty for templates: nil, undefined, or an empty string, list or
+          # mapping. Shared by `compact` and the `empty`/`present` tests.
+          def self.blank?(value : Crinja::Raw) : Bool
+            case value
+            when String, Crinja::SafeString
+              value.to_s.empty?
+            when Array, Hash
+              value.empty?
+            when Nil, Crinja::Undefined
+              true
+            else
+              false
+            end
+          end
+
           def self.register(env : Crinja)
             # Array where filter
             env.filters["where"] = Crinja.filter({attribute: nil, value: nil}) do
@@ -83,13 +98,12 @@ module Hwaro
             env.filters["unique"] = Crinja.filter do
               safe_array do
                 arr = target.as_a
-                seen = Set(String).new
+                seen = Set(Crinja::Value).new
                 arr.select do |item|
-                  key = item.to_s
-                  if seen.includes?(key)
+                  if seen.includes?(item)
                     false
                   else
-                    seen << key
+                    seen << item
                     true
                   end
                 end
@@ -111,14 +125,57 @@ module Hwaro
               end
             end
 
+            # `first` / `last` — override Crinja's built-ins, which call
+            # `Enumerable#first` / `Indexable#last` on the raw value and let
+            # the resulting Crystal exception escape. On an EMPTY sequence
+            # that aborted the whole build with a bare `Empty enumerable` /
+            # `Index out of bounds` and no template file:line, because those
+            # are plain Crystal errors rather than `Crinja::Error`s (see
+            # the render phase's rescue). An empty section/collection is ordinary
+            # site state — `{{ section.pages | first }}` on a section with no
+            # pages must not be fatal. Jinja2 yields `Undefined` there (which
+            # renders as "" and is falsy), so do the same; every non-empty
+            # input still goes through the upstream code path unchanged, and a
+            # non-sequence target still raises Crinja's located `TypeError`.
+            #
+            # A FRESH Undefined each time, never the shared `Value::UNDEFINED`
+            # singleton: the evaluator renames an Undefined in place when it
+            # is stored under a new name (`{% set d = {'a': ([] | first)} %}`
+            # writes `d.a` into it), so handing out the singleton let one
+            # page's variable name leak into another page's error message —
+            # and race across render workers.
+            env.filters["first"] = Crinja.filter do
+              CollectionFilters.empty_sequence?(target) ? Crinja::Value.new(Crinja::Undefined.new) : target.first.raw
+            end
+
+            env.filters["last"] = Crinja.filter do
+              CollectionFilters.empty_sequence?(target) ? Crinja::Value.new(Crinja::Undefined.new) : target.last.raw
+            end
+
             # Compact filter — removes nil/empty values from an array
             env.filters["compact"] = Crinja.filter do
               safe_array do
-                arr = target.as_a
-                arr.reject do |item|
-                  item.raw.nil? || item.to_s.empty?
-                end
+                target.as_a.reject { |item| CollectionFilters.blank?(item.raw) }
               end
+            end
+          end
+
+          # True when `value` is a sequence with no elements — the case
+          # upstream `first`/`last` crash on. Deliberately narrow: anything
+          # that is not a string/hash/indexable (an Int, say) reports `false`
+          # so the upstream filter still raises its located `TypeError`.
+          # An Undefined counts as empty: Jinja2 iterates it as nothing, and
+          # `{{ get_section(path='nope').pages | first }}` or a missing
+          # `page.extra.images | first` is the same "ordinary site state" an
+          # empty section is — Crinja's own `raw_each` already treats it so.
+          def self.empty_sequence?(value : Crinja::Value) : Bool
+            case raw = value.raw
+            when Crinja::Undefined  then true
+            when String             then raw.empty?
+            when Crinja::SafeString then raw.to_s.empty?
+            when Hash               then raw.empty?
+            when Indexable          then raw.empty?
+            else                         false
             end
           end
 

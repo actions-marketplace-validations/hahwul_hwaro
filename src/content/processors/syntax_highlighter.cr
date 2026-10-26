@@ -17,8 +17,9 @@
 require "markd"
 require "tartrazine"
 require "../../ext/tartrazine_mt_fix"
+require "../../ext/tartrazine_bygroups_none_fix"
+require "../../ext/tartrazine_lexer_alias_fix"
 require "digest/md5"
-require "./table_parser"
 require "./markdown_extensions"
 require "./heading_ids"
 require "./render_hooks"
@@ -163,17 +164,35 @@ module Hwaro
           @@tokenize_gate.send(nil)
           result = begin
             String.build do |io|
+              # One span per RUN of same-class tokens, not per token. A lexer
+              # routinely splits one visual atom into several tokens of the
+              # same type — Crystal's `puts "hi"` arrives as four
+              # LiteralString tokens (`"`, `hi`, `"`, and an empty one) — and
+              # emitting a span each produced four elements where one belongs,
+              # including `<span class="hljs-string"></span>` with no content
+              # at all. The extra boundaries are not only bytes: `strip_html`
+              # inserts a space at a tag boundary before a word character, so
+              # the search index and feed descriptions read `puts " hi"`
+              # instead of `puts "hi"`. Runs also survive `LineWrapper`, which
+              # already re-opens a span carried across a newline.
+              open_class : String? = nil
               lexer.tokenizer(code).each do |token|
                 value = token[:value]
+                # An empty token contributes nothing but a tag pair, and
+                # dropping it lets the runs on either side join.
+                next if value.empty?
                 # Most tokens (keywords, identifiers, whitespace) need no
                 # escaping — skip HTML.escape's char-by-char rebuild for them.
                 value = HTML.escape(value) if needs_html_escape?(value)
-                if css_class = class_for(token[:type])
-                  io << %(<span class=") << css_class << %(">) << value << "</span>"
-                else
-                  io << value
+                css_class = class_for(token[:type])
+                if css_class != open_class
+                  io << "</span>" if open_class
+                  io << %(<span class=") << css_class << %(">) if css_class
+                  open_class = css_class
                 end
+                io << value
               end
+              io << "</span>" if open_class
             end
           rescue ex
             # A lexer bug must never take down the build — degrade to plain.
@@ -565,6 +584,102 @@ module Hwaro
           super(options)
         end
 
+        # Safe mode replaces every raw-HTML node with an omission comment —
+        # including the `<!--HWARO-SHORTCODE-PLACEHOLDER-N-->` comments the
+        # shortcode pass leaves for its (trusted, template-rendered) output,
+        # which silently erased every shortcode. Keep exactly those
+        # placeholders; everything else in the node is still omitted.
+        #
+        # Extension markup (tables, `<del>`, footnotes, math, …) is raw HTML
+        # to markd too: a node that STARTS with hwaro-marked markup (see
+        # `MarkdownExtensions.trust`) is kept, minus any author raw HTML in it.
+        def html_block(node : Markd::Node, entering : Bool)
+          return super unless @options.safe?
+          if kept = keep_trusted(node.text)
+            newline
+            literal(kept)
+            newline
+            return
+          end
+          return super unless node.text.includes?("<!--HWARO-SHORTCODE-PLACEHOLDER-")
+          newline
+          literal(keep_shortcode_placeholders(node.text))
+          newline
+        end
+
+        def html_inline(node : Markd::Node, entering : Bool)
+          return super unless @options.safe?
+          if kept = keep_trusted(node.text)
+            return literal(kept)
+          end
+          return super unless node.text.includes?("<!--HWARO-SHORTCODE-PLACEHOLDER-")
+          literal(keep_shortcode_placeholders(node.text))
+        end
+
+        TRUSTED_OPEN_RE    = Regex.new("<(#{Markd::Rule::TAG_NAME_STRING}) #{MarkdownExtensions::TRUSTED_MARK}#{Markd::Rule::ATTRIBUTE}*\\s*/?>")
+        TRUSTED_COMMENT_RE = Regex.new("<!--HWARO-#{MarkdownExtensions::TRUSTED_MARK}.*?-->")
+        CLOSE_TAG_RE       = Regex.new("</(#{Markd::Rule::TAG_NAME_STRING})\\s*>")
+        RAW_HTML_RE        = Regex.new(Markd::Rule::HTML_TAG_STRING, Regex::Options::IGNORE_CASE)
+
+        # Open marked elements by name, so a plain close tag is kept only
+        # when it balances one (it can then close nothing of the template's).
+        @trusted_open = Hash(String, Int32).new(0)
+
+        # nil unless `text` starts with trusted markup. Otherwise `text` with
+        # each marked tag/comment, balancing close tag, and shortcode
+        # placeholder kept, other raw HTML omitted, a stray `<` escaped, and
+        # the text between (never containing `<`) kept as is.
+        private def keep_trusted(text : String) : String?
+          start = text.byte_index('<')
+          return unless start && text.byte_slice(0, start).blank? && trusted_at(text, start, dry_run: true)
+          String.build do |io|
+            pos = 0
+            while lt = text.byte_index('<', pos)
+              io.write(text.to_slice[pos, lt - pos])
+              if m = trusted_at(text, lt)
+                # Unmarked here already, so render hooks never see a mark.
+                io << MarkdownExtensions.untrust(m[0])
+              elsif m = RAW_HTML_RE.match_at_byte_index(text, lt, Regex::MatchOptions::ANCHORED)
+                io << "<!-- raw HTML omitted -->"
+              else
+                io << "&lt;"
+                pos = lt + 1
+                next
+              end
+              pos = m.byte_end(0)
+            end
+            io.write(text.to_slice[pos, text.bytesize - pos])
+          end
+        end
+
+        private def trusted_at(text : String, pos : Int32, dry_run : Bool = false) : Regex::MatchData?
+          if m = TRUSTED_OPEN_RE.match_at_byte_index(text, pos, Regex::MatchOptions::ANCHORED)
+            @trusted_open[m[1].downcase] += 1 unless dry_run
+            m
+          elsif m = TRUSTED_COMMENT_RE.match_at_byte_index(text, pos, Regex::MatchOptions::ANCHORED)
+            m
+          elsif !dry_run && (m = InlineMarkdown::SHORTCODE_PLACEHOLDER_RE.match_at_byte_index(text, pos, Regex::MatchOptions::ANCHORED))
+            # Kept inside trusted markup; a node starting with one keeps the
+            # `keep_shortcode_placeholders` handling.
+            m
+          elsif (m = CLOSE_TAG_RE.match_at_byte_index(text, pos, Regex::MatchOptions::ANCHORED)) && @trusted_open[name = m[1].downcase] > 0
+            @trusted_open[name] -= 1 unless dry_run
+            m
+          end
+        end
+
+        private def keep_shortcode_placeholders(text : String) : String
+          String.build do |io|
+            last = 0
+            text.scan(InlineMarkdown::SHORTCODE_PLACEHOLDER_RE) do |m|
+              io << "<!-- raw HTML omitted -->" unless text[last...m.begin(0)].blank?
+              io << m[0]
+              last = m.end(0)
+            end
+            io << "<!-- raw HTML omitted -->" unless text[last..].blank?
+          end
+        end
+
         # In server mode, emit pre-highlighted spans instead of plain escaped
         # text. Falls back to the default escaped output when the language has
         # no lexer (the `language-*` class is still present for styling).
@@ -612,10 +727,10 @@ module Hwaro
           if @highlight_enabled && lang
             # Add classes for highlight.js
             code_tag_attrs ||= {} of String => String
-            code_tag_attrs["class"] = "language-#{escape_lang(lang)} hljs"
+            code_tag_attrs["class"] = "language-#{HTML.escape(lang)} hljs"
           elsif lang
             code_tag_attrs ||= {} of String => String
-            code_tag_attrs["class"] = "language-#{escape_lang(lang)}"
+            code_tag_attrs["class"] = "language-#{HTML.escape(lang)}"
           end
 
           if opts
@@ -658,7 +773,7 @@ module Hwaro
           label = opts.try(&.name)
 
           newline
-          literal(%(<div class="code-block"><div class="code-filename">#{escape_lang(label)}</div>)) if label
+          literal(%(<div class="code-block"><div class="code-filename">#{HTML.escape(label)}</div>)) if label
           tag("pre", pre_tag_attrs) do
             tag("code", code_tag_attrs) do
               code_block_body(node, lang)
@@ -666,11 +781,6 @@ module Hwaro
           end
           literal("</div>") if label
           newline
-        end
-
-        # Escape special HTML characters in language name
-        private def escape_lang(text : String) : String
-          HTML.escape(text)
         end
 
         # Resolves the language + fence-options for `node`, collapsing every
@@ -970,10 +1080,6 @@ module Hwaro
           @@server_mode = value
         end
 
-        def server_mode? : Bool
-          @@server_mode
-        end
-
         # Global default for fence-level `linenos` (`[highlight]
         # line_numbers`), set from config when the build initializes.
         # Read-only during rendering, mirroring `@@server_mode`.
@@ -1018,65 +1124,18 @@ module Hwaro
         # @param hooks - render-hook context (nil when no `templates/hooks/render-*`
         #   template is configured); when nil the renderer construction below is
         #   byte-identical to the pre-hooks code path.
-        def render(content : String, highlight : Bool = true, safe : Bool = false, *, smart : Bool = false, tables_preprocessed : Bool = false,
+        def render(content : String, highlight : Bool = true, safe : Bool = false, *, smart : Bool = false,
                    hooks : Content::Processors::RenderHooks::HookRenderContext? = nil) : String
-          # Pre-process tables before passing to markd (markd doesn't support
-          # GFM tables). Markdown#render already converts tables before the
-          # extension passes and passes `tables_preprocessed: true` to skip the
-          # redundant per-page scan — the default stays for direct callers of
-          # SyntaxHighlighter.render.
-          processed_content = tables_preprocessed ? content : TableParser.process(content, hooks: hooks)
-
+          # GFM tables are NOT converted here (markd has no table support):
+          # Markdown#render runs TableParser before the extension passes.
           options = Markd::Options.new(safe: safe, smart: smart)
-          document = Markd::Parser.parse(processed_content, options)
+          document = Markd::Parser.parse(content, options)
           renderer = if hooks
                        HookedRenderer.new(options, highlight, @@server_mode, hooks)
                      else
                        HighlightingRenderer.new(options, highlight, @@server_mode)
                      end
           renderer.render(document)
-        end
-
-        # Check if content has code blocks that might benefit from highlighting
-        def has_code_blocks?(content : String) : Bool
-          content.includes?("```") || content.includes?("~~~")
-        end
-
-        # List of supported languages for highlight.js (common ones)
-        SUPPORTED_LANGUAGES = Set.new(%w[
-          bash c cpp csharp css crystal dart diff dockerfile elixir elm
-          erlang go graphql groovy haskell html http ini java javascript
-          json julia kotlin latex less lisp lua makefile markdown matlab
-          nginx nim nix objectivec ocaml perl php plaintext powershell
-          python r ruby rust scala scss shell sql swift toml typescript
-          vim xml yaml zig
-        ])
-
-        # Check if a language is supported
-        def language_supported?(lang : String) : Bool
-          SUPPORTED_LANGUAGES.includes?(lang.downcase)
-        end
-
-        # Get CSS themes available for highlight.js
-        THEMES = Set.new(%w[
-          default a11y-dark a11y-light agate androidstudio an-old-hope
-          arduino-light arta ascetic atom-one-dark atom-one-dark-reasonable
-          atom-one-light brown-paper codepen-embed color-brewer dark
-          devibeans docco far foundation github github-dark github-dark-dimmed
-          googlecode gradient-dark gradient-light grayscale hybrid idea
-          intellij-light ir-black isbl-editor-dark isbl-editor-light
-          kimbie-dark kimbie-light lightfair lioshi magula mono-blue monokai
-          monokai-sublime night-owl nnfx-dark nnfx-light nord obsidian ocean
-          paraiso-dark paraiso-light panda-syntax-dark panda-syntax-light
-          pojoaque purebasic qtcreator-dark qtcreator-light rainbow school-book
-          shades-of-purple srcery stackoverflow-dark stackoverflow-light sunburst
-          tokyo-night-dark tokyo-night-light tomorrow-night-blue
-          tomorrow-night-bright vs vs2015 xcode xt256 zenburn
-        ])
-
-        # Check if a theme is valid
-        def theme_valid?(theme : String) : Bool
-          THEMES.includes?(theme.downcase)
         end
       end
     end

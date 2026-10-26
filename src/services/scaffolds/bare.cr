@@ -25,6 +25,11 @@ module Hwaro
           }
         end
 
+        # Pages the menus/nav link to (kept as stubs by --skip-sample-content).
+        protected def skeleton_page_paths : Array(String)
+          ["index.md", "about.md"]
+        end
+
         # `bare` ships no taxonomy templates by default — taxonomies are
         # opt-in here (see `config_content`), so the matching templates
         # would be dead files. Users who add `[[taxonomies]]` later can
@@ -60,12 +65,25 @@ module Hwaro
         def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
           config = String.build do |str|
             str << base_config
-            str << plugins_config
+            # `--include-multilingual` still produces `.{lang}.md` content
+            # clones for bare, so the enabled `[languages]` block must be
+            # emitted or those files route as literal `/about.ko/` pages.
+            # Only the enabled block: the commented placeholder the other
+            # scaffolds carry is a feature ad, which bare opts out of.
+            str << multilingual_config(multilingual_languages, skip_taxonomies) if multilingual_languages.size > 1
+            str << ConfigSnippets.plugins
             str << content_files_config
-            str << sitemap_config
+            str << ConfigSnippets.sitemap
             str << feeds_config(feed_sections)
           end
           config
+        end
+
+        # No `[[taxonomies]]` anywhere in bare's config — this also keeps
+        # the multilingual `[languages.<code>]` blocks from emitting dead
+        # per-language `taxonomies = [...]` lists (see `Base`).
+        protected def ships_taxonomies? : Bool
+          false
         end
 
         # `hwaro init`'s DEFAULT path (no `--full-config`) and
@@ -106,6 +124,7 @@ module Hwaro
                   <a href="{{ base_url }}{{ lang_prefix }}/">Home</a>
                   <a href="{{ base_url }}{{ lang_prefix }}/about/">About</a>
                 </nav>
+                #{lang_switcher_html}
               </header>
 
             HTML

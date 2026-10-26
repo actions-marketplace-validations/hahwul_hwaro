@@ -27,6 +27,7 @@ module Hwaro
           # Flags defined here are used both for OptionParser and completion generation
           FLAGS = [
             CONTENT_DIR_FLAG,
+            DRY_RUN_FLAG,
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -45,13 +46,23 @@ module Hwaro
             content_dir = "content"
             format : String? = nil
             json_output = false
+            dry_run = false
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool convert <to-yaml|to-toml|to-json> [options]"
               CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
+              CLI.register_flag(parser, DRY_RUN_FLAG) { |_| dry_run = true }
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
-              parser.unknown_args do |unknown|
+              parser.unknown_args do |before_dash, after_dash|
+                unknown = before_dash + after_dash
+                unless unknown.size <= 1
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: "unexpected extra argument(s): '#{unknown[1..].join("', '")}'",
+                    hint: "hwaro tool convert takes a single <format> argument.",
+                  )
+                end
                 format = unknown.first? if unknown.present?
               end
             end
@@ -66,7 +77,7 @@ module Hwaro
               )
             end
 
-            converter = Services::FrontmatterConverter.new(content_dir)
+            converter = Services::FrontmatterConverter.new(content_dir, dry_run: dry_run)
 
             fmt = format.as(String).downcase
             if POSITIONAL_CHOICES.includes?(fmt)
@@ -79,26 +90,19 @@ module Hwaro
               Logger.item("comments in front matter are not preserved by conversion", glyph: :info) unless json_output
             end
 
-            case fmt
-            when "to-yaml"
-              result = converter.convert_to_yaml
-              puts result.to_json if json_output
-              fail_conversion(result, json_output) unless result.success
-            when "to-toml"
-              result = converter.convert_to_toml
-              puts result.to_json if json_output
-              fail_conversion(result, json_output) unless result.success
-            when "to-json"
-              result = converter.convert_to_json
-              puts result.to_json if json_output
-              fail_conversion(result, json_output) unless result.success
-            else
-              raise Hwaro::HwaroError.new(
-                code: Hwaro::Errors::HWARO_E_USAGE,
-                message: "unknown format: #{format}",
-                hint: "Supported: #{POSITIONAL_CHOICES.join(", ")}.",
-              )
-            end
+            result = case fmt
+                     when "to-yaml" then converter.convert_to_yaml
+                     when "to-toml" then converter.convert_to_toml
+                     when "to-json" then converter.convert_to_json
+                     else
+                       raise Hwaro::HwaroError.new(
+                         code: Hwaro::Errors::HWARO_E_USAGE,
+                         message: "unknown format: #{format}",
+                         hint: "Supported: #{POSITIONAL_CHOICES.join(", ")}.",
+                       )
+                     end
+            puts result.to_json if json_output
+            fail_conversion(result, json_output) unless result.success
           end
 
           # Surface the converter's own message instead of exiting 1 in
@@ -106,20 +110,18 @@ module Hwaro
           # at all in human mode, with the reason only ever reachable via
           # `--json`.
           #
-          # BOTH modes exit `HWARO_E_IO`. The `--json` payload was already
+          # BOTH modes exit with the same class: `HWARO_E_CONTENT` when every
+          # failure was unparseable front matter (as `build` and `tool
+          # validate` classify it), `HWARO_E_IO` otherwise. The `--json` payload was already
           # printed by the caller, so this path only needs the status code —
           # but it has to be the SAME code, or a machine consumer branching on
           # exit status gets a different (and less classified) answer for the
           # identical failure purely because it asked for JSON. The payload
           # shape is untouched; only the process exit code changes.
           private def fail_conversion(result : Services::ConversionResult, json_output : Bool) : NoReturn
-            exit(Hwaro::Errors::EXIT_IO) if json_output
-
-            raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_IO,
-              message: result.message,
-              hint: "Pass -c DIR if your content lives outside 'content'; per-file errors are listed above.",
-            )
+            error = Hwaro::Errors.per_file_failure(result.message, result.error_count, result.content_error_count)
+            exit(error.exit_code) if json_output
+            raise error
           end
         end
       end

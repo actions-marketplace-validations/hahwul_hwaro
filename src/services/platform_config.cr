@@ -3,7 +3,10 @@ require "../hwaro"
 require "../models/config"
 require "../models/page"
 require "../content/processors/markdown"
+require "../utils/frontmatter_writer"
 require "../utils/logger"
+require "../utils/path_utils"
+require "./content_lister"
 require "./github_actions_workflow"
 
 module Hwaro
@@ -12,6 +15,9 @@ module Hwaro
       SUPPORTED_PLATFORMS = ["netlify", "vercel", "cloudflare", "github-pages", "gitlab-ci", "codeberg-pages"]
 
       @config : Models::Config
+
+      @output_dir : String? = nil
+      @draft_paths = Set(String).new
 
       def initialize(@config : Models::Config)
       end
@@ -51,22 +57,82 @@ module Hwaro
         "hwaro build"
       end
 
+      # Directory the build writes to. Follows `[build] output_dir` so every
+      # generated platform config publishes the tree `hwaro build` actually
+      # produced — a hardcoded "public" made a site with a customized
+      # output_dir deploy an empty (or stale) directory, with no error
+      # anywhere: the build succeeded and the host published nothing.
+      # `Config.load` rejects an empty or project-escaping value, but passes
+      # `./public`, `public/` and absolute paths through verbatim. Normalize
+      # here so every emitted key gets one clean relative spelling
+      # (cloudflare's `bucket = "./#{dir}"` produced `././public`, gitlab's
+      # default check missed `./public`); an absolute path is not expressible
+      # in any hosted-build config (netlify `publish`, gitlab `artifacts.paths`
+      # must be project-relative), so it is reported and the conventional
+      # `public` used — the host would otherwise publish nothing, silently.
       private def output_dir : String
-        "public"
+        @output_dir ||= begin
+          raw = @config.build.output_dir
+          if raw.nil?
+            "public"
+          elsif Utils::PathUtils.absolute?(raw)
+            Logger.warn "[build] output_dir #{raw.inspect} is an absolute path; platform configs need a project-relative directory. Using \"public\" — set a relative output_dir so the host publishes what hwaro built."
+            "public"
+          else
+            normalized = Path[raw].normalize.to_s.lchop("./").rstrip('/')
+            normalized.empty? || normalized == "." ? "public" : normalized
+          end
+        end
+      end
+
+      # Render a value as a shell word, leaving ordinary directory names bare
+      # so the default workflow is unchanged. `[build] output_dir` is trusted
+      # config, but it may legitimately contain a space — unquoted, that would
+      # split into two `cd` arguments.
+      private def shell_word(value : String) : String
+        return value if value.matches?(/\A[A-Za-z0-9._\/-]+\z/)
+        "'" + value.gsub("'", "'\\''") + "'"
       end
 
       # Escape a value for a TOML basic string. Front-matter aliases are
-      # arbitrary user input; an unescaped quote/backslash would produce an
-      # unparseable netlify.toml.
+      # arbitrary user input; an unescaped quote/backslash — or a raw control
+      # character such as a newline — would produce an unparseable
+      # netlify.toml. Control characters are ESCAPED rather than the alias
+      # skipped (the cloudflare generator skips because `_redirects` has no
+      # escape syntax; TOML does, so the user's redirect is preserved).
       private def toml_escape(s : String) : String
-        s.gsub('\\', "\\\\").gsub('"', "\\\"")
+        String.build do |io|
+          s.each_char do |char|
+            case char
+            when '\\' then io << "\\\\"
+            when '"'  then io << "\\\""
+            when '\n' then io << "\\n"
+            when '\t' then io << "\\t"
+            when '\r' then io << "\\r"
+            when '\b' then io << "\\b"
+            when '\f' then io << "\\f"
+            else
+              if char.control?
+                # TOML `\u` takes exactly four hex digits; codepoints above
+                # U+FFFF (e.g. Cf tag characters) need the 8-digit `\U` form.
+                if char.ord > 0xFFFF
+                  io << "\\U" << char.ord.to_s(16).upcase.rjust(8, '0')
+                else
+                  io << "\\u" << char.ord.to_s(16).upcase.rjust(4, '0')
+                end
+              else
+                io << char
+              end
+            end
+          end
+        end
       end
 
       private def generate_netlify : String
         lines = [] of String
         lines << "[build]"
         lines << "  command = \"#{build_command}\""
-        lines << "  publish = \"#{output_dir}\""
+        lines << "  publish = \"#{toml_escape(output_dir)}\""
         lines << ""
         lines << "[build.environment]"
         lines << "  # Add environment variables here"
@@ -88,10 +154,12 @@ module Hwaro
 
         # Headers for caching. Target the configured asset output dir rather
         # than a hardcoded /assets/ so a customized [assets] output_dir is honored.
-        lines << "[[headers]]"
-        lines << "  for = \"#{with_base_path("/#{assets_url_dir}/*")}\""
-        lines << "  [headers.values]"
-        lines << "    Cache-Control = \"public, max-age=31536000, immutable\""
+        if immutable_assets?
+          lines << "[[headers]]"
+          lines << "  for = \"#{with_base_path("/#{assets_url_dir}/*")}\""
+          lines << "  [headers.values]"
+          lines << "    Cache-Control = \"public, max-age=31536000, immutable\""
+        end
 
         lines.join("\n") + "\n"
       end
@@ -104,6 +172,21 @@ module Hwaro
       private def with_base_path(path : String) : String
         normalized = path.starts_with?("/") ? path : "/#{path}"
         @config.with_base_path(normalized)
+      end
+
+      # Whether every file under the asset output dir is content-hashed, so a
+      # year-long `immutable` cache rule is safe. Only fingerprinted
+      # `[[assets.bundles]]` outputs are named by content. With the pipeline
+      # off (the default), fingerprinting off, or no bundles, nothing there is
+      # hashed; and `static/<output_dir>/` is copied into the same URL space
+      # verbatim (`static/assets/css/…` → `/assets/css/…`, the docs site's
+      # shape), so its presence leaves unhashed files under the rule too.
+      # Marking such files immutable kept browsers on the old CSS/JS for a
+      # year after every deploy.
+      private def immutable_assets? : Bool
+        assets = @config.assets
+        return false if !assets.enabled || !assets.fingerprint || assets.bundles.empty?
+        !Dir.exists?(File.join("static", assets_url_dir))
       end
 
       # URL path segment where the asset pipeline emits fingerprinted files,
@@ -131,18 +214,20 @@ module Hwaro
         end
 
         # Headers for caching
-        header_entries = [
-          JSON::Any.new({
-            "source"  => JSON::Any.new(with_base_path("/#{assets_url_dir}/(.*)")),
-            "headers" => JSON::Any.new([
-              JSON::Any.new({
-                "key"   => JSON::Any.new("Cache-Control"),
-                "value" => JSON::Any.new("public, max-age=31536000, immutable"),
-              }),
-            ]),
-          }),
-        ]
-        config_hash["headers"] = JSON::Any.new(header_entries)
+        if immutable_assets?
+          header_entries = [
+            JSON::Any.new({
+              "source"  => JSON::Any.new(with_base_path("/#{assets_url_dir}/(.*)")),
+              "headers" => JSON::Any.new([
+                JSON::Any.new({
+                  "key"   => JSON::Any.new("Cache-Control"),
+                  "value" => JSON::Any.new("public, max-age=31536000, immutable"),
+                }),
+              ]),
+            }),
+          ]
+          config_hash["headers"] = JSON::Any.new(header_entries)
+        end
 
         result = {
           "buildCommand"    => JSON::Any.new(build_command),
@@ -161,19 +246,19 @@ module Hwaro
         lines = [] of String
         lines << "name = \"#{project_name}\""
         lines << "compatibility_date = \"#{Time.utc.to_s("%Y-%m-%d")}\""
+        lines << "pages_build_output_dir = \"./#{toml_escape(output_dir)}\""
         lines << ""
-        lines << "[site]"
-        lines << "  bucket = \"./#{output_dir}\""
-        lines << ""
-        lines << "# Build configuration (for Cloudflare Pages dashboard)"
+        lines << "# Build configuration for Cloudflare Pages"
         lines << "# Build command: #{build_command}"
-        lines << "# Build output directory: /#{output_dir}"
+        lines << "# Build output directory: ./#{output_dir}"
 
         # Redirects via _redirects file note
         redirects = collect_aliases
         unless redirects.empty?
           lines << ""
-          lines << "# Redirects: Create a `#{output_dir}/_redirects` file with:"
+          # Pages serves `_redirects` from the build output, but every build
+          # regenerates that tree; static/ is copied into it on each build.
+          lines << "# Redirects: Create a `static/_redirects` file with:"
           redirects.each do |from, to|
             # _redirects is space-delimited; an alias with whitespace or a quote
             # would silently corrupt the rule, so skip malformed entries.
@@ -199,9 +284,14 @@ module Hwaro
         lines << "  stage: deploy"
         lines << "  script:"
         lines << "    - hwaro build"
+        # GitLab Pages defaults to publishing `public/`; `pages.publish`
+        # (GitLab 16.1+) points it elsewhere. Emitted only for a customized
+        # `[build] output_dir` so the default pipeline stays compatible with
+        # older GitLab instances.
+        lines << "  publish: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(output_dir)}" unless output_dir == "public"
         lines << "  artifacts:"
         lines << "    paths:"
-        lines << "      - public"
+        lines << "      - #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(output_dir)}"
         lines << "  rules:"
         lines << "    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
         lines << ""
@@ -254,7 +344,7 @@ module Hwaro
         lines << "        env:"
         lines << "          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}"
         lines << "        run: |"
-        lines << "          cd #{output_dir}"
+        lines << "          cd #{shell_word(output_dir)}"
         lines << "          git init -b \"$PAGES_BRANCH\""
         lines << "          git config user.name  \"${{ github.actor }}\""
         lines << "          git config user.email \"${{ github.actor }}@noreply.codeberg.org\""
@@ -276,6 +366,9 @@ module Hwaro
         content_dir = "content"
         return redirects unless Dir.exists?(content_dir)
 
+        # Own flag or one cascaded from a section (ContentLister is the
+        # publish-state source of truth).
+        @draft_paths = ContentLister.new(content_dir).draft_paths
         scan_content_for_aliases(content_dir, redirects)
         redirects
       end
@@ -285,9 +378,24 @@ module Hwaro
       PAGE_EXTENSIONS = {".md", ".markdown"}
 
       private def scan_content_for_aliases(dir : String, redirects : Array(Tuple(String, String)))
-        Dir.each_child(dir) do |entry|
+        # An unreadable subdirectory (Dir.each_child raises on entry) skips
+        # that subtree with a warning instead of aborting the whole run.
+        children = begin
+          Dir.children(dir)
+        rescue ex : File::Error
+          Logger.warn "Skipping unreadable directory during alias scan: #{dir} (#{ex.message})"
+          return
+        end
+        children.each do |entry|
           path = File.join(dir, entry)
-          if File.directory?(path)
+          # `follow_symlinks: false` keeps a symlinked directory (including a
+          # cycle like `ln -s . content/loop`) from being recursed into —
+          # following one used to recurse until ELOOP aborted the whole
+          # command. Symlinked FILES still work: they fall through to the
+          # extension branch and File.read follows the link as usual.
+          info = File.info?(path, follow_symlinks: false)
+          next unless info
+          if info.directory?
             scan_content_for_aliases(path, redirects)
           elsif PAGE_EXTENSIONS.includes?(Path[entry].extension.downcase)
             extract_aliases_from_file(path, redirects)
@@ -306,14 +414,9 @@ module Hwaro
         return unless PAGE_EXTENSIONS.includes?(ext)
         return unless basename.size > ext.size
 
-        stem = basename[0, basename.size - ext.size]
-        idx = stem.rindex('.')
-        return unless idx && idx > 0
-        lang_code = stem[(idx + 1)..]
-        return if lang_code.empty?
-        return lang_code if @config.languages.has_key?(lang_code) || lang_code == @config.default_language
-
-        nil
+        Utils::PathUtils.language_suffix(basename[0, basename.size - ext.size]) do |code|
+          @config.languages.has_key?(code) || code == @config.default_language
+        end
       end
 
       private def extract_aliases_from_file(path : String, redirects : Array(Tuple(String, String)))
@@ -324,7 +427,8 @@ module Hwaro
         # not fail platform generation over a date-token permalink they
         # never ship (build uses resolve_url_lenient + raise only on
         # surviving render=true pages).
-        return if data[:draft]
+        # `[build] drafts = true` publishes them, as `hwaro build` does.
+        return if (data[:draft] || @draft_paths.includes?(File.expand_path(path))) && @config.build.drafts != true
         return unless data[:render]
         now = Time.utc
         if exp = data[:expires]
@@ -344,7 +448,26 @@ module Hwaro
         target_url = calculate_page_url(relative_path, data[:slug], data[:custom_path], language, data[:date], data[:title])
         return unless target_url
 
+        own_url = Utils::PathUtils.normalize_alias_url(target_url)
+        own_file_key = Utils::PathUtils.output_file_key(own_url)
         aliases.each do |alias_path|
+          # Aliases the build refuses (absolute or protocol-relative URLs,
+          # traversing paths) publish no redirect stub, so they get no host
+          # redirect either.
+          if reason = Utils::PathUtils.alias_refusal(alias_path)
+            Logger.warn "Skipping alias #{alias_path.inspect} on #{path}: #{reason}."
+            next
+          end
+          # An alias naming the page's own URL is skipped by the build (it
+          # would overwrite the page with a redirect to itself). Emitted
+          # here as a forced 301 from the page to itself, it made the page
+          # an endless redirect loop on Netlify/Vercel — including the
+          # `/moved` vs `/moved/` spelling, which those hosts match alike,
+          # and spellings of the same output FILE (`/moved//`), which the
+          # build compares by `output_file_key`.
+          norm = Utils::PathUtils.normalize_alias_url(alias_path)
+          next if norm == own_url
+          next if own_file_key && Utils::PathUtils.output_file_key(norm) == own_file_key
           # Carry base_path so generated redirects match the build's own
           # redirect HTML (`url=/myrepo/moved/`) on subpath deploys. Ensure a
           # leading slash first since with_base_path only prefixes root-relative
@@ -353,6 +476,12 @@ module Hwaro
           to = with_base_path(target_url)
           redirects << {from, to}
         end
+      rescue ex : ArgumentError | Hwaro::HwaroError | IO::Error
+        # One bad content file (invalid UTF-8 → ArgumentError from PCRE2,
+        # malformed frontmatter → HwaroError, unreadable file → IO::Error)
+        # must not abort ALL platform config generation — degrade per file,
+        # matching how check-links skips unreadable Markdown.
+        Logger.warn "Skipping #{path} while collecting aliases: #{ex.message}"
       end
 
       # Calculate the URL for a page through the same shared resolver as the
@@ -370,6 +499,7 @@ module Hwaro
           language: language,
           date: date,
           title: title,
+          version: @config.versions.for_path(relative_path),
         )
         return if error
         url

@@ -1,107 +1,118 @@
 # Changelog
 
-## Unreleased
+## v0.21.0
 
-### Fixed
-- HTML minifier no longer deletes rendered `&nbsp;`: Crystal's `\s` (UCP) matched U+00A0/U+3000, so a non-breaking space between two tags was downgraded to a breakable space or dropped outright
-- CSS minifier no longer mangles descendant combinators inside at-rule blocks (`@media screen{.card :hover{…}}` became the compound `.card:hover`), and a comment containing an apostrophe (`/* don't */`) no longer swallows the rules after it
-- `slugify()` treats the ideographic space U+3000 and U+00A0 as word separators instead of dropping them — CJK titles no longer weld into one slug segment
-- Block shortcodes whose name starts with a Jinja keyword (`callout`, `iframe`, `setup`, `format`, `blockquote`, …) expand again when closed with the named form `{% endcallout %}`; previously the raw shortcode source leaked into the published page. Hyphenated names (`include-code`) work too
-- `absolute_url`/`relative_url`/`url_for`/`get_url` leave `mailto:`, `tel:`, `data:` and protocol-relative `//host` URLs alone instead of prefixing base_url onto them
-- `resize_image(width="800")` and `truncate_words(length="20")` accept quoted numbers — every shortcode argument is a String, and these used to raise and abort the page render
-- `og:image`, `twitter:image` and JSON-LD `image` handle protocol-relative and `data:` values, and absolutize a relative path that merely starts with the letters "http"
-- `robots.txt` advertises the sitemap at the path the sitemap generator actually writes (a `filename` with a directory component pointed crawlers at a 404)
-- `get_taxonomy_url` on a multilingual site links to that language's term page (`/ko/tags/foo/`) when one exists — a term appearing only in non-default-language content previously linked to a root page that was never written
-- **Release binaries could hang forever at exit.** `-Dpreview_mt` is deprecated in Crystal 1.21 and its legacy MT scheduler spins in the event loop's spin lock at process exit, so `hwaro build` never returned (measured 4/120 short-lived runs under CPU oversubscription). Parallelism now comes from Crystal's execution contexts, sized in `src/main.cr`
-- Sass grouping parentheses no longer leak into declaration values (`width: (10px / 2)`, `margin: (1px 2px)`); a failing namespaced reference (`math.div(…)`) now warns with a `path:line:col` location instead of silently emitting invalid CSS
-- GFM tables with short alignment delimiters (`|:--|--:|`, `|:-:|`, `| - |`) render as tables; the delimiter cell now matches GFM's `:?-+:?` instead of requiring three hyphens
-- `hwaro tool check-links` stops reporting valid links as dead: angle-bracket destinations (`[t](</about/>)`, including ones containing spaces) and destinations with balanced parentheses (`/docs/foo_(bar)`)
-- An oversized `[image_processing] widths` entry no longer aborts the build with a bare `OverflowError`; the variant is declined by the existing pixel-count guard instead
-- A UTF-8 BOM no longer breaks parsing. Every parser hwaro hands file text to anchors on the first character, so a BOM'd file silently misbehaved: `.md` front matter fell through as body text (page titled "Untitled" with its literal `+++` block printed into the output), `config.toml` failed with `unexpected char '﻿' at 1:1`, and `.json`/`.toml` data files were warn-skipped until the render failed on the missing `site.data` key. Windows editors, "UTF-8 with BOM", and PowerShell `>` redirection all produce these files
-- `slug` works on leaf bundles again (`<dir>/index.md`): the permalink resolver skipped it for every index page, so converting a page to bundle layout — what `hwaro new --bundle` and multilingual siblings produce — silently reverted its URL to the directory name. Section indexes (`_index.md`) are deliberately unaffected, since their directory name is the prefix their child pages derive their own URLs from
-- `content/index.md` no longer republishes the entire `content/` tree. The homepage was treated as a page bundle spanning the whole site, so every non-Markdown file anywhere under `content/` (`private/internal.pdf`, `notes.txt`, `*.bak`) was copied into the output root — the `[content.files]` allowlist only guarded this when that section was present, and hand-written configs usually omit it. Recursion now also stops at nested `index.md`/`_index.md` instead of letting every ancestor index re-copy the same files
-- `--minify` is no longer silently undone for `.json`/`.xml` files inside a page bundle: the minified output was written first and then overwritten by the verbatim bundle-asset copy
-- Shortcode arguments accept an escaped quote (`caption="The \"big\" reveal"`). The value used to be truncated at the first `\"` — leaving a stray backslash — and a comma inside it re-split the argument list, dropping every argument that followed. `\\`, `\"` and `\'` are the only escapes, so `C:\new` and `\alpha` still round-trip verbatim
-- `redirect_to` is prefixed with `base_url`'s path component, like `aliases` already was; on a project-pages deployment under a subpath the redirect previously pointed at the domain root and 404'd. External and protocol-relative targets are left untouched
-
-- **A content path containing `..` silently destroyed the homepage.** `content/no..tes/index.md` or `content/a..b.md` had the offending segment *deleted* rather than refused, collapsing the page's URL to `/` — so it was written over `public/index.html`, with a success exit code, no warning, and a sitemap advertising a URL that 404s. Two such pages raced for the homepage, making the output nondeterministic. A segment that merely contains dots is an ordinary directory name and now publishes at its own URL; only a segment that traverses is refused, and the refusal is loud. The same silent relocation applied to a traversing `path`/`slug` in front matter and to traversing `aliases` entries — those are now refused with an actionable warning instead of being quietly rewritten to a cleaned path
-- **`hwaro build -o <dir>/` (trailing slash) published a broken site and reported success.** The output guard compared against a path that still carried the separator, so every page, taxonomy and feed write was rejected — and the rejected path fell back to `<output>/index.html`, so each skipped page overwrote the site root in turn. The site shipped with static assets, a homepage containing some other page's markup, and exit 0. The guard now normalizes trailing/duplicate separators, and a rejected path is skipped instead of overwriting the root
-- **`hwaro build -o content` recursively deleted the project's own sources.** The clean guard only refused `/`, `$HOME` and the cwd's ancestors, so a *child* of the project root passed straight through to `rm -rf`. `content`, `templates`, `static`, `data`, `i18n`, `themes`, `archetypes` and `.git` are now refused (`HWARO_E_CONFIG`); look-alike targets such as `-o contents` or `-o static-site` are unaffected
-- `--cache` honours output-affecting build flags. `hwaro build --cache --minify` on a warm cache served unminified HTML indefinitely — the invalidation key was built from config and data only, so `--minify`, `--skip-highlighting`, `--skip-cache-busting`, `--skip-og-image` and `--skip-image-processing` never reached it. This is the combination the incremental-build docs recommend
-- Listing pages no longer keep stale `[extra]`, `summary`, `word_count` or `reading_time` values under `--cache`: the page-set fingerprint omitted them, so a homepage or section index that displayed them was frozen at the first build. The fingerprint widens only for sites whose listing templates actually read those fields, and reads qualified by `page.`/`section.` (the current page's own values) do not trigger it — the built-in scaffolds rebuild exactly as many pages as before
-- `--cache` re-copies a static file whose mtime moved *backwards* (`git checkout` of an older branch, `git stash pop`, `rsync --times`). The incremental copy skipped any source not newer than its destination, with no content check, so the stale asset was served forever. Copies now carry the source mtime and are compared for equality
-- A `.hwaro_cache.json` shared between two `-o` targets no longer leaves the older tree permanently stale: cache entries validated the output only with `File.exists?`, so a CI job building prod and staging from one checkout stopped updating whichever tree it had not just written
-- `hwaro serve` sent the full 404 page as the body of a `HEAD` request, desynchronising keep-alive connections — a second pipelined request on the same connection got no response at all. `HEAD` now also reports the same `Content-Length` its matching `GET` would return, including the injected live-reload script
-- `hwaro serve` dropped `; charset=utf-8` from text responses of 32 KiB or more (`search.json`, `llms.txt`, large CSS/JS): the charset was patched onto `Content-Type` after the response body had already flushed the headers. Text MIME types now carry the charset from the start, at any size
-- `hwaro serve -b ::1` (any IPv6 bind) baked an unbracketed `http://::1:PORT` into the serve receipt, the ready signal and every generated link, so the dev site rendered unstyled with dead links. IPv6 literals are now bracketed everywhere a URL appears
-- `hwaro serve --no-error-overlay` genuinely suppresses the in-browser overlay; the flag only reached the per-page render-error HTML, so the full-screen "Build failed" panel still covered the page
-- `hwaro serve --base-url http://host/prefix/` mounts the site under that prefix instead of building prefixed URLs and serving them at the root — previously every stylesheet, script and internal link 404'd, making a project-pages deployment impossible to preview. `/` redirects to the mount point, unprefixed requests still resolve, and live reload, the watcher and the WebSocket endpoint work under the prefix
-- CORS preflight (`OPTIONS`) responses now carry `Cache-Control: no-store` and any `--header` / `[serve.headers]` values, which the docs already promised for *every* dev-server response
-- Directory redirects emit a percent-encoded `Location` (`/my%20page/`, `/%ED%95%9C%EA%B8%80/`) instead of raw spaces and raw UTF-8 bytes, and a path that sanitizes to nothing (`/%00`) no longer redirects to the malformed `Location: //`
-- The dev server no longer serves URL aliases that a static host 404s (`/guide%5Cindex.html`, `/%2Fguide%2Findex.html`), which made a broken link work locally and break after deploy. Percent-encoded unicode paths are unaffected — `/한글/` resolves raw and encoded
-- Unsupported HTTP methods get `405 Method Not Allowed` with `Allow: GET, HEAD, OPTIONS` instead of the 404 page
-- Deleting `public/` while `hwaro serve` is running recovers on the first save: the rebuild escalates to a full build instead of failing every page with a confusing temp-file error and needing a second save
-- **`hwaro tool check-links` reported every `/<lang>/…` link as dead on a multilingual site** — 288 of 576 links on hwaro's own docs — because target resolution never stripped a language prefix and never probed `<name>.<lang>.md`. Exit 1 made it unusable as a CI gate on the very site the scaffold generates
-- **`hwaro tool unused-assets --delete` permanently deleted assets that were in use.** Only `templates/**/*.{html,css,js}` and `static/**/*.{css,js}` were scanned for references, so an asset referenced from a `.jinja`/`.j2`/`.ecr` template, a `.scss` file, a feed `.xml`, a `.webmanifest` or an `.svg` was reported unused and removed. Scanning is now widened to every source that can reference an asset
-- `hwaro tool check-links` also checks reference-style links (`[t][ref]` + `[ref]: /dest/`) and raw HTML `<a href>` / `<img src>`, which it previously did not discover at all — a page full of HTML images got a clean bill of health. Footnote definitions, prose-bodied definitions and template expressions are excluded
-- `hwaro tool check-links` skips a file with invalid UTF-8 instead of aborting the whole scan with a bare `Regex match error`, exit 1 (indistinguishable from "dead links found") and an empty `--json` document
-- `hwaro doctor` recognizes `.jinja`/`.j2`/`.ecr` templates: a site whose templates use those extensions built fine but was reported as missing every required template (exit 4), and real syntax errors in them were never detected
-- `hwaro doctor --fix` / `--approve` / `--full` run the diagnostics and gate on what they could not fix; they previously printed only the fix summary and always exited 0, so a CI step of `hwaro doctor --fix` passed on a broken site
-- `hwaro tool stats` and `hwaro tool validate` no longer swallow a body that begins with `---`: after TOML front matter was stripped, the YAML-front-matter regex matched the body's own leading thematic break and deleted the first block, so its words went uncounted and its images were never checked for alt text
-- `hwaro tool stats` word counts match the `page.word_count` and reading time the site itself publishes (measured 30% apart); both now share one counting implementation
-- `hwaro tool list`, `stats` and `validate` strip ANSI/control bytes from content-supplied titles, tags and messages before printing, and the tables align correctly for CJK and emoji titles instead of measuring them one column wide
-- `hwaro tool list` fails with `HWARO_E_CONTENT` when the content directory does not exist, instead of printing an error on stderr, `[]` on stdout and exiting 0
-- A UTF-8 BOM no longer defeats front-matter detection in every importer and both exporters: title, date, tags and draft status were silently lost, the raw front matter leaked into the page body, and the Jekyll exporter misfiled the post as a page
-- Importers no longer silently drop content when two source files resolve to the same destination. WordPress, Hugo, Hexo, Obsidian and Astro had no collision handling — one file vanished, and `--force` clobbered it while still counting it as imported. Collisions now disambiguate with a warning, `--force` means "overwrite files that pre-date this import", and re-imports stay idempotent
-- A symlink cycle anywhere under the source tree (`ln -s .. notes/loop`) no longer aborts the entire import with a raw `Too many levels of symbolic links` and zero files written
-- Hugo page-bundle imports and exports carry the bundle's co-located assets, so `![](cover.png)` inside an imported bundle no longer 404s
-- The WordPress importer indents nested `<ul>`/`<ol>` lists instead of flattening them onto the parent item's line (`- b- b1`), which rendered as a single list item containing literal markup
-- `hwaro tool convert` reports why it failed. A missing content directory produced exit 1 with no diagnostic at all in human mode, while `--json` printed the real cause
-- The Hugo importer carries `authors` across (previously dropped, so `hwaro → hugo export → hugo import` lost attribution), and the Eleventy importer maps the site root `index.md` to `content/index.md` instead of burying it at `content/posts/index.md` — or dropping it entirely when it had no title
-- The Jekyll exporter emits `layout:` rather than hwaro's `template:`, so exported sites render with their layout and round-trip back through the importer
-- YAML front matter written for export escapes non-printable codepoints in the fixed-width `\xXX`/`\uXXXX`/`\UXXXXXXXX` forms YAML accepts, instead of Crystal's `\u{…}` brace form, which Jekyll's parser rejects
-- The Obsidian importer keeps the filename as alt text for a sized embed (`![[diagram.png|300]]`) instead of using the display width as the alt attribute
-- **`hwaro init --wizard --scaffold blog` created a stray directory named `blog`** and used the simple scaffold: the wizard's positional scan treated a flag's *value* as the target path. `--wizard` also discarded every other flag, so a user who passed `--force` was told to pass `--force` after answering all the prompts. Flags are now parsed first and the wizard fills only what was not supplied
-- `hwaro deploy` warns when `include` / `exclude` / `strip_index_html` cannot be applied. They were silently ignored for `s3://`, `gs://`, `az://` and `command` targets, so files the author explicitly excluded were uploaded anyway
-- `hwaro init` failures use the documented error taxonomy: a non-empty target, an unknown `--scaffold`/`--agents` value and a malformed remote source now exit 2 (`HWARO_E_USAGE`), and filesystem failures exit 6 (`HWARO_E_IO`), instead of a bare `Error:` and exit 1. A malformed remote source is also rejected before the target directory is created
-- The `bare` scaffold's opt-out is no longer dead code: its default config still enabled taxonomies, search and highlighting, producing a dead `search.json`, three empty taxonomy pages rendered by the section fallback, and a JSON-LD `SearchAction` pointing at nothing
-- `hwaro init --minimal-config --include-multilingual en,ko` no longer prints a false "ignoring `--include-multilingual`" warning — the languages were generated correctly all along, and following the warning produced a duplicate-key config
-- `hwaro new "notes/"` creates a page inside that section. The trailing slash — the one unambiguous "this is a directory" signal — was stripped before the decision, so the command meant different things depending on whether the directory already existed, and the second page in a new section was a hard error
-- `hwaro init` rejects extra positional arguments and honours `--`, instead of silently scaffolding an unquoted multi-word name into a directory called `My`
-- `hwaro completion` usage errors exit 2 with a classified message, matching the documented taxonomy
-- `--list-scaffolds` / `--list-archetypes` no longer swallow invalid flags alongside them (a mistyped `--json` yielded human text and exit 0), and `-j` is accepted as `--json` on `init` and `new` as it already was on `deploy`
-- `hwaro init .` works in a directory holding only VCS/OS metadata (`.git`, `.gitignore`, `.DS_Store`, …) — `git init` followed by `hwaro init .` was refused as "not empty"
-- `hwaro new` warns when an archetype overrides a customized `[content.new] front_matter_format` / `default_fields`, which every scaffolded project silently did because it ships `archetypes/default.md`
-- **A long site title crashed PNG OG image generation with a segfault.** The renderer writes through a raw pointer and only clipped the far edge of the canvas, but several coordinates are a fixed edge minus a *measured* text width, so a long `title` pushed the write cursor to a negative offset — silent heap corruption at a few thousand characters, `Invalid memory access (signal 11)` past a few hundred thousand. Every rectangle fill now clips both ends, and coordinates derived from text measurement saturate instead of raising `OverflowError`
-- A page or site title whose bytes end mid-UTF-8-sequence no longer makes the font renderer read past the end of the string. Front matter is not UTF-8 validated, and the C measure/render decoders advanced by the sequence's nominal length, stepping over the string's terminator
-- **A self-referencing YAML anchor (`x: &a` / `b: *a`) in front matter or a data file killed the build with `Stack overflow`.** Crystal's YAML parser accepts it and returns a *cyclic* value, so every recursive converter over that value ran until the stack died — unrescuable, exit 11, from two lines of a document. A source-nesting limit cannot see a cycle, so the guard now lives in the traversal: front matter reports `HWARO_E_CONTENT` like any other malformed block, and a data file is skipped with a warning
-- **A run of 44,000+ `-`, `*` or `_` on one line aborted the build** with `Regex::Error: JIT stack limit reached`. Markd matches thematic breaks with nested quantifiers, so PCRE2 recursed once per marker character — and the block parser offers every line to that rule, so a machine-generated separator or a pasted log divider was enough. Matching is now a linear scan with identical CommonMark semantics
-- Sass no longer hangs on runaway loops or selector nesting. `@for` had no iteration cap at all (`@for $i from 1 through 100000000` emitted rules until memory ran out) and per-loop caps do not survive nesting, so `@for`/`@each`/`@while` now share one budget. Separately, `&` in a deeply nested rule compounds the parent cross-product (10 → 10² → 10⁴ → 10⁸ selectors from eight lines of SCSS); the expansion is cost-checked before it is built
+### Added
+- Windows: static `hwaro-<tag>-windows-x86_64.exe` release asset, published to Chocolatey (`choco install hwaro`) (#829-#835, #860, #862)
+- Search: built-in search UI, per-heading records and facets (#854)
+- Build: privacy mode self-hosts external assets; automatic Content-Security-Policy with inline-script/style hashes (#855, #856)
+- Content: schema-validated front matter per section; `include_code` / `include_md` and note transclusion (#850, #852)
+- Markdown: wikilinks, embeds, foldable callouts and `page.backlinks` (#851)
+- Feeds: JSON Feed 1.1; `robots.txt` Content-Signal (#847)
+- Assets: Subresource Integrity and a `hwaro_stats.json` used-selector manifest (#848)
+- Images: intrinsic `<img>` dimensions and `resize_image` fill/crop (#845)
+- Menus filled from top-level sections; `hwaro serve` hot-swaps stylesheets on CSS-only rebuilds (#843, #844)
+- Deploy: `cache_control` / `content_type` / `gzip` matchers (#842)
+- `tool check-links` validates `#fragment` anchors; `doctor` reports missing translations (#846)
+- `sort_by = "published"` orders by `date` alone, ignoring `updated` (#865, #870)
+- Templates: inline `a if c else b` and comparison tests (`eq`, `lt`, `ge`, …); `youtube` shortcode `start` parameter (#801, #868)
 
 ### Changed
-- **Breaking (rendering):** a page bundle directly under `content/` (`content/about-bundle/index.md`) renders with `templates/page.html` instead of `templates/index.html`. It was being treated as the site homepage, so such a page published the homepage layout — hero, "Latest posts" listing and all — with its own body embedded in it. The real homepage (`content/index.md`) is unaffected. Sites using a top-level bundle will see that page's markup change on the first rebuild
-- **Breaking (rendering):** `{% raw %}` in Markdown content now suppresses shortcode expansion inside the block, as it always should have. The change propagates to derived artifacts, so pages using `{% raw %}` in prose will also see churn in `rss.xml` and `search.json` on the first rebuild
-- A symlinked output directory (`ln -s /var/www/site public`) is published *through* instead of being replaced: the cold build used to delete the link and leave a real directory in its place, so every later build published where nobody deploys. The published bytes are identical; what changes is the on-disk shape of `public`. Because the clean now reaches the link's target, the resolved destination is logged once before anything is removed
-- Taxonomy term slugs are capped at 245 bytes (a filesystem name limit is 255), with a digest suffix keeping distinct terms on distinct URLs, and the truncation is reported by a warning naming the term. Terms at or under the cap — every term on every existing site — keep their exact URL
-- `hwaro build` and `hwaro build --minify` emit identical page bytes for a page carrying a NUL byte (reachable through a data-file value). NUL is invalid in HTML text and is now dropped by the render phase on both paths; previously only `--minify` removed it, so an optional whitespace pass silently changed page content
-- **Breaking (packagers):** minimum Crystal is now 1.21, and no build path passes `-Dpreview_mt` any more. Worker count still honours `CRYSTAL_WORKERS` (now defaulting to the CPU count)
-- The automatic render-worker count now follows the site's **listing fan-out** instead of `cpu_count * 2`. What caps useful render parallelism is how many page objects one page render materializes from a site-wide collection — every `{% for p in site.pages %}` / `section.pages` iteration allocates per item, and past a small worker count Boehm's global allocation lock serializes that work while extra workers add only contention. The old CPU-derived default sat on the worst point of that curve on a 14-core machine, and the curves invert between workloads so no fixed value replaces it: on a 5000-page site whose `page` template lists every page, 28 workers cost **2.5x** (48.6s → 19.4s), while a 5000-page site with no per-page listing wanted *more* workers, not fewer (0.998s → 0.792s). Sites are now rendered with 1 worker at 500+ items materialized per page, 2 at 100-499, and up to 4 below that; a homepage that lists every page does not count against this, since the estimate is the mean across rendered pages rather than the max. `--jobs N` still overrides the heuristic outright, and output is byte-identical at every worker count
-- `hwaro build` tunes the Boehm GC at startup: `GC_MARKERS=1` and `GC_INITIAL_HEAP_SIZE=256M`, each honoured only when the variable is not already exported. Boehm's defaults — one marker thread per core and a tiny initial heap — are the worst shape for a short-lived, allocation-heavy build process, and the tuning measured 3-5x faster on template-heavy sites (64s → 14s on a 3000-page corpus on a 14-core Mac, 105s → 31s on Linux/musl) with every corpus at least slightly faster on both platforms. Costs a higher peak RSS during the build (docs site: 313MB → 390MB). Output is byte-identical. The heap presize steps aside for `--memory-limit` / `HWARO_MEMORYLIMIT`, other commands (`serve` included) keep stock GC behavior, and the injected variables are scrubbed from the environment before user hooks or deploy commands are spawned
-- `hwaro tool convert` names the files whose front-matter comments it drops. The blanket "comments are not preserved" notice fired on every run and identified nothing, so an in-place rewrite across hundreds of files gave no clue what it cost
-- Several failure paths moved off the legacy `Error:` / exit 1 form onto the documented taxonomy: `hwaro init` (non-empty target, bad `--scaffold`/`--agents`/remote source, extra positionals → exit 2; filesystem failures → exit 6), `hwaro completion` (missing or unknown shell → exit 2), `hwaro build --memory-limit` (invalid value → exit 2), `hwaro tool list` (missing content directory → exit 5), `hwaro tool convert` (missing content directory → exit 6), and `hwaro build -o <project source dir>` (refused → exit 3). `hwaro doctor --fix|--approve|--full` now exits non-zero when issues remain, so a CI step that was passing on a broken site will start failing
-- `hwaro init --scaffold bare` produces a smaller site: no `[[taxonomies]]`, `[search]` or `[highlight]` in `config.toml`, and no `search.json`, `/tags/`, `/categories/` or `/authors/` in the output. Other scaffolds are byte-identical
-- `hwaro tool stats` word counts and `hwaro tool check-links` link counts change, in both cases because the old numbers were wrong — stats now agrees with the site's own `page.word_count`, and check-links discovers reference-style and raw-HTML links it previously ignored
-- Files copied from `static/` into the output now carry the source file's mtime rather than the copy time. Content is unchanged, and output mtimes become stable across rebuilds
-- The first `hwaro build --cache` after upgrading re-renders everything once, because the invalidation key gained a build-options component
-- Importing sources that collide on one destination now produces `slug.md` plus `slug-1.md`, reported as one summary line at the end of the run (per-file detail moved behind `--verbose`), where one file used to be silently discarded. Anything grepping for `Destination collision:` should match `destination(s) renamed` instead. The walk is now sorted, so which file carries the suffix is reproducible rather than filesystem-order dependent
-- Jekyll exports carry `layout:` instead of `template:`; Eleventy imports place the site root `index.md` at the content root and map a collection landing page (`blog/index.md`) to `content/blog/_index.md` instead of dropping it
-- `hwaro tool check-links` reports a `/<lang>/…` link as dead when only the default-language source exists — previously it resolved against the untranslated page and passed. Expect it to surface real broken links on multilingual sites. A `/<code>/` prefix is only treated as a language when the code is 2-3 lowercase letters, matching what the build can actually route (so `pt-BR` is not mistaken for one), and a real section named like a language (`content/ko/`) resolves again
-- `hwaro doctor` accepts the template names the build actually honours (`page.jinja`, `page.j2`) and reports the ones it ignores (`page.html.jinja`, and templates that exist only in a subdirectory). Both directions were previously inverted
-- `hwaro tool validate --json` message strings carry the author's original bytes; zero-width and bidi characters were being stripped from the model, so a consumer could not match the tag it was told about. Terminal output still strips control characters
-- `hwaro doctor --fix|--approve|--full --json` gains `schema_version`, `issues`, `summary` and `exit_code`; existing keys are unchanged
-- `hwaro build` reports `built:` as the number of pages actually written, and adds a `skipped:` row (and a `pages_not_published` JSON field) when a page could not be published. Sites with URL collisions or `render = false` pages therefore report a smaller, truer number
-- `hwaro serve` mounts a `--base-url` subpath even when the startup build failed, keeps the mount point on redirects it canonicalises, sends `charset=utf-8` on HTML of any size, 404s URL aliases a static host would refuse (`%2F`, `%5C`, NUL) in both mounted and unmounted shapes, includes the mount point in the machine-readable ready URL, and logs the original request path
-- The shared path sanitizer (`PathUtils.sanitize_path`, used by importers, remote scaffolds, feeds and taxonomies) now drops a segment only when it is nothing but dots and spaces, instead of any segment containing `..`. Dotted directory names are preserved rather than flattened — an imported `content/no..tes/post.md` lands at `no..tes/post.md` instead of colliding at the section root — and `". "` is now rejected as well, since Windows normalizes it to `.`. Every traversal form the old rule neutralized stays neutralized (`..`, `%2e%2e`, `%252e%252e`, `....//`, backslash and mixed forms)
+- Faster builds with byte-identical HTML (up to −37% on listing-heavy sites); OG/PNG images deflate through zlib, ~24% smaller (#796, #874)
+- Page order is sorted by path instead of filesystem order, so `site.pages`, sitemap, search and listing ties are the same on every host (#866)
+- A TOML offset date-time keeps its written offset; date permalinks and year/month grouping use the written day — add the old URL to `aliases` if one moves (#811)
+- Template whitespace control (`{%-`, `-%}`) and `and`/`or` follow Jinja2; pages and generated outputs win over a content file at the same path (#868)
+- Taxonomy terms sort case-insensitively; untitled section crumbs show the directory name instead of "Untitled" (#863, #864, #870)
+- TOML 1.0 values that were rejected now parse (inline `{}`, `0x`/`0o`/`0b`, mixed arrays, …); JPEG EXIF orientation is applied to image variants and OG cards (#866)
+- Distribution recipes moved under `packaging/` (#869)
+
+### Fixed
+- Security: `[data.remote]` drops credentials for the rest of a cross-origin redirect chain; stale-output cleanup never follows symlinks out of the output directory; CLI writers refuse project-escaping symlinks; safe-mode image alt-text attribute injection (#804, #807, #868)
+- `--cache` and `hwaro serve` no longer publish stale output: removed pages, static/content files, search/sitemap/feed/llms files, taxonomy terms, aliases, pagination, AMP mirrors and superseded asset bundles are pruned, and racy mtime stamps are re-hashed (#798, #799, #803, #806, #814, #825, #858, #870)
+- Markdown: PCRE2 JIT-stack failures and quadratic slowdowns on long lines, plus extension, admonition and container edge cases (#800, #808, #817)
+- Config: wrong-shape sections, single-string lists, env substitution quoting and enum casing are reported or accepted instead of silently dropped (#815)
+- Doctor, init, deploy and every `tool` subcommand now resolve content the same way the build does (#813, #820-#822, #824)
+- Import/export: JSON front matter, TOML date/time fidelity and Hugo/Jekyll field mapping (#794, #811)
+- ~400 further crash and wrong-output bugs across build, serve, templates, Sass, assets and images (#805, #809, #810, #812, #816, #849, #866-#868)
+
+## v0.20.2
+
+### Added
+- Search: opt-in sharded index — `[search] shards` splits `search.json` per section/language with a manifest, plus `single_file` and `content_max_length` (#784)
+- Automatic summaries: pages without a `<!-- more -->` marker or `description` get `page.summary` from the first 70 words, tuned by `[content] summary_length`/`summary_ellipsis`; new `page.summary_truncated` (#786)
+- `[git]` config: one `git log` per build exposes `page.git` commit metadata and fills a missing `updated`/`date`, so sitemap, feeds and JSON-LD follow the file's real history (#785)
+- Versioned documentation: `[versions]` + `[[versions.list]]` publish doc versions side by side with `page.version`, version switchers, scoped navigation, canonical + noindex for older versions (#787)
+
+### Changed
+- Internal restructuring for parallel and AI-assisted development: per-concern file splits, a `SECTION_LOADERS` registry, deduplicated pipelines, contributor tooling (`just verify`, `changelog.d/`, `ARCHITECTURE.md`). Generated sites are byte-identical (#790)
+- Built-in shortcodes warn when a required argument is missing instead of emitting a dead embed (#791)
+
+### Fixed
+- `hwaro build --cache` deletes the output of pages that went away — a deleted, renamed, drafted or expired page kept its HTML, aliases, AMP mirror, OG image, taxonomy term page and pagination pages in `public/`. A warm `--cache` build is now byte-identical to a clean one (#791)
+- `--cache`: a page turned `render = false` no longer lingers in `sitemap.xml`, feeds, `search.json` and `llms.txt` (#791)
+- `hwaro build --stream` no longer ships raw shortcodes and unresolved `@/` links into feeds and the search index; also drops a second markdown pass per page (#791)
+- Custom heading ids may start with a digit: `## 1. 프로젝트 {#1-create-a-project}` sets that id instead of rendering literally, matching hwaro's own auto-slugs (#792, #793)
+- Syntax highlighting emits one span per run of same-class tokens — 9.6% fewer spans and 68 KB less HTML on the docs site, and `puts "hi"` reads correctly in search and feed summaries (#791)
+- `aria-hidden="true"` elements stay out of plain-text projections — anchor-link 🔗 and code line numbers no longer pollute the search index and excerpts (#791)
+- `resize_image().width` reports the chosen variant's actual width instead of the requested one, which never upscales (#791)
+
+## v0.20.1
+
+### Added
+- Markdown: admonition custom titles (`> [!NOTE] Custom`) and tables inside blockquotes (#777)
+
+### Fixed
+- macOS release tarballs are re-signed after their dylib load paths are rewritten — the v0.20.0 `osx-arm64` binary (and the Homebrew formula built from it) was SIGKILLed at launch on every Apple Silicon Mac (#782, #783)
+- `--cache`: warm builds no longer ship raw shortcodes into `search.json`/feeds, and static-copy/data-digest staleness gaps closed (#769, #775, #779, #781)
+- Template engine: three build-aborting crashes fixed, and every template error now reports its `file:line:col` (#768, #775, #781)
+- `hwaro build` keeps output directories it does not own instead of wiping them, and warns on silently skipped content and unknown config (#780)
+- Sass: `@import`/`@forward` module configuration and scope, list interpolation, `color.hwb()` alpha, `map.deep-remove()` keywords (#773, #778, #781)
+- Markdown: empty-heading ids, multi-backtick code spans, container closers, code-span restore no longer O(N²) (#771, #779, #781)
+- `hwaro serve`: request path restored after index rewrite, bind failures classified (#774, #781)
+- `hwaro tool`: `[build] output_dir` honored in platform configs, section feeds gated correctly in `check-links`, named `convert` failures (#770, #781)
+- Five `init`/`new`/`doctor` defects found by dogfooding every scaffold; `pwa.display` validated (#772, #776)
+
+## v0.20.0
+
+### Added
+- Remote data sources: `[[data.remote]]` in `config.toml` fetches an HTTP(S) endpoint into `site.data.<key>` — format inference (`json`/`toml`/`yaml`/`csv`), `${VAR}` env interpolation, a disk cache with TTL, and `on_error` handling (#753, #759, #763)
+- Content generation from data: `[[content.generate]]` turns each record of a `site.data` array into a first-class content page — listings, permalinks, taxonomies, feeds, search, sitemap and OG images all apply; authored files win a contested path (#764)
+- `.hwaro/` keeps itself out of version control: hwaro writes a self-ignoring `.hwaro/.gitignore` when creating the workspace (serve output, remote-data cache), and `hwaro init` scaffolds a project `.gitignore` covering the output directory, `.hwaro/`, and `.hwaro_cache.json` (#767)
+
+### Changed
+- `hwaro serve` builds into `.hwaro/serve/` instead of the deployable output directory, and `deploy`/`build` refuse dev-marked output — serve output can no longer poison a production build (#758, #762)
+
+### Fixed
+- `hwaro serve`: pre-build hooks rewriting identical bytes (`data/`, `templates/`, `static/`, `config.toml`) no longer trigger endless rebuild loops (#757, #760, #765)
+- `hwaro doctor` / `tool check-links` no longer validate against a build output directory they cannot trust — absent, stale or serve-written output is refused as evidence and reported as such (#761, #766)
+- Five crash paths on the CLI surfaces found by fuzzing (#751)
+- Dogfood fixes: JS bundle ASI-safe concatenation, blank taxonomy terms, absolute-URL aliases, AMP `loading` attribute (#748)
+- Nix flake repaired — it had never produced a working build (#754)
+
+## v0.19.0
+
+### Added
+- Sass: dart-sass parity round — `@extend`, classic `/` division, unit conversion, static `calc()` folding, the `sass:selector` module, `math`/`string`/`list`/`color` gaps, keyword and variadic arguments, nested properties, `@at-root` queries, `@charset`, and dart-style output formatting (#731, #735, #738)
+- `hwaro tool`: `check-links` discovers reference-style and raw-HTML links, `list` reports `[pub]`/`[draft]`/`[future]`/`[expired]`, `stats`/`validate` read `[taxonomies]` tables and JSON front matter (#734, #739)
+- `hwaro doctor`: SCSS diagnostics — a root `sass/` directory is never scanned, and `.scss` sources ship raw while `[sass]` is disabled (#742)
+- Init scaffolds: PWA wiring, multilingual menus, search fixes, Ember polish (#741)
+
+### Changed
+- **Breaking (packagers):** minimum Crystal is 1.21 and no build path uses `-Dpreview_mt` (#725)
+- **Breaking (rendering):** a page bundle directly under `content/` renders with `page.html` instead of `index.html`, and `{% raw %}` suppresses shortcode expansion inside the block (#722, #725)
+- `slugify` turns `/`, `\` and Unicode dashes into `-` instead of deleting them (`/tags/security-xss/`, `#ci-cd`); affected taxonomy URLs and heading anchors move on the next build (#742)
+- Builds are 3-5x faster on template-heavy sites: Boehm GC tuned at startup and the render worker count derived from listing fan-out. Output is byte-identical (#727, #728)
+- Failure paths moved onto the documented exit-code taxonomy (`init`, `completion`, `build`, `tool`), and `doctor --fix|--approve|--full` exits non-zero when issues remain (#722, #732)
+- `hwaro init --scaffold bare` no longer ships taxonomies, search or highlighting; a symlinked output directory is published through instead of replaced (#722, #725)
+
+### Fixed
+- **`hwaro deploy` wrote and deleted outside the destination** (symlinks in the target were followed) and **wiped the destination when run before `hwaro build`**. Also fixed: `~` paths, `--target NAME`, `--dry-run` validation, and single-slash scheme typos (`s3:/bucket`) deploying locally (#733)
+- Crash and hang audits — ~120 defects across build, serve, tool and init/new/deploy: a long title segfaulting PNG OG generation, a self-referencing YAML anchor overflowing the stack, a long `---` run hitting the regex JIT limit, unbounded Sass loops and selector explosion (#722, #725, #729, #730, #740)
+- `hwaro tool list`/`stats` now agree with `hwaro build` about what is published — future-dated, expired and cascade-drafted pages are no longer counted as shipped (#734)
+- `hwaro doctor`: false-green board, multilingual page bundles flagged as broken sections, `--fix` silently skipping a symlinked `config.toml`, remote `[og] default_image` reported missing, and `[doctor] ignore` typos silencing nothing (#732)
+- Importers/exporters: UTF-8 BOM, destination collisions, symlink cycles, Hugo page-bundle assets, Jekyll `layout:`, and `[taxonomies]` tags dropped on export (#722, #740)
+- `{{ pwa_tags }}` escapes interpolated values, and the scaffold search overlay ranks title matches above body matches again (#743)
+- Rendering: block shortcodes named after a Jinja keyword, URL helpers mangling `mailto:`/`data:`/`//host`, quoted numeric shortcode arguments, `og:image`/JSON-LD non-http values, the `robots.txt` sitemap path, and the minifier eating `&nbsp;` and descendant combinators (#720, #722)
 
 ## v0.18.1
 

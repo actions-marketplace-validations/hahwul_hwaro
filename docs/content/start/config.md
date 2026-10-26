@@ -7,7 +7,9 @@ toc = true
 
 All site configuration lives in `config.toml` at the project root.
 
-Unknown top-level keys are reported instead of silently ignored — a typo'd
+Any option documented as a list of strings also accepts a single string, which is read as a one-item list: `sections = "posts"` means `sections = ["posts"]`. An empty string, such as `exclude = "${SITEMAP_EXCLUDE:-}"` with the variable unset, counts as not set and keeps the default. A value that is neither a string nor a list (`fields = true`) is ignored with a warning. So is a boolean option given anything but `true` or `false`: `safe = "true"` (a quoted bool) keeps the default and warns.
+
+Unknown top-level keys are reported instead of silently ignored. A typo'd
 `[markdonw]` or `titel = "…"` would otherwise disable a feature with no
 feedback. Hwaro warns with a suggestion when one is close to a real key:
 
@@ -15,8 +17,15 @@ feedback. Hwaro warns with a suggestion when one is close to a real key:
 Unknown key 'markdonw' in config.toml — hwaro does not read it. Did you mean 'markdown'?
 ```
 
-The check covers top-level keys only; keys nested inside a section are
-validated by that section's own loader.
+The check covers top-level keys only: a misspelled key nested inside a
+section (`[markdown] emoij = true`) is not reported, so double-check nested
+keys against the tables below. A known section written in the wrong
+shape, such as `highlight = false` instead of a `[highlight]` table or
+`taxonomies = ["tags"]` instead of `[[taxonomies]]` entries, is ignored with a
+warning as well. `sitemap = true` is the one short form still accepted: it
+means `[sitemap] enabled = true`. A list of tables inside a section written with
+single brackets, such as `[robots.rules]` or `[menus.main]` instead of
+`[[robots.rules]]` or `[[menus.main]]`, is ignored with a warning too.
 
 ## Site Settings
 
@@ -31,6 +40,7 @@ base_url = "https://example.com"
 | title | string | Site title |
 | description | string | Site description |
 | base_url | string | Production URL (no trailing slash) |
+| default_language | string | Language code of unsuffixed content files (default `"en"`). See [Multilingual](/features/multilingual/) |
 
 ## Environment Variables
 
@@ -48,7 +58,7 @@ description = "${SITE_DESC:-My awesome site}"
 | `$VAR` | Same as above (bare form) |
 | `${VAR:-default}` | Use `default` if `VAR` is unset or empty |
 
-Missing variables without defaults are left as-is and produce a build warning. See [Environment Variables](/features/env-variables/) for template usage.
+Missing variables without defaults are left as-is and produce a build warning. An unset variable in `base_url` stops `hwaro build` with an error naming it unless `--base-url` is passed; `hwaro serve`, which uses its own local URL, and the other commands keep working. See [Environment Variables](/features/env-variables/) for template usage.
 
 ## Build Options
 
@@ -68,8 +78,22 @@ hooks.post = ["npm run minify"]
 | drafts | bool | false | Include draft content |
 | parallel | bool | true | Parallel processing |
 | cache | bool | false | Enable build caching |
+| template_deps | bool | true | Track template dependencies so a template edit only rebuilds the pages that render it |
+| write_stats | bool | false | Write `hwaro_stats.json` (tags, classes and ids used by the rendered pages) at the project root for Tailwind and similar tools. See [Asset Pipeline](/features/asset-pipeline/#used-selector-manifest-tailwind) |
 | hooks.pre | array | [] | Commands to run before build |
 | hooks.post | array | [] | Commands to run after build |
+
+`output_dir`, `drafts`, `parallel` and `cache` each back a `hwaro build` flag, and the flag wins:
+
+```
+command-line flag  >  config.toml  >  built-in default
+```
+
+So `hwaro build -o dist` overrides `output_dir` in config, and `hwaro build --drafts` still includes drafts when `drafts = false`. The reverse does not exist: there is no `--no-drafts` or `--no-cache` to turn a config value back off, so set those keys only when you want them on for every build. `--no-parallel` is the one exception, and it overrides `parallel = true`.
+
+`drafts`, `parallel` and `cache` apply to `hwaro serve` as well. `output_dir` does not: serve always builds into its own `.hwaro/serve/` and leaves `output_dir` untouched (see the [serve command](/start/cli/#serve)). `hwaro deploy` does follow `output_dir`: when `[deployment] source_dir` is not set, it deploys `output_dir` rather than assuming `public`.
+
+`output_dir` may be relative to the project or absolute. A relative path that escapes the project (`../out`) or an empty value is ignored with a warning, and the default `public` is used instead.
 
 See [Build Hooks](/features/build-hooks/) for error handling and use cases.
 
@@ -78,8 +102,8 @@ See [Build Hooks](/features/build-hooks/) for error handling and use cases.
 ```toml
 [markdown]
 safe = false
-lazy_loading = true
-emoji = true
+lazy_loading = false
+emoji = false
 footnotes = true
 task_lists = true
 definition_lists = true
@@ -100,14 +124,39 @@ math_engine = "katex"
 | mermaid | bool | false | Render ` ```mermaid ` blocks as `<div class="mermaid">` |
 | math | bool | false | Enable math syntax (`$...$` and `$$...$$`) |
 | math_engine | string | "katex" | Math rendering engine (`"katex"` or `"mathjax"`) |
+| admonitions | bool | true | GitHub-style `> [!NOTE]` blockquotes become admonition blocks |
+| heading_ids | bool | true | Custom heading IDs (`## Heading {#custom-id}`) |
+| ins | bool | false | Inserted text (`++text++` → `<ins>text</ins>`) |
+| mark | bool | false | Highlighted text (`==text==` → `<mark>text</mark>`) |
+| sub | bool | false | Subscript (`~text~` → `<sub>text</sub>`) |
+| sup | bool | false | Superscript (`^text^` → `<sup>text</sup>`) |
+| attributes | bool | false | Generalized `{#id .class key=val}` blocks on headings and inline images |
 | smart_punctuation | bool | false | Typographic quotes/dashes/ellipses (`"x"` → “x”, `--` → –, `...` → …) |
 | containers | bool | false | `:::note Title` … `:::` custom containers (admonition markup) |
+| wikilinks | bool | false | Obsidian syntax: `[[wikilinks]]`, `![[image]]` embeds, `![[note]]` transclusion and foldable `> [!type]-` callouts (see [Wikilinks & Backlinks](/writing/obsidian/)) |
 | insert_anchor_links | string | "none" | Site-wide heading anchor links: `"none"`, `"left"`, or `"right"` (page front matter overrides) |
 | external_links_target_blank | bool | false | Add `target="_blank" rel="noopener"` to absolute http(s) links |
 | external_links_no_follow | bool | false | Add `rel="nofollow"` to absolute http(s) links |
 | external_links_no_referrer | bool | false | Add `rel="noreferrer"` to absolute http(s) links |
 
 See [Markdown Extensions](/features/markdown-extensions/) for syntax details and examples.
+
+## Content
+
+```toml
+[content]
+summary_length = 70
+summary_ellipsis = "…"
+backlinks = false
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| summary_length | int | 70 | Automatic summary length for pages without `<!-- more -->` or `description`: words for space-delimited text, characters ×2 for CJK-dominant text. `0` disables the automatic summary |
+| summary_ellipsis | string | "…" | Appended to an automatic summary only when text was cut |
+| backlinks | bool | false | Fill `page.backlinks` with the pages linking to each page (see [Wikilinks & Backlinks](/writing/obsidian/#backlinks)) |
+
+See [Content Summary](/writing/pages/#content-summary) for how `page.summary` is chosen. `[content.files]`, `[content.new]`, `[[content.generate]]` and `[[content.schema]]` are documented in the feature reference below.
 
 ## Permalinks
 
@@ -123,7 +172,7 @@ Rewrite content directory paths to custom URL paths. Useful for site restructuri
 |-------------------|-------------------|----------------|
 | `content/old/posts/a.md` | `posts/` | `/old/posts/a/` -> `/posts/a/` |
 
-Rules are evaluated in declaration order and the **first** source that matches the page's directory (exactly or as a parent prefix) wins — later rules are never consulted for that page. Declare specific prefixes before broad ones (`"posts/tech"` before `"posts"`), or the broad rule shadows the specific one. This applies to token patterns too, and especially to the `""` catch-all: put it **last**, after every other rule.
+Rules are evaluated in declaration order and the **first** source that matches the page's directory (exactly or as a parent prefix) wins. Later rules are never consulted for that page. Declare specific prefixes before broad ones (`"posts/tech"` before `"posts"`), or the broad rule shadows the specific one. This applies to token patterns too, and especially to the `""` catch-all: put it **last**, after every other rule.
 
 ### Token patterns
 
@@ -150,9 +199,9 @@ Notes:
 
 - Tokens must be whole path segments; unknown tokens fail the config load.
 - Patterns apply to leaf pages only. Section `_index` and bundle `index` pages skip pattern rules (they keep their directory URL, or a later plain remap rule).
-- A page without a `date` that matches a pattern using `:year`/`:month`/`:day` fails the build — add a date, set an explicit `path` in front matter, or drop the date tokens. Pages that never publish are exempt: drafts (without `--drafts`), expired/future-dated pages, and headless `render: false` pages don't block the build.
+- A page without a `date` that matches a pattern using `:year`/`:month`/`:day` fails the build. Add a date, set an explicit `path` in front matter, or drop the date tokens. Pages that never publish are exempt: drafts (without `--drafts`), expired/future-dated pages, and headless `render: false` pages don't block the build.
 - An explicit `path` in front matter always wins over any permalink rule.
-- An empty source key (`""` or `"/"`) makes a pattern rule a catch-all for every page — declare it last, since first-match ordering means it would shadow any rule after it.
+- An empty source key (`""` or `"/"`) makes a pattern rule a catch-all for every page. Declare it last, since first-match ordering means it would shadow any rule after it.
 - For non-default languages the `/lang/` prefix comes first: `/ko/2026/03/05/hello/`.
 
 ## Links
@@ -162,13 +211,17 @@ Control how unresolved `@/path.md` internal links are treated during the build.
 ```toml
 [links]
 broken_internal = "error"
+broken_anchors = "warn"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | broken_internal | string | "warn" | `"warn"` logs each unresolved `@/` link and keeps the raw markup; `"error"` fails the build (exit code 5) with one aggregated list of every offender |
+| broken_anchors | string | "ignore" | `"warn"` or `"error"` checks `@/page.md#id` and same-page `#id` links in page content against the `id`/`name` attributes in the target's rendered HTML (headings, `{#id}`, shortcodes, templates, footnotes); `"error"` fails the build listing `source → link → missing id`. `"ignore"` skips the check |
 
 See [Internal Links](/writing/pages/#internal-links) for the `@/` link syntax and the `--cache` caveat in strict mode.
+
+The anchor check reads each target page's output file after the render phase, so on `--cache` and `serve` rebuilds a target that was not re-rendered is checked as last written (no false positives). Only links in pages rendered in that pass are checked; run a cold build in CI for a complete check.
 
 ## Taxonomies
 
@@ -189,7 +242,7 @@ feed = true
 | feed | bool | false | Generate RSS feed for each term |
 | sitemap | bool | true | Include taxonomy pages in sitemap |
 | paginate_by | int | — | Items per page on term pages |
-| sort_by | string | "date" | Order of pages within a term: `"date"` (newest first), `"title"`, or `"weight"` |
+| sort_by | string | "date" | Order of pages within a term: `"date"` (newest first), `"published"` (newest first, ignoring `updated`), `"title"`, or `"weight"` |
 | reverse | bool | false | Flip whichever order `sort_by` produced |
 | terms_sort_by | string | "name" | Order of the terms list on the taxonomy index: `"name"` or `"count"` |
 
@@ -222,9 +275,20 @@ weight = 2
 
 Pages/sections can also join a menu from their own front matter (`menus = ["main"]`) without touching this file. A `[languages.<code>]` block with no menus table inherits this global set; declaring `[[languages.<code>.menus.<name>]]` replaces it for that language. See [Menus](/features/menus/) for the full reference (hierarchy, per-language behavior, `active_path` styling).
 
+To fill a menu from the top-level sections automatically (Hugo's `sectionPagesMenu`), name it under `[menus]`:
+
+```toml
+[menus]
+auto_sections = "main"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| auto_sections | string | none (off) | Menu that every top-level section joins (`identifier` = directory name, `name` = title, `url`, `weight`). Draft, unpublished, headless, `transparent` and off-site `redirect_to` sections are skipped, as is a directory without `_index.md`; an explicit entry with the same `identifier` wins. Reserved key: a non-string or blank value is a config error. See [Automatic Section Menus](/features/menus/#automatic-section-menus). |
+
 ## Static Files
 
-Everything under `static/` is copied verbatim into the site root, preserving its directory structure — `static/css/app.css` is served at `/css/app.css`. Hidden entries are included too, so `static/.well-known/security.txt` is published at `/.well-known/security.txt`. By default Hwaro filters out common OS, editor, and VCS cruft so it never ships to production.
+Everything under `static/` is copied verbatim into the site root, preserving its directory structure, so `static/css/app.css` is served at `/css/app.css`. Hidden entries are included too, so `static/.well-known/security.txt` is published at `/.well-known/security.txt`. By default Hwaro filters out common OS, editor, and VCS cruft so it never ships to production.
 
 ```toml
 [static]
@@ -237,11 +301,11 @@ exclude = ["*.bak", "drafts/**"]         # extra patterns to skip
 | use_default_excludes | bool | true | Filter the built-in cruft denylist (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `.git`, vim swap files, …) |
 | exclude | array | [] | Extra patterns to skip. A glob like `*.bak` matches at any depth, `drafts/**` scopes a subtree, and a literal name is anchored to an exact file or directory (`drafts` drops `drafts/…`) |
 
-The built-in denylist only removes cruft — legitimate dot-paths such as `.well-known/` and `.domains` are **never** filtered and are always published, identically for cold and `--cache`/incremental builds. Set `use_default_excludes = false` to disable the built-in filtering entirely.
+The built-in denylist only removes cruft. Legitimate dot-paths such as `.well-known/` and `.domains` are **never** filtered and are always published, identically for cold and `--cache`/incremental builds. Set `use_default_excludes = false` to disable the built-in filtering entirely.
 
 ## Development Server
 
-Options for `hwaro serve` only — they never affect `hwaro build` output.
+Options for `hwaro serve` only. They never affect `hwaro build` output.
 
 ```toml
 [serve]
@@ -265,31 +329,40 @@ Each feature has its own documentation with full configuration details. Below is
 
 | Config Section | Documentation | Description |
 |----------------|---------------|-------------|
-| `[feeds]` | [SEO](/features/seo/) | RSS/Atom feed generation |
+| `[feeds]` | [SEO](/features/seo/) | RSS/Atom/JSON Feed generation |
 | `[sitemap]` | [SEO](/features/seo/) | Sitemap XML generation |
-| `[robots]` | [SEO](/features/seo/) | Robots.txt generation |
+| `[robots]` | [SEO](/features/seo/) | Robots.txt generation (including Content-Signal lines) |
 | `[og]` | [SEO](/features/seo/) | OpenGraph & Twitter Card meta tags |
 | `[og.auto_image]` | [Auto OG Images](/features/og-images/) | Auto-generate OG preview images (including `lazy_generate` for fast dev server) |
 | `[search]` | [Search](/features/search/) | Client-side search index |
 | `[highlight]` | [Syntax Highlighting](/features/syntax-highlighting/) | Code syntax highlighting |
 | `[pagination]` | [Pagination](/features/pagination/) | Section pagination |
 | `[auto_includes]` | [Auto Includes](/features/auto-includes/) | Auto-include CSS/JS files |
-| `[assets]` | [Asset Pipeline](/features/asset-pipeline/) | CSS/JS minification & fingerprinting |
+| `[assets]` | [Asset Pipeline](/features/asset-pipeline/) | CSS/JS minification & fingerprinting, Subresource Integrity (`sri`) |
 | `[sass]` | [Sass/SCSS](/features/sass/) | Built-in SCSS compilation (pure Crystal) |
 | `[image_processing]` | [Image Processing](/features/image-processing/) | Image resizing & LQIP |
 | `[image_processing.lqip]` | [Image Processing](/features/image-processing/#lqip-low-quality-image-placeholders) | Base64 blur-up placeholders |
 | `[content.files]` | [Content Files](/features/content-files/) | Publish non-Markdown files |
+| `[content.new]` | [Archetypes](/writing/archetypes/) | Default front matter and bundle style for `hwaro new` |
+| `[[content.generate]]` | [Content Generation](/features/content-generation/) | Materialize `site.data` records into pages |
+| `[[content.schema]]` | [Front Matter Schema](/writing/schema/) | Per-section front-matter types, required fields, enums, bounds and defaults |
+| `[[data.remote]]` | [Remote Data Sources](/features/remote-data/) | Fetch remote data into `site.data` at build time |
+| `[outputs]` | [Output Formats](/features/output-formats/) | Extra per-page/per-section output formats (JSON, XML, TXT, CSV) |
+| `[privacy]` | [Privacy Mode](/features/privacy/) | Self-host third-party fonts, scripts and images at build time |
+| `[csp]` | [Content Security Policy](/features/csp/) | Content-Security-Policy from inline script/style hashes (`_headers` or `<meta>`) |
 | `[static]` | [Static Files](#static-files) | Filter cruft / exclude paths from the `static/` copy |
 | `[serve]` | [Development Server](#development-server) | Dev-server response headers & fast mode |
 | `[links]` | [Links](#links) | Broken internal `@/` link handling (warn or fail the build) |
 | `[series]` | [Series](/features/series/) | Group posts into ordered series |
 | `[related]` | [Related Posts](/features/related-posts/) | Related content recommendations |
+| `[git]` | [Git Metadata](/features/git-info/) | `page.git` commit info and `updated`/`date` fallbacks from history |
 | `[llms]` | [LLMs.txt](/features/llms-txt/) | AI/LLM crawler instructions |
 | `[pwa]` | [PWA](/features/pwa/) | Progressive Web App support |
 | `[amp]` | [AMP](/features/amp/) | Accelerated Mobile Pages |
 | `[deployment]` | [Deploy](/deploy/) | Deploy targets configuration |
 | `[doctor]` | [Doctor](/start/tools/doctor/) | Suppress known diagnostic issues |
 | `languages.*` | [Multilingual](/features/multilingual/) | Multi-language support |
+| `[versions]` / `[[versions.list]]` | [Versioned Docs](/features/versioned-docs/) | Several documentation versions side by side |
 | `[[menus.*]]` | [Menus](/features/menus/) | Named navigation menus |
 
 ## Plugins
@@ -345,7 +418,7 @@ url = "/posts/"
 # Feature sections — see Feature Configuration Reference above
 # [feeds], [sitemap], [robots], [og], [search], [highlight],
 # [pagination], [auto_includes], [assets], [sass], [image_processing],
-# [series], [related], [llms], [pwa], [amp], [deployment], etc.
+# [series], [related], [git], [llms], [pwa], [amp], [deployment], etc.
 ```
 
 ## See Also

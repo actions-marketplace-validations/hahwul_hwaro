@@ -6,6 +6,10 @@ weight = 10
 
 hwaro 콘텐츠를 다른 정적 사이트 생성기 형식으로 내보냅니다. `hwaro tool import`의 반대 방향 작업입니다.
 
+원본 파일의 프론트 매터는 TOML(`+++`), YAML(`---`), JSON(`{...}`)을 지원합니다.
+세 형식 모두 동일한 필드 매핑과 초안 제외 규칙을 적용합니다. 잘못된 JSON 프론트
+매터는 본문에 복사하지 않고 내보내기 오류로 보고합니다.
+
 ```bash
 # Hugo로 내보내기
 hwaro tool export hugo
@@ -35,10 +39,47 @@ hwaro tool export hugo --verbose
 | 플래그 | 설명 |
 |------|-------------|
 | -o, --output DIR | 출력 디렉터리 (기본값: export) |
-| -c, --content DIR | 콘텐츠 디렉터리 (기본값: content) |
+| -c, --content-dir DIR | 콘텐츠 디렉터리 (기본값: content) |
 | -d, --drafts | 초안 콘텐츠 포함 |
+| --dry-run | 아무것도 쓰지 않고 모든 대상 경로 미리보기 |
 | -v, --verbose | 상세 출력 표시 |
+| -j, --json | 파일별 매니페스트를 JSON으로 출력 |
 | -h, --help | 도움말 표시 |
+
+같은 디렉터리로 다시 내보내면 이전 출력을 **대체**합니다. 이것이 일반적인
+갱신 워크플로입니다. 기존 파일을 대체한 실행은 요약에 개수와 함께 경고가
+표시되고, JSON 매니페스트에서는 해당 행이 `overwritten`으로 표시됩니다(새
+대상은 `exported`). 쓰기 전에 전체 매니페스트를 보려면 `--dry-run`을
+사용하세요.
+
+## JSON 출력
+
+```json
+{
+  "success": true,
+  "dry_run": false,
+  "exported_count": 2,
+  "skipped_count": 0,
+  "error_count": 0,
+  "files": [
+    { "path": "export/_posts/2024-01-01-hello.md", "action": "exported" },
+    { "path": "export/about.md", "action": "overwritten" }
+  ]
+}
+```
+
+`files`에는 콘텐츠 에셋을 포함해 기록된 모든 대상 경로가 나열되며,
+카운트는 콘텐츠 문서만 셉니다.
+
+## 콘텐츠 에셋
+
+빌드가 `content/`에서 게시하는 Markdown 이외의 파일은 모두 같은 상대 경로로
+내보냅니다. 페이지 번들과 섹션의 파일(`[content.files]`가 설정되어 있으면 그 규칙으로
+거름), 트리 어디에 있든 `[content.files]`에 맞는 파일, 그리고 원시 `.json`/`.xml`
+파일이 대상입니다. 내보내지 않은 초안의 파일은 빌드와 마찬가지로 제외됩니다.
+Hugo는 `index.md`/`_index.md` 옆의 파일을 번들 리소스로 읽습니다. Jekyll로 내보낼 때
+`_posts/`나 `_drafts/`로 평탄화된 글 번들은 파일을 둘 디렉터리가 없으므로, 대신
+경고로 파일 이름을 알려 줍니다.
 
 ## 필드 매핑
 
@@ -53,12 +94,21 @@ hwaro tool export hugo --verbose
 | updated | lastmod |
 | tags | tags |
 | series | series |
-| aliases | aliases |
+| aliases | aliases (상대 alias에는 앞에 `/`를 붙임. 빌드가 건너뛰는 절대 URL, `//host`, `..` alias는 제외) |
 | image | images (배열) |
 | expires | expiryDate |
 | weight | weight |
+| path | url (`/<path>/`) |
+| in_sitemap = false | sitemap = { disable = true } |
+| [taxonomies] 테이블 | 최상위 `tags` / `categories` / … 로 승격 |
+
+그 외 프론트 매터 키는 Hugo 페이지 파라미터로 그대로 전달됩니다.
 
 출력 구조는 `export/content/` 아래에 원본 디렉터리 배치를 그대로 유지합니다.
+사이트 루트의 `index.md`, 또는 아래에 다른 페이지가 있는 `index.md`는
+`_index.md`로 기록됩니다. Hugo는 `index.md`를 리프 번들로 읽어 그 아래의 모든
+페이지를 번들 리소스로 바꾸기 때문입니다. 리프 번들(`posts/my-post/index.md`)은
+이름을 그대로 유지합니다.
 
 ### Jekyll
 
@@ -71,12 +121,23 @@ hwaro tool export hugo --verbose
 | tags | tags |
 | categories | categories |
 | image | image |
+| template | layout |
+| path | permalink (`/<path>/`) |
+| aliases | redirect_from (jekyll-redirect-from. 빌드가 건너뛰는 alias는 제외) |
+| updated | last_modified_at |
+| in_sitemap = false | sitemap: false (jekyll-sitemap) |
+| [taxonomies] 테이블 | 최상위 `tags` / `categories` / … 로 승격 |
 
 출력 규칙:
-- 일반 글은 `_posts/`에 `YYYY-MM-DD-slug.md` 파일명으로 저장
-- 초안 글은 날짜 접두사 없이 `_drafts/`에 저장
-- 섹션 인덱스 파일(`_index.md`)은 `index.md` 페이지로 변환
-- 프론트 매터는 TOML(`+++`)에서 YAML(`---`)로 변환
+- 최상위 `posts/` 또는 `blog/` 섹션 아래의 날짜가 있는 페이지는 `_posts/`에 `YYYY-MM-DD-slug.md` 파일명으로 저장. 그 밖의 페이지(`about.md`, `docs/…`)는 날짜 유무와 관계없이 원래 디렉터리 구조를 유지
+- `_posts/`로 옮겨진 글에는 `path`나 `permalink`가 이미 없는 한 `permalink: /<섹션>/<이름>/`(hwaro 주소)가 붙으므로, 변환된 `@/` 링크와 외부 링크가 Jekyll의 `/YYYY/MM/DD/name.html`로 바뀌지 않고 그대로 동작합니다
+- 초안 글(`posts/` 또는 `blog/` 아래, `--drafts`로 내보낸 경우)은 날짜 접두사 없이 `_drafts/`에 저장
+- `redirect_from`은 Jekyll `_config.yml`의 `plugins:`에서 [jekyll-redirect-from](https://github.com/jekyll/jekyll-redirect-from) 플러그인을 켰을 때만 리다이렉트됩니다(GitHub Pages에서는 허용 목록에 있을 뿐 기본으로 켜져 있지 않음)
+- 섹션 인덱스 파일(`_index.md`, 그리고 `_index.ko.md` 같은 번역본)은 `index.md`(`index.ko.md`) 페이지로 변환
+- 프론트 매터는 TOML, YAML, JSON에서 YAML(`---`)로 변환
+- `[taxonomies]` 테이블은 최상위 키로 승격됩니다. Hugo도 Jekyll도 중첩 테이블에서
+  분류 소속을 읽지 않기 때문입니다. 같은 이름의 최상위 키가 이미 있으면 그쪽이
+  우선하며, 이는 빌드가 둘을 해석하는 순서와 같습니다
 
 ## 내부 링크
 
@@ -87,8 +148,17 @@ hwaro tool export hugo --verbose
 [About](@/about/_index.md)
 
 <!-- Exported -->
-[About](/about)
+[About](/about/)
 ```
+
+섹션 `_index.md`와 페이지 번들 `index.md`는 모두 해당 디렉터리 URL로 변환됩니다.
+코드 블록이나 인라인 코드 안의 링크는 빌드에서도 해석하지 않으므로 작성한
+그대로 유지됩니다.
+
+번역본으로의 링크(`@/about.ko.md`, `ko`가 `[languages]`에 선언된 경우)는 Hugo로
+내보낼 때 Hugo와 빌드가 모두 제공하는 URL인 `/ko/about`이 됩니다. Jekyll에는 언어
+개념이 없으므로 내보낸 파일을 가리킵니다(`/about.ko`, `@/docs/_index.ko.md`는
+`/docs/index.ko`).
 
 ## 출력 예시
 

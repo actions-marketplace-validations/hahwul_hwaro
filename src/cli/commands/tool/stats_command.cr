@@ -23,8 +23,14 @@ module Hwaro
           POSITIONAL_ARGS    = [] of String
           POSITIONAL_CHOICES = [] of String
 
+          # Historical default for the tag chart; `--top` overrides it.
+          DEFAULT_TOP_TAGS = 15
+
+          TOP_FLAG = FlagInfo.new(short: nil, long: "--top", description: "Show the top N tags in the chart (default: #{DEFAULT_TOP_TAGS})", takes_value: true, value_hint: "N")
+
           FLAGS = [
             CONTENT_DIR_FLAG,
+            TOP_FLAG,
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -42,12 +48,32 @@ module Hwaro
           def run(args : Array(String))
             content_dir = "content"
             json_output = false
+            top = DEFAULT_TOP_TAGS
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool stats [options]"
               CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
+              CLI.register_flag(parser, TOP_FLAG) do |v|
+                parsed = v.to_i?
+                unless parsed && parsed > 0
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: "Invalid --top value: #{v}",
+                    hint: "Pass a positive integer, e.g. --top 25.",
+                  )
+                end
+                top = parsed
+              end
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
+              parser.unknown_args do |before_dash, after_dash|
+                unknown = before_dash + after_dash
+                raise Hwaro::HwaroError.new(
+                  code: Hwaro::Errors::HWARO_E_USAGE,
+                  message: "unexpected extra argument(s): '#{unknown.join("', '")}'",
+                  hint: "hwaro tool stats accepts options only.",
+                ) unless unknown.empty?
+              end
             end
 
             Runner.enable_json_mode! if json_output
@@ -57,12 +83,13 @@ module Hwaro
               result = stats.run
             rescue ex
               if json_output
-                err = Hwaro::HwaroError.new(
+                # Keep a classified failure's own code and hint instead of
+                # re-labelling every one of them HWARO_E_CONTENT.
+                err = ex.as?(Hwaro::HwaroError) || Hwaro::HwaroError.new(
                   code: Hwaro::Errors::HWARO_E_CONTENT,
                   message: ex.message || "stats failed",
                 )
-                puts err.to_error_payload.to_json
-                exit(err.exit_code)
+                Runner.exit_with_error_payload(err)
               else
                 raise ex
               end
@@ -73,6 +100,8 @@ module Hwaro
                 "total"      => result.total,
                 "published"  => result.published,
                 "drafts"     => result.drafts,
+                "future"     => result.future,
+                "expired"    => result.expired,
                 "word_count" => {
                   "total"   => result.words_total,
                   "average" => result.words_avg,
@@ -96,7 +125,7 @@ module Hwaro
             # what `build` ships), then bar-chart sections and one outcome.
             receipt = Logger::Receipt.new("stats", content_dir)
             receipt.row("total", "#{result.total.format} #{result.total == 1 ? "file" : "files"}",
-              emphasis: result.drafts > 0 ? "#{result.drafts.format} #{result.drafts == 1 ? "draft" : "drafts"}" : nil)
+              emphasis: unpublished_emphasis(result))
             receipt.row("words", "#{result.words_total.format} total · #{result.words_avg.format} avg")
             receipt.row("range", "#{result.words_min.format} min · #{result.words_max.format} max")
             receipt.emit
@@ -104,17 +133,21 @@ module Hwaro
             # Top tags — bars scale against the most-used tag.
             unless result.tags.empty?
               Logger.info ""
-              Logger.section("tags", result.tags.size > 15 ? "top 15" : nil)
+              Logger.section("tags", result.tags.size > top ? "top #{top}" : nil)
               # Tag names come from semi-trusted front matter — strip control
               # bytes so a crafted tag can't inject ANSI into the report.
-              top_tags = result.tags.first(15).map { |tag, count| {Utils::TextUtils.strip_control(tag), count} }
+              top_tags = result.tags.first(top).map { |tag, count| {Utils::TextUtils.strip_control(tag), count} }
               max_count = top_tags.max_of { |_, count| count }
-              label_width = top_tags.max_of { |tag, _| tag.size }.clamp(0, 20)
+              # Measure and pad in terminal COLUMNS, not codepoints: a CJK or
+              # emoji tag renders wider than its codepoint count, so
+              # `size`/`ljust` misaligned every row after it.
+              label_width = top_tags.max_of { |tag, _| Utils::TextUtils.display_width(tag) }.clamp(0, 20)
               top_tags.each do |tag, count|
-                Logger.info "    #{truncate_label(tag, label_width).ljust(label_width)}  #{count.to_s.rjust(4)}  #{Logger.bar(count, max_count)}"
+                label = Utils::TextUtils.pad_display(truncate_label(tag, label_width), label_width)
+                Logger.info "    #{label}  #{count.to_s.rjust(4)}  #{Logger.bar(count, max_count)}"
               end
-              if result.tags.size > 15
-                Logger.info "    … and #{result.tags.size - 15} more"
+              if result.tags.size > top
+                Logger.info "    … and #{result.tags.size - top} more"
               end
             end
 
@@ -129,15 +162,44 @@ module Hwaro
             end
 
             Logger.info ""
-            Logger.outcome("counted",
-              "#{result.total.format} #{result.total == 1 ? "file" : "files"} · #{result.published.format} published · #{result.drafts.format} #{result.drafts == 1 ? "draft" : "drafts"}")
+            summary = "#{result.total.format} #{result.total == 1 ? "file" : "files"} · " \
+                      "#{result.published.format} published · " \
+                      "#{result.drafts.format} #{result.drafts == 1 ? "draft" : "drafts"}"
+            # Future/expired files are dropped by a default build exactly like
+            # drafts, so name them instead of folding them into "published".
+            summary += " · #{result.future.format} future" if result.future > 0
+            summary += " · #{result.expired.format} expired" if result.expired > 0
+            Logger.outcome("counted", summary)
           end
 
-          # Cap a bar-chart label to the column width, marking the cut with an
-          # ellipsis so rows stay aligned even for very long tag names.
+          # Receipt emphasis naming everything a default build will NOT ship.
+          private def unpublished_emphasis(result : Services::StatsResult) : String?
+            parts = [] of String
+            parts << "#{result.drafts.format} #{result.drafts == 1 ? "draft" : "drafts"}" if result.drafts > 0
+            parts << "#{result.future.format} future" if result.future > 0
+            parts << "#{result.expired.format} expired" if result.expired > 0
+            parts.empty? ? nil : parts.join(" · ")
+          end
+
+          # Cap a bar-chart label to `width` terminal COLUMNS, marking the cut
+          # with an ellipsis so rows stay aligned even for very long tag
+          # names. Walks characters by display width, the same way
+          # ContentLister#truncate does — codepoint slicing let a long CJK
+          # tag claim double the column and skipped truncating it at all.
           private def truncate_label(label : String, width : Int32) : String
-            return label if label.size <= width
-            "#{label[0, width - 1]}…"
+            return label if Utils::TextUtils.display_width(label) <= width
+
+            budget = width - 1
+            kept = String.build do |io|
+              used = 0
+              label.each_char do |c|
+                w = Utils::TextUtils.display_width(c.to_s)
+                break if used + w > budget
+                io << c
+                used += w
+              end
+            end
+            "#{kept}…"
           end
         end
       end

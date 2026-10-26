@@ -16,138 +16,10 @@ require "csv"
 require "crinja"
 require "./filters/*"
 require "../../utils/crinja_utils"
-require "../../utils/errors"
 
 module Hwaro
   module Content
     module Processors
-      # Context for template variable resolution
-      class TemplateContext
-        getter page : Models::Page
-        getter config : Models::Config
-        getter variables : Hash(String, Crinja::Value)
-
-        def initialize(@page : Models::Page, @config : Models::Config)
-          @variables = build_variables
-        end
-
-        # Add a pre-built Crinja::Value to the context
-        def add(name : String, value : Crinja::Value)
-          @variables[name] = value
-        end
-
-        # Add a scalar value (String, Bool, Int, Nil) to the context
-        def add(name : String, value : String | Bool | Int32 | Int64?)
-          @variables[name] = Crinja::Value.new(value)
-        end
-
-        # Add an array of strings to the context
-        def add(name : String, value : Array(String))
-          @variables[name] = Crinja::Value.new(value.map { |v| Crinja::Value.new(v) })
-        end
-
-        # Add a string-keyed hash to the context
-        def add(name : String, value : Hash(String, String))
-          hash = {} of Crinja::Value => Crinja::Value
-          value.each do |k, v|
-            hash[Crinja::Value.new(k)] = Crinja::Value.new(v)
-          end
-          @variables[name] = Crinja::Value.new(hash)
-        end
-
-        private def build_variables : Hash(String, Crinja::Value)
-          vars = {} of String => Crinja::Value
-
-          # Page variables
-          vars["page_title"] = Crinja::Value.new(@page.title)
-          vars["page_description"] = Crinja::Value.new(@page.description || @config.description || "")
-          vars["page_url"] = Crinja::Value.new(@page.url)
-          vars["page_section"] = Crinja::Value.new(@page.section)
-          vars["page_date"] = Crinja::Value.new(@page.date.try(&.to_s("%Y-%m-%d")) || "")
-          vars["page_image"] = Crinja::Value.new(@page.image || @config.og.default_image || "")
-          vars["taxonomy_name"] = Crinja::Value.new(@page.taxonomy_name || "")
-          vars["taxonomy_term"] = Crinja::Value.new(@page.taxonomy_term || "")
-
-          # Page object with boolean properties
-          page_obj = {
-            "title"       => Crinja::Value.new(@page.title),
-            "description" => Crinja::Value.new(@page.description || ""),
-            "url"         => Crinja::Value.new(@page.url),
-            "section"     => Crinja::Value.new(@page.section),
-            "date"        => Crinja::Value.new(@page.date.try(&.to_s("%Y-%m-%d")) || ""),
-            "image"       => Crinja::Value.new(@page.image || ""),
-            "draft"       => Crinja::Value.new(@page.draft),
-            "toc"         => Crinja::Value.new(@page.toc),
-            "render"      => Crinja::Value.new(@page.render),
-            "is_index"    => Crinja::Value.new(@page.is_index),
-            "generated"   => Crinja::Value.new(@page.generated),
-            "in_sitemap"  => Crinja::Value.new(@page.in_sitemap),
-          }
-          vars["page"] = Crinja::Value.new(page_obj)
-
-          # Site variables
-          vars["site_title"] = Crinja::Value.new(@config.title)
-          vars["site_description"] = Crinja::Value.new(@config.description || "")
-          vars["base_url"] = Crinja::Value.new(@config.base_url)
-
-          # Site object (also available as "config" for advanced use)
-          site_obj = {
-            "title"       => Crinja::Value.new(@config.title),
-            "description" => Crinja::Value.new(@config.description || ""),
-            "base_url"    => Crinja::Value.new(@config.base_url),
-          }
-          site_value = Crinja::Value.new(site_obj)
-          vars["site"] = site_value
-          vars["config"] = site_value
-
-          # Section variables (basic, will be enriched by builder with actual section data)
-          vars["section_title"] = Crinja::Value.new("")
-          vars["section_description"] = Crinja::Value.new("")
-          vars["section_list"] = Crinja::Value.new("")
-          section_obj = {
-            "title"       => Crinja::Value.new(""),
-            "description" => Crinja::Value.new(""),
-            "pages"       => Crinja::Value.new([] of Crinja::Value),
-            "list"        => Crinja::Value.new(""),
-          }
-          vars["section"] = Crinja::Value.new(section_obj)
-
-          # TOC variables (basic, will be enriched by builder with actual TOC data)
-          vars["toc"] = Crinja::Value.new("")
-          toc_obj = {
-            "html"    => Crinja::Value.new(""),
-            "headers" => Crinja::Value.new([] of Crinja::Value),
-          }
-          vars["toc_obj"] = Crinja::Value.new(toc_obj)
-
-          # SEO variables (basic defaults, enriched by builder with page-specific data)
-          seo_obj = {
-            "canonical_url"   => Crinja::Value.new(""),
-            "og_type"         => Crinja::Value.new(""),
-            "og_image"        => Crinja::Value.new(""),
-            "twitter_card"    => Crinja::Value.new(""),
-            "twitter_site"    => Crinja::Value.new(""),
-            "twitter_creator" => Crinja::Value.new(""),
-            "fb_app_id"       => Crinja::Value.new(""),
-            "hreflang"        => Crinja::Value.new([] of Crinja::Value),
-          }
-          vars["seo"] = Crinja::Value.new(seo_obj)
-
-          # Time-related variables
-          now = Time.local
-          vars["current_year"] = Crinja::Value.new(now.year)
-          vars["current_date"] = Crinja::Value.new(now.to_s("%Y-%m-%d"))
-          vars["current_datetime"] = Crinja::Value.new(now.to_s("%Y-%m-%d %H:%M:%S"))
-
-          vars
-        end
-
-        # Convert to Crinja variables hash
-        def to_crinja_vars : Hash(String, Crinja::Value)
-          @variables
-        end
-      end
-
       # Template Engine wrapper for Crinja
       class TemplateEngine
         getter env : Crinja
@@ -163,61 +35,6 @@ module Hwaro
           register_custom_functions
         end
 
-        # Set the template loader
-        def loader=(loader : Crinja::Loader)
-          @env.loader = loader
-        end
-
-        # Render a template string with the given context. Pass `name`/`filename`
-        # when the string came from a file so Crinja errors report file:line:col.
-        def render(template_string : String, context : TemplateContext, name : String = "", filename : String? = nil) : String
-          template = Crinja::Template.new(template_string, @env, name, filename)
-          template.render(context.to_crinja_vars)
-        rescue ex : Crinja::Error
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_TEMPLATE,
-            message: "Template error for #{context.page.path}: #{ex.message}",
-            cause: ex,
-          )
-        end
-
-        # Render a template string with raw hash. Pass `name`/`filename`
-        # when the string came from a file so Crinja errors report file:line:col.
-        def render(template_string : String, variables : Hash(String, Crinja::Value), name : String = "", filename : String? = nil) : String
-          template = Crinja::Template.new(template_string, @env, name, filename)
-          template.render(variables)
-        rescue ex : Crinja::Error
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_TEMPLATE,
-            message: "Template error: #{ex.message}",
-            cause: ex,
-          )
-        end
-
-        # Load and render a template by name
-        def render_template(template_name : String, context : TemplateContext) : String
-          template = @env.get_template(template_name)
-          template.render(context.to_crinja_vars)
-        rescue ex : Crinja::Error
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_TEMPLATE,
-            message: "Template error in '#{template_name}' for #{context.page.path}: #{ex.message}",
-            cause: ex,
-          )
-        end
-
-        # Load and render a template by name with raw hash
-        def render_template(template_name : String, variables : Hash(String, Crinja::Value)) : String
-          template = @env.get_template(template_name)
-          template.render(variables)
-        rescue ex : Crinja::Error
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_TEMPLATE,
-            message: "Template error in '#{template_name}': #{ex.message}",
-            cause: ex,
-          )
-        end
-
         # Register custom filters specific to Hwaro
         private def register_custom_filters
           Filters::DateFilters.register(@env)
@@ -231,21 +48,9 @@ module Hwaro
           Filters::MenuFilters.register(@env)
         end
 
-        # Shared body for the `empty`/`present` Crinja tests: a value is empty
-        # when it's an empty string/array/hash or nil.
+        # Shared body for the `empty`/`present` Crinja tests.
         private def value_empty?(value : Crinja::Raw) : Bool
-          case value
-          when String
-            value.empty?
-          when Array
-            value.empty?
-          when Hash
-            value.empty?
-          when Nil
-            true
-          else
-            false
-          end
+          Filters::CollectionFilters.blank?(value)
         end
 
         # Register custom tests
@@ -264,11 +69,16 @@ module Hwaro
             target.to_s.ends_with?(suffix)
           end
 
-          # Test if a string contains a substring
+          # Test if a string contains a substring, or a list/mapping an
+          # element/key (the `in` operator's rules, not the list's text)
           # Usage: {% if page_url is containing("products") %}
           @env.tests["containing"] = Crinja.test do
-            substring = arguments.varargs.first?.try(&.to_s) || ""
-            target.to_s.includes?(substring)
+            needle = arguments.varargs.first? || Crinja::Value.new("")
+            if target.iterable?
+              Crinja::Operator.member?(needle, target)
+            else
+              target.to_s.includes?(needle.to_s)
+            end
           end
 
           # Test if value is empty (string, array, hash)
@@ -320,11 +130,18 @@ module Hwaro
           @env.functions["now"] = Crinja.function({format: nil}) do
             format = arguments["format"]
             time = Time.local
+            # The page is only as fresh as this format's text: a `--cache`
+            # build re-renders it once the formatted clock moves.
+            TemplateEngine.record_clock_read(format.none? ? CLOCK_DEFAULT_FORMAT : format.to_s)
 
             if format.none?
-              Crinja::Value.new(time.to_s("%Y-%m-%d %H:%M:%S"))
+              Crinja::Value.new(time.to_s(CLOCK_DEFAULT_FORMAT))
             else
-              Crinja::Value.new(time.to_s(format.to_s))
+              # Same guard as the `date` filter: a malformed format string
+              # (`now(format="%")`) makes Crystal's `Time#to_s` raise a bare
+              # `IndexError`, which is not a `Crinja::Error` and so kills the
+              # build with `Index out of bounds` and no template file:line.
+              Crinja::Value.new(Filters::DateFilters.format_time(time, format.to_s))
             end
           end
         end
@@ -333,6 +150,9 @@ module Hwaro
           # url_for() function - generate URL for a path
           @env.functions["url_for"] = Crinja.function({path: ""}) do
             path = arguments["path"].to_s
+            # A `page.assets` entry names the content file; it publishes next
+            # to its page.
+            path = TemplateEngine.published_asset_url(env, path) || path
             base_url = env.resolve("base_url").to_s
             Crinja::Value.new(Filters::UrlFilters.absolutize(path, base_url))
           end
@@ -347,6 +167,9 @@ module Hwaro
           #        {{ about.title }}
           @env.functions["get_page"] = Crinja.function({path: ""}) do
             path_arg = arguments["path"].to_s
+            # The lookup maps also hold every key NFC-folded (see
+            # Render#add_nfc_keys).
+            path_arg = path_arg.unicode_normalize(:nfc) unless path_arg.ascii_only?
 
             # Optimised O(1) lookup
             pages_map = env.resolve("__pages_by_path__")
@@ -391,12 +214,36 @@ module Hwaro
           #        {% for page in blog.pages %}
           @env.functions["get_section"] = Crinja.function({path: ""}) do
             path_arg = arguments["path"].to_s
+            path_arg = path_arg.unicode_normalize(:nfc) unless path_arg.ascii_only?
+            # "blog", "/blog", "blog/" and "/blog/" all name the same section.
+            url_key = "/#{path_arg.strip('/')}/"
+
+            # A section name can occur in every language variant. Resolve an
+            # ambiguous name in the current page's language before falling
+            # back to the default language or the legacy site-wide map.
+            language_maps = env.resolve("__sections_by_key_by_lang__").raw
+            if language_maps.is_a?(Hash)
+              language = env.resolve("page_language").to_s
+              default_language = env.resolve("_i18n_default_language").to_s
+              languages = [] of String
+              languages << language unless language.empty?
+              languages << default_language unless default_language.empty? || languages.includes?(default_language)
+
+              languages.each do |candidate|
+                next unless candidate_map = language_maps[candidate]?
+                next unless candidate_map.raw.is_a?(Hash)
+                raw_candidate_map = candidate_map.raw.as(Hash)
+                if found = raw_candidate_map[path_arg]? || raw_candidate_map[url_key]?
+                  return found
+                end
+              end
+            end
 
             # Optimised O(1) lookup via __sections_by_key__ map
             sections_map = env.resolve("__sections_by_key__")
             if !sections_map.raw.nil? && sections_map.raw.is_a?(Hash)
               raw_map = sections_map.raw.as(Hash)
-              found = raw_map[path_arg]? || raw_map["/#{path_arg}/"]?
+              found = raw_map[path_arg]? || raw_map[url_key]?
               found || Crinja::Value.new(nil)
             else
               # Fallback to linear search O(N) if map is not available
@@ -411,7 +258,7 @@ module Hwaro
                     section_name = section_val["name"]?.try(&.to_s) || ""
                     section_url = section_val["url"]?.try(&.to_s) || ""
 
-                    if section_path == path_arg || section_name == path_arg || section_url == "/#{path_arg}/"
+                    if section_path == path_arg || section_name == path_arg || section_url == url_key
                       result = Crinja::Value.new(section_val)
                       break
                     end
@@ -455,6 +302,17 @@ module Hwaro
             default_lang = env.resolve("_i18n_default_language").to_s
 
             menus_val = env.resolve("__menus__")
+            # Versioned page: its version's own menu set (`__menus_v__` is
+            # {version name => {lang => menus}}, built by the render phase)
+            # replaces the site-wide set, so registrations from another
+            # version never leak into this page's nav.
+            page_version = env.resolve("page_version")
+            unless page_version.undefined? || page_version.raw.nil?
+              versioned = env.resolve("__menus_v__").raw
+              if versioned.is_a?(Hash) && (own = versioned[page_version.to_s]?)
+                menus_val = own
+              end
+            end
             result = Crinja::Value.new([] of Crinja::Value)
 
             raw_menus = menus_val.raw
@@ -537,35 +395,107 @@ module Hwaro
           # Usage: {{ resize_image(path="/images/photo.jpg", width=800).url }}
           # Returns object with:
           #   - url: URL to the resized variant (or original if not available)
-          #   - width: requested width (0 if not specified)
+          #   - width: the variant's actual width, falling back to the
+          #     requested one when no variant exists (0 if not specified)
           #   - height: requested height (0 if not specified)
-          # Note: actual output dimensions depend on aspect ratio preservation.
-          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0}) do
+          # `width` is the variant's, not the request's: variants are never
+          # upscaled, so `width=1024` against a 900px source resolves to the
+          # 900px file — and the documented `<img width="{{ img.width }}">`
+          # then told the browser 1024, laying out the image at the wrong
+          # size. `height` stays the requested value: the resize map is
+          # rebuilt from variant FILENAMES on warm builds (`_320w.png`), so a
+          # real height is not recoverable without decoding every image.
+          #
+          # `op="fill"` (cover the box, crop to it) and `op="crop"` (cut the
+          # box out unscaled) write a dedicated variant at render time,
+          # positioned by `anchor`; `width`/`height` are then the written
+          # file's. See ImageHooks.op_variant.
+          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0, op: "fit", anchor: "center"}) do
             path = arguments["path"].to_s
             # Lenient coercion: shortcode arguments are always Strings, so a
             # `width="800"` forwarded from `{% img(width="800") %}` must resize
             # rather than raise Crinja::TypeError and abort the page.
             width = Utils::CrinjaUtils.to_count(arguments["width"])
             height = Utils::CrinjaUtils.to_count(arguments["height"])
+            op = arguments["op"].to_s
+            anchor = arguments["anchor"].to_s
+            unless Processors::ImageProcessor::RESIZE_OPS.includes?(op)
+              raise Crinja::RuntimeError.new("resize_image: unknown op #{op.inspect} (expected one of: #{Processors::ImageProcessor::RESIZE_OPS.join(", ")})")
+            end
+            unless Processors::ImageProcessor::ANCHORS.includes?(anchor)
+              raise Crinja::RuntimeError.new("resize_image: unknown anchor #{anchor.inspect} (expected one of: #{Processors::ImageProcessor::ANCHORS.join(", ")})")
+            end
+            if op != "fit" && (width <= 0 || height <= 0)
+              raise Crinja::RuntimeError.new("resize_image: op=#{op.inspect} needs both width and height")
+            end
 
             base_url = env.resolve("base_url").to_s
+
+            # A remote image (`page.image` is often a full URL) is never
+            # processed; hand it back as written instead of rooting it under
+            # base_url as `/https%3A//cdn…`.
+            if Filters::UrlFilters.has_own_origin?(path)
+              return Crinja::Value.new({
+                "url"            => Crinja::Value.new(path),
+                "width"          => Crinja::Value.new(width),
+                "height"         => Crinja::Value.new(height),
+                "lqip"           => Crinja::Value.new(""),
+                "dominant_color" => Crinja::Value.new(""),
+              })
+            end
 
             # Normalize path to start with /. The resize/LQIP maps are keyed by
             # the decoded filesystem path, so decode any percent-encoding from
             # the incoming URL before the lookup; the returned variant is
             # re-encoded below so the emitted .url is a valid href.
-            normalized = URI.decode(path.starts_with?("/") ? path : "/#{path}")
+            #
+            # A `?query` / `#fragment` (cache-busted `page.image` values) is not
+            # part of the file: it is cut off before the lookup and re-appended,
+            # as written, to whichever URL comes back. `.`/`..` segments are
+            # collapsed so the variant's name, output file and returned URL are
+            # all canonical (no stray `public/sub/` for `/sub/../photo.jpg`).
+            suffix_at = path.index(/[?#]/)
+            suffix = suffix_at ? path[suffix_at..] : ""
+            file_path = suffix_at ? path[0, suffix_at] : path
+            normalized = URI.decode(TemplateEngine.bundle_image_url(env, file_path) || TemplateEngine.published_asset_url(env, file_path) || (file_path.starts_with?("/") ? file_path : "/#{file_path}"))
+            normalized = Path.posix(normalized).normalize.to_s unless normalized.includes?('\0')
+
+            if op != "fit"
+              source = Content::Hooks::ImageHooks.resolve_source(normalized)
+              TemplateEngine.record_file_read(source || File.join("static", normalized))
+              page_path = env.resolve("__page_path__").raw.as?(String)
+              made = source.try { |src| Content::Hooks::ImageHooks.op_variant(normalized, src, width, height, op, anchor, page_path) }
+              return Crinja::Value.new({
+                "url"    => Crinja::Value.new(base_url.rstrip("/") + URI.encode_path(made.try(&.[0]) || normalized) + suffix),
+                "width"  => Crinja::Value.new(made.try(&.[1]) || width),
+                "height" => Crinja::Value.new(made.try(&.[2]) || height),
+                # LQIP describes the whole source image, not the cropped box.
+                "lqip"           => Crinja::Value.new(""),
+                "dominant_color" => Crinja::Value.new(""),
+              })
+            end
+
+            # The variant set, width and LQIP colour all follow the SOURCE
+            # image's bytes. An image no resize job covered (a missing file)
+            # is recorded at its static/ location, so one that appears there
+            # later re-renders the page too.
+            # Serve re-renders the page too: its LQIP / dominant colour are
+            # printed data (see ImageHooks.watch_render_source).
+            if Content::Hooks::ImageHooks.processing_active?
+              Content::Hooks::ImageHooks.watch_render_source(normalized).try { |source| TemplateEngine.record_file_read(source) }
+            end
 
             # Try to find a resized variant from the image hooks map
-            resized_url = if width > 0
-                            Content::Hooks::ImageHooks.find_closest(normalized, width)
-                          end
+            variant = if width > 0
+                        Content::Hooks::ImageHooks.find_closest_variant(normalized, width)
+                      end
 
-            final_url = if resized = resized_url
-                          base_url.rstrip("/") + URI.encode_path(resized)
+            final_url = if resized = variant
+                          base_url.rstrip("/") + URI.encode_path(resized[1]) + suffix
                         else
-                          base_url.rstrip("/") + URI.encode_path(normalized)
+                          base_url.rstrip("/") + URI.encode_path(normalized) + suffix
                         end
+            actual_width = variant.try(&.[0]) || width
 
             # Look up LQIP data
             lqip_data = Content::Hooks::ImageHooks.find_lqip(normalized)
@@ -574,11 +504,101 @@ module Hwaro
 
             Crinja::Value.new({
               "url"            => Crinja::Value.new(final_url),
-              "width"          => Crinja::Value.new(width),
+              "width"          => Crinja::Value.new(actual_width),
               "height"         => Crinja::Value.new(height),
               "lqip"           => Crinja::Value.new(lqip_value),
               "dominant_color" => Crinja::Value.new(dominant_color_value),
             })
+          end
+        end
+
+        # A relative `resize_image` path naming one of the current page's
+        # bundle files (`image = "cover.png"` beside `index.md`) is published
+        # under the page's URL, as relative images in its body and its
+        # og:image (`Page#social_image`) are; rooting it at `/cover.png`
+        # found no variant and emitted a 404. nil for anything else.
+        def self.bundle_image_url(env : Crinja, path : String) : String?
+          return if path.empty? || path.starts_with?('/')
+          own = Path.posix(path).normalize.to_s
+          return if Utils::PathUtils.escapes_parent?(own)
+          page = env.resolve("page")
+          return unless page.mapping?
+          url = page["url"].to_s
+          source = env.resolve("__page_path__").to_s
+          assets = page["assets"]
+          return if url.empty? || source.empty? || !assets.iterable?
+          dir = File.dirname(source)
+          wanted = dir == "." ? own : "#{dir}/#{own}"
+          assets.each { |asset| return "#{url.rstrip('/')}/#{own}" if asset.to_s == wanted }
+          nil
+        end
+
+        # The URL a `page.assets` entry (content path) is published at, next
+        # to its page (Render#bundle_asset_urls); nil for anything else.
+        # Recorded as a render read, hit or miss: the answer moves with the
+        # owning page's slug/path and with the bundle's file list.
+        def self.published_asset_url(env : Crinja, path : String) : String?
+          record_render_read(BUNDLE_ASSET_READ_PREFIX + path) unless path.empty? || path.starts_with?('/') || path.includes?("://")
+          assets = env.resolve("__bundle_asset_urls__").raw
+          assets[path]?.try(&.to_s) if assets.is_a?(Hash)
+        end
+
+        # Inputs a render read from OUTSIDE the tracked tree, recorded so a
+        # `--cache` build can tell when they move: `env()` names, `load_data()`
+        # files and `resize_image()` source images. None of them is in any
+        # cache key (they are read mid-render, per call), so a cached page kept
+        # the old analytics ID / data row / image variant for as long as its
+        # own source stayed untouched. Keys are `"env:NAME"` and `"file:PATH"`;
+        # values are never stored here or anywhere — the build digests them.
+        # Shared across engine instances and mutex-guarded: every parallel
+        # render worker has its own env.
+        @@render_reads = Set(String).new
+        @@render_reads_mutex = Mutex.new
+
+        ENV_READ_PREFIX  = "env:"
+        FILE_READ_PREFIX = "file:"
+        # `asset_integrity(name)`: the value is the integrity of what the name
+        # resolves to (see AssetHooks.integrity), wherever the output lives.
+        ASSET_READ_PREFIX = "asset:"
+        # `get_url`/`resize_image` of a `page.assets` entry: the value is the
+        # URL it publishes at (Render#bundle_asset_urls), or none.
+        BUNDLE_ASSET_READ_PREFIX = "bundle_asset:"
+        # The wall clock, as a `Time#to_s`/date format: `now()` records its
+        # format, and the build records the one behind each `current_*`
+        # variable a template prints. The value is the clock formatted that
+        # way, so a page re-renders exactly when what it prints would differ.
+        CLOCK_READ_PREFIX     = "clock:"
+        CLOCK_DEFAULT_FORMAT  = "%Y-%m-%d %H:%M:%S"
+        CLOCK_VARIABLE_FORMAT = {
+          "current_year"     => "%Y",
+          "current_date"     => "%Y-%m-%d",
+          "current_datetime" => CLOCK_DEFAULT_FORMAT,
+        }
+
+        def self.record_clock_read(format : String) : Nil
+          record_render_read(CLOCK_READ_PREFIX + format)
+        end
+
+        def self.record_render_read(key : String) : Nil
+          @@render_reads_mutex.synchronize { @@render_reads << key }
+        end
+
+        # Record a file read by its project-relative path (the cache outlives
+        # the checkout path: CI restores it under a different directory). A
+        # path that escapes the project is not recorded — nothing reads it.
+        def self.record_file_read(path : String) : Nil
+          return if path.empty? || path.includes?('\0') || Hwaro::Utils::PathUtils.absolute?(path)
+          normalized = Path.posix(path).normalize.to_s
+          return if normalized == ".." || normalized.starts_with?("../")
+          record_render_read(FILE_READ_PREFIX + normalized)
+        end
+
+        # Everything recorded since the last call, and start a new record.
+        def self.take_render_reads : Set(String)
+          @@render_reads_mutex.synchronize do
+            taken = @@render_reads
+            @@render_reads = Set(String).new
+            taken
           end
         end
 
@@ -591,6 +611,31 @@ module Hwaro
         # in a base layout re-read and re-parsed the file once per page.
         @@load_data_cache = {} of String => {Int64, Crinja::Value}
         @@load_data_mutex = Mutex.new
+
+        # Drop every memoized load_data() result. Called at the start of each
+        # build (Builder#run), so the memo only ever spans ONE build.
+        #
+        # The mtime key alone is not a proof of identity: it is millisecond
+        # resolution, and a file rewritten inside one filesystem timestamp
+        # tick (ext4 stamps with the kernel's coarse clock, 1-10ms; FAT/HFS+
+        # are coarser still) keeps the previous mtime, so a same-size,
+        # same-tick rewrite of `data/team.csv` was served from the memo —
+        # the previous file's rows — even though the data digest had already
+        # moved and forced the page to re-render. That is the flake in
+        # "re-renders when a data/*.csv changes": in-process, the two builds
+        # can land in the same tick. `hwaro serve` has the same exposure on
+        # every rebuild. A build must see the disk as it is when it starts,
+        # and within one build a data file cannot legitimately change, so
+        # the memo's whole purpose (parse once per build, not once per page)
+        # survives a per-build reset intact.
+        def self.clear_load_data_cache : Nil
+          @@load_data_mutex.synchronize do
+            @@load_data_cache.clear
+            # A new build (or serve rebuild) gets its warnings again — the
+            # author may have fixed the path, or not, and needs to see which.
+            @@load_data_warned.clear
+          end
+        end
 
         private def register_data_function
           # load_data() function - load data from JSON/TOML/YAML files
@@ -606,15 +651,24 @@ module Hwaro
               # Resolve symlinks BEFORE boundary check to prevent TOCTOU attacks.
               project_root = File.realpath(Dir.current)
               resolved = File.expand_path(path, project_root)
+              # Recorded before the existence check: a page rendered while the
+              # file was missing changes once it appears.
+              if relative = Hwaro::Utils::PathUtils.relative_path(resolved, project_root)
+                TemplateEngine.record_file_read(relative) unless relative.empty?
+              end
               resolved = begin
                 File.realpath(resolved)
               rescue File::Error
                 nil
               end
 
-              if resolved &&
-                 (resolved == project_root || resolved.starts_with?(project_root + "/")) &&
-                 (info = File.info?(resolved)) && info.file?
+              is_file = resolved &&
+                        Hwaro::Utils::PathUtils.within?(resolved, project_root) &&
+                        (info = File.info?(resolved)) && info.file?
+              format = data_format(path)
+              if is_file && format.nil?
+                warn_load_data_once(path, "has an unsupported file type (supported: .json, .toml, .yaml, .yml, .csv)")
+              elsif resolved && format && is_file && info
                 # to_unix_ms (Int64) like the build cache — to_unix_ns is Int128
                 mtime = info.modification_time.to_unix_ms
 
@@ -625,16 +679,20 @@ module Hwaro
                   cached = @@load_data_cache[resolved]?
                   if cached && cached[0] == mtime
                     cached[1]
-                  elsif parsed = parse_data_content(path, File.read(resolved))
+                  elsif parsed = Utils::CrinjaUtils.parse_data_string(Utils::TextUtils.strip_bom(File.read(resolved)), format)
                     @@load_data_cache[resolved] = {mtime, parsed}
                     parsed
                   else
                     Crinja::Value.new(nil)
                   end
                 end
+              elsif resolved && !Hwaro::Utils::PathUtils.within?(resolved, project_root)
+                warn_load_data_once(path, "resolves outside the project directory and is refused")
+              else
+                warn_load_data_once(path, "is not a file (paths resolve against the project root)")
               end
             rescue ex
-              Logger.debug "load_data('#{path}'): #{ex.message}"
+              warn_load_data_once(path, "could not be loaded: #{ex.message}")
               result = Crinja::Value.new(nil)
             end
 
@@ -642,24 +700,35 @@ module Hwaro
           end
         end
 
-        # Parse a data file's content by the extension carried on `path` (the
-        # template-facing argument). Returns nil for unsupported types.
-        private def parse_data_content(path : String, content : String) : Crinja::Value?
-          if path.ends_with?(".json")
-            json_to_crinja(JSON.parse(content))
-          elsif path.ends_with?(".toml")
-            toml_to_crinja(TOML.parse(content))
-          elsif path.ends_with?(".yaml") || path.ends_with?(".yml")
-            yaml_to_crinja(YAML.parse(content))
-          elsif path.ends_with?(".csv")
-            # Parse CSV using stdlib parser (handles quoted fields correctly)
-            csv_data = CSV.parse(content).map do |row|
-              Crinja::Value.new(row.map { |cell| Crinja::Value.new(cell.strip) })
-            end
-            Crinja::Value.new(csv_data)
-          else
-            Logger.debug "load_data('#{path}'): unsupported file type '#{File.extname(path)}' (supported: .json, .toml, .yaml, .yml, .csv)"
-            nil
+        # A `load_data()` miss used to render as a bare `none` (or an empty
+        # loop) with nothing in the log — a typo'd path, a file dropped outside
+        # the project, or a malformed data file were indistinguishable from an
+        # intentionally empty dataset. Warn once per path per build: the
+        # function runs for every page that calls it, and the same typo on a
+        # 500-page site is one problem, not 500 lines.
+        @@load_data_warned = Set(String).new
+
+        private def warn_load_data_once(path : String, reason : String) : Nil
+          first = @@load_data_mutex.synchronize { @@load_data_warned.add?(path) }
+          Logger.warn "load_data(#{path.inspect}) #{reason}; the template receives none." if first
+        end
+
+        # The parse format for a `load_data()` path (the template-facing
+        # argument), or nil for an unsupported type. A suffix match rather
+        # than `File.extname` (which reads a bare ".json" as a dotfile), and
+        # case-insensitive like the `data/` loader: `data/Team.JSON` is
+        # `site.data.Team` there, and `load_data` of the same file used to
+        # return none without a word.
+        private def data_format(path : String) : String?
+          lower = path.downcase
+          if lower.ends_with?(".json")
+            "json"
+          elsif lower.ends_with?(".toml")
+            "toml"
+          elsif lower.ends_with?(".yaml") || lower.ends_with?(".yml")
+            "yaml"
+          elsif lower.ends_with?(".csv")
+            "csv"
           end
         end
 
@@ -684,6 +753,20 @@ module Hwaro
 
           # asset_url is an alias for asset
           @env.functions["asset_url"] = @env.functions["asset"]
+
+          # asset_integrity() - Subresource Integrity value of the file
+          # asset() points to, over its emitted bytes (after minify and
+          # fingerprint). Recorded as a render read by NAME, so `--cache`
+          # re-renders when the bytes move even if the name does not — for
+          # any output directory, inside the project or not.
+          # Usage: integrity="{{ asset_integrity(name="main.css") }}"
+          @env.functions["asset_integrity"] = Crinja.function({name: ""}) do
+            asset_name = arguments["name"].to_s
+            TemplateEngine.record_render_read(ASSET_READ_PREFIX + asset_name)
+            sri = Content::Hooks::AssetHooks.integrity(asset_name)
+            raise Crinja::RuntimeError.new("asset_integrity: unknown asset '#{asset_name}' (no emitted file)") unless sri
+            Crinja::Value.new(sri)
+          end
         end
 
         private def register_env_function
@@ -696,6 +779,7 @@ module Hwaro
             has_default = !default_val.none?
 
             env_value = ENV[var_name]?
+            TemplateEngine.record_render_read(ENV_READ_PREFIX + var_name)
 
             if has_default
               # env("VAR", default="x") — use default when unset or empty
@@ -709,68 +793,23 @@ module Hwaro
               # env("VAR") — substitute if set (even empty)
               Crinja::Value.new(env_value)
             else
-              Logger.warn "Environment variable '#{var_name}' is not set (referenced in template)"
+              # Once per name per build, like load_data(): an `env()` in a
+              # base layout warned once for every page on the site.
+              first = @@load_data_mutex.synchronize { @@load_data_warned.add?("env:#{var_name}") }
+              Logger.warn "Environment variable '#{var_name}' is not set (referenced in template)" if first
               Crinja::Value.new("")
             end
           end
         end
-
-        private def json_to_crinja(json : JSON::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_json(json)
-        end
-
-        private def toml_to_crinja(toml : TOML::Table) : Crinja::Value
-          Utils::CrinjaUtils.from_toml(toml)
-        end
-
-        private def yaml_to_crinja(yaml : YAML::Any) : Crinja::Value
-          Utils::CrinjaUtils.from_yaml(yaml)
-        end
       end
 
-      # Template processor using Crinja
-      # This module provides a singleton-like interface for template processing
+      # Process-lifetime engine shared by builds (see Initialize#setup_crinja_env)
       module Template
         @@engine : TemplateEngine?
 
         # Get or create the template engine
         def self.engine : TemplateEngine
           @@engine ||= TemplateEngine.new
-        end
-
-        # Reset the engine (useful for testing or reconfiguration)
-        def self.reset_engine
-          @@engine = nil
-        end
-
-        # Set custom loader for the engine
-        def self.set_loader(loader : Crinja::Loader)
-          engine.loader = loader
-        end
-
-        # Set loader from templates directory path
-        def self.set_loader(templates_path : String)
-          engine.loader = Crinja::Loader::FileSystemLoader.new(templates_path)
-        end
-
-        # Process a template string with context
-        def self.process(content : String, context : TemplateContext) : String
-          engine.render(content, context)
-        end
-
-        # Process a template string with raw variables hash
-        def self.process(content : String, variables : Hash(String, Crinja::Value)) : String
-          engine.render(content, variables)
-        end
-
-        # Render a named template from the loader
-        def self.render_template(template_name : String, context : TemplateContext) : String
-          engine.render_template(template_name, context)
-        end
-
-        # Create a context for the given page and config
-        def self.create_context(page : Models::Page, config : Models::Config) : TemplateContext
-          TemplateContext.new(page, config)
         end
       end
     end

@@ -1,0 +1,631 @@
+# check-links — resolving internal links against content, generated routes and build output.
+#
+# Reopens `Tool::DeadlinkCommand`; deadlink_command.cr keeps the flag
+# metadata, the ivars and `run`. Parts only reopen the class: no requires, no
+# load-time statements (scripts/check_no_toplevel_effects.sh).
+module Hwaro
+  module CLI
+    module Commands
+      module Tool
+        class DeadlinkCommand
+          # Destinations the filesystem check cannot say anything about:
+          # empty, protocol-relative, pure fragments, and anything carrying a
+          # URI scheme (`mailto:`, `tel:`, `javascript:`, `https:`, …).
+          private def skip_internal?(url : String, allow_fragment : Bool = true) : Bool
+            return true if url.empty?
+            return true if allow_fragment && url.starts_with?("#")
+            return true if url.starts_with?("//")
+            !!(url =~ /\A[a-z][a-z0-9+.\-]*:/i)
+          end
+
+          private def check_internal_links(links : Array(Link), content_dir : String, taxonomy_names : Array(String) = [] of String, base_path : String = "", language_codes : Array(String) = [] of String, generated_routes : GeneratedRoutes = GeneratedRoutes.new, oracle : Utils::BuildOutput::Oracle = Utils::BuildOutput.oracle("public", tool: "check-links"), config : Models::Config? = nil) : Array(Result)
+            results = [] of Result
+            project_root = Utils::PathUtils.find_project_root(content_dir)
+            link_index : Services::InternalLinkIndex? = nil
+            page_routes : Services::PageRouteIndex? = nil
+
+            links.each do |link|
+              # `@/` page links resolve exactly as the build resolves them:
+              # the content path (percent-decoded first, as Markd encodes
+              # destinations, then as written) looked up among
+              # the pages a default build publishes. `@/` images are plain
+              # files under content/ and take the path route below.
+              if link.kind != :image && (key = Services::InternalLinkIndex.key(link.url))
+                index = link_index ||= Services::InternalLinkIndex.new(content_dir)
+                if reason = index.unresolved_reason(key)
+                  error = reason == "not found" ? "Internal link target not found" : "Internal link not resolved by the build: #{Services::InternalLinkIndex.describe(reason)}"
+                  results << Result.new(link: link, status: -1, error: error)
+                end
+                next
+              end
+
+              decoded_url = URI.decode(link.url)
+              resolved_url = decoded_url
+              if resolved_url.starts_with?("/") && !base_path.empty?
+                if resolved_url == base_path
+                  resolved_url = "/"
+                elsif resolved_url.starts_with?(base_path + "/")
+                  resolved_url = resolved_url[base_path.size..]
+                end
+              end
+
+              base_dir = File.dirname(link.file)
+              routes = page_routes ||= Services::PageRouteIndex.new(content_dir, config || route_config(language_codes))
+
+              # The build leaves a relative destination untouched, so the
+              # BROWSER resolves it — against the page's URL, not the source
+              # file's directory. `[x](../about/)` in `content/posts/a.md`
+              # (served at `/posts/a/`) reaches `/posts/about/`, and a leaf
+              # page's `![](img.png)` asks for `/posts/a/img.png`. Only a page
+              # the route index cannot read keeps the source-relative reading.
+              if !resolved_url.starts_with?("/") && (page_url = routes.url_for(link.file))
+                resolved_url = resolve_against_page(page_url, resolved_url)
+              end
+
+              # Resolve the URL exactly as written FIRST. A leading segment
+              # that happens to match a language code may be a real section
+              # (`content/ko/posts/`), and that section outranks any
+              # translation reading — stripping unconditionally reported such
+              # links dead even though the build publishes them.
+              # A link back to the page holding it (`./#intro`) lives exactly
+              # as long as that page does, so a draft or scheduled page is not
+              # reported for pointing at itself.
+              exists = own_page_link?(resolved_url, link, routes) ||
+                       resolves?(resolved_url, link, content_dir, base_dir, project_root, taxonomy_names, oracle, routes) ||
+                       generated_routes.matches?(resolved_url) ||
+                       feed_route?(resolved_url, generated_routes, content_dir, base_dir, language_codes) ||
+                       paginated_route?(resolved_url, link, taxonomy_names, routes) ||
+                       published_route?(resolved_url, routes)
+
+              # Only when the literal path fails do we read the URL as a
+              # translation route (`/ko/about/` ← `content/about.ko.md`), and
+              # then ONLY language-qualified evidence counts. Accepting the
+              # default-language source here would pass `/ko/x/` for a site
+              # that never translated `x` — a link the build emits nothing for.
+              if !exists && (code = translatable_language_prefix(resolved_url, language_codes))
+                stripped = resolved_url[(code.size + 1)..]
+                stripped = "/" if stripped.empty?
+                exists = translated_source?(stripped, code, link, content_dir, base_dir, taxonomy_names, routes, resolved_url)
+              end
+
+              unless exists
+                error = unpublished_page_error(resolved_url, content_dir, base_dir, language_codes, routes)
+                error ||= link.kind == :image ? "Image not found" : "Internal link target not found"
+                results << Result.new(link: link, status: -1, error: error)
+              end
+            rescue ex : ArgumentError
+              # A destination whose percent-encoding decodes to a byte no path
+              # may contain (`/a%00b` → a real NUL) makes every `File.exists?`
+              # probe in `resolves?` raise straight out of libc. Degrade PER
+              # LINK — mirroring the per-file degradation `read_and_strip`
+              # already does for invalid UTF-8 — so one hostile destination
+              # cannot abort the whole run, hide the genuinely dead links in
+              # the other files, or leave `--json` writing nothing at all to
+              # stdout. The link itself is reported dead, which is exactly what
+              # it is: the build cannot resolve it either.
+              results << Result.new(link: link, status: -1, error: "Invalid link target: #{ex.message}")
+            end
+            results
+          end
+
+          # Fragment links whose `#id` names no `id`/`name` attribute in the
+          # target's built HTML. The target page is found the way the
+          # dead-link pass finds it (base_path stripped, relative links
+          # resolved against the page's URL, `@/` through the route index);
+          # a target with no HTML file in a usable build tree is skipped — a
+          # missing page is the dead-link pass's finding, and without build
+          # output there is nothing to read ids from.
+          private def check_anchor_links(links : Array(Link), content_dir : String, base_path : String, language_codes : Array(String), oracle : Utils::BuildOutput::Oracle, config : Models::Config?) : Array(Result)
+            results = [] of Result
+            return results if links.empty? || !oracle.usable?
+            routes = Services::PageRouteIndex.new(content_dir, config || route_config(language_codes))
+            ids_by_file = {} of String => Set(String)
+
+            links.each do |link|
+              path, _, fragment = link.url.partition('#')
+              url = if path.empty?
+                      routes.url_for(link.file)
+                    elsif key = Services::InternalLinkIndex.key(path)
+                      routes.url_for(File.join(content_dir, key))
+                    else
+                      decoded = URI.decode(path)
+                      if decoded.starts_with?("/")
+                        if decoded == base_path
+                          "/"
+                        elsif !base_path.empty? && decoded.starts_with?(base_path + "/")
+                          decoded[base_path.size..]
+                        else
+                          decoded
+                        end
+                      elsif page_url = routes.url_for(link.file)
+                        resolve_against_page(page_url, decoded)
+                      end
+                    end
+              next unless url && (file = built_html_file(url, oracle))
+              ids = ids_by_file.put_if_absent(file) { Content::Processors::InternalLinkResolver.anchor_ids(File.read(file)) }
+              next if Content::Processors::InternalLinkResolver.anchor_exists?(fragment, ids)
+              results << Result.new(link: link, status: -1, error: "Anchor not found: ##{fragment}")
+            rescue ex : ArgumentError | File::Error
+              # Same per-link degradation as check_internal_links: a NUL from
+              # percent-decoding or an unreadable file is not a missing anchor.
+              Logger.debug "check-links: skipped anchor #{link.url}: #{ex.message}"
+            end
+            results
+          end
+
+          # The HTML file the build tree serves for `url` (`/x/` →
+          # `x/index.html`, `/x.html` → itself), or nil when there is none.
+          private def built_html_file(url : String, oracle : Utils::BuildOutput::Oracle) : String?
+            relative = url.lchop('/')
+            candidates = relative.empty? || relative.ends_with?('/') ? ["#{relative}index.html"] : [relative, "#{relative}/index.html"]
+            candidates.each do |candidate|
+              next unless candidate.ends_with?(".html") || candidate.ends_with?(".htm")
+              file = File.join(oracle.base, candidate)
+              return file if File.file?(file) && oracle.exists?(candidate)
+            end
+          end
+
+          # Routes the BUILD writes that have no source file to check against:
+          # the sitemap, robots.txt, llms.txt, the search index and the feeds.
+          #
+          # Without this the checker only accepted them once `public/` existed,
+          # so a `check-links` run in CI *before* `hwaro build` reported a
+          # site's own `/rss.xml` and `/sitemap.xml` links dead — the exact
+          # order a lint-then-build pipeline uses.
+          struct GeneratedRoutes
+            # Exact absolute paths (`/sitemap.xml`).
+            getter paths : Set(String)
+            # The feed filename, when feeds are enabled. Feeds are ALSO
+            # emitted per section and per language (`/posts/rss.xml`,
+            # `/ko/rss.xml`), so those are resolved by `feed_route?`, which
+            # still requires the prefix to name a real section — matching the
+            # bare basename anywhere would have declared `/nowhere/rss.xml`
+            # live, hiding exactly the dead link this command exists to find.
+            getter feed_filename : String?
+            # The filename section and language feeds are written under —
+            # always `rss.xml`/`atom.xml` from `[feeds] type`, regardless of
+            # the root feed's `filename` or `enabled` (see `Seo::Feeds`).
+            getter section_feed_filename : String?
+
+            def initialize(@paths : Set(String) = Set(String).new, @feed_filename : String? = nil, @section_feed_filename : String? = nil)
+            end
+
+            def matches?(url : String) : Bool
+              url.starts_with?("/") && paths.includes?(url)
+            end
+          end
+
+          private def generated_routes(config : Models::Config?) : GeneratedRoutes
+            paths = Set(String).new
+            # The build always synthesizes a 404 page.
+            paths << "/404.html"
+            return GeneratedRoutes.new(paths) unless config
+
+            add_route = ->(filename : String) do
+              name = File.basename(filename)
+              paths << "/#{name}" unless name.empty?
+            end
+
+            add_route.call(config.sitemap.filename) if config.sitemap.enabled
+            add_route.call(config.robots.filename) if config.robots.enabled
+            add_route.call(config.llms.filename) if config.llms.enabled
+            add_route.call(config.llms.full_filename) if config.llms.enabled && config.llms.full_enabled
+            Content::Seo::Pwa.published_outputs(config, "/").each { |path| add_route.call(path) }
+            add_route.call(config.search.filename) if config.search.enabled && (!config.search.sharded? || config.search.single_file)
+            # Sharded index: the manifest is a fixed well-known route; the
+            # per-shard files are only discoverable through it.
+            paths << "/#{Content::Search::SHARDS_DIR}/#{Content::Search::MANIFEST_FILENAME}" if config.search.enabled && config.search.sharded?
+
+            feed_filename = nil
+            if config.feeds.enabled
+              name = config.feeds.filename.empty? ? default_feed_filename(config.feeds.type) : File.basename(config.feeds.filename)
+              unless name.empty?
+                paths << "/#{name}"
+                feed_filename = name
+              end
+            end
+
+            GeneratedRoutes.new(paths, feed_filename, default_feed_filename(config.feeds.type))
+          end
+
+          # `/posts/rss.xml` / `/ko/rss.xml` / `/ko/posts/rss.xml` — a feed the
+          # build emits beside a section or under a language prefix. The root
+          # feed is already an exact path, so this only has to vouch for the
+          # prefixed forms, and only when the prefix resolves to a section.
+          #
+          # Two different filenames are in play (see `Seo::Feeds.generate`):
+          # the ROOT feed honours `[feeds] filename` and `[feeds] enabled`,
+          # while section and language feeds are always written as
+          # `rss.xml`/`atom.xml` (from `[feeds] type`) and a section feed is
+          # gated by the section's own `generate_feeds`, not by the global
+          # switch. Keying the section route on the root feed's name and
+          # switch reported `/posts/rss.xml` dead on a site with `[feeds]
+          # enabled = false` + `generate_feeds = true` (the build writes it)
+          # and live as `/posts/feed.xml` under `filename = "feed.xml"` (the
+          # build never writes it).
+          private def feed_route?(url : String, routes : GeneratedRoutes, content_dir : String, base_dir : String, language_codes : Array(String)) : Bool
+            return false unless url.starts_with?("/")
+            basename = File.basename(url)
+            if basename == routes.feed_filename
+              prefix = url[0, url.size - basename.size].rstrip("/")
+              return true if prefix.empty?
+            end
+            name = routes.section_feed_filename
+            return false unless name
+            return false unless basename == name
+
+            prefix = url[0, url.size - name.size].rstrip("/")
+            # `/rss.xml` at the root is only a route when the ROOT feed is
+            # enabled under that name — handled above.
+            return false if prefix.empty?
+
+            segments = prefix.lstrip("/").split("/")
+            if (code = segments.first?) && language_codes.includes?(code)
+              segments = segments[1..]
+              return true if segments.empty?
+              prefix = "/#{segments.join("/")}"
+            end
+
+            return false unless index_path = section_index_path(prefix, content_dir, base_dir)
+            section_generates_feeds?(File.dirname(index_path))
+          end
+
+          # A per-section feed exists only when the section opts in with
+          # `generate_feeds = true` (see `Seo::Feeds`); `[feeds] sections`
+          # merely filters the SITE feed's items and emits nothing per
+          # section. Requiring a section index alone accepted
+          # `/posts/rss.xml` on every site with a `content/posts/_index.md`
+          # — a link the build never writes, waved through by the very check
+          # meant to catch it. Same discipline as `paginated_route?`, which
+          # reads `paginate_by` off the index before trusting `/page/N/`.
+          #
+          # Every `_index*` in the directory counts, not just `_index.md`:
+          # a multilingual section may declare the flag only in
+          # `_index.ko.md`, and `/ko/posts/rss.xml` is a real route then.
+          # The glob stays case-sensitive on purpose: see
+          # SECTION_INDEX_EXTENSIONS.
+          private def section_generates_feeds?(dir : String) : Bool
+            Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "_index*.{md,markdown}")).any? do |path|
+              frontmatter_flag?(path, "generate_feeds")
+            end
+          end
+
+          # True when a content file's front matter sets `key` to boolean
+          # true, in any of the three supported front-matter formats. An
+          # unreadable or malformed file reads as "not set" — the checker
+          # degrades to reporting the link rather than crashing the run.
+          private def frontmatter_flag?(path : String, key : String) : Bool
+            content = Utils::TextUtils.strip_bom(File.read(path))
+            return false unless fm = Utils::FrontmatterScanner.detect(content)
+            dialect, source = fm
+
+            case dialect
+            when :toml
+              return TOML.parse(source)[key]?.try(&.raw) == true
+            when :yaml
+              if h = YAML.parse(source).as_h?
+                return h[YAML::Any.new(key)]?.try(&.raw) == true
+              end
+            when :json
+              if h = JSON.parse(source).as_h?
+                return h[key]?.try(&.raw) == true
+              end
+            end
+
+            false
+          rescue
+            false
+          end
+
+          # Mirrors `Seo::Feeds.safe_feed_filename` for an unset filename.
+          private def default_feed_filename(feed_type : String) : String
+            case feed_type.downcase
+            when "atom" then "atom.xml"
+            when "json" then "feed.json"
+            else             "rss.xml"
+            end
+          end
+
+          # `/posts/page/2/` — a paginated listing route. It exists only in the
+          # output, so accept it when the URL minus its `/<paginate_path>/<n>/`
+          # tail resolves to a section that actually paginates. The `/page/`
+          # segment is trusted only for a real section, so an ordinary dead
+          # `/foo/page/2/` still reports.
+          private def paginated_route?(url : String, link : Link, taxonomy_names : Array(String), routes : Services::PageRouteIndex) : Bool
+            return false if link.kind == :image
+            match = url.match(/\A(.*)\/([^\/]+)\/(\d+)\/?\z/)
+            return false unless match
+            prefix = match[1]
+            segment = match[2]
+            prefix = "/" if prefix.empty?
+
+            # Taxonomy term listings paginate too (`/tags/crystal/page/2/`).
+            return true if segment == "page" && taxonomy_url?(prefix, taxonomy_names)
+
+            # The section the build publishes at `prefix` — slugged, remapped,
+            # versioned or translated (`/ko/blog/p/2/`) — and whether it
+            # paginates there, the way the build decides it (`paginate`,
+            # `pagination_enabled`, the site-wide `[pagination]`).
+            paginate_path, per_page, dir = routes.pager_for(prefix) || return false
+            return false unless segment == paginate_path
+
+            number = match[3].to_i?
+            return false unless number && number >= 1
+
+            # Bound the page number by how many pages could possibly exist.
+            # Accepting any N declared `/posts/page/99/` live on a two-page
+            # section. The count is a deliberate OVER-estimate (every
+            # descendant, drafts included), so the bound can never report a
+            # link the build does publish.
+            descendants = section_page_count(dir)
+            return true if descendants == 0
+            number <= (descendants + per_page - 1) // per_page
+          end
+
+          # Upper bound on the pages a section can paginate: every Markdown
+          # descendant that is not itself a section index. Extensions match
+          # case-insensitively (the build publishes `post.MD`); only a
+          # lowercase-extension `_index` is a section in the build, so an
+          # `_index.MD` still counts as a page.
+          private def section_page_count(dir : String) : Int32
+            count = 0
+            Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "**", "*")) do |path|
+              next unless Services::ContentWalk.markdown?(path)
+              next if File.basename(path).starts_with?("_index.") && SECTION_INDEX_EXTENSIONS.includes?(File.extname(path))
+              count += 1
+            end
+            count
+          end
+
+          # ReadContent recognizes a section index only when the extension is
+          # already lowercase (`_index.md`); `_index.MD` builds as a plain
+          # page. Section probes (feeds, pagination) keep that exact match.
+          SECTION_INDEX_EXTENSIONS = {".md", ".markdown"}
+
+          # Path of the `_index` file backing a section URL, if any.
+          private def section_index_path(url : String, content_dir : String, base_dir : String) : String?
+            base = content_target(url, content_dir, base_dir).rstrip("/")
+            {"_index.md", "_index.markdown"}.each do |name|
+              candidate = File.join(base, name)
+              return candidate if File.exists?(candidate)
+            end
+            nil
+          end
+
+          # Taxonomy listing and term pages (`/tags/`, `/categories/foo/`) are
+          # generated by Hwaro at build time, so they have no source file to
+          # check against. Match the URL's leading segment against the site's
+          # declared taxonomy names and accept it when it lines up.
+          # Language codes that get a `/<code>/` URL prefix: every declared
+          # language except the default one, which is served at the root.
+          private def translation_language_codes(config : Models::Config?) : Array(String)
+            return [] of String unless config
+            config.languages.keys.reject { |code| code.empty? || code == config.default_language }
+          end
+
+          # Returns the leading language segment of an absolute URL when it
+          # names a non-default language the build can actually route, else
+          # nil. The build matches filename suffixes against DECLARED codes
+          # (ReadContent#extract_language_from_filename), so every declared
+          # non-default code — including hyphenated ones like `pt-BR` —
+          # produces `/<code>/…` routes.
+          private def translatable_language_prefix(url : String, codes : Array(String)) : String?
+            return if codes.empty?
+            return unless url.starts_with?("/")
+            segment = url.lstrip("/").split("/").first?
+            return unless segment
+            return unless codes.includes?(segment)
+            segment
+          end
+
+          # Does `url` resolve to a source file, taxonomy route, or shipped
+          # asset, read literally? This is the language-agnostic resolution the
+          # checker has always performed.
+          private def resolves?(url : String, link : Link, content_dir : String, base_dir : String,
+                                project_root : String, taxonomy_names : Array(String),
+                                oracle : Utils::BuildOutput::Oracle,
+                                routes : Services::PageRouteIndex) : Bool
+            target = content_target(url, content_dir, base_dir)
+
+            # Most internal URLs are written with a trailing slash (`/about/`,
+            # `/posts/hello/`) — strip it before computing the leaf-file
+            # candidate so `target_no_slash + ".md"` resolves to
+            # `content/about.md` instead of the broken `content/about/.md`.
+            # The directory candidates work either way.
+            target_no_slash = target.rstrip("/")
+
+            sources = page_sources(target_no_slash)
+            if sources.empty?
+              # A Markdown source is published as a page, never under its own
+              # name, so `/posts/a.md` is not a route even though the file
+              # exists.
+              return true if File.exists?(target) && !Services::ContentWalk.markdown?(target_no_slash)
+            elsif serves_page?(sources, url, routes)
+              return true
+            end
+            return true if link.kind != :image && taxonomy_url?(url, taxonomy_names)
+
+            # Also accept assets that live in static/ (source) or the build
+            # output (after build): images under static/images/, resized/LQIP
+            # variants the image pipeline emits, and anything published via
+            # [content.files] or the asset pipeline. The output probe doubles
+            # as the oracle for generated routes on an already-built site, and
+            # follows `[build] output_dir` so a site that builds elsewhere is
+            # not reported as one big pile of broken links — but only while
+            # that tree is trustworthy: absent, empty and `hwaro serve` output
+            # all answer false, and the run reports why (#761).
+            asset_path = url.lstrip("/")
+            File.exists?(File.join(project_root, "static", asset_path)) ||
+              oracle.exists?(asset_path)
+          end
+
+          # Language-qualified resolution for a `/<code>/…` URL whose literal
+          # path did not resolve. Deliberately narrow: only a `.<code>` source
+          # or a taxonomy route counts, never the default-language file.
+          private def translated_source?(url : String, code : String, link : Link,
+                                         content_dir : String, base_dir : String,
+                                         taxonomy_names : Array(String),
+                                         routes : Services::PageRouteIndex, full_url : String) : Bool
+            sources = translated_page_sources(url, code, content_dir, base_dir)
+            return true if !sources.empty? && serves_page?(sources, full_url, routes)
+            link.kind != :image && taxonomy_url?(url, taxonomy_names)
+          end
+
+          private def translated_page_sources(url : String, code : String, content_dir : String, base_dir : String) : Array(String)
+            target_no_slash = content_target(url, content_dir, base_dir).rstrip("/")
+            markdown_files_for("#{target_no_slash}.#{code}") +
+              markdown_files_for(File.join(target_no_slash, "_index.#{code}")) +
+              markdown_files_for(File.join(target_no_slash, "index.#{code}"))
+          end
+
+          # The Markdown sources a page-shaped path names: `<path>.md`,
+          # `<path>/_index.md` and `<path>/index.md`, extensions in any case.
+          private def page_sources(target_no_slash : String) : Array(String)
+            markdown_files_for(target_no_slash) +
+              markdown_files_for(File.join(target_no_slash, "_index")) +
+              markdown_files_for(File.join(target_no_slash, "index"))
+          end
+
+          # A link that names page sources is live only where the build
+          # actually publishes one of them: a draft, future-dated, expired or
+          # `render = false` page writes nothing, and a `slug`/`path` moves
+          # the page away from its source path. A source the route index
+          # could not read keeps the plain existence test.
+          #
+          # A URL still relative here comes from a page the index could not
+          # place (so it was resolved against the source directory); it has
+          # no site URL to look up, and keeps the plain existence test too.
+          private def serves_page?(sources : Array(String), url : String, routes : Services::PageRouteIndex) : Bool
+            return true unless url.starts_with?("/")
+            sources.any? { |source| routes.state_for(source).nil? } || routes.published?(url)
+          end
+
+          # Page URLs, aliases and bundle files the build writes away from
+          # their source path (`slug`, `path`, `[permalinks]`, a translated
+          # bundle's `/ko/…/img.png`), known before any build has run.
+          private def published_route?(url : String, routes : Services::PageRouteIndex) : Bool
+            return false unless url.starts_with?("/")
+            routes.published?(url) || routes.bundle_asset?(url)
+          end
+
+          # Why a link that names real page sources is still dead: the pages
+          # it names publish nothing, or publish somewhere else.
+          private def unpublished_page_error(url : String, content_dir : String, base_dir : String,
+                                             language_codes : Array(String),
+                                             routes : Services::PageRouteIndex) : String?
+            sources = page_sources(content_target(url, content_dir, base_dir).rstrip("/"))
+            if sources.empty? && (code = translatable_language_prefix(url, language_codes))
+              stripped = url[(code.size + 1)..]
+              sources = translated_page_sources(stripped.empty? ? "/" : stripped, code, content_dir, base_dir)
+            end
+            return if sources.empty?
+
+            states = sources.compact_map { |source| routes.state_for(source) }
+            return if states.size < sources.size
+            if published = sources.find { |source| routes.state_for(source) == Services::PublishState::Published.label }
+              return "Internal link target not found: the page is published at #{routes.url_for(published)}"
+            end
+            state = states.first
+            reason = state == Services::PageRouteIndex::NOT_RENDERED ? "target sets render = false" : Services::InternalLinkIndex.describe(state)
+            "Internal link not resolved by the build: #{reason}"
+          end
+
+          private def own_page_link?(url : String, link : Link, routes : Services::PageRouteIndex) : Bool
+            return false if link.kind == :image || !url.starts_with?("/")
+            return false unless page_url = routes.url_for(link.file)
+            Services::PageRouteIndex.normalize(url) == Services::PageRouteIndex.normalize(page_url)
+          end
+
+          # Resolve a relative destination against the URL of the page that
+          # holds it, the way a browser does (`..` stops at the root).
+          private def resolve_against_page(page_url : String, relative : String) : String
+            segments = page_url.split('/').reject(&.empty?)
+            parts = relative.split('/')
+            directory = {"", ".", ".."}.includes?(parts.last)
+            parts.each do |part|
+              case part
+              when "", "." then next
+              when ".."    then segments.pop?
+              else              segments << part
+              end
+            end
+            return "/" if segments.empty?
+            path = "/#{segments.join('/')}"
+            directory ? "#{path}/" : path
+          end
+
+          # Without a loaded config (unit callers pass only the language
+          # codes), the route index still needs the codes to place
+          # `about.ko.md` at `/ko/about/`.
+          private def route_config(language_codes : Array(String)) : Models::Config?
+            return if language_codes.empty?
+            config = Models::Config.new
+            languages = {} of String => Models::LanguageConfig
+            language_codes.each { |code| languages[code] = Models::LanguageConfig.new(code) }
+            config.default_language = "" if language_codes.includes?(config.default_language)
+            config.languages = languages
+            config
+          end
+
+          # The content files `stem` plus a Markdown extension names, the
+          # extension matched case-insensitively as ReadContent does:
+          # `content/leaf.MD` and `content/b/index.MARKDOWN` publish `/leaf/`
+          # and `/b/` like their lowercase twins. A directory's sources are
+          # listed once per run (see @markdown_stems).
+          private def markdown_files_for(stem : String) : Array(String)
+            dir = File.dirname(stem)
+            by_stem = @markdown_stems.fetch(dir) do
+              found = {} of String => Array(String)
+              if Dir.exists?(dir)
+                Dir.each_child(dir) do |child|
+                  next unless Services::ContentWalk.markdown?(child)
+                  path = File.join(dir, child)
+                  next unless File.exists?(path)
+                  (found[child[0, child.size - File.extname(child).size]] ||= [] of String) << path
+                end
+              end
+              @markdown_stems[dir] = found
+            end
+            by_stem[File.basename(stem)]? || [] of String
+          rescue File::Error
+            [] of String
+          end
+
+          # Map a link destination onto a path under the content directory.
+          private def content_target(url : String, content_dir : String, base_dir : String) : String
+            if url.starts_with?("@/")
+              # Zola-style content-root link (`@/posts/hello.md`). The build
+              # resolves these against the content dir, so the checker must too.
+              File.join(content_dir, url[2..])
+            elsif url.starts_with?("/")
+              File.join(content_dir, url.lstrip("/"))
+            else
+              File.join(base_dir, url)
+            end
+          end
+
+          private def taxonomy_url?(url : String, names : Array(String)) : Bool
+            return false if names.empty?
+            return false unless url.starts_with?("/")
+            segments = url.lstrip("/").rstrip("/").split("/")
+            return false if segments.empty? || segments.first.empty?
+            names.includes?(segments.first)
+          end
+
+          # nil only when there is no config.toml. A config that fails to load
+          # is a HWARO_E_CONFIG error (as in every other command): falling
+          # back to defaults dropped taxonomies/base_path/languages and
+          # reported /tags/ etc. as dead links.
+          private def load_config(project_root : String = ".") : Models::Config?
+            config_path = File.join(project_root, "config.toml")
+            return unless File.exists?(config_path)
+
+            Dir.cd(project_root) do
+              Models::Config.load
+            end
+          end
+        end
+      end
+    end
+  end
+end

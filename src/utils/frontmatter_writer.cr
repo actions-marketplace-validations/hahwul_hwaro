@@ -5,6 +5,7 @@
 # emission rules — key quoting, string escaping, date formatting — stay
 # identical across every tool that produces content files.
 
+require "base64"
 require "yaml"
 require "json"
 require "toml"
@@ -24,21 +25,60 @@ module Hwaro
       # a bare `YYYY-MM-DD`; genuine timestamps keep their own offset
       # (`to_rfc3339` would silently convert `08:00+09:00` to the previous
       # day's `23:00Z`).
+      #
+      # The bare-date shortcut applies only to a UTC or LOCAL-ZONE midnight —
+      # the shapes a parsed bare date actually takes (local midnight; YAML
+      # gave UTC midnight before ext/yaml_local_time_fix) — so authored bare
+      # dates round-trip unchanged through their own format. Note the UTC branch is
+      # deliberately lossy for an *authored* `...T00:00:00Z` timestamp when
+      # the file is later reparsed as TOML (local zone); that trade-off keeps
+      # YAML bare dates stable and predates this rule. A midnight with any
+      # other fixed offset is a genuine timestamp: collapsing it to
+      # `YYYY-MM-DD` silently shifted the instant, so it keeps its offset.
+      # Fractional seconds are preserved in both timestamp forms.
+      #
+      # Any other local-zone value is a zone-less date-time as authored
+      # (`2024-01-02T03:04:05`, which TOML and YAML both parse in the local
+      # zone), so it is written without an offset rather than pinning the
+      # converting machine's zone. On a UTC machine it can't be told from an
+      # authored `Z`, so it stays `Z` there.
       def self.serialize_time(time : Time) : String
-        if time.hour == 0 && time.minute == 0 && time.second == 0 && time.nanosecond == 0
+        midnight = time.hour == 0 && time.minute == 0 && time.second == 0 && time.nanosecond == 0
+        if midnight && (time.offset == 0 || time.location == Time::Location.local)
           time.to_s("%Y-%m-%d")
+        elsif time.location == Time::Location.local && !time.location.utc?
+          "#{time.to_s("%Y-%m-%dT%H:%M:%S")}#{second_fraction(time.nanosecond)}"
         elsif time.offset == 0
-          time.to_rfc3339
+          time.to_rfc3339(fraction_digits: rfc3339_fraction_digits(time.nanosecond))
         else
-          time.to_s("%Y-%m-%dT%H:%M:%S%:z")
+          "#{time.to_s("%Y-%m-%dT%H:%M:%S")}#{second_fraction(time.nanosecond)}#{time.to_s("%:z")}"
+        end
+      end
+
+      # Fraction width for `to_rfc3339`, which only accepts 0/3/6/9 digits.
+      private def self.rfc3339_fraction_digits(nanosecond : Int32) : Int32
+        return 0 if nanosecond == 0
+        return 3 if nanosecond % 1_000_000 == 0
+        return 6 if nanosecond % 1_000 == 0
+        9
+      end
+
+      # `.NNN` suffix for the offset format, at the same widths RFC 3339 uses.
+      private def self.second_fraction(nanosecond : Int32) : String
+        return "" if nanosecond == 0
+        if nanosecond % 1_000_000 == 0
+          ".#{(nanosecond // 1_000_000).to_s.rjust(3, '0')}"
+        elsif nanosecond % 1_000 == 0
+          ".#{(nanosecond // 1_000).to_s.rjust(6, '0')}"
+        else
+          ".#{nanosecond.to_s.rjust(9, '0')}"
         end
       end
 
       # Escape a string for a double-quoted TOML basic string. Unlike Crystal's
       # `String#inspect`, this never emits TOML-invalid escapes (`\a`, `\e`,
-      # `\v`) and leaves non-ASCII text raw — toml.cr's `\uXXXX` reader greedily
-      # consumes a following hex digit, so escaping U+200B in "Auto​build" would
-      # produce an unparseable file.
+      # `\v`) and leaves non-ASCII text raw (`\u` is exactly four digits —
+      # ext/toml_unicode_escape_fix.cr — so a following hex digit is literal).
       def self.escape_toml_string(str : String) : String
         str
           .gsub("\\", "\\\\")
@@ -145,7 +185,13 @@ module Hwaro
       # tree: scalars first, then `[table]` sections, then `[[array-of-table]]`
       # sections, preserving source key order within each group.
       class TomlBuilder
-        def initialize
+        # `omit_null_keys`: TOP-LEVEL keys dropped when their value is null.
+        # TOML has no null, so a null is otherwise written as `""` — which
+        # keeps the key declared (it still shadows a section `[cascade]`) and
+        # matches what the build makes of a null custom/extra value. For a
+        # key whose `""` is a meaningful SET value (`slug = ""` collides with
+        # the section index) a caller can name it here instead.
+        def initialize(@omit_null_keys : Set(String) = Set(String).new)
           @output = String::Builder.new
         end
 
@@ -167,6 +213,9 @@ module Hwaro
         private def process_table(yaml : YAML::Any, path : Array(String), print_header : Bool, depth : Int32 = 0)
           Nesting.check!(depth)
           return unless hash = yaml.as_h?
+          if path.empty? && !@omit_null_keys.empty?
+            hash = hash.reject { |key, value| value.raw.nil? && @omit_null_keys.includes?(key.as_s? || key.to_s) }
+          end
 
           # An empty table (`extra: {}`) has no values to force a header out,
           # but dropping the key entirely would silently lose it.
@@ -311,6 +360,8 @@ module Hwaro
             end
           when Time
             FrontmatterWriter.serialize_time(raw)
+          when Bytes
+            "\"#{Base64.strict_encode(raw)}\""
           when Array
             "[#{array_items(value, depth).join(", ")}]"
           when Hash

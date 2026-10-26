@@ -1,0 +1,1557 @@
+require "../../../../spec_helper"
+require "../../../../../src/content/processors/template"
+
+# Helper to build a Crinja::Value from an array of hashes
+private def crinja_hash_array(items : Array(Hash(String, String))) : Crinja::Value
+  arr = items.map do |h|
+    hash = {} of Crinja::Value => Crinja::Value
+    h.each { |k, v| hash[Crinja::Value.new(k)] = Crinja::Value.new(v) }
+    Crinja::Value.new(hash)
+  end
+  Crinja::Value.new(arr)
+end
+
+# =============================================================================
+# Collection Filters
+# =============================================================================
+describe "CollectionFilters" do
+  describe "where" do
+    it "filters array of hashes by attribute value" do
+      items = crinja_hash_array([
+        {"name" => "Alice", "role" => "admin"},
+        {"name" => "Bob", "role" => "user"},
+        {"name" => "Carol", "role" => "admin"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | where(attribute='role', value='admin') %}{{ item.name }},{% endfor %}", vars)
+      result.should contain("Alice")
+      result.should contain("Carol")
+      result.should_not contain("Bob")
+    end
+
+    it "returns empty array when no items match" do
+      items = crinja_hash_array([
+        {"name" => "Alice", "role" => "admin"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | where(attribute='role', value='guest') %}{{ item.name }}{% endfor %}", vars)
+      result.strip.should eq("")
+    end
+
+    it "returns empty array for non-array input" do
+      vars = {"items" => Crinja::Value.new("not an array")}
+      result = render_crinja("{% for item in items | where(attribute='x', value='y') %}found{% endfor %}", vars)
+      result.strip.should eq("")
+    end
+
+    it "handles missing attribute gracefully" do
+      items = crinja_hash_array([
+        {"name" => "Alice"},
+        {"name" => "Bob", "role" => "admin"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | where(attribute='role', value='admin') %}{{ item.name }},{% endfor %}", vars)
+      result.should contain("Bob")
+      result.should_not contain("Alice")
+    end
+  end
+
+  describe "sort_by" do
+    it "sorts array of hashes by attribute" do
+      items = crinja_hash_array([
+        {"name" => "Charlie", "weight" => "3"},
+        {"name" => "Alice", "weight" => "1"},
+        {"name" => "Bob", "weight" => "2"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | sort_by(attribute='weight') %}{{ item.name }},{% endfor %}", vars)
+      result.should eq("Alice,Bob,Charlie,")
+    end
+
+    it "sorts in reverse order" do
+      items = crinja_hash_array([
+        {"name" => "Alice", "weight" => "1"},
+        {"name" => "Bob", "weight" => "2"},
+        {"name" => "Charlie", "weight" => "3"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | sort_by(attribute='weight', reverse=true) %}{{ item.name }},{% endfor %}", vars)
+      result.should eq("Charlie,Bob,Alice,")
+    end
+
+    it "sorts by name alphabetically" do
+      items = crinja_hash_array([
+        {"name" => "Cherry"},
+        {"name" => "Apple"},
+        {"name" => "Banana"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja("{% for item in items | sort_by(attribute='name') %}{{ item.name }},{% endfor %}", vars)
+      result.should eq("Apple,Banana,Cherry,")
+    end
+
+    it "returns empty array for non-array input" do
+      vars = {"items" => Crinja::Value.new("not an array")}
+      result = render_crinja("{% for item in items | sort_by(attribute='x') %}found{% endfor %}", vars)
+      result.strip.should eq("")
+    end
+
+    it "handles missing attribute by treating as empty string" do
+      items = crinja_hash_array([
+        {"name" => "Bob"},
+        {"name" => "Alice", "weight" => "1"},
+      ])
+
+      vars = {"items" => items}
+      # Missing attribute treated as "", so comes first
+      result = render_crinja("{% for item in items | sort_by(attribute='weight') %}{{ item.name }},{% endfor %}", vars)
+      result.should eq("Bob,Alice,")
+    end
+  end
+
+  describe "group_by" do
+    it "groups array of hashes by attribute" do
+      items = crinja_hash_array([
+        {"name" => "Alice", "dept" => "eng"},
+        {"name" => "Bob", "dept" => "sales"},
+        {"name" => "Carol", "dept" => "eng"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja(
+        "{% for group in items | group_by(attribute='dept') %}{{ group.grouper }}:{% for item in group.list %}{{ item.name }},{% endfor %};{% endfor %}",
+        vars
+      )
+      result.should contain("eng:")
+      result.should contain("sales:")
+      result.should contain("Alice")
+      result.should contain("Bob")
+      result.should contain("Carol")
+    end
+
+    it "returns empty array for non-array input" do
+      vars = {"items" => Crinja::Value.new("not an array")}
+      result = render_crinja("{% for group in items | group_by(attribute='x') %}found{% endfor %}", vars)
+      result.strip.should eq("")
+    end
+
+    it "groups items with missing attribute under empty string key" do
+      items = crinja_hash_array([
+        {"name" => "Alice", "dept" => "eng"},
+        {"name" => "Bob"},
+      ])
+
+      vars = {"items" => items}
+      result = render_crinja(
+        "{% for group in items | group_by(attribute='dept') %}[{{ group.grouper }}]{% endfor %}",
+        vars
+      )
+      result.should contain("[eng]")
+      result.should contain("[]")
+    end
+  end
+end
+
+# =============================================================================
+# Date Filters
+# =============================================================================
+describe "DateFilters" do
+  describe "date" do
+    it "formats a date string with default format" do
+      vars = {"d" => Crinja::Value.new("2024-06-15")}
+      result = render_crinja("{{ d | date }}", vars)
+      result.strip.should eq("2024-06-15")
+    end
+
+    it "formats a date string with custom format" do
+      vars = {"d" => Crinja::Value.new("2024-06-15")}
+      result = render_crinja("{{ d | date(format='%Y/%m/%d') }}", vars)
+      result.strip.should eq("2024/06/15")
+    end
+
+    it "formats a Time value with default format" do
+      vars = {"d" => Crinja::Value.new(Time.utc(2024, 3, 20))}
+      result = render_crinja("{{ d | date }}", vars)
+      result.strip.should eq("2024-03-20")
+    end
+
+    it "formats a Time value with custom format" do
+      vars = {"d" => Crinja::Value.new(Time.utc(2024, 3, 20, 14, 30, 0))}
+      result = render_crinja("{{ d | date(format='%H:%M') }}", vars)
+      result.strip.should eq("14:30")
+    end
+
+    it "formats a Time value with year only" do
+      vars = {"d" => Crinja::Value.new(Time.utc(2024, 12, 25))}
+      result = render_crinja("{{ d | date(format='%Y') }}", vars)
+      result.strip.should eq("2024")
+    end
+
+    it "returns original value for unparseable string" do
+      vars = {"d" => Crinja::Value.new("not a date")}
+      result = render_crinja("{{ d | date }}", vars)
+      result.strip.should eq("not a date")
+    end
+
+    # Regression: a malformed strftime pattern (a trailing `%`) made
+    # Crystal's `Time#to_s` raise a bare `IndexError`, which is not a
+    # `Crinja::Error` and so escaped the render error handling —
+    # the whole build died with `Index out of bounds` and no template
+    # file:line. It must surface as a located template error naming the
+    # bad format instead.
+    it "raises a located Crinja error for a malformed format string" do
+      vars = {"d" => Crinja::Value.new("2024-06-15")}
+      ex = expect_raises(Crinja::Error) do
+        render_crinja("{{ d | date(format='%') }}", vars)
+      end
+      ex.message.not_nil!.should contain("invalid date format")
+    end
+
+    it "raises a located Crinja error for a malformed format on a Time value" do
+      vars = {"d" => Crinja::Value.new(Time.utc(2024, 3, 20))}
+      ex = expect_raises(Crinja::Error) do
+        render_crinja("{{ d | date(format='%') }}", vars)
+      end
+      ex.message.not_nil!.should contain("invalid date format")
+    end
+
+    it "converts non-string non-time values to string" do
+      vars = {"d" => Crinja::Value.new(12345)}
+      result = render_crinja("{{ d | date }}", vars)
+      result.strip.should eq("12345")
+    end
+
+    it "parses ISO 8601 datetime with T separator" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00")}
+      result = render_crinja("{{ d | date(format='%Y-%m-%d %H:%M') }}", vars)
+      result.strip.should eq("2024-06-15 14:30")
+    end
+
+    it "parses datetime with space separator" do
+      vars = {"d" => Crinja::Value.new("2024-06-15 14:30:00")}
+      result = render_crinja("{{ d | date(format='%Y-%m-%d %H:%M') }}", vars)
+      result.strip.should eq("2024-06-15 14:30")
+    end
+
+    it "parses RFC 3339 datetime with timezone" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00Z")}
+      result = render_crinja("{{ d | date(format='%Y-%m-%d') }}", vars)
+      result.strip.should eq("2024-06-15")
+    end
+
+    it "parses RFC 3339 datetime with offset timezone" do
+      vars = {"d" => Crinja::Value.new("2024-06-15T14:30:00+09:00")}
+      result = render_crinja("{{ d | date(format='%Y-%m-%d') }}", vars)
+      result.strip.should eq("2024-06-15")
+    end
+
+    it "keeps the offset of every zoned string form" do
+      {
+        "2024-03-05 08:00:00 UTC"    => "08:00 +0000",
+        "2024-03-05 08:00:00 -05:00" => "08:00 -0500",
+        "2024-01-15T10:30:00-03:30"  => "10:30 -0330",
+        "2024-01-15T10:30:00+0900"   => "10:30 +0900",
+        "2024-01-15 10:30:00 +09:00" => "10:30 +0900",
+        "2024-01-15T10:30+09:00"     => "10:30 +0900",
+        "2024-01-15 10:30 -05:00"    => "10:30 -0500",
+      }.each do |input, expected|
+        vars = {"d" => Crinja::Value.new(input)}
+        render_crinja("{{ d | date(format='%H:%M %z') }}", vars).strip.should eq(expected)
+      end
+    end
+
+    it "formats the Time#to_s form front matter datetimes reach templates as" do
+      vars = {"d" => Crinja::Value.new("2024-03-05 08:00:00 UTC")}
+      render_crinja("{{ d | date(format='%B %d, %Y') }}", vars).strip.should eq("March 05, 2024")
+    end
+  end
+end
+
+# =============================================================================
+# String Filters
+# =============================================================================
+describe "StringFilters" do
+  describe "truncate_words" do
+    it "truncates text to specified word count" do
+      vars = {"text" => Crinja::Value.new("one two three four five six")}
+      result = render_crinja("{{ text | truncate_words(length=3) }}", vars)
+      result.strip.should eq("one two three...")
+    end
+
+    it "does not truncate when text has fewer words than limit" do
+      vars = {"text" => Crinja::Value.new("one two")}
+      result = render_crinja("{{ text | truncate_words(length=5) }}", vars)
+      result.strip.should eq("one two")
+    end
+
+    it "uses custom ending" do
+      vars = {"text" => Crinja::Value.new("one two three four")}
+      result = render_crinja("{{ text | truncate_words(length=2, end=' [more]') }}", vars)
+      result.strip.should eq("one two [more]")
+    end
+
+    it "uses default of 50 words" do
+      words = (1..60).map { |i| "word#{i}" }.join(" ")
+      vars = {"text" => Crinja::Value.new(words)}
+      result = render_crinja("{{ text | truncate_words }}", vars)
+      result.strip.should end_with("...")
+      # Should have 50 words + "..."
+      result.strip.split(/\s+/).size.should be <= 51
+    end
+
+    it "handles empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | truncate_words(length=5) }}", vars)
+      result.strip.should eq("")
+    end
+
+    it "handles single word" do
+      vars = {"text" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ text | truncate_words(length=1) }}", vars)
+      result.strip.should eq("hello")
+    end
+
+    it "returns only the ending for a non-positive length (pinned contract)" do
+      # length <= 0 is nonsensical input (e.g. a dynamically-computed length
+      # that hits 0). Pin the current behavior so a future fix is a deliberate
+      # change rather than an accidental flip — both 0 and -1 collapse to just
+      # the ending today.
+      vars = {"text" => Crinja::Value.new("one two three")}
+      render_crinja("{{ text | truncate_words(length=0) }}", vars).strip.should eq("...")
+      render_crinja("{{ text | truncate_words(length=-1) }}", vars).strip.should eq("...")
+    end
+
+    it "returns the text unchanged for an out-of-range length" do
+      # to_count saturates over-large input at its `max` instead of raising,
+      # but the filter then splits at `length + 1` to detect truncation — with
+      # the clamp sitting on Int32::MAX that increment raised
+      # `Arithmetic overflow` and aborted the render of the whole page.
+      vars = {"text" => Crinja::Value.new("a b c d")}
+      render_crinja("{{ text | truncate_words(length=2147483647) }}", vars).strip.should eq("a b c d")
+      # Same value arriving as a string, which is all a shortcode can forward.
+      render_crinja(%({{ text | truncate_words(length="2147483647") }}), vars).strip.should eq("a b c d")
+    end
+  end
+
+  describe "slugify" do
+    it "converts text to URL slug" do
+      vars = {"text" => Crinja::Value.new("Hello World")}
+      result = render_crinja("{{ text | slugify }}", vars)
+      result.strip.should eq("hello-world")
+    end
+
+    it "removes special characters" do
+      vars = {"text" => Crinja::Value.new("Hello! World? #2024")}
+      result = render_crinja("{{ text | slugify }}", vars)
+      result.strip.should eq("hello-world-2024")
+    end
+
+    it "handles multiple spaces and hyphens" do
+      vars = {"text" => Crinja::Value.new("  hello   world  ")}
+      result = render_crinja("{{ text | slugify }}", vars)
+      result.strip.should eq("hello-world")
+    end
+
+    it "handles empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | slugify }}", vars)
+      result.strip.should eq("")
+    end
+
+    it "preserves numbers" do
+      vars = {"text" => Crinja::Value.new("Part 3 of 10")}
+      result = render_crinja("{{ text | slugify }}", vars)
+      result.strip.should eq("part-3-of-10")
+    end
+  end
+
+  describe "split" do
+    it "splits string by default separator (comma)" do
+      vars = {"text" => Crinja::Value.new("a, b, c")}
+      result = render_crinja("{% for item in text | split %}[{{ item }}]{% endfor %}", vars)
+      result.should contain("[a]")
+      result.should contain("[b]")
+      result.should contain("[c]")
+    end
+
+    it "splits string by custom separator" do
+      vars = {"text" => Crinja::Value.new("a|b|c")}
+      result = render_crinja("{% for item in text | split(pat='|') %}[{{ item }}]{% endfor %}", vars)
+      result.should contain("[a]")
+      result.should contain("[b]")
+      result.should contain("[c]")
+    end
+
+    it "returns single-element array when separator not found" do
+      vars = {"text" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ text | split(pat='|') | length }}", vars)
+      result.strip.should eq("1")
+    end
+
+    it "handles empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | split | length }}", vars)
+      result.strip.should eq("1")
+    end
+  end
+
+  describe "trim" do
+    it "removes leading and trailing whitespace" do
+      vars = {"text" => Crinja::Value.new("  hello  ")}
+      result = render_crinja("[{{ text | trim }}]", vars)
+      result.strip.should eq("[hello]")
+    end
+
+    it "handles string with no extra whitespace" do
+      vars = {"text" => Crinja::Value.new("hello")}
+      result = render_crinja("[{{ text | trim }}]", vars)
+      result.strip.should eq("[hello]")
+    end
+
+    it "handles string with only whitespace" do
+      vars = {"text" => Crinja::Value.new("   ")}
+      result = render_crinja("[{{ text | trim }}]", vars)
+      result.strip.should eq("[]")
+    end
+
+    it "preserves internal whitespace" do
+      vars = {"text" => Crinja::Value.new("  hello world  ")}
+      result = render_crinja("[{{ text | trim }}]", vars)
+      result.strip.should eq("[hello world]")
+    end
+
+    it "handles tabs and newlines" do
+      vars = {"text" => Crinja::Value.new("\thello\n")}
+      result = render_crinja("[{{ text | trim }}]", vars)
+      result.strip.should eq("[hello]")
+    end
+  end
+end
+
+# =============================================================================
+# Misc Filters
+# =============================================================================
+describe "MiscFilters" do
+  describe "jsonify" do
+    it "encodes a string as JSON" do
+      vars = {"text" => Crinja::Value.new("hello world")}
+      result = render_crinja("{{ text | jsonify }}", vars)
+      result.strip.should eq("\"hello world\"")
+    end
+
+    it "encodes a string with special characters" do
+      vars = {"text" => Crinja::Value.new("say \"hello\"")}
+      result = render_crinja("{{ text | jsonify }}", vars)
+      result.strip.should contain("\\\"")
+    end
+
+    it "encodes empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | jsonify }}", vars)
+      result.strip.should eq("\"\"")
+    end
+
+    it "escapes script tag closing to prevent XSS" do
+      vars = {"text" => Crinja::Value.new("</script>")}
+      result = render_crinja("{{ text | jsonify }}", vars)
+      result.should_not contain("</script>")
+      result.should contain("<\\/script>")
+    end
+  end
+
+  # Regression: Crinja's stock `tojson` wraps its output in
+  # `SafeString.escape`, HTML-entity-escaping the JSON (`"` -> `&quot;`),
+  # which is invalid JSON in a standalone output-format file (and unusable
+  # inside a <script>). Hwaro overrides it to emit real JSON like `jsonify`.
+  describe "tojson (hwaro override)" do
+    it "produces valid, non-HTML-escaped JSON for a string" do
+      vars = {"text" => Crinja::Value.new("hello world")}
+      result = render_crinja("{{ text | tojson }}", vars)
+      result.strip.should eq("\"hello world\"")
+      result.should_not contain("&quot;")
+    end
+
+    it "escapes an embedded quote as a JSON escape, not an HTML entity" do
+      vars = {"text" => Crinja::Value.new(%(say "hi"))}
+      result = render_crinja("{{ text | tojson }}", vars).strip
+      result.should eq(%("say \\"hi\\""))
+      result.should_not contain("&quot;")
+      JSON.parse(result).as_s.should eq(%(say "hi"))
+    end
+
+    it "emits raw JSON for an array (round-trips)" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new("a"), Crinja::Value.new("b")])}
+      result = render_crinja("{{ items | tojson }}", vars).strip
+      result.should eq(%(["a","b"]))
+      JSON.parse(result).as_a.map(&.as_s).should eq(["a", "b"])
+    end
+
+    it "keeps </script> script-safe while staying valid JSON" do
+      vars = {"text" => Crinja::Value.new("</script>")}
+      result = render_crinja("{{ text | tojson }}", vars).strip
+      result.should_not contain("</script>")
+      result.should contain("<\\/script>")
+      JSON.parse(result).as_s.should eq("</script>")
+    end
+
+    it "supports the indent argument" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new(2)])}
+      result = render_crinja("{{ items | tojson(indent=2) }}", vars).strip
+      result.should contain("\n")
+      JSON.parse(result).as_a.map(&.as_i).should eq([1, 2])
+    end
+
+    # A negative indent would make `String#*` raise ArgumentError (aborting the
+    # whole build); a huge one would overflow/allocate a giant string. Both are
+    # clamped to a sane range instead of crashing.
+    it "clamps a negative indent to compact output instead of crashing" do
+      vars = {"text" => Crinja::Value.new("hi")}
+      result = render_crinja("{{ text | tojson(indent=-5) }}", vars).strip
+      result.should eq(%("hi"))
+    end
+
+    it "clamps an oversized indent instead of overflowing or exhausting memory" do
+      vars = {"items" => Crinja::Value.new([Crinja::Value.new(1)])}
+      result = render_crinja("{{ items | tojson(indent=999999999999) }}", vars).strip
+      JSON.parse(result).as_a.map(&.as_i).should eq([1])
+      # Clamped to <= 16 spaces per level, not billions.
+      result.should_not match(/ {17,}/)
+    end
+  end
+
+  describe "default" do
+    it "returns original value when not empty" do
+      vars = {"text" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ text | default(value='fallback') }}", vars)
+      result.strip.should eq("hello")
+    end
+
+    it "returns default value when empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | default(value='fallback') }}", vars)
+      result.strip.should eq("fallback")
+    end
+
+    it "preserves the fallback value's type" do
+      render_crinja("{{ (missing | default(value=40)) + 2 }}").strip.should eq("42")
+    end
+
+    # Jinja's (and the replaced Crinja built-in's) second argument was
+    # silently ignored: `false | default("x", true)` rendered "false".
+    it "replaces falsy values when boolean is true" do
+      render_crinja(%([{{ false | default("x", true) }}|{{ 0 | default(value="x", boolean=true) }}|{{ [] | default("x", true) }}])).should eq("[x|x|x]")
+      render_crinja(%([{{ false | default("x") }}|{{ 0 | default("x") }}|{{ "a" | default("x", true) }}])).should eq("[false|0|a]")
+    end
+
+    it "renders a none fallback as an empty string" do
+      render_crinja("[{{ missing | default(value=none) }}]").strip.should eq("[]")
+      vars = {"text" => Crinja::Value.new("")}
+      render_crinja("[{{ text | default(value=none) }}]", vars).strip.should eq("[]")
+    end
+
+    it "stringifies a non-empty scalar value so string filters keep working" do
+      vars = {"num" => Crinja::Value.new(42), "flag" => Crinja::Value.new(true)}
+      render_crinja("{{ num | default(value='') | length }}", vars).strip.should eq("2")
+      render_crinja("{{ num | default(value='') | replace('4', '5') }}", vars).strip.should eq("52")
+      render_crinja("{{ flag | default(value='') | length }}", vars).strip.should eq("4")
+    end
+
+    it "passes a non-empty array or hash through unchanged" do
+      items = Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new(2), Crinja::Value.new(3)])
+      hash = Crinja::Value.new({Crinja::Value.new("a") => Crinja::Value.new("x")})
+      vars = {"items" => items, "meta" => hash}
+      render_crinja("{{ items | default(value=[]) | length }}", vars).strip.should eq("3")
+      render_crinja("{% for i in items | default(value=[]) %}{{ i }},{% endfor %}", vars).strip.should eq("1,2,3,")
+      render_crinja("{% set m = meta | default(value='') %}{{ m.a }}", vars).strip.should eq("x")
+      render_crinja("{{ items | default(value='') }}", vars).should_not contain("Crinja::Value")
+    end
+
+    it "returns default value for undefined variable" do
+      result = render_crinja("{{ undefined_var | default(value='fallback') }}")
+      result.strip.should eq("fallback")
+    end
+
+    it "uses empty string as default when no value specified" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("[{{ text | default }}]", vars)
+      result.strip.should eq("[]")
+    end
+
+    it "returns original numeric value as string when not empty" do
+      vars = {"num" => Crinja::Value.new(42)}
+      result = render_crinja("{{ num | default(value='zero') }}", vars)
+      result.strip.should eq("42")
+    end
+  end
+end
+
+# =============================================================================
+# HTML Filters
+# =============================================================================
+describe "HtmlFilters" do
+  describe "strip_html" do
+    it "removes HTML tags" do
+      vars = {"html" => Crinja::Value.new("<p>Hello <b>World</b></p>")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      result.strip.should eq("Hello World")
+    end
+
+    it "removes self-closing tags" do
+      vars = {"html" => Crinja::Value.new("Hello<br/>World")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      # TextUtils.strip_html inserts space at tag boundaries for word separation
+      result.strip.should eq("Hello World")
+    end
+
+    it "handles text without HTML" do
+      vars = {"html" => Crinja::Value.new("plain text")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      result.strip.should eq("plain text")
+    end
+
+    it "handles empty string" do
+      vars = {"html" => Crinja::Value.new("")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      result.strip.should eq("")
+    end
+
+    it "removes nested tags" do
+      vars = {"html" => Crinja::Value.new("<div><p><span>deep</span></p></div>")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      result.strip.should eq("deep")
+    end
+
+    it "removes tags with attributes" do
+      vars = {"html" => Crinja::Value.new("<a href=\"https://example.com\" class=\"link\">Click</a>")}
+      result = render_crinja("{{ html | strip_html }}", vars)
+      result.strip.should eq("Click")
+    end
+  end
+
+  describe "markdownify" do
+    it "converts markdown to HTML" do
+      vars = {"md" => Crinja::Value.new("**bold**")}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain("<strong>bold</strong>")
+    end
+
+    it "honors the site's safe mode when the build config is published" do
+      cfg = Hwaro::Models::MarkdownConfig.new
+      cfg.safe = true
+      Hwaro::Processor::Markdown.filter_markdown_config = cfg
+      begin
+        vars = {"md" => Crinja::Value.new("<script>x()</script>\n\ntext")}
+        result = render_crinja("{{ md | markdownify }}", vars)
+        result.should_not contain("<script>")
+        result.should contain("text")
+      ensure
+        Hwaro::Processor::Markdown.filter_markdown_config = nil
+      end
+    end
+
+    # A block body carries nested shortcodes as placeholder comments; safe
+    # mode replaced them with `<!-- raw HTML omitted -->`, so the nested
+    # shortcode's output vanished (the built-in alert markdownifies its body).
+    it "keeps shortcode placeholders under safe mode" do
+      cfg = Hwaro::Models::MarkdownConfig.new
+      cfg.safe = true
+      Hwaro::Processor::Markdown.filter_markdown_config = cfg
+      begin
+        vars = {"md" => Crinja::Value.new("A <!--HWARO-SHORTCODE-PLACEHOLDER-0--> <b>x</b>\n\n<!--HWARO-SHORTCODE-PLACEHOLDER-1-->\n")}
+        result = render_crinja("{{ md | markdownify }}", vars)
+        result.should contain("<!--HWARO-SHORTCODE-PLACEHOLDER-0-->")
+        result.should contain("<!--HWARO-SHORTCODE-PLACEHOLDER-1-->")
+        result.should_not contain("<b>")
+      ensure
+        Hwaro::Processor::Markdown.filter_markdown_config = nil
+      end
+    end
+
+    it "honors the site's smart_punctuation setting" do
+      cfg = Hwaro::Models::MarkdownConfig.new
+      cfg.smart_punctuation = true
+      Hwaro::Processor::Markdown.filter_markdown_config = cfg
+      begin
+        vars = {"md" => Crinja::Value.new(%(say "hi" -- ok))}
+        result = render_crinja("{{ md | markdownify }}", vars)
+        result.should contain("“hi”")
+        result.should contain("–")
+      ensure
+        Hwaro::Processor::Markdown.filter_markdown_config = nil
+      end
+    end
+
+    it "keeps bare defaults when no build config is published" do
+      Hwaro::Processor::Markdown.filter_markdown_config = nil
+      vars = {"md" => Crinja::Value.new(%(say "hi"))}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain(%(&quot;hi&quot;))
+    end
+
+    it "converts markdown headings" do
+      vars = {"md" => Crinja::Value.new("# Title")}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain("<h1>")
+      result.should contain("Title")
+    end
+
+    it "converts markdown links" do
+      vars = {"md" => Crinja::Value.new("[link](https://example.com)")}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain("<a href=\"https://example.com\">link</a>")
+    end
+
+    it "handles plain text" do
+      vars = {"md" => Crinja::Value.new("plain text")}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain("plain text")
+    end
+
+    it "converts markdown lists" do
+      vars = {"md" => Crinja::Value.new("- item1\n- item2")}
+      result = render_crinja("{{ md | markdownify }}", vars)
+      result.should contain("<li>")
+      result.should contain("item1")
+      result.should contain("item2")
+    end
+  end
+
+  describe "xml_escape" do
+    it "escapes ampersand" do
+      vars = {"text" => Crinja::Value.new("Tom & Jerry")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should eq("Tom &amp; Jerry")
+    end
+
+    it "escapes angle brackets" do
+      vars = {"text" => Crinja::Value.new("<script>alert('xss')</script>")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should contain("&lt;script&gt;")
+      result.strip.should contain("&lt;/script&gt;")
+    end
+
+    it "escapes double quotes" do
+      vars = {"text" => Crinja::Value.new("say \"hello\"")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should contain("&quot;")
+    end
+
+    it "escapes single quotes" do
+      vars = {"text" => Crinja::Value.new("it's")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should contain("&apos;")
+    end
+
+    it "handles text without special characters" do
+      vars = {"text" => Crinja::Value.new("hello world")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should eq("hello world")
+    end
+
+    it "handles empty string" do
+      vars = {"text" => Crinja::Value.new("")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should eq("")
+    end
+
+    it "escapes multiple special characters" do
+      vars = {"text" => Crinja::Value.new("<a href=\"url\">M&M's</a>")}
+      result = render_crinja("{{ text | xml_escape }}", vars)
+      result.strip.should contain("&lt;")
+      result.strip.should contain("&gt;")
+      result.strip.should contain("&amp;")
+      result.strip.should contain("&quot;")
+      result.strip.should contain("&apos;")
+    end
+  end
+
+  describe "safe" do
+    it "marks content as safe (no escaping)" do
+      vars = {"html" => Crinja::Value.new("<b>bold</b>")}
+      result = render_crinja("{{ html | safe }}", vars)
+      result.strip.should eq("<b>bold</b>")
+    end
+
+    it "preserves HTML entities" do
+      vars = {"html" => Crinja::Value.new("<p class=\"test\">hello</p>")}
+      result = render_crinja("{{ html | safe }}", vars)
+      result.strip.should eq("<p class=\"test\">hello</p>")
+    end
+  end
+end
+
+# =============================================================================
+# URL Filters
+# =============================================================================
+describe "UrlFilters" do
+  describe "absolute_url" do
+    it "prepends base_url to relative path starting with /" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("/blog/post/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars)
+      result.strip.should eq("https://example.com/blog/post/")
+    end
+
+    it "prepends base_url with slash to relative path without leading /" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("blog/post/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars)
+      result.strip.should eq("https://example.com/blog/post/")
+    end
+
+    it "returns absolute URL unchanged" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("https://other.com/page/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars)
+      result.strip.should eq("https://other.com/page/")
+    end
+
+    it "returns http URL unchanged" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("http://other.com/page/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars)
+      result.strip.should eq("http://other.com/page/")
+    end
+
+    it "strips trailing slash from base_url to avoid double slash" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com/")
+
+      vars["my_url"] = Crinja::Value.new("/about/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars)
+      result.strip.should eq("https://example.com/about/")
+    end
+  end
+
+  describe "relative_url" do
+    it "returns path-only URL (strips protocol and host)" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("/blog/post/")
+
+      result = render_crinja("{{ my_url | relative_url }}", vars)
+      result.strip.should eq("/blog/post/")
+    end
+
+    it "returns path without leading / unchanged" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      vars["my_url"] = Crinja::Value.new("blog/post/")
+
+      result = render_crinja("{{ my_url | relative_url }}", vars)
+      result.strip.should eq("blog/post/")
+    end
+
+    it "includes base_url path component" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com/subdir/")
+
+      vars["my_url"] = Crinja::Value.new("/about/")
+
+      result = render_crinja("{{ my_url | relative_url }}", vars)
+      result.strip.should eq("/subdir/about/")
+    end
+  end
+
+  describe "values that already carry their own origin" do
+    # `absolute_url`/`relative_url` only special-cased http(s)://, so a
+    # `mailto:` link came back as https://example.com/mailto:a@b.com and a
+    # protocol-relative CDN URL (which starts with "/") became
+    # https://example.com//cdn.example.com/x.js.
+    {
+      "mailto:hello@example.com",
+      "tel:+15551234",
+      "data:image/png;base64,AAAA",
+      "//cdn.example.com/lib.js",
+      "ftp://files.example.com/x.zip",
+    }.each do |url|
+      it "absolute_url passes #{url} through unchanged" do
+        vars = {} of String => Crinja::Value
+        vars["base_url"] = Crinja::Value.new("https://example.com")
+
+        vars["my_url"] = Crinja::Value.new(url)
+
+        result = render_crinja("{{ my_url | absolute_url }}", vars).strip
+        result.should eq(url)
+      end
+
+      it "relative_url passes #{url} through unchanged" do
+        vars = {} of String => Crinja::Value
+        vars["base_url"] = Crinja::Value.new("https://example.com/sub/")
+
+        vars["my_url"] = Crinja::Value.new(url)
+
+        result = render_crinja("{{ my_url | relative_url }}", vars).strip
+        result.should eq(url)
+      end
+
+      it "url_for passes #{url} through unchanged" do
+        vars = {} of String => Crinja::Value
+        vars["base_url"] = Crinja::Value.new("https://example.com")
+
+        vars["my_url"] = Crinja::Value.new(url)
+
+        result = render_crinja("{{ url_for(path=my_url) }}", vars).strip
+        result.should eq(url)
+      end
+    end
+
+    it "relative_url survives a malformed base_url instead of aborting the build" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("http://[bad")
+
+      vars["my_url"] = Crinja::Value.new("/about/")
+
+      result = render_crinja("{{ my_url | relative_url }}", vars).strip
+      result.should eq("/about/")
+    end
+  end
+
+  describe "numeric arguments given as strings" do
+    # Every shortcode argument is parsed into a String, so a numeric argument
+    # forwarded from a shortcode always arrives quoted. `as_number` raised
+    # Crinja::TypeError on those and the raise aborted the whole page render.
+    it "truncate_words accepts a quoted length" do
+      vars = {} of String => Crinja::Value
+      vars["text"] = Crinja::Value.new("one two three four five")
+
+      result = render_crinja(%({{ text | truncate_words(length="2", end="…") }}), vars).strip
+      result.should eq("one two…")
+    end
+
+    it "truncate_words falls back to the default for a non-numeric length" do
+      vars = {} of String => Crinja::Value
+      vars["text"] = Crinja::Value.new("one two three")
+
+      result = render_crinja(%({{ text | truncate_words(length="wat") }}), vars).strip
+      result.should eq("one two three")
+    end
+
+    it "truncate_words does not drop trailing words for a negative length" do
+      vars = {} of String => Crinja::Value
+      vars["text"] = Crinja::Value.new("one two three")
+
+      result = render_crinja(%({{ text | truncate_words(length=-5, end="…") }}), vars).strip
+      result.should eq("…")
+    end
+
+    it "resize_image accepts a quoted width instead of aborting the render" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      result = render_crinja(%({{ resize_image(path="/img/a.png", width="800").width }}), vars).strip
+      result.should eq("800")
+    end
+
+    it "resize_image clamps an out-of-range width instead of raising" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("https://example.com")
+
+      result = render_crinja(%({{ resize_image(path="/img/a.png", width="999999999999").width }}), vars).strip
+      result.should eq(Int32::MAX.to_s)
+    end
+
+    it "resize_image hands a remote image URL back unchanged" do
+      vars = {"base_url" => Crinja::Value.new("https://example.com")}
+      render_crinja(%({{ resize_image(path="https://cdn.x/a.png", width=100).url }}), vars).strip.should eq("https://cdn.x/a.png")
+    end
+  end
+
+  describe "empty base_url (pre-deploy state)" do
+    it "absolute_url returns the path unchanged and never emits a // prefix" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("")
+
+      vars["my_url"] = Crinja::Value.new("/about/")
+
+      result = render_crinja("{{ my_url | absolute_url }}", vars).strip
+      result.should eq("/about/")
+      result.starts_with?("//").should be_false
+    end
+
+    it "relative_url returns the path unchanged and never emits a // prefix" do
+      vars = {} of String => Crinja::Value
+      vars["base_url"] = Crinja::Value.new("")
+
+      vars["my_url"] = Crinja::Value.new("/about/")
+
+      result = render_crinja("{{ my_url | relative_url }}", vars).strip
+      result.should eq("/about/")
+      result.starts_with?("//").should be_false
+    end
+  end
+end
+
+# =============================================================================
+# Filter Chaining
+# =============================================================================
+describe "Filter Chaining" do
+  it "chains strip_html and truncate_words" do
+    vars = {"html" => Crinja::Value.new("<p>one</p> <p>two</p> <p>three</p> <p>four</p> <p>five</p>")}
+    result = render_crinja("{{ html | strip_html | truncate_words(length=3) }}", vars)
+    result.strip.should end_with("...")
+  end
+
+  it "chains slugify and truncate_words" do
+    vars = {"text" => Crinja::Value.new("Hello Beautiful World")}
+    result = render_crinja("{{ text | slugify }}", vars)
+    result.strip.should eq("hello-beautiful-world")
+  end
+
+  it "chains split and length" do
+    vars = {"text" => Crinja::Value.new("a,b,c,d")}
+    result = render_crinja("{{ text | split | length }}", vars)
+    result.strip.should eq("4")
+  end
+
+  it "chains default and trim" do
+    vars = {"text" => Crinja::Value.new("")}
+    result = render_crinja("[{{ text | default(value='  hello  ') | trim }}]", vars)
+    result.strip.should eq("[hello]")
+  end
+
+  it "chains xml_escape and safe" do
+    vars = {"text" => Crinja::Value.new("Tom & Jerry")}
+    result = render_crinja("{{ text | xml_escape | safe }}", vars)
+    result.strip.should eq("Tom &amp; Jerry")
+  end
+
+  it "chains where and sort_by on collections" do
+    items = crinja_hash_array([
+      {"name" => "Charlie", "role" => "admin", "weight" => "3"},
+      {"name" => "Alice", "role" => "admin", "weight" => "1"},
+      {"name" => "Bob", "role" => "user", "weight" => "2"},
+      {"name" => "Diana", "role" => "admin", "weight" => "2"},
+    ])
+
+    vars = {"items" => items}
+    result = render_crinja(
+      "{% for item in items | where(attribute='role', value='admin') | sort_by(attribute='weight') %}{{ item.name }},{% endfor %}",
+      vars
+    )
+    result.should eq("Alice,Diana,Charlie,")
+  end
+end
+
+# =============================================================================
+# Collection Filters — unique, flatten, compact
+# =============================================================================
+describe "CollectionFilters (extended)" do
+  describe "unique" do
+    it "removes duplicate values from an array" do
+      items = Crinja::Value.new([1, 2, 2, 3, 1].map { |n| Crinja::Value.new(n) })
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | unique %}{{ i }},{% endfor %}", vars)
+      result.should eq("1,2,3,")
+    end
+
+    it "keeps values of different types distinct when their text is the same" do
+      items = Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new("1")])
+      render_crinja("{{ items | unique | length }}", {"items" => items}).strip.should eq("2")
+    end
+
+    it "removes duplicate strings" do
+      items = Crinja::Value.new(["a", "b", "a", "c"].map { |s| Crinja::Value.new(s) })
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | unique %}{{ i }},{% endfor %}", vars)
+      result.should eq("a,b,c,")
+    end
+
+    it "returns empty array for empty input" do
+      items = Crinja::Value.new([] of Crinja::Value)
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | unique %}{{ i }}{% endfor %}", vars)
+      result.should eq("")
+    end
+  end
+
+  describe "flatten" do
+    it "flattens nested arrays one level" do
+      inner1 = Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new(2)])
+      inner2 = Crinja::Value.new([Crinja::Value.new(3)])
+      items = Crinja::Value.new([inner1, inner2])
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | flatten %}{{ i }},{% endfor %}", vars)
+      result.should eq("1,2,3,")
+    end
+
+    it "passes through non-array items" do
+      inner = Crinja::Value.new([Crinja::Value.new(1), Crinja::Value.new(2)])
+      scalar = Crinja::Value.new("hello")
+      items = Crinja::Value.new([inner, scalar])
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | flatten %}{{ i }},{% endfor %}", vars)
+      result.should eq("1,2,hello,")
+    end
+  end
+
+  describe "compact" do
+    it "removes nil values from an array" do
+      items = Crinja::Value.new([Crinja::Value.new("a"), Crinja::Value.new(nil), Crinja::Value.new("b")])
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | compact %}{{ i }},{% endfor %}", vars)
+      result.should eq("a,b,")
+    end
+
+    it "removes empty string values" do
+      items = Crinja::Value.new([Crinja::Value.new("a"), Crinja::Value.new(""), Crinja::Value.new("b")])
+      vars = {"items" => items}
+      result = render_crinja("{% for i in items | compact %}{{ i }},{% endfor %}", vars)
+      result.should eq("a,b,")
+    end
+
+    it "removes empty lists and mappings" do
+      vars = {"items" => Crinja.value([1, [] of String, {} of String => String, [2]])}
+      render_crinja("{{ items | compact | length }}", vars).should eq("2")
+    end
+  end
+end
+
+# =============================================================================
+# Math Filters — ceil, floor
+# =============================================================================
+describe "MathFilters" do
+  describe "ceil" do
+    it "rounds up a float" do
+      vars = {"val" => Crinja::Value.new(3.2)}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("4")
+    end
+
+    it "returns same value for integer" do
+      vars = {"val" => Crinja::Value.new(5.0)}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("5")
+    end
+
+    it "rounds up negative float towards zero" do
+      vars = {"val" => Crinja::Value.new(-2.3)}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("-2")
+    end
+
+    it "handles integer input" do
+      vars = {"val" => Crinja::Value.new(7)}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("7")
+    end
+
+    it "handles zero" do
+      vars = {"val" => Crinja::Value.new(0.0)}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("0")
+    end
+
+    it "returns target for non-numeric input" do
+      vars = {"val" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ val | ceil }}", vars)
+      result.should eq("hello")
+    end
+  end
+
+  describe "floor" do
+    it "rounds down a float" do
+      vars = {"val" => Crinja::Value.new(3.7)}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("3")
+    end
+
+    it "returns same value for integer" do
+      vars = {"val" => Crinja::Value.new(5.0)}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("5")
+    end
+
+    it "rounds down negative float away from zero" do
+      vars = {"val" => Crinja::Value.new(-2.3)}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("-3")
+    end
+
+    it "handles integer input" do
+      vars = {"val" => Crinja::Value.new(7)}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("7")
+    end
+
+    it "handles zero" do
+      vars = {"val" => Crinja::Value.new(0.0)}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("0")
+    end
+
+    it "returns target for non-numeric input" do
+      vars = {"val" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ val | floor }}", vars)
+      result.should eq("hello")
+    end
+  end
+end
+
+# =============================================================================
+# Misc Filters — inspect
+# =============================================================================
+describe "MiscFilters (extended)" do
+  describe "inspect" do
+    it "inspects a string value" do
+      vars = {"val" => Crinja::Value.new("hello")}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("\"hello\"")
+    end
+
+    it "inspects nil value" do
+      vars = {"val" => Crinja::Value.new(nil)}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("nil")
+    end
+
+    it "inspects a number" do
+      vars = {"val" => Crinja::Value.new(42)}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("42")
+    end
+
+    it "inspects an array" do
+      items = Crinja::Value.new([Crinja::Value.new("a"), Crinja::Value.new("b")])
+      vars = {"val" => items}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("[a, b]")
+    end
+
+    it "inspects a boolean" do
+      vars = {"val" => Crinja::Value.new(true)}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("true")
+    end
+
+    it "inspects false boolean" do
+      vars = {"val" => Crinja::Value.new(false)}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("false")
+    end
+
+    it "inspects a float" do
+      vars = {"val" => Crinja::Value.new(3.14)}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("3.14")
+    end
+
+    # Nested containers printed Crystal internals: `[1, [Crinja::Value<2>]]`.
+    it "inspects nested arrays and mappings" do
+      result = render_crinja(%({{ [1, [2, [3]], {"k": ["v"]}] | inspect }}), {} of String => Crinja::Value)
+      result.should eq("[1, [2, [3]], {k: [v]}]")
+      result = render_crinja(%({{ {"a": [1, 2], "b": {"c": "d"}} | inspect }}), {} of String => Crinja::Value)
+      result.should eq("{a: [1, 2], b: {c: d}}")
+    end
+
+    it "inspects an empty array" do
+      items = Crinja::Value.new([] of Crinja::Value)
+      vars = {"val" => items}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should eq("[]")
+    end
+
+    it "inspects a string with special characters" do
+      vars = {"val" => Crinja::Value.new("hello \"world\"")}
+      result = render_crinja("{{ val | inspect }}", vars)
+      result.should contain("hello")
+      result.should contain("world")
+    end
+  end
+end
+
+# =============================================================================
+# I18n Filters
+# =============================================================================
+describe "I18nFilters" do
+  describe "t (translate)" do
+    it "translates key using current language" do
+      translations = {
+        Crinja::Value.new("ko") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("안녕하세요"),
+        }),
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("Hello"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("ko"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_crinja("{{ \"greeting\" | t }}", vars)
+      result.should eq("안녕하세요")
+    end
+
+    it "falls back to default language when key missing in current language" do
+      translations = {
+        Crinja::Value.new("ko") => Crinja::Value.new({} of Crinja::Value => Crinja::Value),
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("greeting") => Crinja::Value.new("Hello"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("ko"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_crinja("{{ \"greeting\" | t }}", vars)
+      result.should eq("Hello")
+    end
+
+    it "returns key itself when no translation found" do
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new({} of Crinja::Value => Crinja::Value),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_crinja("{{ \"missing_key\" | t }}", vars)
+      result.should eq("missing_key")
+    end
+
+    it "returns key when no translations data available" do
+      vars = {} of String => Crinja::Value
+      result = render_crinja("{{ \"hello\" | t }}", vars)
+      result.should eq("hello")
+    end
+
+    it "defaults language to en when page_language is empty" do
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new({
+          Crinja::Value.new("title") => Crinja::Value.new("Title"),
+        }),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new(""),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      result = render_crinja("{{ \"title\" | t }}", vars)
+      result.should eq("Title")
+    end
+
+    it "falls back to the key when a language entry is not a hash" do
+      # A translations file where a language maps to a scalar/array instead of
+      # a table must not crash render (the blanket rescue returns the key).
+      translations = {
+        Crinja::Value.new("en") => Crinja::Value.new("not-a-hash"),
+      }
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new(translations),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      render_crinja("{{ \"k\" | t }}", vars).should eq("k")
+    end
+
+    it "falls back to the key when the translations table itself is not a hash" do
+      vars = {
+        "_i18n_translations"     => Crinja::Value.new("not-a-hash"),
+        "page_language"          => Crinja::Value.new("en"),
+        "_i18n_default_language" => Crinja::Value.new("en"),
+      }
+      render_crinja("{{ \"k\" | t }}", vars).should eq("k")
+    end
+  end
+
+  describe "pluralize" do
+    it "returns singular when count is 1" do
+      vars = {"count" => Crinja::Value.new(1)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("item")
+    end
+
+    it "returns plural when count is 0" do
+      vars = {"count" => Crinja::Value.new(0)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "returns plural when count is greater than 1" do
+      vars = {"count" => Crinja::Value.new(5)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "returns plural for negative count" do
+      vars = {"count" => Crinja::Value.new(-1)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "defaults to 0 for non-numeric input" do
+      vars = {"count" => Crinja::Value.new("abc")}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "selects plural for a fractional count above 1 (no truncation to singular)" do
+      # 1.9 must not be truncated to 1 and wrongly rendered singular.
+      vars = {"count" => Crinja::Value.new(1.9)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("items")
+    end
+
+    it "treats an exact 1.0 as singular" do
+      vars = {"count" => Crinja::Value.new(1.0)}
+      result = render_crinja("{{ count | pluralize(\"item\", \"items\") }}", vars)
+      result.should eq("item")
+    end
+
+    it "reads a numeric string as its number" do
+      vars = {"one" => Crinja::Value.new("1"), "two" => Crinja::Value.new(" 2 ")}
+      render_crinja(%({{ one | pluralize("item", "items") }}|{{ two | pluralize("item", "items") }}), vars).should eq("item|items")
+    end
+  end
+end
+
+describe "MenuFilters" do
+  describe "active_path" do
+    it "matches the current page's own url exactly" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_crinja("{{ '/posts/' | active_path }}", vars).should eq("true")
+    end
+
+    it "does not match a sibling url" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_crinja("{{ '/about/' | active_path }}", vars).should eq("false")
+    end
+
+    it "treats missing/present trailing slash as equal" do
+      vars = {"page_url" => Crinja::Value.new("/posts")}
+      render_crinja("{{ '/posts/' | active_path }}", vars).should eq("true")
+    end
+
+    it "does not match a descendant page without ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_crinja("{{ '/posts/' | active_path }}", vars).should eq("false")
+    end
+
+    it "matches a descendant page with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_crinja("{{ '/posts/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "still matches the entry's own url exactly with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_crinja("{{ '/posts/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "does not treat every page as a descendant of the root entry, even with ancestor=true" do
+      vars = {"page_url" => Crinja::Value.new("/posts/first/")}
+      render_crinja("{{ '/' | active_path(ancestor=true) }}", vars).should eq("false")
+    end
+
+    it "matches the root entry only on the homepage itself" do
+      vars = {"page_url" => Crinja::Value.new("/")}
+      render_crinja("{{ '/' | active_path }}", vars).should eq("true")
+      render_crinja("{{ '/' | active_path(ancestor=true) }}", vars).should eq("true")
+    end
+
+    it "never matches an empty url, even on the homepage" do
+      vars = {"page_url" => Crinja::Value.new("/")}
+      render_crinja("{{ '' | active_path }}", vars).should eq("false")
+    end
+
+    it "never matches an external http(s) entry" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_crinja("{{ 'https://example.com' | active_path }}", vars).should eq("false")
+    end
+
+    it "never matches an external protocol-relative entry" do
+      vars = {"page_url" => Crinja::Value.new("/posts/")}
+      render_crinja("{{ '//cdn.example.com/x' | active_path }}", vars).should eq("false")
+    end
+  end
+end
+
+# =============================================================================
+# first / last (Crinja built-ins overridden for empty sequences)
+# =============================================================================
+describe "first/last filters" do
+  # Regression: `{{ items | first }}` on an EMPTY array called
+  # `Enumerable#first`, which raises `Empty enumerable` — a plain Crystal
+  # error, so it bypassed the Crinja error path and aborted the entire
+  # build with no template location. `last` did the same with
+  # `Index out of bounds`. An empty section is ordinary site state.
+  it "returns undefined (empty output) for first on an empty array" do
+    render_crinja("<{{ [] | first }}>").should eq("<>")
+  end
+
+  it "returns undefined (empty output) for last on an empty array" do
+    render_crinja("<{{ [] | last }}>").should eq("<>")
+  end
+
+  it "returns undefined for first/last on an empty string" do
+    vars = {"s" => Crinja::Value.new("")}
+    render_crinja("<{{ s | first }}|{{ s | last }}>", vars).should eq("<|>")
+  end
+
+  it "returns undefined for first/last on an empty hash" do
+    vars = {"h" => Crinja::Value.new({} of Crinja::Value => Crinja::Value)}
+    render_crinja("<{{ h | first }}|{{ h | last }}>", vars).should eq("<|>")
+  end
+
+  it "is falsy so {% if %} guards work on an empty collection" do
+    render_crinja("{% if [] | first %}yes{% else %}no{% endif %}").should eq("no")
+  end
+
+  it "still returns the first/last element of a non-empty array" do
+    render_crinja("{{ [1, 2, 3] | first }}-{{ [1, 2, 3] | last }}").should eq("1-3")
+  end
+
+  it "still returns the first/last character of a non-empty string" do
+    render_crinja("{{ 'abc' | first }}-{{ 'abc' | last }}").should eq("a-c")
+  end
+end
+
+# =============================================================================
+# now() function
+# =============================================================================
+describe "now() function" do
+  it "formats with a valid format string" do
+    render_crinja("{{ now(format='%Y') }}").should eq(Time.local.to_s("%Y"))
+  end
+
+  # Regression: same bare `IndexError` as the `date` filter — a malformed
+  # format killed the build with `Index out of bounds` and no location.
+  it "raises a located Crinja error for a malformed format string" do
+    ex = expect_raises(Crinja::Error) do
+      render_crinja("{{ now(format='%') }}")
+    end
+    ex.message.not_nil!.should contain("invalid date format")
+  end
+end
+
+describe "first/last filters on undefined input" do
+  # `{{ get_section(path='nope').pages | first }}` or a missing
+  # `page.extra.images | first`: Jinja2 iterates an Undefined as nothing, so
+  # `first` yields Undefined instead of a fatal TypeError.
+  it "returns undefined instead of raising when the target is undefined" do
+    render_crinja("<{{ nope | first }}|{{ nope | last }}>").should eq("<|>")
+  end
+end

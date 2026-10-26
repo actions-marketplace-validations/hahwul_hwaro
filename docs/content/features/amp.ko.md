@@ -27,7 +27,7 @@ sections = ["posts"]
 |-----|------|---------|-------------|
 | enabled | bool | false | AMP 페이지 생성 활성화 |
 | path_prefix | string | "amp" | AMP 페이지의 URL 접두사 |
-| sections | array | [] | AMP를 생성할 섹션 (비워 두면 전체) |
+| sections | array | [] | AMP를 생성할 섹션 (비워 두면 전체). `[feeds]`처럼 하위 섹션도 포함 (`"posts"`는 `posts/2024`도 포함) |
 
 ## 변환 내용
 
@@ -36,12 +36,14 @@ AMP 변환기는 다음 변환을 자동으로 적용합니다:
 | 원본 | AMP 버전 |
 |----------|-------------|
 | `<html>` | `<html amp>` |
-| `<img>` | `<amp-img layout="responsive">` |
+| `<img>` | `width`와 `height`가 있으면 `<amp-img layout="responsive">`, 없으면 `<div class="amp-img-container">` 안의 `<amp-img layout="fill">` |
 | `<video>` | `<amp-video layout="responsive">` |
 | `<iframe>` | `<amp-iframe layout="responsive">` |
 | `<script>` (인라인) | 제거 |
 | `style="..."` 속성 | 제거 |
 | `onclick` 핸들러 | 제거 |
+| `loading="lazy"` 속성 | 제거 (AMP 요소는 자체 지연 로딩을 하며 이 속성을 허용하지 않음) |
+| 상대 경로 `src` / `href` (`cover.png`, `../other/`) | AMP 사본이 한 단계 더 깊은 디렉터리에 있으므로 원본 페이지 URL 기준으로 변환 |
 
 추가로 다음이 주입됩니다:
 - AMP 보일러플레이트 CSS
@@ -65,7 +67,7 @@ public/
 ```toml
 [amp]
 enabled = true
-sections = ["posts", "blog"]   # 이 섹션들만 AMP 버전 생성
+sections = ["posts", "blog"]   # 이 섹션들(과 하위 섹션)만 AMP 버전 생성
 ```
 
 ## 사용자 지정 경로 접두사

@@ -27,7 +27,7 @@ sections = ["posts"]
 |-----|------|---------|-------------|
 | enabled | bool | false | Enable AMP page generation |
 | path_prefix | string | "amp" | URL prefix for AMP pages |
-| sections | array | [] | Sections to generate AMP for (empty = all) |
+| sections | array | [] | Sections to generate AMP for (empty = all); a section also covers its subsections (`"posts"` includes `posts/2024`), as in `[feeds]` |
 
 ## What Gets Converted
 
@@ -36,12 +36,14 @@ The AMP converter automatically applies these transformations:
 | Original | AMP Version |
 |----------|-------------|
 | `<html>` | `<html amp>` |
-| `<img>` | `<amp-img layout="responsive">` |
+| `<img>` | `<amp-img layout="responsive">` when it has `width` and `height`; otherwise `<amp-img layout="fill">` inside `<div class="amp-img-container">` |
 | `<video>` | `<amp-video layout="responsive">` |
 | `<iframe>` | `<amp-iframe layout="responsive">` |
 | `<script>` (inline) | Removed |
 | `style="..."` attributes | Removed |
 | `onclick` handlers | Removed |
+| `loading="lazy"` attributes | Removed (AMP elements do their own lazy loading and reject the attribute) |
+| Relative `src` / `href` (`cover.png`, `../other/`) | Resolved against the original page's URL, because the AMP copy lives one directory deeper |
 
 Additionally injected:
 - AMP boilerplate CSS
@@ -65,7 +67,7 @@ By default, AMP pages are generated for all sections. Use `sections` to limit:
 ```toml
 [amp]
 enabled = true
-sections = ["posts", "blog"]   # Only these sections get AMP versions
+sections = ["posts", "blog"]   # Only these sections (and their subsections) get AMP versions
 ```
 
 ## Custom Path Prefix

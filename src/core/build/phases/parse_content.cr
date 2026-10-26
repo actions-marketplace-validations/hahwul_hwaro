@@ -10,10 +10,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     profiler.start_phase("ParseContent")
     result = @lifecycle.run_phase(Lifecycle::Phase::ParseContent, ctx) do
       Logger.status_phase("parse")
-      # Default parsing if no hooks registered
-      unless @lifecycle.has_hooks?(Lifecycle::HookPoint::BeforeParseContent)
-        parse_content_default(ctx)
-      end
+      parse_content_default(ctx)
     end
     profiler.end_phase
     return result if result != Lifecycle::HookResult::Continue
@@ -21,6 +18,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     # Link multilingual translations between pages/sections (for language switchers)
     if config = ctx.config
       Content::Multilingual.link_translations!(ctx.all_pages, config)
+      Content::Versions.link!(ctx.all_pages, config)
     end
 
     # Build subsections first (needed for flat navigation ordering)
@@ -34,7 +32,12 @@ module Hwaro::Core::Build::Phases::ParseContent
     # page's URL is final (internal-link resolution) — and before Transform,
     # which bakes summary_html into Crinja page values.
     if (site = @site) && (templates = @templates)
-      render_page_summaries(ctx.all_pages, site, templates, ctx.options.highlight && site.config.highlight.enabled)
+      # A full build reports each ambiguous wikilink again; serve rebuilds don't.
+      @wikilink_warnings.clear
+      refresh_wikilink_index(ctx.all_pages, site)
+      # The image hooks have not run yet: rerender_image_summaries redoes
+      # the summaries they change once the resize map is filled.
+      render_page_summaries(ctx.all_pages, site, templates, ctx.options.highlight && site.config.highlight.enabled, images_ready: false)
     end
 
     Lifecycle::HookResult::Continue
@@ -61,6 +64,25 @@ module Hwaro::Core::Build::Phases::ParseContent
   # (run_rerender). When nil, build_template_variables self-heals by building
   # globals per shortcode-bearing page — cheap during the full-build call
   # (site.pages is still empty pre-Transform) but O(site) per page after.
+  #
+  # `images_ready` is false only before the BeforeRender `image:resize`
+  # hook has filled the resize map: `<img>` then get no srcset/dimensions
+  # (rerender_image_summaries redoes those pages). `rerender` keeps the
+  # warnings an earlier pass of this build already printed.
+  # The link tail of a summary: `@/` links (strict mode must see summary links
+  # too: a `render: false` page never reaches the body render pass, yet its
+  # summary ships inside every listing that embeds `{{ p.summary }}`), then
+  # relative links rooted at the page — listings and other pages print the
+  # summary too, so a bundle's `![](photo.jpg)` must not resolve against
+  # THEIR URL.
+  private def finish_summary_html(html : String, page : Models::Page, site : Models::Site, pages_by_path : Hash(String, Models::Page), images_ready : Bool) : String
+    html = resolve_internal_links(html, pages_by_path, page, site)
+    html = Content::Processors::InternalLinkResolver.absolutize_links(html, page.url, document_relative_only: true)
+    html = Content::Processors::InternalLinkResolver.prefix_root_relative_links(html, site.config.base_url, site.config.base_path)
+    html = apply_responsive_images(html, page, site.config) if images_ready
+    close_open_elements(html)
+  end
+
   private def render_page_summaries(
     pages : Array(Models::Page),
     site : Models::Site,
@@ -68,9 +90,21 @@ module Hwaro::Core::Build::Phases::ParseContent
     use_highlight : Bool,
     link_targets : Array(Models::Page) = pages,
     global_vars : Hash(String, Crinja::Value)? = nil,
+    images_ready : Bool = true,
+    rerender : Bool = false,
   )
     md_config = site.config.markdown
     pages_by_path : Hash(String, Models::Page)? = nil
+    # Built once, on the first summary that needs it.
+    link_map = -> do
+      map = pages_by_path
+      unless map
+        map = {} of String => Models::Page
+        link_targets.each { |p| map[p.path] ||= p }
+        pages_by_path = map = Content::Processors::InternalLinkResolver.add_default_language_aliases(map, site.config)
+      end
+      map
+    end
     # Pages whose summary_html this pass (re)assigns. The shortcode-context
     # build below caches the page's own Crinja value BEFORE the assignment,
     # so without invalidation every `{{ p.summary }}` in a listing would
@@ -79,75 +113,58 @@ module Hwaro::Core::Build::Phases::ParseContent
     recomputed_paths = [] of String
 
     pages.each do |page|
-      # parse_single_page already extracted the chunk into page.summary;
-      # extract_summary is only a fallback for hook-based parse paths that
-      # skipped it (it re-scans the whole raw_content, so don't repeat it).
-      summary_md = page.summary || page.extract_summary
-      next unless summary_md
-
-      shortcode_results = {} of String => String
-      processed = if content_may_contain_shortcodes?(summary_md)
-                    context = build_template_variables(page, site, "", "", "", global_vars: global_vars)
-                    process_shortcodes_jinja(summary_md, templates, context, shortcode_results)
-                  else
-                    summary_md
-                  end
-
-      html, _ = Processor::Markdown.render(processed, use_highlight, md_config.safe, md_config.lazy_loading, md_config.emoji, markdown_config: md_config)
-      html = replace_shortcode_placeholders(html, shortcode_results)
-
-      pbp = (pages_by_path ||= begin
-        map = {} of String => Models::Page
-        link_targets.each { |p| map[p.path] ||= p }
-        map
-      end)
-      if site.config.links.broken_internal == "error"
-        # Strict mode must see summary links too: a `render: false` page
-        # never reaches the body render pass, yet its summary ships inside
-        # every listing that embeds `{{ p.summary }}`. Entries use the same
-        # "path → @/target (reason)" shape as the body pass, so pages that
-        # DO render report each link once (raise_… sort-uniqs).
-        misses = [] of {String, String}
-        html = Content::Processors::InternalLinkResolver.resolve(html, pbp, page.path, site.config.base_url, misses: misses)
-        unless misses.empty?
-          @broken_links_mutex.synchronize do
-            misses.each { |target, reason| @broken_internal_links << "#{page.path} → @/#{target} (#{reason})" }
-          end
+      # The body render shares the set, so each warning prints once per page.
+      page.warned_messages.clear unless rerender
+      Logger.dedupe_warnings(page.warned_messages) do
+        recomputed_paths << page.path if recount_included_words(page, site)
+        # parse_single_page already extracted the chunk into page.summary;
+        # extract_summary is only a fallback for hook-based parse paths that
+        # skipped it (it re-scans the whole raw_content, so don't repeat it).
+        summary_md = page.summary || page.extract_summary
+        unless summary_md
+          # No marker: the automatic body excerpt, unless a description
+          # already provides the summary (precedence: marker > description >
+          # excerpt). Recorded in recomputed_paths for the same cache reason.
+          recomputed_paths << page.path if assign_auto_summary(page, site, templates, global_vars)
+          next
         end
-      else
-        html = Content::Processors::InternalLinkResolver.resolve(html, pbp, page.path, site.config.base_url)
-      end
-      html = Content::Processors::InternalLinkResolver.prefix_root_relative_links(html, site.config.base_url, site.config.base_path)
+        # The marker wins: drop an excerpt a serve rerender left on this
+        # page object before the marker was added.
+        page.auto_summary = nil
+        page.summary_truncated = false
 
-      page.summary_html = html
-      recomputed_paths << page.path
-    rescue ex
-      # A broken shortcode in a summary must not abort the whole parse
-      # phase — fall back to plain-Markdown rendering (same config flags,
-      # critically including safe mode). Still resolve `@/` links: body
-      # render never sees render:false summaries, and strict mode would
-      # otherwise miss broken links that ship in listings.
-      Logger.warn "Summary render failed for #{page.path} — falling back to plain Markdown: #{ex.message}"
-      fallback, _ = Processor::Markdown.render(summary_md.to_s, use_highlight, md_config.safe, md_config.lazy_loading, md_config.emoji, markdown_config: md_config)
-      pbp = (pages_by_path ||= begin
-        map = {} of String => Models::Page
-        link_targets.each { |p| map[p.path] ||= p }
-        map
-      end)
-      if site.config.links.broken_internal == "error"
-        misses = [] of {String, String}
-        fallback = Content::Processors::InternalLinkResolver.resolve(fallback, pbp, page.path, site.config.base_url, misses: misses)
-        unless misses.empty?
-          @broken_links_mutex.synchronize do
-            misses.each { |target, reason| @broken_internal_links << "#{page.path} → @/#{target} (#{reason})" }
-          end
+        shortcode_results = {} of String => String
+        summary_md = complete_summary_chunk(summary_md, page.raw_content, md_config.footnotes)
+        summary_md = expand_includes(summary_md, page, site)
+        processed = if content_may_contain_shortcodes?(summary_md)
+                      context = build_template_variables(page, site, "", "", "", global_vars: global_vars)
+                      process_shortcodes_jinja(summary_md, templates, context, shortcode_results)
+                    else
+                      summary_md
+                    end
+        processed = rewrite_wikilinks(processed, page, site)
+
+        # The body's render hooks too: the summary is the body's opening HTML.
+        hooks = Content::Processors::RenderHooks.registry.try { |reg| build_hook_render_context(reg, page, site, nil, nil) }
+        html, _ = Processor::Markdown.render(processed, use_highlight, md_config.safe, md_config.lazy_loading, md_config.emoji, markdown_config: md_config, hooks: hooks)
+        html = replace_shortcode_placeholders(html, shortcode_results)
+
+        page.summary_html = finish_summary_html(html, page, site, link_map.call, images_ready)
+        recomputed_paths << page.path
+      rescue ex
+        # A broken shortcode in a summary must not abort the whole parse
+        # phase — fall back to plain-Markdown rendering (same config flags,
+        # critically including safe mode). Still resolve `@/` links: body
+        # render never sees render:false summaries, and strict mode would
+        # otherwise miss broken links that ship in listings. An include
+        # failure on a rendered page is the body render's to report (once).
+        unless rerender || (page.render && ex.is_a?(Content::Processors::Includes::IncludeError))
+          Logger.warn "Summary render failed for #{page.path} — falling back to plain Markdown: #{ex.message}"
         end
-      else
-        fallback = Content::Processors::InternalLinkResolver.resolve(fallback, pbp, page.path, site.config.base_url)
+        fallback, _ = Processor::Markdown.render(rewrite_wikilinks(summary_md.to_s, page, site), use_highlight, md_config.safe, md_config.lazy_loading, md_config.emoji, markdown_config: md_config)
+        page.summary_html = finish_summary_html(fallback, page, site, link_map.call, images_ready)
+        recomputed_paths << page.path
       end
-      fallback = Content::Processors::InternalLinkResolver.prefix_root_relative_links(fallback, site.config.base_url, site.config.base_path)
-      page.summary_html = fallback
-      recomputed_paths << page.path
     end
 
     # Drop Crinja values cached before the summaries above were assigned —
@@ -161,6 +178,527 @@ module Hwaro::Core::Build::Phases::ParseContent
         @section_pages_url_index_cache.clear
       end
     end
+  end
+
+  # Redo the ParseContent summaries the BeforeRender image hooks change:
+  # `<img>` that now get srcset/dimensions, and shortcodes whose
+  # `resize_image()` returned the original URL before the resize map was
+  # filled. Rebuilds the author lists that embedded the old summaries and
+  # drops every Crinja value cached since. True when anything was redone,
+  # so the caller rebuilds `global_vars`.
+  private def rerender_image_summaries(
+    pages : Array(Models::Page),
+    site : Models::Site,
+    templates : Hash(String, String),
+    use_highlight : Bool,
+    global_vars : Hash(String, Crinja::Value),
+  ) : Bool
+    image_cfg = site.config.image_processing
+    srcset = image_cfg.enabled || image_cfg.dimensions
+    resizes = templates.each_value.any?(&.includes?("resize_image"))
+    return false unless srcset || resizes
+    redo = pages.select do |page|
+      next false unless html = page.summary_html
+      (srcset && html.includes?("<img")) ||
+        (resizes && page.summary.try { |chunk| content_may_contain_shortcodes?(chunk) })
+    end
+    return false if redo.empty?
+
+    render_page_summaries(redo, site, templates, use_highlight,
+      link_targets: pages, global_vars: global_vars, rerender: true)
+    aggregate_site_authors(site)
+    @crinja_cache_mutex.synchronize do
+      @page_crinja_value_cache.clear
+      @section_pages_crinja_cache.clear
+      @section_pages_url_index_cache.clear
+      @series_crinja_cache.clear
+      @related_posts_crinja_cache.clear
+    end
+    true
+  end
+
+  # `page.word_count` / `reading_time` count the text the page renders, so a
+  # page built from `include_md` / `include_code` / `![[note]]` counts what
+  # they bring in (parse counted the call text only). A failing include keeps
+  # the raw count; the body render reports it. True when the counts changed.
+  private def recount_included_words(page : Models::Page, site : Models::Site) : Bool
+    raw = page.raw_content
+    expanded = begin
+      expanded_raw_content(page, site)
+    rescue Hwaro::HwaroError
+      return false
+    end
+    return false if expanded.same?(raw)
+    before = page.word_count
+    page.calculate_word_count(expanded)
+    page.calculate_reading_time
+    page.word_count != before
+  end
+
+  # Automatic summary for a page with neither `<!-- more -->` nor a
+  # description: run the body through the same shortcode → Markdown →
+  # placeholder sub-pipeline the marker summary uses (so shortcode syntax,
+  # math placeholders and footnote markers never leak), reduce the HTML to
+  # prose (code, figures and headings dropped) and cut it to
+  # `[content] summary_length`. Link resolution is skipped: only text
+  # survives. Highlighting is off — code blocks are discarded anyway.
+  #
+  # Returns true when `page.auto_summary` changed (assigned, or cleared on
+  # a page object that had one). A shortcode
+  # failure here is not retried with a plain-Markdown pass the way the
+  # marker path does: rendering the raw body would put `{{ … }}` syntax in
+  # every listing, and the body pass will report the same error loudly.
+  private def assign_auto_summary(
+    page : Models::Page,
+    site : Models::Site,
+    templates : Hash(String, String),
+    global_vars : Hash(String, Crinja::Value)?,
+  ) : Bool
+    # `had` — a page object recomputed in place (serve rerender) whose
+    # excerpt is now cleared must still drop its cached Crinja value.
+    had = !page.auto_summary.nil?
+    page.auto_summary = nil
+    page.summary_truncated = false
+    summary_cfg = site.config.summary
+    return had unless summary_cfg.enabled?
+    return had if page.description
+    raw = page.raw_content
+    return had if raw.strip.empty?
+    raw = begin
+      expanded_raw_content(page, site)
+    rescue ex : Content::Processors::Includes::IncludeError
+      # The body render reports it; only a page that never renders warns.
+      raise ex unless page.render
+      return had
+    end
+
+    md_config = site.config.markdown
+    shortcode_results = {} of String => String
+    processed = if content_may_contain_shortcodes?(raw)
+                  context = build_template_variables(page, site, "", "", "", global_vars: global_vars)
+                  process_shortcodes_jinja(raw, templates, context, shortcode_results)
+                else
+                  raw
+                end
+    # Only text survives, and the body render reports any broken link.
+    processed = rewrite_wikilinks(processed, page, site, report: false)
+    html, _ = Processor::Markdown.render(processed, false, md_config.safe, md_config.lazy_loading, md_config.emoji, markdown_config: md_config)
+    html = replace_shortcode_placeholders(html, shortcode_results)
+
+    text = Utils::TextUtils.excerpt_text(html)
+    return had if text.empty?
+
+    excerpt, truncated = Utils::TextUtils.truncate_excerpt(text, summary_cfg.length, summary_cfg.ellipsis)
+    page.auto_summary = excerpt
+    page.summary_truncated = truncated
+    true
+  rescue ex
+    Logger.warn "Automatic summary skipped for #{page.path}: #{ex.message}"
+    had || false # nil when the raise preceded the assignment above
+  end
+
+  # Comments and script/style bodies are skipped; group 3 is a tag name.
+  SUMMARY_TAG_RE     = /<!--.*?-->|<(script|style)\b.*?<\/\1\s*>|<(\/?)([a-zA-Z][\w-]*)[^>]*>/im
+  VOID_HTML_ELEMENTS = Set{"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+  # A marker inside a raw HTML block (`<details>` … `<!-- more -->` …
+  # `</details>`) ends the summary inside that element: close what is still
+  # open, as complete_summary_chunk does for a block shortcode, or the
+  # unclosed tag swallows whatever a listing prints after the summary.
+  private def close_open_elements(html : String) : String
+    open = [] of String
+    html.scan(SUMMARY_TAG_RE) do |m|
+      next unless name = m[3]?
+      next if m[0].ends_with?("/>")
+      name = name.downcase
+      if m[2].empty?
+        open << name unless VOID_HTML_ELEMENTS.includes?(name)
+      elsif at = open.rindex(name)
+        open.truncate(0, at)
+      end
+    end
+    return html if open.empty?
+    String.build do |io|
+      io << html
+      open.reverse_each { |name| io << "</" << name << ">\n" }
+    end
+  end
+
+  SUMMARY_LINK_DEFINITION_RE     = /\A {0,3}\[(?!\^)[^\]\n]+\]:[ \t]*\S/
+  SUMMARY_FOOTNOTE_DEFINITION_RE = /\A {0,3}\[\^([^\]\s]+)\]:/
+  SUMMARY_FOOTNOTE_REF_RE        = /\[\^([^\]\s]+)\](?!:)/
+
+  # The summary chunk is rendered alone, but definitions normally sit at the
+  # end of a post, after the marker. Append the link reference definitions
+  # found there (outside fences) so `[text][ref]` still links, and drop
+  # footnote references that have no definition inside the chunk — they
+  # would ship as literal `[^1]` in every listing and feed. A chunk that is
+  # already self-contained is returned untouched.
+  private def complete_summary_chunk(chunk : String, raw : String, footnotes : Bool) : String
+    rest_start = raw.byte_index(chunk)
+    rest = rest_start ? raw.byte_slice(rest_start + chunk.bytesize) : ""
+    definitions = [] of String
+    if !rest.empty? && rest.includes?("]:")
+      tracker = Content::Processors::FenceTracker.new
+      rest.each_line(chomp: true) do |line|
+        next if tracker.fence_line?(line)
+        definitions << line if SUMMARY_LINK_DEFINITION_RE.matches?(line)
+      end
+    end
+    chunk = strip_dangling_footnote_refs(chunk) if footnotes && chunk.includes?("[^")
+    # A marker inside a block shortcode's body: close the block where the
+    # summary ends, as the body would at its own `{% end %}`.
+    chunk += "\n{% end %}" * blocks_open_across(chunk, rest)
+    definitions.empty? ? chunk : "#{chunk}\n\n#{definitions.join('\n')}"
+  end
+
+  private def strip_dangling_footnote_refs(chunk : String) : String
+    defined = Set(String).new
+    chunk.each_line do |line|
+      if match = SUMMARY_FOOTNOTE_DEFINITION_RE.match(line)
+        defined << match[1]
+      end
+    end
+    tracker = Content::Processors::FenceTracker.new
+    String.build do |io|
+      chunk.each_line(chomp: false) do |line|
+        fenced = tracker.fence_line?(line)
+        if !fenced && line.includes?("[^")
+          # Refs inside inline code spans are literal text: blank the spans
+          # out (byte offsets preserved) before looking.
+          probe = line.includes?('`') ? line.gsub(Content::Processors::InlineMarkdown::INLINE_CODE_SPAN_RE) { |span| " " * span.bytesize } : line
+          bytes = line.to_slice
+          pos = 0
+          probe.scan(SUMMARY_FOOTNOTE_REF_RE) do |match|
+            next if defined.includes?(match[1])
+            io.write bytes[pos, match.byte_begin(0) - pos]
+            pos = match.byte_end(0)
+          end
+          io.write bytes[pos, bytes.size - pos]
+        else
+          io << line
+        end
+      end
+    end
+  end
+
+  # Rebuild the `[[wikilink]]` lookup over `pages` (the published set).
+  # Called wherever that set may have changed before content renders.
+  private def refresh_wikilink_index(pages : Array(Models::Page), site : Models::Site) : Nil
+    unless site.config.markdown.wikilinks
+      @wikilink_index = nil
+      return
+    end
+    files = -> { published_embed_files(pages, site.config) }
+    @wikilink_index = Content::Processors::Wikilinks::Index.new(pages, site.config.default_language, files, @wikilink_warnings)
+  end
+
+  # Every published non-page file an `![[embed]]` can name, as
+  # `{relative path, URL}`: bundle assets of published pages, `[content.files]`
+  # outside withheld bundles, and `static/`.
+  private def published_embed_files(pages : Array(Models::Page), config : Models::Config) : Array({String, String})
+    files = [] of {String, String}
+    pages.each do |page|
+      next if page.assets.empty?
+      bundle = File.dirname(page.path)
+      base = page.url.ends_with?('/') ? page.url : "#{page.url}/"
+      page.assets.each do |asset|
+        files << {asset, "#{base}#{asset.lchop("#{bundle}/")}"} if publishable_source_file?(File.join("content", asset))
+      end
+    end
+    if config.content_files.enabled? && Dir.exists?("content")
+      # withheld_bundle_dirs reads site.pages, which Transform fills only
+      # after the summaries this index serves.
+      withheld = @content_index_dirs - pages.select(&.is_index).map { |p| File.dirname(p.path) }.to_set
+      Dir.glob("content/**/*") do |file|
+        rel = file.lchop("content/")
+        next if withheld_content_file?(rel, withheld)
+        files << {rel, "/#{rel}"} if config.content_files.publish?(rel) && publishable_source_file?(file)
+      end
+    end
+    if Dir.exists?("static")
+      Dir.glob("static/**/*") do |file|
+        rel = file.lchop("static/")
+        next if config.static.excluded?(rel) || config.sass_source?(rel)
+        files << {rel, "/#{rel}"} if publishable_source_file?(file)
+      end
+    end
+    files
+  end
+
+  # Whether the copiers would publish `path`: a regular file, or a symlink
+  # resolving inside the project to one (their skip policy, minus the
+  # warnings they already print). lstat first, so a symlink loop is skipped,
+  # never followed.
+  private def publishable_source_file?(path : String) : Bool
+    lstat = File.info?(path, follow_symlinks: false)
+    return false unless lstat
+    return lstat.file? unless lstat.symlink?
+    return false unless Utils::PathUtils.resolves_within?(path, Dir.current)
+    File.info?(path, follow_symlinks: true).try(&.file?) || false
+  rescue File::Error
+    false
+  end
+
+  # `content` with its wikilinks rewritten for `page` (a no-op unless
+  # `[markdown] wikilinks`). `report: true` routes unresolved links through
+  # `[links] broken_internal`, like an unresolved `@/` link.
+  private def rewrite_wikilinks(content : String, page : Models::Page, site : Models::Site, report : Bool = true) : String
+    return content unless index = @wikilink_index
+    strict = report && site.config.links.broken_internal == "error"
+    misses = strict ? [] of {String, String} : nil
+    md = site.config.markdown
+    result = Content::Processors::Wikilinks.rewrite(content, page, index, md.safe, misses, warn: report, math: md.math)
+    if misses && !misses.empty?
+      @broken_links_mutex.synchronize do
+        misses.each { |target, reason| @broken_internal_links << "#{page.path} → #{target} (#{reason})" }
+      end
+    end
+    result
+  end
+
+  # `{{ include_code(…) }}` / `{{ include_md(…) }}`, plus an own-line
+  # `![[note]]` / `![[note#Heading]]` under `[markdown] wikilinks`.
+  INCLUDE_CALL_RE    = /\{\{-?\s*include_(code|md)\s*\((.*?)\)\s*-?\}\}/
+  TRANSCLUDE_LINE_RE = /\A([ \t>]*)!\[\[([^\[\]\n]+)\]\][ \t]*\r?\n?\z/
+  # What may precede a call alone on its line: indentation, blockquote
+  # markers and one list marker. The spliced lines repeat it (the marker as
+  # spaces), so an include stays inside its list item or quote.
+  INCLUDE_PREFIX_RE = /\A[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?\z/
+  LIST_MARKER_RE    = /[-*+]|\d{1,9}[.)]/
+
+  # `content` with its include calls and transclusions replaced by the text
+  # they name (see Content::Processors::Includes). Runs before shortcodes,
+  # with the shortcode pass's own fence walk and code-span / `{% raw %}`
+  # masks, so the spliced Markdown is processed as if written in place and
+  # a call shown in code stays literal. One pass per line: spliced text is
+  # never scanned again here (nested calls were expanded by the recursion
+  # that produced it). Every file read is recorded as a render input
+  # (`--cache`) and an include source (serve). `chain` lists what is being
+  # expanded, outermost first: project-relative paths, `path#slug` for a
+  # heading section.
+  private def expand_includes(content : String, page : Models::Page, site : Models::Site, chain : Array(String)? = nil) : String
+    transclude = !@wikilink_index.nil? && Utils::ByteScan.includes?(content, "![[")
+    return content unless transclude || Utils::ByteScan.includes?(content, "include_")
+    unless chain
+      chain = [File.join("content", page.path)]
+      # Per top-level expansion; nested calls always pass `chain`. On the
+      # fiber because the recursion threads no other state, and one page is
+      # expanded on one fiber without yielding to another page's expansion.
+      Fiber.current.hwaro_include_splices = 0
+    end
+    math = transclude && site.config.markdown.math
+    map_shortcode_chunks(content) do |chunk|
+      # Fences inside a block-shortcode body are masked before code spans:
+      # a span may start on a fence line and hide it from the fence walk.
+      spans = [] of String
+      masked, spans = mask_inline_code(mask_body_fences(chunk, spans), spans)
+      masked = mask_raw_blocks(masked, spans)
+      # With `[markdown] math`, math is stashed out first, as the wikilink
+      # walk does, so an embed inside display math stays literal.
+      expanded = if math && masked.includes?('$')
+                   Content::Processors::MarkdownExtensions.protect_math(masked) do |stashed, sources|
+                     expand_include_lines(stashed, sources, spans, transclude, page, site, chain)
+                   end
+                 else
+                   expand_include_lines(masked, [] of String, spans, transclude, page, site, chain)
+                 end
+      unmask_inline_code(expanded, spans)
+    end
+  end
+
+  # The line pass of `expand_includes` over one masked chunk (math stashed
+  # as `math_sources` when on; include calls see the math restored).
+  private def expand_include_lines(text : String, math_sources : Array(String), spans : Array(String), transclude : Bool,
+                                   page : Models::Page, site : Models::Site, chain : Array(String)) : String
+    # What the wikilink rewrite leaves alone: raw HTML blocks (and code).
+    verbatim_lines = Content::Processors::FenceTracker.new
+    String.build(text.bytesize) do |io|
+      text.each_line(chomp: false) do |line|
+        verbatim = verbatim_lines.fence_line?(line) || verbatim_lines.html_block_line?
+        if transclude && !verbatim && (m = TRANSCLUDE_LINE_RE.match(line)) &&
+           (spliced = transclusion(m[2], m[1], page, site, chain))
+          io << spliced
+          io << '\n' if line.ends_with?('\n')
+        else
+          line = Content::Processors::MarkdownExtensions.restore_math(line, math_sources) unless math_sources.empty?
+          io << expand_include_calls(line, spans, page, site, chain)
+        end
+      end
+    end
+  end
+
+  # One masked line with its `include_*` calls replaced.
+  private def expand_include_calls(line : String, spans : Array(String), page : Models::Page, site : Models::Site, chain : Array(String)) : String
+    return line unless line.includes?("include_")
+    line.gsub(INCLUDE_CALL_RE) do |call, md|
+      # A project's own `templates/shortcodes/include_*.html` wins, as it
+      # does over every built-in; the shortcode pass renders it.
+      next call if @templates.try(&.has_key?("shortcodes/include_#{md[1]}"))
+      prefix = INCLUDE_PREFIX_RE.matches?(md.pre_match) ? md.pre_match : nil
+      own_line = prefix && md.post_match.blank?
+      args = parse_shortcode_args_jinja(unmask_inline_code(md[2], spans))
+      text = begin
+        md[1] == "code" ? include_code_text(args, site) : include_md_text(args, page, site, chain)
+      rescue ex : Content::Processors::Includes::Error
+        raise Content::Processors::Includes::IncludeError.new("#{unmask_inline_code(call, spans)} in #{chain.last}: #{ex.message}")
+      end
+      text = text.rstrip('\n') if own_line || md[1] == "md"
+      text = "\n#{text}" if md[1] == "code" && !own_line
+      prefix ? text.gsub('\n', "\n#{prefix.gsub(LIST_MARKER_RE) { |marker| " " * marker.size }}") : text
+    end
+  end
+
+  # The page's raw content with includes and transclusions expanded,
+  # memoised per build (see @expanded_raw_memo). Raises like
+  # expand_includes; a failure is not memoised, so the render re-raises it.
+  private def expanded_raw_content(page : Models::Page, site : Models::Site) : String
+    raw = page.raw_content
+    index = @wikilink_index
+    unless Utils::ByteScan.includes?(raw, "include_") || (index && Utils::ByteScan.includes?(raw, "![["))
+      return raw
+    end
+    @include_sources_mutex.synchronize do
+      memo = @expanded_raw_memo[page.path]?
+      return memo[2] if memo && memo[0].same?(raw) && memo[1] == index
+    end
+    expanded = expand_includes(raw, page, site)
+    warn_duplicate_labels(page, expanded) unless expanded == raw
+    @include_sources_mutex.synchronize { @expanded_raw_memo[page.path] = {raw, index, expanded} }
+    expanded
+  end
+
+  LABEL_DEF_RE = /\A {0,3}\[(\^?[^\]\s][^\]]*)\]:/
+
+  # Footnote labels and link reference labels are document-global, and
+  # includes splice raw text, so two notes (or a note and the page) that use
+  # `[^1]` or `[ref]` collide: one definition wins for all. Said once per
+  # page and label; each definition is only counted outside code fences.
+  private def warn_duplicate_labels(page : Models::Page, expanded : String) : Nil
+    counts = {} of String => Int32
+    tracker = Content::Processors::FenceTracker.new
+    expanded.each_line do |line|
+      next if tracker.fence_line?(line)
+      next unless md = LABEL_DEF_RE.match(line)
+      counts[md[1].downcase] = (counts[md[1].downcase]? || 0) + 1
+    end
+    counts.each do |label, count|
+      next if count < 2
+      next unless @wikilink_warnings.first?(page.path, "[#{label}]:")
+      Logger.warn "'#{page.path}': [#{label}] is defined #{count} times once its includes and transclusions are spliced in; one definition is used for every reference."
+    end
+  end
+
+  # What a per-page scan reads (shortcodes used, `@/` targets, wikilinks):
+  # the raw content, plus its include-expanded form when that differs, so
+  # what an included file brings in counts for the includer. A failing
+  # include scans as raw; the render reports it.
+  private def page_scan_texts(page : Models::Page) : Array(String)
+    raw = page.raw_content
+    return [raw] unless site = @site
+    expanded = begin
+      expanded_raw_content(page, site)
+    rescue Hwaro::HwaroError
+      raw
+    end
+    expanded == raw ? [raw] : [raw, expanded]
+  end
+
+  private def include_code_text(args : Hash(String, String), site : Models::Site) : String
+    relative = include_relative_path(args)
+    text = read_include(relative)
+    text = Content::Processors::Includes.region(text, args["region"], markdown: false) if args["region"]?
+    text = Content::Processors::Includes.lines(text, args["lines"]) if args["lines"]?
+    lang = args["lang"]? || begin
+      lexer = Content::Processors::Includes.language_for(relative)
+      # highlight.js reads the class, and does not know every lexer's name.
+      site.config.highlight.server? ? lexer : Content::Processors::Includes.hljs_language(lexer)
+    end
+    Content::Processors::Includes.fenced(Content::Processors::Includes.dedent(text), lang, args)
+  end
+
+  private def include_md_text(args : Hash(String, String), page : Models::Page, site : Models::Site, chain : Array(String)) : String
+    relative = include_relative_path(args)
+    check_include_chain(relative, chain)
+    text = Content::Processors::Includes.strip_front_matter(read_include(relative))
+    text = Content::Processors::Includes.region(text, args["region"], markdown: true) if args["region"]?
+    expand_includes(text, page, site, chain + [relative])
+  end
+
+  # The `path` argument (or the first positional one).
+  private def include_relative_path(args : Hash(String, String)) : String
+    Content::Processors::Includes.relative_path(args["path"]? || args["_0"]? || "")
+  end
+
+  # The file's text, recorded as a dependency when it was read or is
+  # missing (a page rendered while it is missing changes once it appears).
+  # A refused path is never recorded: watching one inside the output would
+  # be a serve rebuild loop.
+  private def read_include(relative : String) : String
+    raw = Content::Processors::Includes.read(relative, include_output_dir)
+    record_include_source(relative, Digest::MD5.hexdigest(raw))
+    Content::Processors::Includes.clean(raw)
+  rescue ex : Content::Processors::Includes::MissingFile
+    record_include_source(relative)
+    raise ex
+  end
+
+  private def check_include_chain(relative : String, chain : Array(String)) : Nil
+    if (Fiber.current.hwaro_include_splices += 1) > Content::Processors::Includes::MAX_SPLICES
+      raise Content::Processors::Includes::Error.new("include limit (#{Content::Processors::Includes::MAX_SPLICES} per page) exceeded at #{relative}")
+    end
+    if chain.includes?(relative)
+      raise Content::Processors::Includes::Error.new("include cycle: #{(chain + [relative]).join(" → ")}")
+    end
+    if chain.size > Content::Processors::Includes::MAX_DEPTH
+      raise Content::Processors::Includes::Error.new("include depth limit (#{Content::Processors::Includes::MAX_DEPTH}) exceeded: #{(chain + [relative]).join(" → ")}")
+    end
+  end
+
+  # The resolved page's Markdown (or its `#Heading` section) for an
+  # own-line `![[inner]]`, wrapped in a `.transclusion` div; nil leaves the
+  # line to the wikilink rewrite (an image or file embed, an unresolved
+  # target — reported there — or a heading the page does not have). The
+  # cycle check is per section, so a note may embed its own other heading.
+  private def transclusion(inner : String, prefix : String, page : Models::Page, site : Models::Site, chain : Array(String)) : String?
+    return unless index = @wikilink_index
+    link = Content::Processors::Wikilinks.parse(inner, true)
+    # Not `link.file?`: a note named `v1.2 plan` or `2026.10.05` has an
+    # "extension" too, and an attachment (`doc.pdf`) resolves to no page here.
+    return if link.nil? || link.target.empty? || link.image?
+    return unless target = index.resolve(link.target, page)
+    relative = File.join("content", target.path)
+    record_include_source(relative)
+    body = Content::Processors::Includes.clean(target.raw_content)
+    key = relative
+    if heading = link.heading
+      unless body = Content::Processors::Includes.heading_section(body, heading)
+        if @wikilink_warnings.first?(page.path, inner)
+          Logger.warn "Transclusion '![[#{inner}]]' in '#{page.path}': '#{target.path}' has no heading '#{heading}'; rendering a link."
+        end
+        return
+      end
+      key = "#{relative}##{Utils::TextUtils.slugify(heading)}"
+    end
+    begin
+      check_include_chain(key, chain)
+    rescue ex : Content::Processors::Includes::Error
+      raise Content::Processors::Includes::IncludeError.new("![[#{inner}]] in #{chain.last}: #{ex.message}")
+    end
+    body = expand_includes(body, page, site, chain + [key]).rstrip('\n')
+    source = HTML.escape(site.config.with_base_path(target.url))
+    # The closing blank line ends the `</div>` HTML block, so the next line
+    # is Markdown again (otherwise it is raw HTML, dropped under `safe`).
+    %(<div class="transclusion" data-source="#{source}">\n\n#{body}\n\n</div>\n).gsub('\n', "\n#{prefix}").insert(0, prefix)
+  end
+
+  private def include_output_dir : String?
+    @context.try(&.options.output_dir)
+  end
+
+  private def record_include_source(relative : String, digest : String? = nil) : Nil
+    Content::Processors::TemplateEngine.record_file_read(relative)
+    @include_sources_mutex.synchronize { @include_sources[relative] = digest }
   end
 
   # Default parsing when no hooks are registered.
@@ -183,6 +721,10 @@ module Hwaro::Core::Build::Phases::ParseContent
     # Sections the AfterReadContent hook already filtered out (draft/expired
     # _index files) still cascade to their descendants — include them.
     apply_cascades(ctx.all_pages, ctx.sections + ctx.excluded_cascade_sections)
+
+    # [[content.schema]] after cascade (cascaded values count as present).
+    # Only pages that survive the filters below fail the build.
+    schema_violations = apply_content_schemas(ctx.pages, ctx.options.parallel)
 
     # Single-pass filtering: remove parse-failed, draft, and expired pages.
     # Combines multiple reject! calls into one pass per array to avoid
@@ -248,6 +790,10 @@ module Hwaro::Core::Build::Phases::ParseContent
     # Deferred date-token permalink errors: only pages that survived the
     # filters above can publish a URL, so only they can fail the build.
     raise_on_permalink_errors!(ctx.pages)
+    unless schema_violations.empty?
+      published = ctx.pages.map { |p| File.join("content", p.path) }.to_set
+      Content::FrontMatterSchema.raise_if_any!(schema_violations.select { |v| published.includes?(v.file) })
+    end
 
     # The skipped total feeds the receipt's "parse … N skipped" emphasis; the
     # per-reason breakdown stays available under --verbose. Parse errors remain
@@ -285,18 +831,35 @@ module Hwaro::Core::Build::Phases::ParseContent
   # Parse a single page: read file, parse frontmatter, assign properties
   private def parse_single_page(page : Models::Page)
     source_path = File.join("content", page.path)
-    unless File.exists?(source_path)
-      # A dangling symlink (or a file deleted mid-rebuild) must be filtered
-      # like any parse failure. Returning silently left a ghost page with
-      # url "" whose output path resolves to <output>/index.html — silently
-      # clobbering the homepage, nondeterministically under parallel render.
-      page.parse_failed = true
-      Logger.warn "Failed to parse #{page.path}: source file missing (deleted mid-build or dangling symlink)"
-      return
-    end
+    if synthesis = page.synthesis
+      # A `[[content.generate]]` page has no disk file: its source document
+      # was composed at read time (see Models::Page::Synthesis). Everything
+      # below — front matter, dates, taxonomies, draft/expiry filtering,
+      # URL resolution — runs on it unchanged, which is the whole design.
+      raw_content = synthesis.markdown
+    else
+      unless File.exists?(source_path)
+        # A dangling symlink (or a file deleted mid-rebuild) must be filtered
+        # like any parse failure. Returning silently left a ghost page with
+        # url "" whose output path resolves to <output>/index.html — silently
+        # clobbering the homepage, nondeterministically under parallel render.
+        page.parse_failed = true
+        Logger.warn "Failed to parse #{page.path}: source file missing (deleted mid-build or dangling symlink)"
+        return
+      end
 
-    raw_content = File.read(source_path)
-    data = Processor::Markdown.parse(raw_content, source_path)
+      # Stat BEFORE the read: a save between the two then shows up as a
+      # stamp mismatch in Cache#update instead of being recorded as the
+      # bytes this render used (#859).
+      now_ms = Time.utc.to_unix_ms
+      info = File.info(source_path)
+      raw_content = File.read(source_path)
+      mtime_ms = info.modification_time.to_unix_ms
+      # Must equal Cache#compute_file_hash of the same bytes.
+      racy_digest = Cache.stable_mtime?(mtime_ms, now_ms) ? nil : Digest::MD5.hexdigest(raw_content)
+      page.source_read = {mtime_ms, info.size.to_i64, racy_digest}
+    end
+    data = Processor::Markdown.parse(raw_content, source_path, @config.try { |c| Content::FrontMatterSchema.declared_keys(c) })
 
     # A serve incremental re-parse works on the LIVE page object, and
     # `og_image:generate` (a BeforeRender hook the incremental paths never
@@ -309,6 +872,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     # (page.image nil), so this is a no-op there. A front-matter image the
     # edit just added still wins.
     previous_image = page.image
+    previous_url = page.url
 
     page.title = data[:title]
     page.description = data[:description]
@@ -328,7 +892,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     page.render = data[:render]
     page.slug = data[:slug]
     page.custom_path = data[:custom_path]
-    page.aliases = data[:aliases]
+    page.aliases = site_relative_aliases(data[:aliases], page.path)
     page.tags = data[:tags]
     page.taxonomies = data[:taxonomies]
     page.menus = data[:menus]
@@ -339,6 +903,12 @@ module Hwaro::Core::Build::Phases::ParseContent
     # New fields assignment
     page.authors = data[:authors]
     page.extra = data[:extra]
+    if synthesis = page.synthesis
+      # Publish the WHOLE source record to templates as `page.extra.item` —
+      # a single_template can read any record field without the
+      # [[content.generate]] rule having to map each one into front matter.
+      page.extra["item"] = ContentGenerate.item_to_extra(synthesis.item)
+    end
     page.in_search_index = data[:in_search_index]
     page.insert_anchor_links = data[:insert_anchor_links]
     page.weight = data[:weight]
@@ -353,6 +923,10 @@ module Hwaro::Core::Build::Phases::ParseContent
     # Redirect support — applies to both regular pages and sections
     page.redirect_to = data[:redirect_to]
 
+    # `[git]` metadata + date fallbacks. Must run before calculate_page_url
+    # so a `[permalinks]` date token can resolve from a git-derived `date`.
+    apply_git_info(page)
+
     # Calculate word count and reading time
     page.calculate_word_count
     page.calculate_reading_time
@@ -362,6 +936,13 @@ module Hwaro::Core::Build::Phases::ParseContent
     # fan-out — it needs every page's final URL (internal links) and the
     # body's full pipeline (shortcodes, markdown extensions, emoji), none of
     # which are available while pages are still being parsed in parallel.
+    #
+    # Cleared first: a serve incremental re-parse works on the LIVE page, and
+    # extract_summary keeps whatever chunk is already set when the body has
+    # no marker — so deleting `<!-- more -->` left the old marker summary
+    # (and its rendered HTML) in every listing until restart.
+    page.summary = nil
+    page.summary_html = nil
     page.extract_summary
 
     if page.is_a?(Models::Section)
@@ -380,6 +961,37 @@ module Hwaro::Core::Build::Phases::ParseContent
 
     # Calculate URL
     calculate_page_url(page)
+
+    # The preserved auto-OG URL above is named after the page URL. A slug or
+    # path edit moved the page, and the image regenerated after this
+    # re-render lives under the new name: re-derive it now, or the page's
+    # og:image kept pointing at the old, deleted file.
+    if (img = page.image) && img == previous_image && page.url != previous_url && (cfg = @config)
+      ai = cfg.og.auto_image
+      if ai.enabled && Content::Seo::OgImage.auto_assigned?(img, ai)
+        page.image = "/#{ai.output_dir}/#{Content::Seo::OgImage.slug_for(page, {} of String => String)}#{File.extname(img)}"
+      end
+    end
+  end
+
+  # Attach the page's commit metadata (see Builder#@git_info) and fill the
+  # `updated`/`date` gaps front matter left, per `[git] use_lastmod` /
+  # `use_date`. Always resets `page.git` first: the serve re-parse works on
+  # the live page object, and a feature toggled off mid-session must not
+  # leave the previous build's value behind. Front matter always wins — a
+  # fallback only applies to a field the file did not set. Synthesized
+  # (`[[content.generate]]`) pages have no source file and never match.
+  private def apply_git_info(page : Models::Page)
+    page.git = nil
+    return unless info_map = @git_info
+    return if page.synthesized?
+    return unless info = info_map[GitInfo.key(page.path)]?
+
+    page.git = info
+    git_config = @config.try(&.git)
+    return unless git_config
+    page.updated = info.lastmod if git_config.use_lastmod && page.updated.nil?
+    page.date = info.first_commit if git_config.use_date && page.date.nil?
   end
 
   private def parse_content_sequential(pages : Array(Models::Page))
@@ -405,44 +1017,22 @@ module Hwaro::Core::Build::Phases::ParseContent
     config = ParallelConfig.new(enabled: true)
     worker_count = config.calculate_workers(pages.size)
 
-    done = Channel(Nil).new(pages.size)
-    work_queue = Channel(Models::Page).new(pages.size)
-
-    # Enqueue all pages
-    pages.each { |page| work_queue.send(page) }
-    work_queue.close
-
     # Track the first classified frontmatter error seen by any worker so
     # the build can abort deterministically after draining the queue.
     classified_error : Hwaro::HwaroError? = nil
     error_mutex = Mutex.new
 
-    # Spawn workers
-    worker_count.times do
-      spawn do
-        while page = work_queue.receive?
-          begin
-            parse_single_page(page)
-          rescue ex : Hwaro::HwaroError
-            error_mutex.synchronize do
-              classified_error ||= ex
-            end
-            page.parse_failed = true
-          rescue ex
-            page.parse_failed = true
-            Logger.warn "Failed to parse #{page.path}: #{ex.message}"
-          ensure
-            # Must run even if a rescue handler raises: a missing send leaves
-            # the `pages.size.times { done.receive }` wait below one short and
-            # the build hangs instead of surfacing the error.
-            done.send(nil)
-          end
-        end
+    ParallelHelper.each_concurrently(pages, worker_count) do |page, _worker_id|
+      parse_single_page(page)
+    rescue ex : Hwaro::HwaroError
+      error_mutex.synchronize do
+        classified_error ||= ex
       end
+      page.parse_failed = true
+    rescue ex
+      page.parse_failed = true
+      Logger.warn "Failed to parse #{page.path}: #{ex.message}"
     end
-
-    # Wait for all pages to finish
-    pages.size.times { done.receive }
 
     # Surface the first classified frontmatter error now that all workers
     # have drained. We prefer this over re-raising inside the worker fiber
@@ -476,8 +1066,93 @@ module Hwaro::Core::Build::Phases::ParseContent
     end
   end
 
+  # Validate regular pages against `[[content.schema]]` and fill the
+  # defaults of their missing fields. Returns every violation, in page
+  # order. The check (a source re-read and front-matter parse per page) is
+  # pure and fans out; defaults are applied afterwards, on this fiber.
+  private def apply_content_schemas(pages : Array(Models::Page), parallel : Bool) : Array(Content::FrontMatterSchema::Violation)
+    violations = [] of Content::FrontMatterSchema::Violation
+    config = @config
+    return violations if config.nil? || config.content_schema.empty?
+    cascade_map = @cascade_map || build_cascade_map([] of Models::Section)
+    taxonomies = Content::FrontMatterSchema.taxonomy_names(config)
+    # ParallelHelper.map drops an item whose block raises, so the block
+    # never raises: a failure is carried out and re-raised here instead of
+    # leaving that page silently unchecked.
+    checked = ParallelHelper.map(pages.reject(&.parse_failed), parallel) do |page|
+      result = begin
+        content_schema_result(page, config, cascade_map, taxonomies)
+      rescue ex
+        ex
+      end
+      {page, result}
+    end
+    checked.each do |page, result|
+      raise result if result.is_a?(Exception)
+      violations.concat(apply_schema_result(page, result)) if result
+    end
+    violations
+  end
+
+  # Check one page and apply its defaults (the serve incremental path).
+  protected def apply_content_schema(page : Models::Page, config : Models::Config, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))) : Array(Content::FrontMatterSchema::Violation)
+    result = content_schema_result(page, config, cascade_map, Content::FrontMatterSchema.taxonomy_names(config))
+    result ? apply_schema_result(page, result) : [] of Content::FrontMatterSchema::Violation
+  end
+
+  # nil when the page is a section or matches no schema.
+  private def content_schema_result(page : Models::Page, config : Models::Config, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue)), taxonomies : Array(String)) : Content::FrontMatterSchema::Result?
+    return if page.is_a?(Models::Section)
+    return unless rule = Content::FrontMatterSchema.rule_for(config, page.section)
+    source_path = File.join("content", page.path)
+    source = page.synthesis.try(&.markdown) || File.read(source_path)
+    Content::FrontMatterSchema.check(rule, source_path, source, page.extra, merged_cascade_for(page, cascade_map),
+      locate: !page.synthesized?, taxonomies: taxonomies)
+  end
+
+  private def apply_schema_result(page : Models::Page, result : Content::FrontMatterSchema::Result) : Array(Content::FrontMatterSchema::Violation)
+    result.defaults.each { |name, value| apply_schema_default(page, name, value) }
+    result.violations
+  end
+
+  # The typed property for a known field (the set
+  # `ContentSchemaField::DEFAULTABLE_KNOWN` allows), else `page.extra`.
+  private def apply_schema_default(page : Models::Page, name : String, value : Models::SchemaValue)
+    extra_value = value.is_a?(Time) ? value.to_s : value
+    if name.starts_with?("extra.") || !Content::FrontMatterSchema::KNOWN_KEYS.includes?(name)
+      page.extra[name.lchop("extra.")] = extra_value
+      return
+    end
+
+    case name
+    when "description"         then extra_value.as?(String).try { |v| page.description = v }
+    when "image"               then extra_value.as?(String).try { |v| page.image = v }
+    when "template"            then extra_value.as?(String).try { |v| page.template = normalize_template_name(v) }
+    when "series"              then extra_value.as?(String).try { |v| page.series = v }
+    when "render"              then extra_value.as?(Bool).try { |b| page.render = b }
+    when "toc"                 then extra_value.as?(Bool).try { |b| page.toc = b }
+    when "insert_anchor_links" then extra_value.as?(Bool).try { |b| page.insert_anchor_links = b }
+    when "in_sitemap"          then extra_value.as?(Bool).try { |b| page.in_sitemap = b }
+    when "in_search_index"     then extra_value.as?(Bool).try { |b| page.in_search_index = b }
+    when "weight"              then extra_value.as?(Int64).try { |i| page.weight = i.clamp(Int32::MIN.to_i64, Int32::MAX.to_i64).to_i32 }
+    when "series_weight"       then extra_value.as?(Int64).try { |i| page.series_weight = i.clamp(Int32::MIN.to_i64, Int32::MAX.to_i64).to_i32 }
+    when "authors"
+      # Like a cascade: authors/tags given through [taxonomies] are present.
+      cascade_string_array(extra_value).try { |a| page.authors = a } if page.authors.empty?
+    when "tags"
+      if page.tags.empty? && (tags = cascade_string_array(extra_value))
+        page.tags = tags
+        page.taxonomies["tags"] = tags unless tags.empty?
+      end
+    when "updated"
+      page.updated = value.as?(Time) || extra_value.as?(String).try { |s| Utils::DateUtils.parse_content_date(s) }
+    end
+  end
+
   # Build {directory, language} => validated cascade map from sections.
-  protected def build_cascade_map(sections : Array(Models::Section)) : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))
+  # Public: the schema tools (doctor, `tool validate`) resolve cascades
+  # through it too.
+  def build_cascade_map(sections : Array(Models::Section)) : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))
     map = {} of Tuple(String, String) => Hash(String, Models::ExtraValue)
     sections.each do |section|
       next if section.cascade.empty?
@@ -577,7 +1252,7 @@ module Hwaro::Core::Build::Phases::ParseContent
 
   # Collect cascades from the page's ancestor directories, shallowest first,
   # restricted to sections in the same language tree.
-  private def merged_cascade_for(page : Models::Page, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))) : Hash(String, Models::ExtraValue)
+  def merged_cascade_for(page : Models::Page, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))) : Hash(String, Models::ExtraValue)
     dir = Path[page.path].dirname.to_s
     dir = "" if dir == "."
 
@@ -609,15 +1284,40 @@ module Hwaro::Core::Build::Phases::ParseContent
     page.language || @config.try(&.default_language) || ""
   end
 
+  # An alias names an incoming path ON THIS SITE — the build writes a redirect
+  # stub at it — so anything carrying a URL scheme, or an authority
+  # (`//host/path`), is not something this build can publish.
+  #
+  # Both used to be treated as plain path text: `aliases = ["http://x.com/y"]`
+  # created the directory `public/http:/x.com/y/`, and `["//x.com/"]` created
+  # `public/x.com/`. Nonsense output on POSIX, and a hard build failure on
+  # Windows, where `:` is not a legal path character. Dropped here rather than
+  # at write time so `compute_output_url_winners` and `generate_aliases` see
+  # the same list — a value filtered in only one of them would still claim an
+  # output URL, or warn about colliding with a stub nothing ever writes.
+  # The predicate lives in Utils::PathUtils so the tools that mirror the
+  # build's alias handling (`tool export`, `tool platform`) cannot drift.
+
+  private def site_relative_aliases(aliases : Array(String), page_path : String) : Array(String)
+    return aliases unless aliases.any? { |a| Utils::PathUtils.unpublishable_alias(a) }
+    aliases.reject do |a|
+      next false unless reason = Utils::PathUtils.unpublishable_alias(a)
+      Logger.warn "Skipping alias #{a.inspect} on #{page_path}: #{reason}."
+      true
+    end
+  end
+
   # Cascade values arrive as ExtraValue; tags/taxonomies/authors need plain
   # string arrays. Non-string elements are skipped.
-  # Values are stripped to match `fm_string_array` — cascaded taxonomy
-  # terms must not become distinct whitespace-padded terms either.
+  # Values are stripped and blank-dropped to match `fm_string_array` —
+  # cascaded taxonomy terms must not become distinct whitespace-padded terms
+  # either, and a term that strips to "" gets no written page, so leaving it
+  # on the page renders a term link to a 404.
   private def cascade_string_array(value : Models::ExtraValue) : Array(String)?
     if value.is_a?(Array(String))
-      value.map(&.strip)
+      value.map { |term| Utils::TextUtils.normalize_term(term) }.reject(&.empty?)
     elsif value.is_a?(Array(Models::ExtraValue))
-      value.compact_map(&.as?(String)).map(&.strip)
+      value.compact_map(&.as?(String)).map { |term| Utils::TextUtils.normalize_term(term) }.reject(&.empty?)
     end
   end
 
@@ -686,6 +1386,7 @@ module Hwaro::Core::Build::Phases::ParseContent
       language: page.language,
       date: page.date,
       title: page.title,
+      version: page.version,
     )
     page.url = url
     page.permalink_error = error

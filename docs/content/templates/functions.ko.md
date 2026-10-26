@@ -26,7 +26,7 @@ toc = true
 |------|------|-------------|
 | path | String | 소스 상대 경로(예: `about.md`) 또는 URL 경로(예: `/about/`) |
 
-**반환값:** Page? (못 찾으면 nil) — 표준 [Page 속성](/ko/templates/data-model/)을 노출하되, 렌더링 시점에 계산되는 필드(`permalink`, `lower`/`higher`, `ancestors`, `series_index`, `series_pages`, `related_posts`)는 제외됩니다.
+**반환값:** Page? (못 찾으면 nil). 표준 [Page 속성](/ko/templates/data-model/#page)을 노출하되, 렌더링 시점에 계산되는 필드(`permalink`, `lower`/`higher`, `ancestors`, `series_index`, `series_pages`, `related_posts`, `backlinks`)는 제외됩니다.
 
 **예시:**
 
@@ -67,6 +67,10 @@ toc = true
 
 **반환값:** Section? (못 찾으면 nil)
 
+번역된 섹션이 같은 이름을 공유하면 `get_section()`은 현재 페이지의 언어를
+먼저 찾고, 없으면 기본 언어를 사용합니다. 특정 언어 버전을 고르려면 소스
+경로나 URL을 지정하세요.
+
 **반환 속성:**
 
 | 속성 | 타입 |
@@ -79,6 +83,7 @@ toc = true
 | pages | Array<Page> |
 | pages_count | Int |
 | assets | Array<String> |
+| subsections | Array<Section> |
 
 **예시:**
 
@@ -134,9 +139,10 @@ toc = true
 
 `items`의 순서는 해당 택소노미의
 [`terms_sort_by`](/ko/writing/taxonomies/#정렬)를 따릅니다. `"name"`(기본값,
-가나다순) 또는 `"count"`(페이지 수 내림차순, 동수일 때 이름 오름차순)입니다.
-개수는 모든 언어를 합산한 사이트 전체 기준으로, 루트 택소노미 인덱스
-페이지와 동일합니다.
+대소문자 구분 없는 알파벳순) 또는 `"count"`(페이지 수 내림차순, 동수일 때 이름 오름차순)입니다.
+개수는 모든 언어를 합산한 사이트 전체 기준입니다. 다국어 사이트의 루트
+택소노미 인덱스 페이지는 기본 언어 페이지만 세므로 `"count"` 순서가 다를 수
+있습니다.
 
 **Term 속성:**
 
@@ -168,6 +174,12 @@ toc = true
 
 **반환값:** String(절대 URL)
 
+기본 언어가 아닌 페이지에서는 해당 언어의 항목 페이지(`/ko/tags/crystal/`)가
+있으면 그 URL을, 없으면 루트 항목 페이지 URL을 반환합니다. URL은 어떤 항목에
+대해서도 만들어지므로, 그 항목이 실제로 게시된 페이지를 가질 때만 존재하는
+페이지를 가리킵니다. 기본 언어의 `[languages.<code>] taxonomies`에서 빠진
+택소노미에는 루트 항목 페이지가 없습니다.
+
 ---
 
 ### get_menu()
@@ -186,7 +198,7 @@ toc = true
 |------|------|-------------|
 | name | String | 메뉴 이름(예: "main", "footer") |
 
-**반환값:** Array\<Entry\> — **현재 페이지**의 언어를 기준으로 해석하고, 그 언어에 `name` 메뉴 엔트리가 없으면 기본 언어로 폴백합니다. 알 수 없거나 등록되지 않은 메뉴 이름은 빈 배열을 반환하므로(nil이 아님) `{% for %}` 루프에서 오류가 나지 않습니다.
+**반환값:** Array\<Entry\>. **현재 페이지**의 언어를 기준으로 해석하고, 그 언어에 `name` 메뉴 엔트리가 없으면 기본 언어로 폴백합니다. 알 수 없거나 등록되지 않은 메뉴 이름은 빈 배열을 반환하므로(nil이 아님) `{% for %}` 루프에서 오류가 나지 않습니다.
 
 **엔트리 속성:**
 
@@ -201,7 +213,7 @@ toc = true
 | children | Array\<Entry\> | 중첩 엔트리 |
 | page | Page? | 등록한 페이지의 데이터(프론트 매터로 등록된 엔트리만) |
 
-현재 페이지와 무관하게 **기본 언어**의 메뉴가 꼭 필요할 때만 `site.menus.<name>`을 사용합니다 — 공용 내비게이션 파셜 안에서는 거의 언제나 `get_menu()`가 맞는 선택입니다.
+현재 페이지와 무관하게 **기본 언어**의 메뉴가 꼭 필요할 때만 `site.menus.<name>`을 사용합니다. 공용 내비게이션 파셜 안에서는 거의 언제나 `get_menu()`가 맞는 선택입니다.
 
 ---
 
@@ -225,6 +237,8 @@ toc = true
 | path | String | 데이터 파일 경로 |
 
 **반환값:** 파싱된 데이터 또는 nil
+
+`load_data()`는 로컬 파일 시스템만 읽으며, 경로는 프로젝트 디렉터리 안에서 해석됩니다. 프로젝트 밖의 파일도, URL도 읽을 수 없습니다. HTTP(S) GET 요청 하나의 페이로드라면 [`[[data.remote]]`](/ko/features/remote-data/)로 `site.data`에 노출하세요. 여러 요청이나 변형이 필요하면 [사전 빌드 훅](/ko/features/build-hooks/)으로 `data/`에 내려받습니다. `data/` 아래 파일은 `load_data()` 호출 없이도 `site.data`로 노출됩니다.
 
 **지원 포맷:**
 
@@ -286,7 +300,7 @@ url = "https://twitter.com/example"
 | 이름 | 타입 | 설명 |
 |------|------|-------------|
 | name | String | 환경 변수 이름 |
-| default | String? | 변수가 없을 때의 폴백 값(선택) |
+| default | String? | 변수가 없거나 비어 있을 때의 폴백 값(선택) |
 
 **반환값:** String(환경 변수 값, 기본값, 또는 빈 문자열)
 
@@ -327,6 +341,8 @@ base_url이 포함된 URL을 생성합니다.
 
 **반환값:** String(절대 URL)
 
+`page.assets`/`section.assets` 항목(`blog/my-trip/photo.jpg`)을 넘기면 페이지 옆에 게시된 사본의 URL이 됩니다. `slug`, `path`, 언어 접두사로 페이지가 옮겨 가도 마찬가지입니다.
+
 ---
 
 ### get_url()
@@ -354,13 +370,33 @@ base_url이 포함된 URL을 생성합니다.
 |------|------|-------------|
 | name | String | 번들 또는 에셋 이름(예: `main.css`, `app.js`) |
 
-**반환값:** String — `base_url` 아래의 절대 URL. 매니페스트에 항목이 없으면 이름을 그대로 `base_url` 아래 경로로 반환하므로, 파이프라인을 켜기 전에도 템플릿이 그대로 동작합니다.
+**반환값:** String. `base_url` 아래의 절대 URL. 매니페스트에 항목이 없으면 이름을 그대로 `base_url` 아래 경로로 반환하므로, 파이프라인을 켜기 전에도 템플릿이 그대로 동작합니다.
 
 ---
 
 ### asset_url()
 
 `asset()`의 별칭입니다. 템플릿에서 더 읽기 좋은 쪽을 사용하면 됩니다.
+
+---
+
+### asset_integrity()
+
+`asset()`이 가리키는 파일의 [하위 리소스 무결성](/ko/features/asset-pipeline/#sri) 값을 돌려줍니다. 출력에 쓰인 바이트(압축과 핑거프린트 이후)로 계산합니다.
+
+```jinja
+<script src="{{ asset(name='app.js') }}" integrity="{{ asset_integrity(name='app.js') }}" crossorigin="anonymous"></script>
+```
+
+페이지 번들과 `[content.files]` 에셋은 렌더링 뒤에 복사되므로 원본 파일로 해시를 계산합니다. 페이지를 `base_url`과 다른 호스트에서 열어도 검사가 통과하도록 `crossorigin="anonymous"`를 함께 붙이세요.
+
+**파라미터:**
+
+| 이름 | 타입 | 설명 |
+|------|------|-------------|
+| name | String | 번들 이름 또는 출력 경로(예: `main.css`, `css/site.css`) |
+
+**반환값:** String(예: `sha384-…`). 이번 빌드가 게시하지 않는 이름은 템플릿 오류를 일으킵니다. `--minify`일 때의 원본 `.json`/`.xml`/`.html` 파일도 렌더링 뒤에 다시 쓰이므로 마찬가지입니다.
 
 ---
 
@@ -381,7 +417,7 @@ base_url이 포함된 URL을 생성합니다.
 
 | 이름 | 타입 | 설명 |
 |------|------|-------------|
-| format | String? | 날짜 포맷 문자열(선택) |
+| format | String? | 날짜 포맷 문자열(선택, 기본값 `%Y-%m-%d %H:%M:%S`) |
 
 **반환값:** String
 
@@ -415,21 +451,35 @@ base_url이 포함된 URL을 생성합니다.
 
 | 이름 | 타입 | 설명 |
 |------|------|-------------|
-| path | String | 이미지 경로(예: `/images/photo.jpg`) |
+| path | String | 이미지 경로(예: `/images/photo.jpg`) 또는 `page.assets` 항목 |
 | width | Int | 요청 너비(픽셀, 0 = 원본) |
 | height | Int | 요청 높이(픽셀, 0 = 원본) |
+| op | String | `fit`(기본값), `fill`, `crop` — [자르기와 채우기](/ko/features/image-processing/#자르기와-채우기) 참고 |
+| anchor | String | `fill`/`crop`이 남길 위치: `center`(기본값), `top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right` |
 
 **반환값:** 다음 속성을 가진 객체:
 
 | 속성 | 타입 | 설명 |
 |----------|------|-------------|
 | url | String | 리사이즈된 변형의 URL(사용할 수 없으면 원본) |
-| width | Int | 요청한 너비 |
-| height | Int | 요청한 높이 |
+| width | Int | 선택된 변형의 실제 너비. 변형이 없으면 요청한 너비 |
+| height | Int | 요청한 높이(전달하지 않으면 0) |
 | lqip | String | 작은 JPEG 플레이스홀더의 Base64 데이터 URI(LQIP 비활성 시 빈 문자열) |
 | dominant_color | String | 이미지 주요 색상의 16진수 색상 문자열, 예: `#a3b2c1`(LQIP 비활성 시 빈 문자열) |
 
 이 함수는 설정된 `widths` 중 가장 가까운 너비를 고릅니다. `width=500`을 요청했고 설정된 너비가 `[320, 640, 1024]`라면 640px 변형(요청 이상인 가장 작은 너비)을 반환합니다. 충분히 큰 것이 없으면 가장 큰 변형으로 폴백합니다.
+
+변형은 절대 확대하지 않으므로 900px 원본에 `width=1024`를 요청하면 900px 파일이
+나오고, `img.width`도 `900`을 반환합니다. 따라서
+`<img width="{{ img.width }}">`가 브라우저가 실제로 내려받는 파일과 일치합니다.
+`height`는 전달한 값 그대로입니다(전달하지 않으면 `0`). 증분 빌드에서는 변형
+맵을 파일 이름으로 복원하기 때문에, 모든 이미지를 디코딩하지 않고서는 실제
+높이를 알 수 없습니다.
+
+`op="fill"`이나 `op="crop"`에서는 `width`와 `height`가 모두 필요하고, 변형은
+렌더링 시점에 만들어지며(`hero_400x300_fill_center.jpg` 같은 이름),
+`width`/`height`는 실제로 쓴 파일의 크기를 돌려줍니다. 알 수 없는 `op`나
+`anchor`는 템플릿 오류입니다.
 
 `lqip`과 `dominant_color` 속성은 `[image_processing.lqip]`이 활성화되어 있어야 합니다. 꺼져 있으면 빈 문자열을 반환합니다.
 
@@ -521,5 +571,5 @@ data/
 ## 함께 보기
 
 - [데이터 모델](/ko/templates/data-model/) — Site, Section, Page 타입
-- [데이터 모델 › Paginator](/ko/templates/data-model/) — 섹션 템플릿의 페이지네이션 객체
+- [데이터 모델 › Paginator](/ko/templates/data-model/#paginator) — 섹션 템플릿의 페이지네이션 객체
 - [필터](/ko/templates/filters/) — 값 변환

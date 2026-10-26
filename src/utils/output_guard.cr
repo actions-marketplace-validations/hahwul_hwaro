@@ -19,8 +19,18 @@ module Hwaro
         # Canonicalize once — the previous within_output_dir? + canonical
         # sequence expanded output_path twice (a getcwd syscall and several
         # Path allocations each), and this runs for every written file.
-        canonical_output = canonical(output_path)
-        if contains?(canonical(output_dir), canonical_output)
+        #
+        # One `Dir.current` for both expansions. `File.expand_path` with no
+        # base resolves the working directory itself, and that is a `getcwd`
+        # syscall — on macOS an `open` plus `stat`, not a cheap read. This
+        # method runs for every file a build writes, so paying it twice per
+        # page was pure waste. Resolving it here (rather than memoizing it
+        # process-wide) keeps the guard correct for callers that run under a
+        # different working directory later in the same process.
+        cwd = Dir.current
+        canonical_output = canonical?(output_path, cwd)
+        canonical_dir = canonical?(output_dir, cwd)
+        if canonical_output && canonical_dir && PathUtils.within?(canonical_output, canonical_dir)
           canonical_output
         else
           Logger.warn "Skipping output outside output directory: #{output_path}"
@@ -31,17 +41,55 @@ module Hwaro
       # Check if a path is within the output directory.
       #
       def within_output_dir?(output_path : String, output_dir : String) : Bool
-        contains?(canonical(output_dir), canonical(output_path))
+        cwd = Dir.current
+        dir = canonical?(output_dir, cwd)
+        target = canonical?(output_path, cwd)
+        return false unless dir && target
+        PathUtils.within?(target, dir)
       end
 
-      private def contains?(canonical_dir : String, canonical_output : String) : Bool
-        return true if canonical_output == canonical_dir
-        # Build the prefix from the canonical dir rather than always appending
-        # a separator: at the filesystem root `canonical` legitimately returns
-        # "/", and "/" + "/" would reintroduce the double-separator mismatch
-        # this method exists to avoid.
-        prefix = canonical_dir.ends_with?(File::SEPARATOR) ? canonical_dir : canonical_dir + File::SEPARATOR
-        canonical_output.starts_with?(prefix)
+      # Check an existing file before unlinking it. Lexical containment alone
+      # is not enough for a persisted stale path such as
+      # `public/link/secret`: `public/link` may point outside the output tree.
+      # The leaf may itself be a symlink because deleting it removes the link,
+      # so resolve and check its parent instead.
+      def safe_to_delete_file?(path : String, output_dir : String) : Bool
+        return false unless within_output_dir?(path, output_dir)
+
+        cwd = Dir.current
+        root = File.realpath(File.expand_path(output_dir, cwd))
+        parent = File.realpath(File.expand_path(File.dirname(path), cwd))
+        within_output_dir?(parent, root)
+      rescue File::Error | IO::Error | ArgumentError
+        false
+      end
+
+      # Check an existing directory before pruning it. Resolve the directory
+      # itself (including symlinked ancestors), reject a symlink leaf, and
+      # never allow pruning the output root.
+      def safe_to_delete_directory?(path : String, output_dir : String) : Bool
+        return false unless within_output_dir?(path, output_dir)
+        return false if File.symlink?(path)
+
+        cwd = Dir.current
+        root = File.realpath(File.expand_path(output_dir, cwd))
+        directory = File.realpath(File.expand_path(path, cwd))
+        directory != root && within_output_dir?(directory, root)
+      rescue File::Error | IO::Error | ArgumentError
+        false
+      end
+
+      # A path that cannot be canonicalized at all is, by definition, not
+      # inside the output directory. `File.expand_path` builds a `Path`, whose
+      # `check_no_null_byte` raises `ArgumentError` for an embedded NUL — so
+      # these two SAFETY predicates used to abort the build with a bare
+      # "String contains null byte" instead of answering "not safe", which is
+      # exactly the outcome a guard exists to produce. Nil means "no canonical
+      # form"; the callers treat that as outside.
+      private def canonical?(path : String, base : String? = nil) : String?
+        canonical(path, base)
+      rescue ArgumentError
+        nil
       end
 
       # Absolute, comparison-ready form of `path`.
@@ -53,10 +101,8 @@ module Hwaro
       # every page — a `-o public/` build (what shell directory completion
       # types for you) silently published nothing. Dropping trailing
       # separators makes `public/` and `public` the same directory again.
-      private def canonical(path : String) : String
-        expanded = File.expand_path(path)
-        return expanded if expanded == File::SEPARATOR_STRING
-        expanded.rstrip(File::SEPARATOR)
+      private def canonical(path : String, base : String? = nil) : String
+        PathUtils.chomp_separator(File.expand_path(path, base))
       end
     end
   end

@@ -10,6 +10,7 @@ require "../utils/js_minifier"
 require "../utils/logger"
 require "../utils/output_guard"
 require "../utils/path_utils"
+require "../utils/text_utils"
 require "../models/config"
 require "./sass_compiler"
 
@@ -20,12 +21,20 @@ module Hwaro
       # e.g. "main.css" => "/assets/main.a1b2c3d4.css"
       getter manifest : Hash(String, String)
 
+      # Output files this run actually wrote, as filesystem paths under the
+      # build output directory. The caller (AssetHooks) claims them so a
+      # `--cache` build — which never wipes the output directory — can drop
+      # the previous fingerprinted bundle instead of accumulating one file
+      # per edit in `public/assets/` forever.
+      getter written_paths : Array(String)
+
       # `sass_enabled` mirrors `[sass].enabled`: `.scss` bundle entries
       # compile through the built-in compiler only when the feature is on;
       # otherwise they concatenate verbatim (pre-Sass behavior, and the
       # escape hatch for sources outside the supported subset).
-      def initialize(@config : Models::AssetsConfig, @base_url : String, @sass_enabled : Bool = false)
+      def initialize(@config : Models::AssetsConfig, @sass_enabled : Bool = false)
         @manifest = {} of String => String
+        @written_paths = [] of String
       end
 
       def process(output_dir : String)
@@ -42,22 +51,31 @@ module Hwaro
           Logger.warn "Asset pipeline: output_dir '#{@config.output_dir}' escapes the output directory; skipping asset processing."
           return
         end
-        Hwaro::Utils::FileSafe.mkdir_p(assets_output)
-
+        # The directory is created by `process_bundle` when a bundle actually
+        # has bytes to write. Creating it up front left an empty `assets/`
+        # in the output of every build that produced no bundle (all sources
+        # missing, or `bundles` empty) — a stray directory a cold build ships
+        # and a `--cache` build, which prunes emptied directories, does not.
         @config.bundles.each do |bundle|
           process_bundle(bundle, assets_output)
         end
       end
 
       private def process_bundle(bundle : Models::AssetBundleConfig, assets_output : String)
+        separator = bundle_separator(bundle.name)
+        css_bundle = File.extname(bundle.name).downcase == ".css"
+        # Output-root-relative directory the bundle is published in
+        # ("assets", or "assets/vendor" for a "vendor/x.css" bundle name).
+        bundle_dir = Path.posix(@config.output_dir, File.dirname(bundle.name)).normalize.to_s
         # Read and concatenate source files
         contents = String.build do |io|
-          bundle.files.each_with_index do |file, i|
+          wrote_any = false
+          bundle.files.each do |file|
             # Validate source path stays within source_dir
             source = File.join(@config.source_dir, file)
             source_real = File.expand_path(source)
             source_dir_real = File.expand_path(@config.source_dir)
-            unless source_real == source_dir_real || source_real.starts_with?(source_dir_real + "/")
+            unless Utils::PathUtils.within?(source_real, source_dir_real)
               Logger.warn "Asset pipeline: source file outside source directory: #{file}"
               next
             end
@@ -73,14 +91,31 @@ module Hwaro
               Logger.warn "Asset pipeline: source outside source directory (symlink?): #{file}"
               next
             end
-            io << "\n" if i > 0
-            content = File.read(source)
+            # Keyed off what was actually written, not the loop index: a
+            # skipped first entry (missing file, escaping symlink) used to
+            # leave the bundle starting with a stray separator.
+            io << separator if wrote_any
+            content = Utils::TextUtils.strip_bom(File.read(source))
+            # Sass, url() rebasing and both minifiers are regex-based, and
+            # PCRE2 rejects the whole subject over one legacy (Latin-1) byte,
+            # failing the build.
+            unless content.valid_encoding?
+              Logger.warn "Asset pipeline: '#{file}' is not valid UTF-8; invalid bytes were replaced with U+FFFD. Re-save it as UTF-8."
+              content = content.scrub
+            end
             # `.scss` bundle entries compile before concatenation when the
             # built-in Sass feature is on; verbatim otherwise.
             if @sass_enabled && file.ends_with?(".scss")
               content = SassCompiler.compile_source(content, source)
             end
+            content = rebase_css_urls(content, file, bundle_dir) if css_bundle && publishes_source_dir?
+            # `@import` is only honoured before every other rule, so one in a
+            # later entry is dropped by the browser once concatenated.
+            if css_bundle && wrote_any && css_import?(content)
+              Logger.warn "Asset pipeline: '#{file}' has an @import that browsers ignore after the earlier files of bundle '#{bundle.name}'; move it to the first file."
+            end
             io << content
+            wrote_any = true
           end
         end
 
@@ -118,6 +153,7 @@ module Hwaro
         end
         Hwaro::Utils::FileSafe.mkdir_p(File.dirname(output_path))
         File.write(output_path, contents)
+        @written_paths << output_path
 
         # Record in manifest
         manifest_path = "/" + File.join(@config.output_dir, output_name)
@@ -126,12 +162,144 @@ module Hwaro
         Logger.debug "  Asset: #{bundle.name} → #{manifest_path} (#{contents.bytesize} bytes)"
       end
 
+      # `static/` is copied to the output root verbatim, so a file beside a
+      # stylesheet in `source_dir = "static"` is published beside that
+      # stylesheet's own copy. Any other source_dir is not published, and
+      # its relative URLs have no published target to rebase onto.
+      private def publishes_source_dir? : Bool
+        File.expand_path(@config.source_dir) == File.expand_path("static")
+      end
+
+      CSS_URL_RE = /url\(\s*(["']?)([^"')]+?)\1\s*\)/i
+
+      # A stylesheet's relative `url(...)` resolves against the stylesheet's
+      # own location, but the bundle is published elsewhere
+      # (`/assets/main.<hash>.css`): `url(img/x.png)` written in
+      # `static/css/a.css` pointed at `/assets/img/x.png`, a 404, and vendor
+      # CSS lost its fonts the same way. Rewrite such a URL to the same file
+      # seen from the bundle's directory — but only when that file exists
+      # beside the source, so a URL the author already wrote relative to the
+      # bundle output keeps working. Relative results keep subpath
+      # (`base_path`) deploys working.
+      #
+      # Only real `url(...)` tokens are rewritten: the text of a CSS string
+      # (`content:"url(sp.png)"`) or a comment is copied through untouched.
+      private def rebase_css_urls(css : String, file : String, bundle_dir : String) : String
+        source_dir = File.dirname(file)
+        return css if source_dir == bundle_dir
+        bytes = css.to_slice
+        n = bytes.size
+        String.build(css.bytesize) do |io|
+          i = 0
+          copied = 0 # bytes[copied...i] are pending verbatim output
+          while i < n
+            b = bytes[i]
+            if b == '"'.ord || b == '\''.ord
+              i = css_string_end(bytes, i, n)
+            elsif b == '/'.ord && i + 1 < n && bytes[i + 1] == '*'.ord
+              close = css.byte_index("*/", i + 2)
+              i = close ? close + 2 : n
+            elsif (b == 'u'.ord || b == 'U'.ord) && (i == 0 || !css_ident_byte?(bytes[i - 1])) &&
+                  (m = CSS_URL_RE.match_at_byte_index(css, i, Regex::MatchOptions::ANCHORED))
+              stop = i + m[0].bytesize
+              io.write(bytes[copied, i - copied])
+              io << rebase_css_url(m[0], m[1], m[2], source_dir, bundle_dir)
+              copied = i = stop
+            else
+              i += 1
+            end
+          end
+          io.write(bytes[copied, n - copied])
+        end
+      end
+
+      # One matched `url(...)` token, rebased when it names a file beside the
+      # source stylesheet (see rebase_css_urls), else returned as written.
+      private def rebase_css_url(whole : String, quote : String, raw_url : String, source_dir : String, bundle_dir : String) : String
+        url = raw_url.strip
+        return whole if url.empty? || url.starts_with?('/') || url.starts_with?('#') ||
+                        url.includes?("://") || url.starts_with?("//") || url.matches?(/\A[a-z][a-z0-9+.-]*:/i)
+        path_part = url.split(/[?#]/, 2).first
+        suffix = url[path_part.size..]
+        # A URL is percent-encoded (`fonts/A%20B.woff2`) while the file on
+        # disk is not, so the existence check decodes. An encoded `.` or `/`
+        # would change the segment structure between the two spellings; such
+        # a URL is left as written.
+        return whole if path_part.matches?(/%2[EeFf]/)
+        target = Path.posix(source_dir, path_part).normalize
+        return whole if Utils::PathUtils.escapes_parent?(target.to_s)
+        decoded = URI.decode(target.to_s)
+        return whole if decoded.includes?('\0') # File.file? raises on NUL
+        return whole unless File.file?(File.join(@config.source_dir, decoded))
+        rebased = target.relative_to(Path.posix(bundle_dir)).to_s
+        "url(#{quote}#{rebased}#{suffix}#{quote})"
+      end
+
+      # Index just past the CSS string starting at `start` (backslash
+      # escapes honoured). An unterminated string ends at the line break, as
+      # CSS tokenizes it, or at the end of the input.
+      private def css_string_end(bytes : Bytes, start : Int32, n : Int32) : Int32
+        quote = bytes[start]
+        i = start + 1
+        while i < n
+          c = bytes[i]
+          return i + 1 if c == quote
+          return i if c == '\n'.ord
+          i += c == '\\'.ord ? 2 : 1
+        end
+        n
+      end
+
+      # True when `css` holds an `@import` rule outside strings and comments.
+      private def css_import?(css : String) : Bool
+        bytes = css.to_slice
+        n = bytes.size
+        i = 0
+        while i < n
+          b = bytes[i]
+          if b == '"'.ord || b == '\''.ord
+            i = css_string_end(bytes, i, n)
+          elsif b == '/'.ord && i + 1 < n && bytes[i + 1] == '*'.ord
+            close = css.byte_index("*/", i + 2)
+            i = close ? close + 2 : n
+          elsif b == '@'.ord && i + 7 <= n && String.new(bytes[i + 1, 6]).compare("import", case_insensitive: true) == 0 &&
+                (i + 7 == n || !css_ident_byte?(bytes[i + 7]))
+            return true
+          else
+            i += 1
+          end
+        end
+        false
+      end
+
+      private def css_ident_byte?(b : UInt8) : Bool
+        b >= 0x80 || b.unsafe_chr.ascii_alphanumeric? || b == '-'.ord || b == '_'.ord
+      end
+
+      # Separator placed between concatenated bundle sources.
+      #
+      # JavaScript needs an explicit statement terminator: a newline alone does
+      # NOT trigger automatic semicolon insertion when the next file opens with
+      # `(`, `[`, a backtick, `+`, `-` or `/`. Two individually valid files —
+      # `const a = 1` and `(function(){…})()` — then concatenate into
+      # `1(function(){…})()`, a runtime `TypeError` with nothing in the build
+      # log. The `;` sits on its own line so a source ending in an unterminated
+      # `// line comment` cannot swallow it (the minifier drops the blank
+      # framing lines, keeping the `;`). CSS keeps the bare newline: a stray
+      # top-level `;` is a parse error browsers only recover from.
+      private def bundle_separator(name : String) : String
+        case File.extname(name).downcase
+        when ".js", ".mjs" then "\n;\n"
+        else                    "\n"
+        end
+      end
+
       private def minify(content : String, filename : String) : String
         ext = File.extname(filename).downcase
         case ext
         when ".css"
           Utils::CssMinifier.minify(content)
-        when ".js"
+        when ".js", ".mjs"
           Utils::JsMinifier.minify(content)
         else
           content

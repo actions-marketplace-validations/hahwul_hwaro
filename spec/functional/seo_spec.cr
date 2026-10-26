@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 
 # =============================================================================
 # SEO feature integration tests
@@ -518,15 +518,57 @@ describe "SEO: Custom feed templates" do
         # Cold build (no hooks: exercises the Generate phase's default
         # skip-if-unchanged path, which the hook-based CLI flow bypasses).
         builder1 = Hwaro::Core::Build::Builder.new
-        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder1.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
         File.read("public/rss.xml").should eq("FEED-V1")
 
         # Template-only edit, then a warm build in a fresh process: every
         # page is a cache hit (0 rendered), but the feed must not skip.
         File.write("templates/rss.xml.jinja", "FEED-V2")
         builder2 = Hwaro::Core::Build::Builder.new
-        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder2.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
         File.read("public/rss.xml").should eq("FEED-V2")
+      end
+    end
+  end
+end
+
+# Regression: a `redirect_to` page is written as a meta-refresh stub whose
+# canonical is the target, yet it was advertised as content in the sitemap,
+# the feeds, search.json and llms.txt (search consoles flag "page with
+# redirect" sitemap entries, and feed/search hits land on a bounce page).
+describe "SEO: redirect_to pages stay off discovery surfaces" do
+  it "omits redirect stubs from sitemap, feeds, search and llms.txt" do
+    config = <<-TOML
+      title = "Test"
+      base_url = "http://localhost"
+
+      [sitemap]
+      enabled = true
+
+      [feeds]
+      enabled = true
+
+      [search]
+      enabled = true
+
+      [llms]
+      enabled = true
+      TOML
+
+    build_site(
+      config,
+      content_files: {
+        "blog/_index.md" => "+++\ntitle = \"Blog\"\ngenerate_feeds = true\n+++\n",
+        "blog/real.md"   => "+++\ntitle = \"Real\"\ndate = 2024-01-01\n+++\nbody",
+        "blog/moved.md"  => "+++\ntitle = \"Moved\"\ndate = 2024-01-02\nredirect_to = \"/blog/real/\"\n+++\n",
+      },
+      template_files: {"page.html" => "{{ content }}", "section.html" => "S"},
+    ) do
+      File.read("public/blog/moved/index.html").should contain("url=/blog/real/")
+      {"public/sitemap.xml", "public/rss.xml", "public/blog/rss.xml", "public/search.json", "public/llms.txt"}.each do |path|
+        body = File.read(path)
+        body.should contain("/blog/real/")
+        body.should_not contain("/blog/moved/")
       end
     end
   end

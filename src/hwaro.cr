@@ -1,36 +1,70 @@
 # Hwaro - A fast and lightweight static site generator
 #
-# This is the main entry point for the Hwaro application.
-# The codebase is organized as follows:
+# This is the main entry point for the Hwaro library; src/main.cr wraps it in
+# the process entry. The require list below is ORDERED and explicit; part
+# files of a split owner (e.g. core/build/phases/render/*.cr) are required
+# from their owner, never from here. .github/ARCHITECTURE.md is the map:
 #
-# - config/    : Configuration loading and options
-#   - options/ : Command option structs (BuildOptions, ServeOptions, etc.)
-# - core/      : Build orchestration (builder, cache, parallel, lifecycle)
-# - content/   : Content domain
-#   - processors/ : Content processors (markdown, html, etc.)
-#   - seo/     : SEO file generators (sitemap, feeds, robots, llms)
-#   - hooks/   : Lifecycle hook implementations
-# - services/  : Non-build features (init, new, serve)
-# - models/    : Data structures (config, page, site, etc.)
-# - cli/       : Command-line interface
-# - utils/     : Utility modules (logger, etc.)
+# - cli/       : Runner + CommandRegistry, commands/, commands/tool/
+# - config/    : options/ — typed option structs (BuildOptions, ServeOptions, ...)
+# - models/    : Page, Section, Site, Toc, Deployment, GitInfo, Config (+ config/ per section)
+# - content/   : processors/ (markdown, template, html, ...), hooks/, seo/, pagination/,
+#                search, taxonomies, menus, i18n, versions
+# - core/      : lifecycle/ (Manager, phases, BuildContext) and build/ (Builder + phases/)
+# - services/  : everything the CLI does that is not a build: doctor, deployer, server,
+#                scaffolds, importers/exporters, content tools, defaults
+# - assets/    : asset pipeline and the Sass compiler (sass/)
+# - utils/     : Logger, PathUtils, TextUtils, FileSafe, minifiers, ...
+# - ext/       : vendored patches for markd/crinja/toml/tartrazine, stb_image bindings
 
 require "option_parser"
 require "yaml"
+require "./ext/yaml_local_time_fix"
 require "file_utils"
+require "./ext/windows_paths"
+require "./ext/execution_context_wake"
 require "crinja"
 require "./ext/crinja_resolve_fix"
 require "./ext/crinja_include_depth_fix"
+require "./ext/crinja_import_cycle_fix"
+require "./ext/crinja_caller_fix"
+require "./ext/crinja_recursion_depth_fix"
+require "./ext/crinja_render_perf"
+require "./ext/crinja_error_location_fix"
+require "./ext/crinja_in_operator"
+require "./ext/crinja_striptags_fix"
+require "./ext/crinja_whitespace_control_fix"
+require "./ext/crinja_raw_fix"
+require "./ext/crinja_logic_operators_fix"
+require "./ext/crinja_loop_fix"
+require "./ext/crinja_wordwrap_fix"
+require "./ext/crinja_attribute_path_fix"
+require "./ext/crinja_filter_fixes"
+require "./ext/crinja_string_escape_fix"
+require "./ext/crinja_conditional_expression"
+require "./ext/crinja_parenthesis_postfix_fix"
+require "./ext/crinja_tag_dict_literal_fix"
+require "./ext/crinja_comparison_tests"
 require "http/server"
 require "markd"
 require "./ext/markd_entity_fix"
 require "./ext/markd_list_fix"
 require "./ext/markd_thematic_break_fix"
+require "./ext/markd_regex_stack_fix"
+require "./ext/markd_link_label_fix"
+require "./ext/markd_uri_fix"
+require "./ext/markd_unsafe_image_fix"
 require "toml"
 require "./ext/toml_nesting_limit_fix"
+require "./ext/toml_datetime_fix"
+require "./ext/toml_multiline_string_fix"
+require "./ext/toml_syntax_fix"
+require "./ext/toml_parser_fix"
+require "./ext/toml_float_fix"
 require "emoji"
 
 # Load utilities
+require "./utils/byte_scan"
 require "./utils/errors"
 require "./utils/nesting"
 require "./utils/logger"
@@ -50,17 +84,14 @@ require "./config/options/serve_options"
 
 # Load models
 require "./models/config"
+require "./models/git_info"
 require "./models/page"
 require "./models/section"
 require "./models/site"
 require "./models/toc"
 
 # Load content processors
-require "./content/processors/base"
 require "./content/processors/markdown"
-require "./content/processors/content_files"
-require "./content/processors/html"
-require "./content/processors/json"
 require "./content/processors/xml"
 require "./content/processors/table_parser"
 require "./content/processors/internal_link_resolver"
@@ -68,12 +99,15 @@ require "./content/processors/syntax_highlighter"
 require "./content/processors/image_processor"
 require "./content/processors/template"
 require "./content/multilingual"
+require "./content/versions"
+require "./content/front_matter_schema"
 
 # Load lifecycle system
 require "./core/lifecycle"
 
 # Load core modules
 require "./core/build/cache"
+require "./core/build/git_info"
 require "./core/build/parallel"
 require "./core/build/builder"
 
@@ -92,6 +126,7 @@ require "./content/seo/robots"
 require "./content/seo/llms"
 require "./content/seo/jsonld"
 require "./content/search"
+require "./content/search_ui"
 require "./content/taxonomies"
 require "./content/menus"
 
@@ -106,5 +141,5 @@ require "./content/hooks"
 require "./cli/runner"
 
 module Hwaro
-  VERSION = "0.18.1"
+  VERSION = "0.21.0"
 end

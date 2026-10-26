@@ -1,0 +1,80 @@
+require "../../spec_helper"
+
+private def render_filter(source : String) : String
+  Crinja.new.from_string(source).render({"d" => Crinja.value({"b" => 2, "a" => 1, "C" => 3})})
+end
+
+# Expected strings are Jinja2 3.1's output for the same source.
+describe "Crinja built-in filter fixes" do
+  describe "dictsort" do
+    it "honours reverse" do
+      render_filter("{{ d | dictsort }}").should eq("[('a', 1), ('b', 2), ('C', 3)]")
+      render_filter("{{ d | dictsort(reverse=true) }}").should eq("[('C', 3), ('b', 2), ('a', 1)]")
+      render_filter("{{ d | dictsort(by='value', reverse=true) }}").should eq("[('C', 3), ('b', 2), ('a', 1)]")
+      render_filter("{{ d | dictsort(true) }}").should eq("[('C', 3), ('a', 1), ('b', 2)]")
+    end
+  end
+
+  describe "urlencode" do
+    it "keeps slashes in a string, like Python's quote" do
+      render_filter("{{ '/a b/c?d=é~*' | urlencode }}").should eq("/a%20b/c%3Fd%3D%C3%A9~%2A")
+    end
+
+    it "encodes a mapping as a query string" do
+      render_filter("{{ {'a': 'b c', 'x': '/~*'} | urlencode }}").should eq("a=b+c&x=%2F~%2A")
+    end
+  end
+
+  describe "indent" do
+    it "leaves blank lines and the trailing newline unindented" do
+      render_filter("{{ 'a\\n\\nb\\n' | indent(2) }}").should eq("a\n\n  b\n")
+      render_filter("{{ 'a\\n  \\nb' | indent(2, blank=true) }}").should eq("a\n    \n  b")
+    end
+
+    it "supports first= and a string width" do
+      render_filter("{{ 'a\\nb' | indent(width=3, first=true) }}").should eq("   a\n   b")
+      render_filter("{{ 'a\\nb' | indent('> ') }}").should eq("a\n> b")
+      render_filter("{{ 'a\\nb' | indent(2, true) }}").should eq("  a\n  b")
+    end
+  end
+
+  describe "wordcount" do
+    it "counts word-character runs" do
+      render_filter("{{ '' | wordcount }}|{{ ' -- ' | wordcount }}|{{ \"it's a-b\" | wordcount }}|{{ '한국어 문장 x_y 42' | wordcount }}")
+        .should eq("0|0|4|4")
+    end
+  end
+
+  describe "truncate" do
+    it "keeps the text when the cut has no space" do
+      render_filter("{{ 'abcdefghijklmnop' | truncate(10) }}").should eq("abcdefg...")
+      render_filter("{{ '안녕하세요반갑습니다여러분안녕하세요반갑습니다' | truncate(10) }}").should eq("안녕하세요반갑...")
+      render_filter("{{ 'abcdefghij' | truncate(5, leeway=0) }}").should eq("ab...")
+    end
+
+    it "returns a string within length + leeway whole" do
+      render_filter("{{ 'Hello' | truncate(3) }}").should eq("Hello")
+    end
+
+    it "still cuts at the last space" do
+      render_filter("{{ 'hello world foo bar' | truncate(12, leeway=0) }}").should eq("hello...")
+      render_filter("{{ 'hello world foo bar' | truncate(12, true, leeway=0) }}").should eq("hello wor...")
+    end
+  end
+
+  describe "format" do
+    it "formats numbers with float conversions" do
+      render_filter("{{ '%.2f' | format(3.14159) }}|{{ '%.1f' | format(4) }}|{{ '%5.1f%%' | format(12.345) }}|{{ '%03d' | format(7) }}|{{ '%s-%s' | format('a', 2) }}")
+        .should eq("3.14|4.0| 12.3%|007|a-2")
+    end
+  end
+
+  describe "float and int" do
+    it "converts numbers and booleans" do
+      render_filter("{{ 3 | float }}|{{ 1.5 | float }}|{{ true | float }}|{{ '2.5' | float }}|{{ 'x' | float }}")
+        .should eq("3.0|1.5|1.0|2.5|0.0")
+      render_filter("{{ true | int }}|{{ false | int }}|{{ 4.7 | int }}|{{ '42' | int }}|{{ 'x' | int(5) }}")
+        .should eq("1|0|4|42|5")
+    end
+  end
+end

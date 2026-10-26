@@ -1,0 +1,115 @@
+# Markdown extensions — custom heading ids ({#id}) and fence-aware line passes.
+#
+# One file per `# --- X ---` pass of the pre/post-processing pipeline; the
+# pass ORDER is fixed in ../markdown_extensions.cr (`preprocess` /
+# `postprocess`). Parts only reopen the module: no requires, no load-time
+# statements (scripts/check_no_toplevel_effects.sh).
+module Hwaro
+  module Content
+    module Processors
+      module MarkdownExtensions
+        # --- Custom Heading IDs ---
+        # `## My Heading {#custom-id}` → `## My Heading <!--HID:custom-id-->`
+        # The marker survives Markd rendering and is converted to an `id="..."`
+        # attribute in `postprocess_heading_ids`.
+        # Restricting the id charset to `[\w][\w:-]*` keeps it valid as an
+        # HTML id without further escaping (no quote, `<` or `&` can occur
+        # in it). A leading digit is deliberately allowed: that's the HTML5
+        # rule, and hwaro's own auto-slugs already produce digit-leading ids
+        # like `1-create-a-project` for `## 1. Create a project`, so a
+        # translated heading has to be able to pin that same anchor (#792).
+        # CommonMark allows up to 3 leading spaces before an ATX heading, which
+        # we capture and preserve so Markd still recognises the line as a heading.
+        # `\r?` before `$`: CRLF content otherwise never matches and the id is
+        # silently dropped.
+        HEADING_ID_RE = /^((?: {0,3}>[ \t]?)*+ {0,3})(\#{1,6})[ \t]+(.+?)[ \t]*\{\#([\w][\w:-]*)\}[ \t]*\r?$/
+
+        # --- Custom Attributes (F9) ---
+        # Generalized `{#id .class key=val}` attribute blocks — headings and
+        # inline images. See `markdown_attributes.cr` for the token grammar.
+        # Deliberately broader than HEADING_ID_RE's brace group
+        # (`[^{}]+` vs `\#[\w][\w:-]*`): this is what makes the two
+        # regexes disjoint on `## H {#id}` (HEADING_ID_RE wins) while still
+        # catching `## H {#id .class}` (falls through to this one, since
+        # HEADING_ID_RE requires the braces to contain ONLY `#id`).
+        HEADING_ATTR_RE = /^((?: {0,3}>[ \t]?)*+ {0,3})(\#{1,6})[ \t]+(.+?)[ \t]*\{([^{}]+)\}[ \t]*\r?$/
+        # `![alt](url){.class key=val}` — an attribute block immediately
+        # following an inline image's closing `)`. Matched inside
+        # `transform_outside_code_spans` so a literal example in a code span
+        # isn't rewritten.
+        IMAGE_ATTR_RE = /(!\[[^\]]*\]\([^)]*\))\{([^{}]+)\}/
+
+        # Engine-generated marker comments (footnote data blocks, shortcode
+        # placeholders) start with this prefix and must pass through the
+        # transforming passes verbatim: a footnote body containing `~~x~~` or
+        # `$x$` lives inside a `<!--HWARO-FN:…-->` line until postprocess,
+        # and rewriting it there corrupts the data. Author-typed lookalikes
+        # are neutralized to `<!-- HWARO-` (with a space) by
+        # preprocess_footnotes before this prefix check can match them.
+        ENGINE_MARKER_PREFIX = "<!--HWARO-"
+
+        # Unified fence-aware line processor.
+        # This allows multiple extensions (heading_ids + strikethrough, etc.)
+        # to be applied in a *single* pass over the document instead of
+        # separate full-string walks. This is the main optimization for
+        # reducing regex passes in MarkdownExtensions (see issue #559).
+        # Fence state (nested fences, indented code, closing-fence rules)
+        # lives in the shared FenceTracker.
+        #
+        # The block is called for every line outside fenced code; fence
+        # delimiters, fence content, and engine marker lines pass through
+        # verbatim.
+        private def process_lines_fence_aware(content : String, &) : String
+          String.build do |io|
+            tracker = FenceTracker.new
+            content.each_line(chomp: false) do |line|
+              if tracker.fence_line?(line) || line.starts_with?(ENGINE_MARKER_PREFIX)
+                io << line
+              else
+                io << yield(line)
+              end
+            end
+          end
+        end
+
+        # Quote-aware attrs (a `>` inside a quoted value must not end the
+        # tag); the id checks guard with `(?<![\w-])` so `data-id=` never
+        # counts as the element's id.
+        HEADING_TAG_FOR_HID_RE = /<(h[1-6])((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)<\/\1>/m
+        HID_MARKER_RE          = /<!--HID:([\w][\w:-]*)-->/
+        EXISTING_ID_RE         = /(?<![\w-])id\s*=\s*"[^"]*"/i
+        ANY_ID_ATTR_PRESENT_RE = /(?<![\w-])id\s*=/i
+
+        def postprocess_heading_ids(html : String) : String
+          return html unless Utils::ByteScan.includes?(html, "<!--HID:")
+
+          html.gsub(HEADING_TAG_FOR_HID_RE) do |match|
+            tag = $1
+            attrs = $2
+            inner = $3
+
+            if hid_match = inner.match(HID_MARKER_RE)
+              id = hid_match[1]
+              cleaned_inner = inner.sub(hid_match[0], "").rstrip
+
+              # `backreferences: false`: `HID_MARKER_RE`'s grammar already
+              # excludes `\`, so no id can carry one today — but the guard
+              # keeps that invariant local, so loosening the marker grammar
+              # later can't turn an id into a replacement backreference (see
+              # the same guard in `postprocess_external_links`).
+              new_attrs = if attrs.matches?(ANY_ID_ATTR_PRESENT_RE)
+                            attrs.sub(EXISTING_ID_RE, %(id="#{id}"), backreferences: false)
+                          else
+                            "#{attrs.rstrip} id=\"#{id}\""
+                          end
+
+              "<#{tag}#{new_attrs}>#{cleaned_inner}</#{tag}>"
+            else
+              match
+            end
+          end
+        end
+      end
+    end
+  end
+end

@@ -5,20 +5,20 @@ weight = 4
 toc = true
 +++
 
-Shortcodes are reusable template snippets you can use in Markdown content. Custom shortcodes are Jinja2 templates placed in `templates/shortcodes/` — see [Template Syntax](/templates/syntax/) for the templating language reference.
+Shortcodes are reusable template snippets you can use in Markdown content. Custom shortcodes are Jinja2 templates placed in `templates/shortcodes/`. See [Template Syntax](/templates/syntax/) for the templating language reference.
 
 ## Using Shortcodes
 
 Two syntax patterns work in content files:
 
 ```markdown
-{%raw%}{{ shortcode_name(arg1="value", arg2="value") }}{%endraw%}
+{{ shortcode_name(arg1="value", arg2="value") }}
 ```
 
 Or explicitly:
 
 ```markdown
-{%raw%}{{ shortcode("shortcode_name", arg1="value") }}{%endraw%}
+{{ shortcode("shortcode_name", arg1="value") }}
 ```
 
 ### Block Shortcode Closers
@@ -38,17 +38,26 @@ Block shortcodes support two closer styles:
 
 **We strongly recommend named closers** (`{% endNAME %}`) for any non-trivial content. They make your Markdown much easier to read and maintain, especially when mixing multiple shortcodes or using deep nesting.
 
+To keep shortcode syntax literal in a Markdown page outside a code fence, wrap
+it in a raw block. The `{% raw %}` and `{% endraw %}` markers remain visible in
+Markdown output; fenced blocks inside the region do not split it.
+
 ## Built-in Shortcodes
 
-Hwaro ships with built-in shortcodes that work out of the box — no template files needed.
+Hwaro ships with built-in shortcodes that work out of the box, with no template files needed.
+
+Pass parameters by name or in the shortcode's documented order. For example,
+`{{ youtube("VIDEO_ID") }}` and `{{ gist("username", "gist_id") }}` use
+positional arguments; quoted empty values still occupy their position.
 
 ### youtube
 
 Embed a YouTube video.
 
 ```markdown
-{%raw%}{{ youtube(id="dQw4w9WgXcQ") }}
-{{ youtube(id="dQw4w9WgXcQ", width="800", height="450") }}{%endraw%}
+{{ youtube(id="dQw4w9WgXcQ") }}
+{{ youtube(id="dQw4w9WgXcQ", width="800", height="450") }}
+{{ youtube(id="dQw4w9WgXcQ", start="30") }}
 ```
 
 | Param | Default | Description |
@@ -57,13 +66,14 @@ Embed a YouTube video.
 | `width` | `560` | Player width |
 | `height` | `315` | Player height |
 | `title` | `YouTube Video` | Accessible title |
+| `start` | | Start playback at a given timestamp in seconds |
 
 ### vimeo
 
 Embed a Vimeo video.
 
 ```markdown
-{%raw%}{{ vimeo(id="123456789") }}{%endraw%}
+{{ vimeo(id="123456789") }}
 ```
 
 | Param | Default | Description |
@@ -78,8 +88,8 @@ Embed a Vimeo video.
 Embed a GitHub Gist.
 
 ```markdown
-{%raw%}{{ gist(user="octocat", id="abc123") }}
-{{ gist(user="octocat", id="abc123", file="hello.rb") }}{%endraw%}
+{{ gist(user="octocat", id="abc123") }}
+{{ gist(user="octocat", id="abc123", file="hello.rb") }}
 ```
 
 | Param | Default | Description |
@@ -95,8 +105,8 @@ Display an alert box. Use as a block shortcode to wrap content.
 Both bare and named closers are supported (named closers are recommended for complex pages):
 
 ```markdown
-{%raw%}{% alert(type="warning", title="Caution") %}Be careful with this!{% end %}
-{% alert(type="tip") %}Using named closer also works{% endalert %}{%endraw%}
+{% alert(type="warning", title="Caution") %}Be careful with this!{% end %}
+{% alert(type="tip") %}Using named closer also works{% endalert %}
 ```
 
 (We recommend the named closer style for clarity.)
@@ -111,7 +121,7 @@ Both bare and named closers are supported (named closers are recommended for com
 Image with optional caption.
 
 ```markdown
-{%raw%}{{ figure(src="/img/photo.jpg", alt="A photo", caption="My caption") }}{%endraw%}
+{{ figure(src="/img/photo.jpg", alt="A photo", caption="My caption") }}
 ```
 
 | Param | Default | Description |
@@ -127,7 +137,7 @@ Image with optional caption.
 Embed a tweet.
 
 ```markdown
-{%raw%}{{ tweet(user="jack", id="20") }}{%endraw%}
+{{ tweet(user="jack", id="20") }}
 ```
 
 | Param | Default | Description |
@@ -140,8 +150,8 @@ Embed a tweet.
 Embed a CodePen.
 
 ```markdown
-{%raw%}{{ codepen(user="chriscoyier", id="gfdDu") }}
-{{ codepen(user="chriscoyier", id="gfdDu", tab="css,result", height="400") }}{%endraw%}
+{{ codepen(user="chriscoyier", id="gfdDu") }}
+{{ codepen(user="chriscoyier", id="gfdDu", tab="css,result", height="400") }}
 ```
 
 | Param | Default | Description |
@@ -152,11 +162,89 @@ Embed a CodePen.
 | `height` | `300` | Embed height |
 | `title` | `CodePen Embed` | Accessible title |
 
-> To override any built-in shortcode, create a file with the same name in `templates/shortcodes/` (e.g., `templates/shortcodes/youtube.html`). User templates always take priority.
+Every parameter marked **(required)** above lands directly in a URL or an
+`src`. Omitting one still renders — into an embed that points nowhere
+(`https://codepen.io//embed/gfdDu`) — so the build warns instead of leaving you
+to find the dead embed on the published page:
+
+```
+[WARN] Shortcode `codepen` is missing required argument `user` — it renders a broken embed. Usage: `{{ codepen(user="…", id="…") }}`.
+```
+
+### include_code
+
+Include a source file, or part of it, as a fenced code block. The block goes through the normal code pipeline: highlighting, [fence options](/features/syntax-highlighting/), the copy button and render-codeblock hooks.
+
+```markdown
+{{ include_code(path="examples/site/config.toml") }}
+{{ include_code(path="examples/site/config.toml", region="feeds", lines="2-8", title="config.toml", hl_lines="3") }}
+```
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `path` | (required) | File path, relative to the project root |
+| `region` | (none) | Only the lines between `#region <name>` and `#endregion <name>` |
+| `lines` | (none) | Line range `a-b` or a single line `a` (1-based, inclusive; counted inside `region` when both are set) |
+| `lang` | from the file name or extension (`Makefile`, `Dockerfile`, `.rs`); in client highlight mode, as highlight.js names it | Language of the code block |
+| `title`, `hl_lines`, `hide_lines`, `linenos`, `linenostart`, `copy` | | Passed on as fence options |
+
+Region markers can follow any comment leader, so they stay valid code in the source file:
+
+```crystal
+module App
+  # #region server
+  def run
+    serve
+  end
+  # #endregion server
+end
+```
+
+`//`, `#`, `--`, `<!--`, `/*` and `;` all work, and a bare `#endregion` closes the innermost open region. The markers, and any nested markers inside the selected region, are left out of the output. Without `region`, the file is included as it is. Common leading indentation is removed.
+
+### include_md
+
+Render a Markdown file in place, as if its text were written at that spot.
+
+```markdown
+{{ include_md(path="shared/install.md") }}
+{{ include_md(path="shared/install.md", region="brew") }}
+```
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `path` | (required) | File path, relative to the project root |
+| `region` | (none) | Only the lines between `<!-- #region <name> -->` and `<!-- #endregion <name> -->` |
+
+Shortcodes inside the included file expand, and its headings take part in the page's table of contents and heading ids. Its front matter is dropped. An included file can include others, up to 8 levels deep. A cycle is an error that shows the chain.
+
+#### Paths and errors
+
+Both shortcodes read files under the project root only. Absolute paths, `..`, symlinks that resolve outside the project, the build output directory and `.hwaro/` are refused. A missing file or region, a line range outside the file, or a refused path fails the build with an error that names the page and the file:
+
+```
+Error [HWARO_E_TEMPLATE]: {{ include_code(path="examples/app.cr", region="srv") }} in content/guide.md: region 'srv' not found
+```
+
+An included file is a dependency of the page that includes it. A warm `--cache` build and `hwaro serve` both re-render the page when the file changes, including files outside `content/`.
+
+A call inside a code span, a fenced code block or a `{% raw %}` region stays literal.
+
+> To override any built-in shortcode, create a file with the same name in `templates/shortcodes/` (e.g., `templates/shortcodes/youtube.html`). User templates always take priority — and define their own contract, so the warning above does not apply to them.
 
 ## Creating Custom Shortcodes
 
 Shortcode templates live in `templates/shortcodes/`.
+
+A shortcode template that fails while rendering (for example, an undefined
+attribute access or an `{% include %}` of a missing template) fails the build
+with `HWARO_E_TEMPLATE` (exit code 4), just like a page template. The error
+names the shortcode file and line, such as `templates/shortcodes/alert.html:3:5`.
+Under `hwaro serve` it appears in the error overlay instead.
+
+A syntax error in a shortcode template is reported as a warning with the same
+file and location. Hwaro places a visible HTML comment at the call and keeps
+rendering the page.
 
 ### Example: Alert Box
 
@@ -173,7 +261,7 @@ Create `templates/shortcodes/alert.html`:
 Use in content:
 
 ```markdown
-{%raw%}{{ alert(type="warning", message="This is important!") }}{%endraw%}
+{{ alert(type="warning", message="This is important!") }}
 ```
 
 Output:
@@ -203,7 +291,7 @@ Create `templates/shortcodes/youtube.html`:
 Use in content:
 
 ```markdown
-{%raw%}{{ youtube(id="dQw4w9WgXcQ") }}{%endraw%}
+{{ youtube(id="dQw4w9WgXcQ") }}
 ```
 
 ### Example: Figure with Caption
@@ -222,7 +310,7 @@ Create `templates/shortcodes/figure.html`:
 Use in content:
 
 ```markdown
-{%raw%}{{ figure(src="/images/photo.jpg", alt="A photo", caption="My caption") }}{%endraw%}
+{{ figure(src="/images/photo.jpg", alt="A photo", caption="My caption") }}
 ```
 
 ### Example: Image Gallery (Asset Colocation)
@@ -247,7 +335,7 @@ Create `templates/shortcodes/gallery.html`:
 Use in content (inside a Page Bundle directory):
 
 ```markdown
-{%raw%}{{ gallery() }}{%endraw%}
+{{ gallery() }}
 ```
 
 This will render a grid of all JPG and PNG images found alongside the Markdown file.
@@ -257,12 +345,12 @@ This will render a grid of all JPG and PNG images found alongside the Markdown f
 Block shortcodes wrap content between opening and closing tags:
 
 ```markdown
-{%raw%}{% note() %}
+{% note() %}
 This is the **body** content of the shortcode.
-{% end %}{%endraw%}
+{% end %}
 ```
 
-The body is passed to the shortcode template as the `body` variable. Markdown conversion is **not** applied automatically — use the `markdownify` filter in your template if needed:
+The body is passed to the shortcode template as the `body` variable. Markdown conversion is **not** applied automatically, so use the `markdownify` filter in your template if needed:
 
 ```jinja
 <div class="note">
@@ -281,9 +369,9 @@ Or use the body as-is for raw content:
 Block shortcodes can be nested up to 5 levels deep:
 
 ```markdown
-{%raw%}{% outer() %}
+{% outer() %}
   Some text with {{ inner(type="info") }} inside.
-{% end %}{%endraw%}
+{% end %}
 ```
 
 ## Argument Syntax
@@ -293,17 +381,19 @@ Block shortcodes can be nested up to 5 levels deep:
 Arguments support multiple quote styles:
 
 ```markdown
-{%raw%}{{ alert(type="warning", message="Double quotes") }}
+{{ alert(type="warning", message="Double quotes") }}
 {{ alert(type='info', message='Single quotes') }}
-{{ alert(type=danger, message=No quotes for simple values) }}{%endraw%}
+{{ alert(type=danger, message=Unquoted) }}
 ```
+
+An unquoted value ends at the first space (`message=No quotes here` passes just `No`), so quote anything longer than one word.
 
 ### Positional Arguments
 
 When no `key=value` syntax is used, arguments are assigned as `_0`, `_1`, etc.:
 
 ```markdown
-{%raw%}{{ youtube("dQw4w9WgXcQ") }}{%endraw%}
+{{ youtube("dQw4w9WgXcQ") }}
 ```
 
 In the shortcode template, access via `{{ _0 }}`:
@@ -364,6 +454,11 @@ templates/shortcodes/
     ├── twitter.html
     └── github.html
 ```
+
+Call a shortcode in a subdirectory with the explicit form, naming its path
+under `templates/shortcodes/`: `{{ shortcode("code/tabs", lang="crystal") }}`.
+The short form only accepts a plain name, so `{{ code/tabs() }}` stays literal
+text.
 
 ## See Also
 

@@ -27,6 +27,7 @@ module Hwaro
       property pages_for_section_cache : Hash(Tuple(String, String?), Array(Page))
       @lookup_index_built : Bool = false
       @all_content_cache : Array(Page)?
+      @home_languages_cache : Set(String?)?
       # Guards the lazy memo Hashes above: pages_for_section runs inside
       # parallel render fibers (render_section_with_pagination), and an
       # unsynchronized Hash insert there is undefined behavior under
@@ -58,20 +59,21 @@ module Hwaro
           @sections_by_name[{name, @config.default_language}]?
       end
 
-      def taxonomy_terms(name : String) : Array(String)
-        terms = @taxonomies[name]?
-        return [] of String unless terms
-        terms.keys.sort!
-      end
-
-      def taxonomy_pages(name : String, term : String) : Array(Page)
-        @taxonomies[name]?.try(&.[term]?) || [] of Page
-      end
-
       def all_content : Array(Page)
         @memo_mutex.synchronize do
           @all_content_cache ||= (pages + sections.map { |s| s.as(Page) }).sort_by!(&.path)
         end
+      end
+
+      # Does `language` have a written homepage (`/`, `/<lang>/`)? A partial
+      # translation often has none, and its pages must not link `/<lang>/`.
+      def home_language?(language : String?) : Bool
+        homes = @memo_mutex.synchronize { @home_languages_cache }
+        unless homes
+          homes = all_content.select { |p| p.home? && p.render && !p.draft }.map(&.language).to_set
+          @memo_mutex.synchronize { @home_languages_cache = homes }
+        end
+        homes.includes?(language)
       end
 
       def build_lookup_index
@@ -80,6 +82,7 @@ module Hwaro
         @sections_by_name.clear
         @pages_for_section_cache.clear
         @all_content_cache = nil
+        @home_languages_cache = nil
 
         @pages.each do |p|
           list = @pages_by_section[p.section]?
@@ -113,6 +116,25 @@ module Hwaro
         @lookup_index_built = true
       end
 
+      # What a transparent subsection contributes to its parent's listing. A
+      # headless transparent subsection keeps its own headless pages (see
+      # `pages_for_section`), but once bubbled into a rendered parent they
+      # would link a 404 again.
+      private def bubbled(pages : Array(Page), keep_headless : Bool) : Array(Page)
+        keep_headless ? pages : pages.select(&.render)
+      end
+
+      # Every listing (`section.pages`, `section_list`, pagination,
+      # `get_section().pages`) reads this, so headless (`render = false`)
+      # pages and non-transparent sections are left out here: they are never
+      # written, and listing them linked a 404. A headless transparent
+      # section still bubbles its rendered pages up — only its own index is
+      # unwritten. `get_page` is a lookup, not a listing, and still sees them.
+      #
+      # Except in a section that is itself headless: nothing of it is ever
+      # written, so nothing links a 404, and it is the "data section" pattern
+      # (`team/_index.md` with `render = false` and a cascade, iterated through
+      # `get_section(path="team/_index.md").pages`). Filtering there emptied it.
       def pages_for_section(section_name : String, language : String?, items : Array(Page)? = nil, visited : Set(String)? = nil) : Array(Page)
         # Normalize section name: remove leading/trailing slashes and handle root
         normalized_name = section_name.strip.strip('/')
@@ -133,18 +155,23 @@ module Hwaro
           end
 
           result = [] of Page
+          keep_headless = section_for(normalized_name, language).try { |sec| !sec.render } || false
 
           # 1. Add direct pages
           if pages = @pages_by_section[normalized_name]?
             pages.each do |p|
-              result << p if p.language == language
+              result << p if p.language == language && (p.render || keep_headless)
             end
           end
 
-          # 2. Add subsections (handling transparency)
+          # 2. Add subsections (handling transparency). A version root
+          # (`docs/v2`) is not a subsection of its unversioned parent
+          # (`docs`) — listings never cross a version boundary.
+          section_version = @config.versions.for_path(normalized_name)
           if subsections = @sections_by_parent[normalized_name]?
             subsections.each do |s|
               next unless s.language == language
+              next unless s.version.same?(section_version)
 
               if s.transparent
                 # Recursive bubble up: get pages from this sub-section
@@ -153,8 +180,8 @@ module Hwaro
                 subsection_name = "" if subsection_name == "."
 
                 seen ||= Set{normalized_name}
-                result.concat(pages_for_section(subsection_name, language, nil, seen))
-              else
+                result.concat(bubbled(pages_for_section(subsection_name, language, nil, seen), keep_headless))
+              elsif s.render || keep_headless
                 # Non-transparent sections are included as Section (Page) objects
                 result << s
               end
@@ -169,6 +196,12 @@ module Hwaro
 
         # Initial call: filter by language and collect all content to improve performance
         content_items = items || all_content.select { |p| p.language == language }
+        section_version = @config.versions.for_path(normalized_name)
+        keep_headless = content_items.any? do |p|
+          next false if !p.is_a?(Section) || p.render
+          dir = Path[p.path].dirname
+          (dir == "." ? "" : dir) == normalized_name
+        end
 
         content_items.each do |p|
           if p.is_a?(Section)
@@ -184,11 +217,12 @@ module Hwaro
             parent_dir = "" if parent_dir == "."
 
             if parent_dir == normalized_name
+              next unless p.version.same?(section_version)
               if p.transparent
                 # Recursive bubble up: get pages from this sub-section
                 seen ||= Set{normalized_name}
-                result.concat(pages_for_section(p_dirname, language, content_items, seen))
-              else
+                result.concat(bubbled(pages_for_section(p_dirname, language, content_items, seen), keep_headless))
+              elsif p.render || keep_headless
                 # Non-transparent sections are included as Section (Page) objects
                 result << p
               end
@@ -196,7 +230,7 @@ module Hwaro
           else
             # Regular Page (not a Section)
             # p.section is already normalized by the builder (e.g., "blog" or "blog/archive")
-            if p.section == normalized_name
+            if p.section == normalized_name && (p.render || keep_headless)
               result << p
             end
           end

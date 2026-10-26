@@ -115,6 +115,46 @@ data/
 
 **충돌.** 디렉터리와 파일이 같은 이름을 공유하면(예: `data/users.yml`과 `data/users/`가 나란히 있는 경우) **디렉터리가 우선**하고 파일은 무시됩니다. 가려진 파일이 조용히 사라지지 않도록 Hwaro는 빌드 중에 경고를 출력합니다.
 
+### 원격 데이터 소스
+
+`site.data`는 `config.toml`에 선언한 HTTP(S) 엔드포인트에서도 채울 수 있습니다. 각 소스는 **빌드당 한 번, 렌더링이 시작되기 전에** 가져옵니다. 템플릿은 네트워크 요청을 일으키지 않고, 빌드가 접근하는 모든 엔드포인트를 한곳에서 볼 수 있습니다.
+
+캐시 동작, 오프라인 오류 정책, 타임아웃, 보안 범위를 포함한 독립 설정 안내는
+[원격 데이터 소스](/ko/features/remote-data/)를 참고하세요.
+
+```toml
+[[data.remote]]
+key = "team"                # site.data.team으로 노출
+url = "https://api.example.com/team"
+format = "json"             # json | toml | yaml | csv (생략 가능, 아래 추론 참고)
+headers = { Authorization = "Bearer ${API_TOKEN}" }
+cache = "1h"                # 캐시된 사본이 이 시간보다 오래되지 않았으면 요청을 건너뜀
+on_error = "fail"           # fail | warn-and-use-cache | warn-and-skip
+```
+
+템플릿에서는 로컬 데이터 파일과 똑같이 `site.data.team`으로 사용합니다. 따라서 어떤 키를 `data/team.json`과 원격 소스 사이에서 옮겨도 템플릿은 손댈 필요가 없습니다. 레코드를 템플릿에 공급하는 대신 페이지 자체로 만들려면 [콘텐츠 생성](/ko/features/content-generation/)을 참고하세요.
+
+| 필드 | 필수 | 의미 |
+|------|------|------|
+| `key` | 예 | `site.data` 아래의 이름. 문자, 숫자, `_`, `-`만 허용하며 각 키는 한 번만 선언할 수 있습니다. 키는 대소문자를 구분하지 않고 비교합니다. macOS와 Windows에서는 `Team`과 `team`이 같은 캐시 파일을 쓰게 되므로 중복으로 거부됩니다. |
+| `url` | 예 | 절대 `http://` 또는 `https://` URL. 다른 스킴은 설정을 읽는 시점에 거부됩니다. |
+| `format` | 아니요 | `json`, `toml`, `yaml`, `csv`. 생략하면 응답의 `Content-Type`, 그다음 (리디렉션을 모두 따라간 뒤) 실제로 도달한 URL의 파일 확장자에서 추론합니다. 둘 다 실패하면 `format`을 명시하라는 안내와 함께 가져오기가 실패합니다. |
+| `headers` | 아니요 | 추가 요청 헤더. 자격 증명으로 취급되어 로그에 남지 않으며, 리디렉션이 원래 출처(origin)를 벗어나면 전송하지 않습니다. |
+| `cache` | 아니요 | `"90s"`, `"30m"`, `"1h"`, `"7d"` 같은 디스크 캐시 TTL(`"1h30m"`처럼 조합 가능). 캐시가 신선한 동안에는 요청 자체를 건너뜁니다. `cache`가 없으면 매 빌드마다 다시 가져오지만, 마지막 페이로드는 `warn-and-use-cache`를 위해 항상 저장됩니다. |
+| `on_error` | 아니요 | 가져오기나 파싱이 실패했을 때의 동작. `fail`(기본값)은 빌드를 중단하고, `warn-and-use-cache`는 경고 후 마지막으로 성공한 페이로드(나이 무관)로 빌드하며, `warn-and-skip`은 경고 후 이번 빌드에서 `site.data.<key>`를 비워 둡니다. |
+
+CSV 페이로드는 행의 배열로 파싱되며 각 행은 공백을 제거한 문자열 셀의 배열입니다. `load_data()`가 `.csv` 파일에 대해 만드는 것과 같은 모양입니다.
+
+**환경 변수.** `url`과 `headers` 값의 `${VAR}`는 환경 변수로 치환됩니다. 참조한 변수가 설정되어 있지 않으면 변수 이름을 명시한 오류와 함께 빌드가 실패합니다(`config.toml`의 다른 곳에서는 경고에 그칩니다). 기본값이 필요하면 `${VAR:-default}`를 쓰세요. 이 오류는 소스를 실제로 가져오는 시점에 발생하므로, 네트워크를 쓰지 않는 `hwaro deploy`, `hwaro new`, `hwaro tool ...`은 변수를 내보내지 않아도 그대로 동작합니다.
+
+**캐싱.** 페이로드는 `.hwaro/remote_data/` 아래에 캐시됩니다. `data/`를 비롯해 `hwaro serve`가 감시하는 어떤 디렉터리에도 속하지 않으므로, TTL 안의 serve 재빌드는 API를 다시 호출하는 대신 캐시를 재사용하고, 캐시 기록이 재빌드를 유발하지도 않습니다. 이 캐시는 `hwaro build --full`에도 지워지지 않으며(페이지 캐시만 초기화됩니다), `on_error = "warn-and-use-cache"`와 함께 오프라인 빌드를 가능하게 하는 것도 이 캐시입니다. `.hwaro/`는 생성 시 자기 자신을 무시하는 `.hwaro/.gitignore`가 함께 쓰이므로 캐시가 `git status`에 나타나지 않습니다. 긴 `hwaro serve` 세션에서는 각 소스를 한 번 가져와 메모리에서 재사용합니다. `cache` TTL이 있는 항목은 TTL이 만료된 뒤 첫 전체 재빌드에서 다시 가져오고, TTL이 없는 항목은 저장할 때마다가 아니라 세션당 한 번만 가져옵니다. 세션이 이미 페이로드를 갖고 있는 상태에서 재요청이 실패하면 `on_error` 설정과 무관하게 경고를 남기고 기존 페이로드를 계속 사용하므로, 오프라인에서도 편집을 이어갈 수 있습니다. `hwaro build`는 빌드마다 별도 프로세스이므로 영향이 없으며 `cache`/`on_error`를 그대로 따릅니다. 페이로드가 바뀌면 `data/` 파일을 편집했을 때와 같은 방식으로 캐시된 페이지가 무효화됩니다.
+
+**타임아웃.** 소스마다 연결 10초, 읽기 1회당 30초, 그리고 전체 120초가 주어집니다. 마지막 제한은 모든 리디렉션 구간과 본문 전체를 아우르므로, 읽기 타임아웃을 아슬아슬하게 피하며 바이트를 흘려보내는 소스가 빌드를 붙잡아 둘 수 없습니다. 어느 하나라도 초과하면 다른 실패와 마찬가지로 `on_error`가 처리합니다.
+
+**충돌.** 원격 `key`가 디스크에도 존재하면(예: `key = "team"` 옆에 `data/team.json`) 두 소스를 모두 명시한 설정 오류가 발생합니다. 하나의 키는 정확히 하나의 소스만 가져야 하므로, `site.data.team`이 어느 쪽이 이기는지에 따라 조용히 달라지는 일은 없습니다.
+
+원격 소스는 의도적으로 설정 전용입니다. `load_data()`와 숏코드는 URL을 받을 수 없습니다. 소스마다 GET 요청 하나 이상이 필요하다면(페이지네이션, POST 본문, 응답 가공) [사전 빌드 훅](/ko/features/build-hooks/#api에서-데이터-가져오기)으로 `data/`에 받아 두세요.
+
 ### 사이트 작성자
 
 Hwaro는 프론트 매터의 `authors` 필드(`authors = ["id"]`)에 정의된 모든 작성자를 `site.authors`로 자동 집계합니다.
@@ -188,7 +228,7 @@ john-doe:
 | section.pages | Array<Page> | 이 섹션의 페이지 |
 | section.pages_count | Int | 페이지 수 |
 | section.list | String | 미리 렌더링된 HTML 목록(`section_list`) |
-| section.subsections | Array<Section> | 자식 섹션 |
+| section.subsections | Array<Section> | 자식 섹션(`weight`, 경로 순으로 정렬) |
 | section.assets | Array<String> | 섹션의 정적 파일 |
 | section.page_template | String? | 페이지 기본 템플릿 |
 | section.paginate_path | String | 페이지네이션 URL 패턴 |
@@ -208,8 +248,8 @@ john-doe:
 
 | 속성 | 타입 | 기본값 | 설명 |
 |----------|------|---------|-------------|
-| sort_by | String? | "date" | 정렬 기준: date(최신순), weight(낮은 값 우선), title(A→Z) |
-| reverse | Bool? | false | 기본 정렬 순서 뒤집기 — [콘텐츠 작성 › 섹션 › 정렬 방향](/ko/writing/sections/) 참고 |
+| sort_by | String? | "date" | 정렬 기준: date(최신순), published(최신순, `updated` 무시), weight(낮은 값 우선), title(A→Z) |
+| reverse | Bool? | false | 기본 정렬 순서 뒤집기 — [콘텐츠 작성 › 섹션 › 정렬 방향](/ko/writing/sections/#정렬-방향) 참고 |
 | paginate | Int? | — | 한 페이지에 표시할 페이지 수 |
 | transparent | Bool | false | 페이지를 부모 섹션으로 전달 |
 | generate_feeds | Bool | false | RSS 피드 생성 |
@@ -279,6 +319,8 @@ john-doe:
 | page.updated | String? | 마지막 수정일 |
 | page.language | String | 적용된 언어 코드 |
 | page.translations | Array<TranslationLink> | 언어별 번역본 |
+| page.version | Object? | 문서 버전 (버전이 없으면 `nil`) — [page.version](#pageversion) 참고 |
+| page.version_links | Array<VersionLink> | 버전 전환기 행 (버전이 없으면 빈 배열) |
 
 렌더링된 HTML 콘텐츠는 최상위 `content` 변수로 제공됩니다.
 
@@ -290,6 +332,7 @@ john-doe:
 | page.weight | Int | 정렬 가중치 |
 | page.image | String? | 대표 이미지 경로 |
 | page.authors | Array<String> | 작성자 이름 |
+| page.tags | Array<String> | 프론트 매터의 태그 |
 | page.taxonomies | Object | 이 페이지의 택소노미 항목(`page.taxonomies.tags`, `page.taxonomies.<name>`) |
 | page.extra | Object | 커스텀 프론트 매터 필드 |
 
@@ -297,14 +340,17 @@ john-doe:
 
 | 속성 | 타입 | 설명 |
 |----------|------|-------------|
-| page.word_count | Int | 단어 수 |
-| page.reading_time | Int | 읽기 시간(분) |
-| page.summary | String? | `<!-- more -->` 앞부분을 렌더링한 HTML. 마커가 없으면 `page.description`으로 폴백. 삽입할 때는 `\| safe`와 함께 사용(예: `{{ page.summary \| safe }}`). `<meta name="description">`에는 `page.description`을 직접 사용 |
+| page.word_count | Int | 단어 수. `include_md`, `include_code`, `![[note]]`로 가져온 텍스트도 포함. 중국어/일본어(한자, 히라가나, 가타카나)는 글자 하나를 한 단어로 세고, 한국어를 포함한 나머지 문자는 공백으로 구분된 단어를 셈 |
+| page.reading_time | Int | 읽기 시간(분, 올림): 분당 약 200단어, 중국어/일본어 글자는 분당 약 500자 |
+| page.summary | String? | 요약 HTML: `<!-- more -->` 앞부분, 없으면 `page.description`, 그것도 없으면 렌더링된 본문의 자동 발췌문(`[content] summary_length`, 이스케이프된 `<p>` 하나). 삽입할 때는 `\| safe`와 함께 사용(예: `{{ page.summary \| safe }}`). `<meta name="description">`에는 `page.description`을 직접 사용 |
+| page.summary_truncated | Bool | `page.summary`가 잘린 자동 발췌문일 때만 `true` ("더 읽기" 링크에 유용) |
 | page.assets | Array<String> | 페이지 번들의 정적 파일 |
 | page.series | String | 프론트 매터의 시리즈 이름(없으면 빈 문자열) |
 | page.series_index | Int | 시리즈 안에서 1부터 시작하는 순번(`[series]` 활성화 필요) |
 | page.series_pages | Array<Page> | 같은 시리즈의 모든 페이지(`series_weight` 순 정렬) |
 | page.related_posts | Array<Page> | 택소노미 항목을 공유하는 페이지(`[related]` 활성화 필요) |
+| page.backlinks | Array<Page> | 이 페이지로 링크하는 같은 언어의 게시된 페이지, 최신순(`[content] backlinks = true` 필요, [백링크](/ko/writing/obsidian/#백링크) 참고) |
+| page.git | Object? | 소스 파일의 커밋 메타데이터(`[git]` 활성화 필요, 커밋되지 않았거나 생성된 페이지는 `nil`). 필드: `hash`, `short_hash`, `lastmod`(Time), `first_commit`(Time), `author_name`, `author_email` — [Git 메타데이터](/ko/features/git-info/) 참고 |
 
 ### 불리언 플래그
 
@@ -312,8 +358,10 @@ john-doe:
 |----------|------|---------|-------------|
 | page.toc | Bool | false | 목차 표시 여부 |
 | page.render | Bool | true | 렌더링 여부 |
-| page.is_index | Bool | — | 인덱스 파일 여부 |
+| page.is_index | Bool | — | 인덱스 파일 여부: 섹션의 `_index.md`, 홈 페이지, 페이지 번들의 `index.md` |
+| page.is_section | Bool | — | 섹션의 `_index.md` 여부. `section.pages`에서 페이지 번들은 남기고 하위 섹션 항목만 빼려면 `rejectattr("is_section")`을 사용하세요 |
 | page.generated | Bool | false | 자동 생성된 페이지 여부 |
+| page.synthesized | Bool | false | [`[[content.generate]]`](/ko/features/content-generation/)로 만들어진 페이지 여부 |
 | page.in_sitemap | Bool | true | 사이트맵 포함 여부 |
 | page.in_search_index | Bool | true | 검색 인덱스 포함 여부 |
 
@@ -323,7 +371,7 @@ john-doe:
 |----------|------|-------------|
 | page.lower | Page? | 읽기 순서상 이전 페이지 |
 | page.higher | Page? | 읽기 순서상 다음 페이지 |
-| page.ancestors | Array<Page> | 부모 섹션 체인 |
+| page.ancestors | Array<Object> | 부모 섹션 체인(각 항목은 `title`과 `url`을 가짐) |
 | page.translations | Array<TranslationLink> | 언어별 번역본 |
 
 ### 커스텀 메타데이터
@@ -337,19 +385,21 @@ john-doe:
 | 변수 | 동일 표현 |
 |----------|------------|
 | page_title | page.title |
-| page_description | page.description |
+| page_description | page.description, 없으면 site.description |
 | page_url | page.url |
 | page_section | page.section |
 | page_date | page.date |
-| page_image | page.image |
+| page_image | page.image, 없으면 `[og] default_image` |
 | page_summary | page.summary |
 | page_word_count | page.word_count |
 | page_reading_time | page.reading_time |
 | page_permalink | page.permalink |
 | page_authors | page.authors |
+| page_tags | page.tags |
 | page_weight | page.weight |
 | page_language | page.language |
 | page_translations | page.translations |
+| lang_prefix | 기본 언어면 `""`, 다른 언어면 `"/<code>"`(예: `{{ base_url }}{{ lang_prefix }}/posts/`) |
 | taxonomy_name | 현재 택소노미 이름(택소노미 페이지) |
 | taxonomy_term | 현재 택소노미 항목(택소노미 항목 페이지) |
 | content | 렌더링된 HTML 콘텐츠 |
@@ -360,7 +410,7 @@ john-doe:
 
 ### page.lower / page.higher
 
-내비게이션은 mdBook이나 Docusaurus처럼 사이트 전체를 하나로 펼친 읽기 순서를 따릅니다. 페이지는 섹션 트리를 깊이 우선으로 순회하는 순서로 정렬됩니다: **섹션 인덱스 → 섹션 페이지 → 하위 섹션(재귀)**. 각 섹션 안에서는 그 섹션의 `sort_by` 설정(weight, date, title)에 따라 정렬됩니다.
+내비게이션은 mdBook이나 Docusaurus처럼 사이트 전체를 하나로 펼친 읽기 순서를 따릅니다. 페이지는 섹션 트리를 깊이 우선으로 순회하는 순서로 정렬됩니다: **섹션 인덱스 → 섹션 페이지 → 하위 섹션(재귀)**. 각 섹션 안에서는 그 섹션의 `sort_by` 설정(weight, date, title)에 따라 정렬됩니다. `_index.md`가 없는 디렉터리의 페이지는 섹션 트리 뒤에 디렉터리별로 모여 섹션 페이지처럼(날짜, 다음으로 경로 순) 정렬됩니다. 사이트 루트 `index.md`는 항상 맨 앞에 옵니다.
 
 | 속성 | 타입 | 설명 |
 |----------|------|-------------|
@@ -383,7 +433,9 @@ john-doe:
 
 ### page.ancestors
 
-브레드크럼에 쓰는 부모 섹션 목록:
+브레드크럼에 쓰는 부모 섹션 목록. `title`이 없는 상위 섹션(예: `transparent`
+연도 폴더)은 디렉터리 이름(`2022`)을 사용하며, JSON-LD `BreadcrumbList`도
+마찬가지입니다:
 
 ```jinja
 <nav class="breadcrumbs">
@@ -394,6 +446,38 @@ john-doe:
   / <span>{{ page.title }}</span>
 </nav>
 ```
+
+### page.version
+
+`[[versions.list]]`가 있는 사이트에서만 제공됩니다([버전별 문서](/ko/features/versioned-docs/) 참고). 어떤 버전 디렉터리에도 속하지 않는 페이지에서는 `nil`입니다.
+
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| .name | String | 버전 이름 (URL 세그먼트, 예: "v2") |
+| .label | String | 표시 라벨 |
+| .latest | Bool | 최신 버전인지 |
+| .url | String | 페이지 언어 기준 버전 루트 URL |
+
+### page.version_links
+
+설정된 버전마다 한 행씩, 설정 순서대로.
+
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| .name | String | 버전 이름 |
+| .label | String | 표시 라벨 |
+| .latest | Bool | 최신 버전인지 |
+| .url | String | 그 버전에 같은 페이지가 있으면 그 URL, 없으면 그 버전의 루트 |
+| .exists | Bool | 대응 페이지 존재 여부 |
+| .current | Bool | 현재 페이지의 버전인지 |
+
+```jinja
+{% for v in page.version_links %}
+<a href="{{ base_url }}{{ v.url }}"{% if v.current %} aria-current="page"{% endif %}>{{ v.label }}</a>
+{% endfor %}
+```
+
+전역 `versions` 리스트(`{% for v in versions %}`, `versions.latest`, `versions.all`)는 현재 페이지 언어 기준 모든 버전의 루트 URL을 노출합니다.
 
 ### page.translations
 
@@ -450,7 +534,7 @@ pros = ["Fast", "Reliable"]
 </ul>
 ```
 
-프론트 매터 최상위에 쓴 `outputs = ["json"]`도 마찬가지로 알려지지 않은 일반 키로 취급되어 `page.extra.outputs`에 들어갑니다 — 해당 페이지/섹션에 한해 `[outputs]` 설정 기본값을 재정의합니다. [출력 포맷](/ko/features/output-formats/)을 참고합니다.
+프론트 매터 최상위에 쓴 `outputs = ["json"]`도 마찬가지로 알려지지 않은 일반 키로 취급되어 `page.extra.outputs`에 들어가며, 해당 페이지/섹션에 한해 `[outputs]` 설정 기본값을 재정의합니다. [출력 포맷](/ko/features/output-formats/)을 참고합니다.
 
 ---
 
@@ -480,6 +564,8 @@ pros = ["Fast", "Reliable"]
 | canonical_tag | 캐노니컬 링크 태그 |
 | hreflang_tags | Hreflang 대체 링크 태그(다국어) |
 | pagination_seo_links | `<link rel="prev/next">` 태그 |
+| alternate_output_tags | 페이지에 활성화된 [출력 포맷](/ko/features/output-formats/)의 `<link rel="alternate">` 태그 |
+| jsonld | JSON-LD 구조화 데이터(`jsonld_article`, `jsonld_breadcrumb`, `jsonld_website` 등도 제공, [구조화 데이터](/ko/features/structured-data/) 참고) |
 
 ```jinja
 <head>
@@ -538,6 +624,10 @@ pros = ["Fast", "Reliable"]
 | auto_includes_css | 자동 인클루드된 CSS `<link>` 태그 |
 | auto_includes_js | 자동 인클루드된 JS `<script>` 태그 |
 | auto_includes | 모든 자동 인클루드 태그 |
+| math_tags | `[markdown] math`용 KaTeX/MathJax 태그(math가 꺼져 있으면 빈 문자열) |
+| mermaid_tags | Mermaid 스크립트 태그(`[markdown] mermaid`가 꺼져 있으면 빈 문자열) |
+| pwa_tags | PWA manifest 링크, theme-color 메타, 서비스 워커 등록 태그(`[pwa]` 비활성 시 빈 문자열) |
+| search_tags | [내장 검색 UI](/ko/features/search/#내장-ui)의 스타일시트와 스크립트 태그(`[search] ui = true`가 아니면 빈 문자열) |
 
 ```jinja
 <head>
@@ -580,7 +670,7 @@ pros = ["Fast", "Reliable"]
 | toc_obj.headers[].level | Int | 헤딩 레벨(2-6) |
 | toc_obj.headers[].id | String | 앵커 ID |
 | toc_obj.headers[].title | String | 헤딩 텍스트 |
-| toc_obj.headers[].permalink | String | 전체 앵커 퍼머링크 |
+| toc_obj.headers[].permalink | String | 헤딩으로 가는 프래그먼트 링크(`#id`) |
 | toc_obj.headers[].children | Array | 중첩된 자식 헤더(같은 구조) |
 
 ```jinja
@@ -608,7 +698,7 @@ pros = ["Fast", "Reliable"]
 
 ### Paginator
 
-섹션·택소노미 항목 템플릿에서 페이지네이션이 활성화된 경우([섹션 프론트 매터](/ko/writing/sections/)의 `paginate`, 택소노미는 `paginate_by`) 사용할 수 있습니다. 1페이지는 섹션 URL에, 이후 페이지는 `{url}/{paginate_path}/{n}/`에 생성됩니다.
+섹션·택소노미 항목 템플릿에서 페이지네이션이 활성화된 경우([섹션 프론트 매터](/ko/writing/sections/#프론트-매터)의 `paginate`, 택소노미는 `paginate_by`) 사용할 수 있습니다. 1페이지는 섹션 URL에, 이후 페이지는 `{url}/{paginate_path}/{n}/`에 생성됩니다.
 
 | 속성 | 타입 | 설명 |
 |----------|------|-------------|
@@ -647,13 +737,13 @@ pros = ["Fast", "Reliable"]
 | taxonomy_term | String | 현재 항목 이름(인덱스 페이지에서는 빈 문자열) |
 | content | String | 미리 렌더링된 목록 HTML(항목 또는 페이지) |
 
-목록을 직접 구성하려면 `get_taxonomy()`를 사용합니다 — [택소노미](/ko/writing/taxonomies/) 참고.
+목록을 직접 구성하려면 `get_taxonomy()`를 사용합니다. [택소노미](/ko/writing/taxonomies/)를 참고합니다.
 
 ---
 
 ## 메뉴
 
-`site.menus`는 **기본 언어**의 이름 있는 메뉴(설정의 `[[menus.*]]` + 프론트 매터의 `menus`/`menu` 등록)를 노출합니다. 템플릿 안에서는 `site.menus.<name>`보다 `get_menu(name="...")`을 권장합니다 — **현재 페이지**의 언어를 기준으로 해석하고, 없으면 기본 언어로 폴백합니다.
+`site.menus`는 **기본 언어**의 이름 있는 메뉴(설정의 `[[menus.*]]` + 프론트 매터의 `menus`/`menu` 등록)를 노출합니다. 템플릿 안에서는 `site.menus.<name>`보다 `get_menu(name="...")`을 권장합니다. **현재 페이지**의 언어를 기준으로 해석하고, 없으면 기본 언어로 폴백합니다.
 
 ```jinja
 {% for item in get_menu(name="main") %}

@@ -18,11 +18,10 @@ module Hwaro
         # instead of silently overwriting the earlier export.
         @written_paths = Set(String).new
 
-        # Page-bundle assets left behind this run (see
-        # `note_unexported_bundle_assets`), folded into the skipped count so
-        # the summary never reports a clean export of a post whose images
-        # were not written.
-        @unexported_assets = 0
+        # Expanded bundle directory → its index source, for each page bundle
+        # flattened into `_posts/` or `_drafts/` this run (see
+        # `note_flattened_bundle`).
+        @flattened_bundles = {} of String => String
 
         def run(options : Config::Options::ExportOptions) : ExportResult
           content_dir = options.content_dir
@@ -31,8 +30,10 @@ module Hwaro
           verbose = options.verbose
 
           @written_paths.clear
-          @unexported_assets = 0
+          @flattened_bundles.clear
+          @exported_index_dirs.clear
           files = scan_content_files(content_dir)
+          load_draft_paths(content_dir)
 
           if files.empty?
             return ExportResult.new(
@@ -44,6 +45,7 @@ module Hwaro
           exported = 0
           skipped = 0
           errors = 0
+          content_errors = 0
 
           files.each do |file_path|
             result = export_file(file_path, content_dir, output_dir, include_drafts, verbose)
@@ -53,27 +55,39 @@ module Hwaro
             end
           rescue ex
             errors += 1
+            content_errors += 1 if front_matter_error?(ex)
             Logger.warn "Error exporting #{file_path}: #{ex.message}"
           end
 
-          # Bundle assets that were not carried across count as skipped: they
-          # are content the user handed the exporter and did not get back.
-          skipped += @unexported_assets
+          export_assets(content_dir, files, output_dir, verbose)
 
+          # Any per-file error fails the run: `exported > 0` used to mask
+          # errors, so a partial export reported success and exited 0.
           ExportResult.new(
-            success: exported > 0 || errors == 0,
-            message: "Exported #{exported} items, skipped #{skipped}, errors #{errors}",
+            success: errors == 0,
+            message: errors > 0 ? "#{errors} file(s) could not be exported (#{exported} exported, #{skipped} skipped)" : "Exported #{exported} items, skipped #{skipped}, errors #{errors}",
             exported_count: exported,
             skipped_count: skipped,
-            error_count: errors
+            error_count: errors,
+            content_error_count: content_errors
           )
         end
 
-        # Keys emitted explicitly below; everything else passes through as a
-        # Jekyll page variable (Jekyll accepts arbitrary front-matter keys, so
-        # dropping `slug`, `weight`, `layout`, `extra.*`, … was silent data
-        # loss — the same bug class gh#527 fixed for the Hugo exporter).
+        # Keys the explicit emitters below may claim; everything else passes
+        # through as a Jekyll page variable (Jekyll accepts arbitrary
+        # front-matter keys, so dropping `slug`, `weight`, `layout`,
+        # `extra.*`, … was silent data loss — the same bug class gh#527 fixed
+        # for the Hugo exporter). A key is only excluded from the passthrough
+        # when its emitter actually produced a line: a value the emitter
+        # cannot represent (hash-valued `tags`, array `title`, …) used to be
+        # swallowed — skipped by the emitter AND skipped by name here.
         HANDLED_KEYS = Set{"title", "date", "description", "draft", "tags", "categories", "authors", "image", "template"}
+
+        # Matches the date/timestamp shapes Jekyll's YAML loader reads
+        # natively; anything else is emitted via `yaml_scalar` — raw
+        # interpolation of an arbitrary string into `date:` let a newline or
+        # `: ` inject or break the frontmatter.
+        DATE_SHAPE_RE = /\A\d{4}-\d{2}-\d{2}([Tt ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?( ?([Zz]|[+-]\d{2}:?\d{2}))?)?\z/
 
         private def export_file(
           file_path : String,
@@ -84,38 +98,67 @@ module Hwaro
         ) : Symbol
           raw = read_content(file_path)
           fields, body = parse_content(raw)
+          # Jekyll reads `tags:` / `categories:` at the top level, so a
+          # `[taxonomies]` table has to be hoisted or the post loses every
+          # taxonomy it belongs to.
+          fields = flatten_taxonomies(fields)
 
-          is_draft = fields["draft"]?.try(&.raw) == true
+          is_draft = draft?(file_path, fields)
           if is_draft && !include_drafts
             return :skipped
           end
 
-          # Build Jekyll YAML frontmatter
+          # Build Jekyll YAML frontmatter. Keys are marked handled only when
+          # an emitter actually produced a line, so a value the emitters
+          # cannot represent falls through to `passthrough_yaml` instead of
+          # being silently dropped.
           yaml_lines = [] of String
+          handled = Set(String).new
+          # A boolean draft is fully translated (true → `published: false`,
+          # false → omitted, Jekyll's default); any other type falls through
+          # to passthrough_yaml like every other unrepresentable value.
+          handled << "draft" if fields["draft"]?.try(&.raw).is_a?(Bool)
 
-          if title = fields["title"]?.try(&.as_s?)
+          if title = scalar_string(fields["title"]?)
             yaml_lines << "title: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(title)}"
+            handled << "title"
           end
 
-          if date = fields["date"]?.try(&.as_s?)
-            yaml_lines << "date: #{date}"
+          if date = scalar_string(fields["date"]?)
+            yaml_lines << "date: #{yaml_date_value(date)}"
+            handled << "date"
           end
 
-          if desc = fields["description"]?.try(&.as_s?)
+          if desc = scalar_string(fields["description"]?)
             yaml_lines << "description: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(desc)}"
+            handled << "description"
           end
 
           # Hwaro's `template` is Jekyll's `layout`, the exact inverse of the
           # Jekyll importer's `layout` → `template` mapping. Passing the key
           # through verbatim meant Jekyll ignored it (rendering the page with
-          # no layout at all) and a re-import dropped it entirely.
-          if layout = fields["template"]?.try(&.as_s?)
+          # no layout at all) and a re-import dropped it entirely. An
+          # authored `layout` wins (existing-key-wins, like the Hugo
+          # renames): emitting both would produce a duplicate YAML key.
+          if (layout = scalar_string(fields["template"]?)) && fields["layout"]?.try(&.raw).nil?
             yaml_lines << "layout: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(layout)}"
+            handled << "template"
+            handled << "layout"
           end
 
-          # Jekyll uses `published: false` instead of `draft: true`
-          if is_draft
+          # Jekyll uses `published: false` instead of `draft: true`. The
+          # draft flag is hwaro's source of truth, so it also claims
+          # `published`: letting an authored `published: true` pass through
+          # would duplicate the key and (under Jekyll's last-wins loader)
+          # publish the draft.
+          # A headless page (`render = false`: no output, kept out of
+          # listings) is unpublished in Jekyll terms; the bare `render` key
+          # was ignored and Jekyll published the page.
+          headless = fields["render"]?.try(&.raw) == false
+          handled << "render" if headless
+          if is_draft || (headless && fields["published"]?.try(&.raw).nil?)
             yaml_lines << "published: false"
+            handled << "published"
           end
 
           # Accept both list (`tags: [a, b]`) and scalar (`tags: crystal`)
@@ -126,12 +169,14 @@ module Hwaro
           if tags = string_list_field(fields["tags"]?)
             yaml_lines << "tags:"
             tags.each { |t| yaml_lines << "  - #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(t)}" }
+            handled << "tags"
           end
 
           # categories from taxonomies if present
           if cats = string_list_field(fields["categories"]?)
             yaml_lines << "categories:"
             cats.each { |c| yaml_lines << "  - #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(c)}" }
+            handled << "categories"
           end
 
           # Jekyll natively understands an `authors` front-matter list, so
@@ -139,75 +184,151 @@ module Hwaro
           if authors = string_list_field(fields["authors"]?)
             yaml_lines << "authors:"
             authors.each { |a| yaml_lines << "  - #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(a)}" }
+            handled << "authors"
           end
 
-          if image = fields["image"]?.try(&.as_s?)
+          if image = scalar_string(fields["image"]?)
             yaml_lines << "image: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(image)}"
+            handled << "image"
           end
 
-          if passthrough = passthrough_yaml(fields)
+          # jekyll-sitemap leaves out a page marked `sitemap: false`; the
+          # bare `in_sitemap` key was ignored and the page was listed again.
+          if fields["in_sitemap"]?.try(&.raw) == false && fields["sitemap"]?.try(&.raw).nil?
+            yaml_lines << "sitemap: false"
+            handled << "in_sitemap"
+          end
+
+          # The inverse of the Jekyll importer's mappings. Passed through
+          # under hwaro's names, Jekyll ignored all three: the page moved off
+          # its `path`, its `aliases` stopped redirecting, and its
+          # modification date was lost. An authored Jekyll key wins
+          # (existing-key-wins, like `layout` above).
+          out_path = disambiguate_path(resolve_jekyll_path(file_path, content_dir, output_dir, fields, is_draft, include_drafts))
+
+          if fields["permalink"]?.try(&.raw).nil?
+            if (custom = scalar_string(fields["path"]?)) && !(trimmed = custom.strip('/')).empty?
+              yaml_lines << "permalink: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar("/#{trimmed}/")}"
+              handled << "path"
+            elsif File.dirname(out_path) == File.join(output_dir, "_posts")
+              # A post flattened into `_posts/` would otherwise be published at
+              # Jekyll's default `/:year/:month/:day/:title.html`, away from the
+              # address the build gave it and the one the rewritten `@/` links
+              # (and every inbound URL) point at.
+              relative = file_path.sub(content_dir, "").lstrip('/')
+              url = (front_matter_url(relative, fields) || relative.sub(/\.(?:md|markdown)\z/, "").sub(/(\A|\/)_?index\z/, "\\1")).strip('/')
+              yaml_lines << "permalink: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar("/#{url}/")}" unless url.empty?
+            end
+          end
+
+          if fields["redirect_from"]?.try(&.raw).nil? && (aliases = publishable_aliases(fields["aliases"]?, file_path))
+            unless aliases.empty?
+              yaml_lines << "redirect_from:"
+              aliases.each { |a| yaml_lines << "  - #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(a)}" }
+            end
+            handled << "aliases"
+          end
+
+          if fields["last_modified_at"]?.try(&.raw).nil? && (updated = scalar_string(fields["updated"]?))
+            yaml_lines << "last_modified_at: #{yaml_date_value(updated)}"
+            handled << "updated"
+          end
+
+          # Jekyll's excerpt is the first paragraph unless the page names its
+          # separator, so the build's `<!-- more -->` summary was lost.
+          if fields["excerpt_separator"]?.try(&.raw).nil? && (marker = summary_marker(body))
+            yaml_lines << "excerpt_separator: #{Hwaro::Utils::FrontmatterWriter.yaml_scalar(marker[0])}"
+          end
+
+          if passthrough = passthrough_yaml(fields, handled)
             yaml_lines << passthrough
           end
 
           frontmatter = "---\n#{yaml_lines.join("\n")}\n---"
           body = rewrite_internal_links(body)
 
-          out_path = resolve_jekyll_path(file_path, content_dir, output_dir, fields, is_draft, include_drafts)
-          out_path = disambiguate_path(out_path)
-
           # A refused destination (outside `output_dir`) is reported as
           # skipped; the bundle-asset accounting below only describes files
           # that accompany an exported post, so it is skipped too.
           return :skipped unless write_file(out_path, "#{frontmatter}\n\n#{body.strip}\n", output_dir, verbose)
 
-          @unexported_assets += note_unexported_bundle_assets(file_path, content_dir)
+          note_exported_index(file_path, content_dir)
+          note_flattened_bundle(file_path, content_dir, out_path, output_dir)
           :exported
         end
 
         # A page bundle keeps its assets next to `index.md`
-        # (`posts/my-post/cover.png`), and the Hugo exporter copies them across
-        # because it preserves the bundle directory. Jekyll's `_posts/` layout
-        # is FLAT — `_posts/2024-01-15-my-post.md` — so there is no destination
-        # that keeps a bare `![](cover.png)` resolving without ALSO rewriting
-        # the exported body, which is a separate change with its own spec.
-        #
-        # Until then the assets stay behind, so name them and return the count:
-        # the export used to report `exported: 1 files, 0 skipped` and exit 0
-        # for a post whose every image link was dead.
-        private def note_unexported_bundle_assets(file_path : String, content_dir : String) : Int32
-          basename = File.basename(file_path)
-          return 0 unless basename == "index.md" || basename == "index.markdown"
-
-          # The site root is never a bundle: `content/index.md` sits beside
-          # every top-level file in the content tree, none of which belongs to
-          # it. Same nesting test the Hugo exporter uses before copying.
+        # (`posts/my-post/cover.png`). Jekyll's `_posts/` layout is FLAT —
+        # `_posts/2024-01-15-my-post.md` — so for a bundle exported there is
+        # no destination that keeps a bare `![](cover.png)` resolving without
+        # ALSO rewriting the exported body, which is a separate change with
+        # its own spec. Every other index keeps its directory.
+        private def note_flattened_bundle(file_path : String, content_dir : String, out_path : String, output_dir : String) : Nil
+          return unless File.basename(file_path).matches?(INDEX_PAGE_RE)
           relative = file_path.sub(content_dir, "").lstrip('/')
-          return 0 unless relative.includes?('/')
-
-          source_dir = File.dirname(file_path)
-          assets = Dir.children(source_dir).sort!.reject do |entry|
-            entry.ends_with?(".md") || entry.ends_with?(".markdown") ||
-              File.directory?(File.join(source_dir, entry))
-          end
-          return 0 if assets.empty?
-
-          Logger.warn "#{assets.size} bundle asset(s) not exported for #{file_path}: #{assets.join(", ")}. " \
-                      "Copy them into the Jekyll site and update the links."
-          assets.size
-        rescue ex : File::Error
-          # The bundle directory vanished or is unreadable between the scan and
-          # here — the post itself already exported, so don't fail the run.
-          Logger.debug "Could not inspect bundle directory for #{file_path}: #{ex.message}"
-          0
+          # The site root is never a bundle.
+          return unless relative.includes?('/')
+          return if File.dirname(out_path) == File.join(output_dir, File.dirname(relative))
+          @flattened_bundles[File.expand_path(File.dirname(file_path))] = file_path
         end
 
-        # Serialize the non-allowlisted fields through the YAML emitter (which
-        # handles nesting, typing, and quoting), returning frontmatter lines
-        # without the `---` fences, or nil when there is nothing to carry.
-        private def passthrough_yaml(fields : Hash(String, YAML::Any)) : String?
+        # Copy every non-Markdown file the build publishes to the same
+        # relative path, where Jekyll publishes it at the same URL. A
+        # flattened bundle's files stay behind and are named in a warning:
+        # the export used to report a clean run for a post whose every image
+        # link was dead. Counts cover content documents only, as Hugo's do.
+        private def export_assets(content_dir : String, files : Array(String), output_dir : String, verbose : Bool) : Nil
+          left_behind = {} of String => Array(String)
+          begin
+            each_published_asset(content_dir, files) do |src, relative, owner|
+              if owner && (index = @flattened_bundles[owner]?)
+                (left_behind[index] ||= [] of String) << Path[File.expand_path(src)].relative_to(owner).to_s
+              else
+                copy_asset(src, File.join(output_dir, relative), output_dir, verbose)
+              end
+            end
+          rescue ex : File::Error
+            Logger.warn "Could not export content assets: #{ex.message}"
+          end
+
+          left_behind.each do |index, assets|
+            Logger.warn "#{assets.size} bundle asset(s) not exported for #{index}: #{assets.join(", ")}. " \
+                        "Copy them into the Jekyll site and update the links."
+          end
+        end
+
+        # String form of a scalar front-matter value: strings pass through
+        # and Bool/Int/Float stringify (a non-string `title: 2024` used to be
+        # silently dropped). Structured or null values return nil so the
+        # caller leaves the key to `passthrough_yaml`. Time never reaches
+        # here — `parse_content` already normalizes it to a date string.
+        private def scalar_string(value : YAML::Any?) : String?
+          return unless value
+          if str = value.as_s?
+            return str
+          end
+          case raw = value.raw
+          when Bool, Int64, Float64
+            raw.to_s
+          end
+        end
+
+        # A well-formed date/timestamp is written raw so Jekyll's YAML loader
+        # reads it as a date; anything else goes through `yaml_scalar`.
+        private def yaml_date_value(date : String) : String
+          date.matches?(DATE_SHAPE_RE) ? date : Hwaro::Utils::FrontmatterWriter.yaml_scalar(date)
+        end
+
+        # Serialize the fields no emitter claimed through the YAML emitter
+        # (which handles nesting, typing, and quoting), returning frontmatter
+        # lines without the `---` fences, or nil when there is nothing to
+        # carry. `handled` holds the keys actually emitted above — filtering
+        # by the static HANDLED_KEYS list swallowed handled-key values the
+        # emitters had skipped as unrepresentable.
+        private def passthrough_yaml(fields : Hash(String, YAML::Any), handled : Set(String)) : String?
           leftovers = {} of YAML::Any => YAML::Any
           fields.each do |key, value|
-            next if HANDLED_KEYS.includes?(key)
+            next if handled.includes?(key)
             next if value.raw.nil?
             leftovers[YAML::Any.new(key)] = value
           end
@@ -264,9 +385,14 @@ module Hwaro
           # Section indices become regular pages (Jekyll has no `_index`).
           # The site root maps to `index.md` at the export root — an
           # `index/index.md` would be served at `/index/`, leaving `/` empty.
-          if filename == "_index.md" || filename == "_index.markdown"
-            return File.join(output_dir, "index.md") if dir_part == "." || dir_part.empty?
-            return File.join(output_dir, dir_part, "index.md")
+          # A translated index (`_index.ko.md`) keeps its language suffix:
+          # passed through verbatim it kept the leading underscore, and
+          # Jekyll never reads an underscore-prefixed file — the section's
+          # landing page vanished from that language.
+          if index_match = filename.match(/\A_index((?:\.[^.\/]+)?)\.(?:md|markdown)\z/)
+            index_name = "index#{index_match[1]}.md"
+            return File.join(output_dir, index_name) if dir_part == "." || dir_part.empty?
+            return File.join(output_dir, dir_part, index_name)
           end
 
           date_str = fields["date"]?.try(&.as_s?)

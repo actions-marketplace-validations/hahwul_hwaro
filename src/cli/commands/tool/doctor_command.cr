@@ -21,11 +21,15 @@ module Hwaro
           # that machine consumers may rely on.
           JSON_SCHEMA_VERSION = 1
 
+          # Translation issues listed per language in the human report.
+          TRANSLATION_ISSUES_SHOWN = 10
+
           MAX_WARNINGS_FLAG = FlagInfo.new(short: nil, long: "--max-warnings", description: "Exit non-zero when warning count exceeds N (default: unlimited)", takes_value: true, value_hint: "N")
 
           # Flags defined here are used both for OptionParser and completion generation
           FLAGS = [
             CONTENT_DIR_FLAG,
+            ENV_FLAG,
             FlagInfo.new(short: nil, long: "--fix", description: "Perform real fixes (normalize values like base_url trailing slash, sitemap priority, etc.)"),
             FlagInfo.new(short: nil, long: "--approve", description: "Approve and add recommended optional config sections (use with --fix or alone)"),
             FlagInfo.new(short: nil, long: "--full", description: "Equivalent to --fix --approve (real fixes + all recommended sections)"),
@@ -58,6 +62,7 @@ module Hwaro
           def run(args : Array(String), invocation : String = "hwaro tool doctor")
             content_dir = "content"
             config_path = "config.toml"
+            env_name = ENV["HWARO_ENV"]?.presence
             json_output = false
             fix_mode = false
             approve_mode = false
@@ -69,6 +74,7 @@ module Hwaro
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: #{invocation} [options]"
               CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
+              CLI.register_flag(parser, ENV_FLAG) { |v| env_name = v }
               parser.on("--fix", "Perform real fixes (normalize values like base_url trailing slash, sitemap priority, etc.)") { fix_mode = true }
               parser.on("--approve", "Approve and add recommended optional config sections") { approve_mode = true }
               parser.on("--full", "Perform real fixes and approve all recommended sections (equivalent to --fix --approve)") { full_mode = true }
@@ -77,17 +83,41 @@ module Hwaro
               CLI.register_flag(parser, MAX_WARNINGS_FLAG) do |v|
                 parsed = v.to_i?
                 unless parsed && parsed >= 0
-                  Logger.error "--max-warnings expects a non-negative integer (got: #{v.inspect})"
-                  exit(Hwaro::Errors::EXIT_GENERIC)
+                  # Raise the classified usage error exactly as `tool
+                  # validate` does: the runner maps it to EXIT_USAGE (2)
+                  # and renders the standard JSON error payload under
+                  # --json, where Logger.error + exit(1) emitted neither.
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: "Invalid --max-warnings value: #{v}",
+                    hint: "Pass a non-negative integer, e.g. --max-warnings 0.",
+                  )
                 end
                 max_warnings = parsed
               end
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, QUIET_FLAG) { |_| Logger.quiet = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
+              # `hwaro doctor content/blog` used to run a full check of the
+              # default `content/` and exit 0, as if the path had been
+              # honoured. Directories are passed with --content-dir.
+              parser.unknown_args do |before_dash, after_dash|
+                unknown = before_dash + after_dash
+                raise Hwaro::HwaroError.new(
+                  code: Hwaro::Errors::HWARO_E_USAGE,
+                  message: "unexpected extra argument(s): '#{unknown.join("', '")}'",
+                  hint: "#{invocation} accepts options only; pass a content directory with --content-dir DIR.",
+                ) unless unknown.empty?
+              end
             end
 
-            doctor = Services::Doctor.new(content_dir: content_dir, config_path: config_path)
+            # Route through the shared JSON mode like every sibling command:
+            # it silences human log lines AND flips `Runner.json_mode?`, so a
+            # classified error raised mid-run renders as the standard JSON
+            # error payload instead of human text on a machine-read stream.
+            Runner.enable_json_mode! if json_output
+
+            doctor = Services::Doctor.new(content_dir: content_dir, config_path: config_path, env: env_name)
 
             if dry_run_mode && !fix_mode && !approve_mode && !full_mode
               Logger.warn "--dry-run has no effect without --fix, --approve, or --full"
@@ -126,9 +156,13 @@ module Hwaro
                   "exit_code" => code,
                 }.to_json)
               else
-                render_fix_summary(summary, approve_sections: approve_mode, dry_run: dry_run_mode)
-                if code != Hwaro::Errors::EXIT_SUCCESS
-                  Logger.warn "#{remaining.count { |i| i.level != :info }} issue(s) remain — run '#{invocation}' for details."
+                outstanding = remaining.count { |i| i.level != :info }
+                render_fix_summary(summary, approve_sections: approve_mode, dry_run: dry_run_mode, outstanding: outstanding)
+                # Not only on a failing exit: a warning `--fix` cannot repair
+                # (an inline-table priority, a placeholder title) used to end
+                # the run on "Config is up to date" with nothing else said.
+                if outstanding > 0
+                  Logger.warn "#{outstanding} issue(s) remain — run '#{invocation}' for details."
                 end
               end
               exit(code)
@@ -156,7 +190,7 @@ module Hwaro
             if Logger.quiet?
               render_quiet(issues, code)
             else
-              render_human(issues, config_path)
+              render_human(issues, config_path, doctor.observed_blocking_ids)
             end
             exit(code)
           end
@@ -207,25 +241,22 @@ module Hwaro
           # success.
           private def render_quiet(issues : Array(Services::Issue), exit_code : Int32)
             # Logger.quiet silences `Logger.info`, but a CI run that fails
-            # still needs *something* on stdout. Use direct STDOUT.puts so
-            # the output bypasses the Logger gate and surfaces the
-            # actionable issues only — no inline check headers, no banner.
+            # still needs *something*. Write past the Logger gate — the
+            # actionable issues only, no inline check headers, no banner —
+            # to stderr, where `--quiet` keeps warnings and errors for every
+            # other command (`tool validate -q` included).
             issues.each do |issue|
               next if issue.level == :info
               file_part = issue.file ? "#{issue.file}: " : ""
-              STDOUT.puts "[#{issue.level}] #{file_part}#{issue.message}"
+              Logger.err_io.puts "[#{issue.level}] #{file_part}#{issue.message}"
             end
           end
 
           # Render human-readable diagnostics with inline status glyphs per check.
-          private def render_human(issues : Array(Services::Issue), config_path : String)
+          # `blocking_ids` comes from the service and is NOT filtered by
+          # `[doctor] ignore` — see `Doctor#observed_blocking_ids`.
+          private def render_human(issues : Array(Services::Issue), config_path : String, blocking_ids : Set(String))
             plain = plain_output?
-
-            # A missing/unparseable config aborts `check_config` before any of
-            # the other config sub-checks (and `check_referenced_paths`) run.
-            # Those checks must render as skipped — a green ✓ for a check that
-            # never executed is reassuring noise on top of a broken config.
-            config_blocked = issues.any? { |i| i.id == "config-not-found" || i.id == "config-parse-error" }
 
             Logger.heading("doctor")
             # TTY already gets its blank line from `heading`; keep the plain
@@ -235,7 +266,17 @@ module Hwaro
               heading = group.key == :config ? config_path : group.default_heading
               Logger.info "  #{heading}"
               group.checks.each do |spec|
-                skipped = config_blocked && group.key == :config && !spec.issue_ids.includes?("config-parse-error")
+                # A missing/unparseable config, a missing `templates/` or a
+                # missing `content/` aborts a scan before the checks that
+                # depend on it can run. Those render as skipped — a green ✓
+                # for a check that never executed is reassuring noise on top
+                # of a broken site. The blocking ids live on the group and
+                # the check in `Services::CHECK_GROUPS`, so the service and
+                # this renderer can't drift apart.
+                blockers = group.blocked_by | spec.blocked_by
+                # The check that reports the blocking issue still renders it.
+                skipped = blockers.any? { |id| blocking_ids.includes?(id) } &&
+                          (spec.issue_ids & blockers).empty?
                 Logger.info "    #{render_check_line(spec, issues, plain, skipped)}"
               end
               Logger.info ""
@@ -280,6 +321,23 @@ module Hwaro
             unless structure_issues.empty?
               Logger.info "Structure:"
               structure_issues.each { |issue| print_issue(issue, plain) }
+              Logger.info ""
+            end
+
+            translation_issues = issues.select { |i| i.category == "i18n" }
+            unless translation_issues.empty?
+              Logger.info "Translations:"
+              translation_issues.group_by(&.language).each do |code, group|
+                missing = group.count { |i| i.id == "translation-missing" }
+                counts = [] of String
+                counts << "#{missing} missing" if missing > 0
+                counts << "#{group.size - missing} without original" if group.size > missing
+                Logger.info "  #{code}: #{counts.join(" · ")}"
+                # A partly translated site can list thousands of pages; the
+                # counts carry the size, --json carries every issue.
+                group.first(TRANSLATION_ISSUES_SHOWN).each { |issue| print_issue(issue, plain) }
+                Logger.info "  … and #{group.size - TRANSLATION_ISSUES_SHOWN} more (use --json for all)" if group.size > TRANSLATION_ISSUES_SHOWN
+              end
               Logger.info ""
             end
 
@@ -359,11 +417,15 @@ module Hwaro
           # Human rendering of a completed fix run. JSON mode composes its own
           # payload in `run` so the fix result and the post-fix diagnosis ship
           # as one document.
-          private def render_fix_summary(summary : Services::Doctor::FixSummary, approve_sections : Bool, dry_run : Bool)
+          private def render_fix_summary(summary : Services::Doctor::FixSummary, approve_sections : Bool, dry_run : Bool, outstanding : Int32 = 0)
             plain = plain_output?
 
             if summary.empty?
-              Logger.info "#{ok_glyph(plain)} Config is up to date — no fixable issues."
+              if outstanding > 0
+                Logger.info "No automatic fixes apply to config.toml."
+              else
+                Logger.info "#{ok_glyph(plain)} Config is up to date — no fixable issues."
+              end
               return
             end
 

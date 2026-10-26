@@ -38,7 +38,7 @@ cache_strategy = "cache-first"
 | short_name | string | name | Short name for home screen |
 | theme_color | string | "#ffffff" | Browser toolbar / status bar color |
 | background_color | string | "#ffffff" | Splash screen background color |
-| display | string | "standalone" | Display mode |
+| display | string | "standalone" | Display mode: `fullscreen`, `standalone`, `minimal-ui` or `browser` (an unknown value falls back to `standalone`) |
 | start_url | string | "/" | URL when the app launches |
 | icons | array | [] | Icon file paths |
 | offline_page | string | — | Fallback page when offline |
@@ -49,24 +49,48 @@ cache_strategy = "cache-first"
 
 ## Icon Sizing
 
-Icon sizes are automatically extracted from filenames:
+The `sizes` field of each icon is measured from the file itself: the real
+pixel dimensions read out of the PNG, JPEG, BMP, GIF, or WebP header. Browsers pick the
+install icon by this value, so a measured size is always preferred over a
+guess.
 
-| Filename | Detected Size |
-|----------|--------------|
-| `icon-192.png` | 192x192 |
-| `icon-512x512.png` | 512x512 |
-| `logo-180.svg` | 180x180 |
+| Icon | Declared `sizes` |
+|------|------------------|
+| `logo.png` (200x60 on disk) | 200x60 |
+| `icon-2024.jpg` (192x192 on disk) | 192x192 |
+| `favicon.svg` | `any` (scalable — no pixel size) |
+| `icon-192.png` (unreadable / missing) | 192x192 (from the filename) |
+| `icon-512x512.png` (unreadable / missing) | 512x512 (from the filename) |
+| `logo.webp` (100x100 on disk) | 100x100 |
+| `https://cdn.example/icon.png` | from the filename, else 512x512 |
+
+The filename heuristic is only a fallback: it applies to formats whose header
+Hwaro cannot read (ICO), to remote `http(s)://` icons, and to files whose
+bytes turn out to be unreadable. A build warning names the icon when that
+happens.
 
 Place icon files in your `static/` directory so they are copied to the build output.
 
 ## Template Integration
 
-Add the manifest link and service worker registration to your base template:
+The easiest wiring is the `{{ pwa_tags }}` template variable. It expands to
+the manifest link, a theme-color meta, and the service worker registration
+(already base-path-prefixed), and renders as an empty string while `[pwa]` is
+disabled. The scaffold header templates include it out of the box:
+
+```jinja
+<head>
+  {{ pwa_tags }}
+</head>
+```
+
+To wire things manually instead, add the manifest link and service worker
+registration to your base template:
 
 ```html
 <head>
   <link rel="manifest" href="{{ base_url }}/manifest.json">
-  <meta name="theme-color" content="{{ config.pwa.theme_color }}">
+  <meta name="theme-color" content="#1a1a2e"> <!-- your [pwa] theme_color -->
 </head>
 <body>
   ...
@@ -88,7 +112,7 @@ Add the manifest link and service worker registration to your base template:
 
 The generated service worker uses:
 
-- **Precache on install** — URLs listed in `precache_urls` plus `start_url` are cached immediately
+- **Precache on install** — URLs listed in `precache_urls` plus `start_url` (and `offline_page`, when set) are cached immediately. An entry with no matching output file is dropped with a build warning, since one missing URL would fail the whole install
 - **Asset fetching** — Controlled by `cache_strategy` (see below)
 - **Network-first for navigation** — Page navigations always try the network first, falling back to the offline page
 - **Automatic cache versioning** — Old caches are cleaned up on service worker activation

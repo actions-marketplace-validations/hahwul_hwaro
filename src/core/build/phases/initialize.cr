@@ -1,3 +1,7 @@
+require "../../../utils/dev_marker"
+require "../../../utils/hwaro_dir"
+require "../../../utils/output_ownership"
+
 # Phase: Initialize — output dir setup, cache init, config loading, template loading
 #
 # Handles the first phase of the build lifecycle:
@@ -15,9 +19,17 @@ module Hwaro::Core::Build::Phases::Initialize
       verbose = ctx.options.verbose
       cache_enabled = ctx.options.cache
 
-      build_cache = Cache.new(enabled: cache_enabled)
+      build_cache = Cache.new(enabled: cache_enabled, cache_path: Cache.path_for(ctx.options.serve_mode))
       @cache = build_cache
-      ctx.cache = build_cache
+      # Before `--full` clears the metadata it reads.
+      cache_tracks_output = build_cache.tracks_output_dir?(output_dir)
+      # Source-less generated outputs are re-claimed from scratch every build;
+      # the Finalize phase diffs this build's claims against the last one's.
+      reset_generated_output_claims
+      reset_static_copied_outputs
+      # Before ANY write into the output directory (the static copy below is
+      # the first), so the Finalize prune can tell what this build produced.
+      mark_build_output_epoch
 
       if cache_enabled
         if ctx.options.full
@@ -27,15 +39,56 @@ module Hwaro::Core::Build::Phases::Initialize
           stats = build_cache.stats
           Logger.info "  Cache enabled (#{stats[:valid]} valid entries)"
         end
+      elsif ctx.options.full
+        # `--full` only means anything to the cache, and without `--cache`
+        # there is none to force past — a plain build already rebuilds
+        # everything. Silently accepting it let people believe they had
+        # cleared a `.hwaro_cache.json` that a later `--cache` build still
+        # reads.
+        Logger.warn "--full has no effect without --cache (a plain build already rebuilds everything); pass --cache --full to discard the existing cache."
       end
+      # Before the wipe below: this build is about to replace what the cache
+      # file describes, and it will not update it.
+      Cache.discard_if_tracking(output_dir) unless cache_enabled || ctx.options.serve_mode
 
       # `preserve_output` keeps existing output files between rebuilds (used
       # by `hwaro serve` watch rebuilds) so mtime-based skip logic in hooks
       # like image processing can actually short-circuit. For a cold build
       # we always wipe to guarantee a clean state.
-      keep_output = cache_enabled || ctx.options.preserve_output
+      #
+      # `--cache` keeps the tree only when the cache actually describes it
+      # (see Cache#tracks_output_dir?): the Finalize prune can only remove
+      # what the cache remembers writing, so a missing/corrupt cache or one
+      # written for another `-o` left deleted pages published for good. That
+      # build re-renders everything anyway, so the cold (ownership-checked)
+      # wipe costs nothing but the static copy.
+      keep_output = (cache_enabled && cache_tracks_output) || ctx.options.preserve_output
+      # Read before setup_output_dir — the cold-build wipe would erase the
+      # evidence that a serve session (an older hwaro shared the output dir)
+      # had written here. `present?` matches the marker's content, so a user's
+      # own `static/.hwaro-dev` (published by copy_static_files below like any
+      # hidden static file) is not mistaken for one.
+      dev_marker_found = !ctx.options.serve_mode && Utils::DevMarker.present?(output_dir)
       setup_output_dir(output_dir, keep_output)
+      @kept_output_dir = keep_output ? output_dir : nil
       copy_static_files(output_dir, verbose, keep_output)
+
+      if ctx.options.serve_mode
+        # Serve output is never deployable (dev base_url baked into every
+        # page) — stamp the directory so `hwaro deploy` can refuse it.
+        Utils::DevMarker.write(output_dir)
+        # And keep the `.hwaro/` workspace holding it out of `git status` —
+        # the basename guard makes this a no-op for any other output dir.
+        Utils::HwaroDir.ensure_self_ignore(File.dirname(output_dir))
+      elsif dev_marker_found
+        # A `--cache`/preserved build keeps existing files, so the stale
+        # marker must go explicitly; on a cold build the wipe already took
+        # it. Warn either way — the user should know dev output sat in the
+        # deployable tree until now. `remove` re-checks the content, so a
+        # user's `static/.hwaro-dev` just published over the leftover stays.
+        Utils::DevMarker.remove(output_dir)
+        Logger.warn "  A previous `hwaro serve` session had written dev output into #{output_dir} — this build replaces it with deployable output."
+      end
 
       config = @config || raise "Config not loaded"
       if url = ctx.options.base_url
@@ -44,7 +97,9 @@ module Hwaro::Core::Build::Phases::Initialize
       end
       site = Models::Site.new(config)
       @site = site
-      load_data_files(site)
+      load_data_files(site, config, ctx.options.serve_mode)
+      @privacy = config.privacy.enabled ? Privacy.new(config, output_dir, config.assets.sri ? output_dir : nil) : nil
+      collect_git_info(config)
 
       # Load i18n translations
       i18n_dir = File.join("i18n")
@@ -53,6 +108,9 @@ module Hwaro::Core::Build::Phases::Initialize
       @config = config
       ctx.site = @site
       ctx.config = config
+
+      # Before Render: `search_tags` hashes these files under `[assets] sri`.
+      Content::SearchUi.write_assets(config, output_dir, verbose).each { |path| claim_generated_output(path) }
 
       # Propagate the highlighting mode to the markdown renderer once per
       # build — read-only afterwards, including by parallel render fibers.
@@ -106,9 +164,26 @@ module Hwaro::Core::Build::Phases::Initialize
     # incremental branch, and `build --cache -o content` used to exit 0 after
     # scattering `index.html` files through the source tree.
     guard_output_dir!(output_dir)
+    existed_before = Dir.exists?(output_dir)
     # In incremental mode (--cache), keep existing output to avoid
     # re-generating unchanged pages and re-copying unchanged static files.
-    if !incremental && Dir.exists?(output_dir)
+    if !incremental && existed_before
+      # The guard above only refuses the catastrophic targets. Any OTHER
+      # pre-existing directory — `-o ~/Documents/site`, a `dist/` shared
+      # with a bundler — was emptied silently, exit 0. Only clear what hwaro
+      # can vouch for (see Utils::OutputOwnership); keep the rest and say so.
+      resolved = Hwaro::Utils::PathUtils.resolved_real_path(File.expand_path(output_dir))
+      project_root = Hwaro::Utils::PathUtils.resolved_real_path(File.expand_path(Dir.current))
+      existing = begin
+        Dir.children(output_dir)
+      rescue File::Error
+        [] of String
+      end
+      if !existing.empty? && !Hwaro::Utils::OutputOwnership.clearable?(output_dir, resolved, project_root)
+        Logger.warn "Output directory #{output_dir} already holds #{existing.size} entr#{existing.size == 1 ? "y" : "ies"} hwaro did not write — keeping them. hwaro only clears the conventional public/ directory and directories it created or found empty, so files from an earlier build there may be stale; empty the directory once for a clean build."
+        return ensure_output_dir(output_dir)
+      end
+
       # Trailing separators are stripped for the symlink test only: `-o public/`
       # is what shell completion types, and lstat on a path ending in `/`
       # follows the final link, so `public/` would report as a plain directory.
@@ -142,21 +217,38 @@ module Hwaro::Core::Build::Phases::Initialize
         FileUtils.rm_rf(output_dir)
       end
     end
-    begin
-      Hwaro::Utils::FileSafe.mkdir_p(output_dir)
-    rescue ex : File::Error
-      # `-o` pointing at an existing plain file (or /dev/null), a read-only
-      # parent, a name the filesystem rejects: ordinary misconfiguration the
-      # user can fix. Unclassified it reached the CLI as HWARO_E_INTERNAL /
-      # exit 70 — the code reserved for hwaro bugs — so CI that alerts on
-      # internal faults fired on a typo. Name the path and say what to do.
-      raise Hwaro::HwaroError.new(
-        code: Hwaro::Errors::HWARO_E_IO,
-        message: "Cannot create output directory #{output_dir.inspect}: #{ex.message}",
-        hint: "Remove or rename whatever occupies that path, or build into a different directory with -o/--output.",
-        cause: ex,
+    ensure_output_dir(output_dir)
+    # Created, found empty, or cleared: from here on the directory is hwaro's
+    # to clear on the next cold build. The incremental paths (`--cache`,
+    # `serve`) never clear anything and must not hand a PRE-EXISTING
+    # directory over — but one that did not exist a moment ago is hwaro's
+    # own creation, whatever mode created it. Without that, `build --cache -o
+    # dist` on a fresh checkout left `dist/` unrecorded, and every later cold
+    # build warned "entries hwaro did not write" about hwaro's own files and
+    # kept the stale ones forever. The conventional `public/` needs no record
+    # (`clearable?` accepts it by name), so plain builds leave no `.hwaro/`.
+    if (!incremental || !existed_before) && !Hwaro::Utils::OutputOwnership.conventional?(output_dir)
+      Hwaro::Utils::OutputOwnership.record(
+        Hwaro::Utils::PathUtils.resolved_real_path(File.expand_path(output_dir)),
+        Hwaro::Utils::PathUtils.resolved_real_path(File.expand_path(Dir.current)),
       )
     end
+  end
+
+  private def ensure_output_dir(output_dir : String)
+    Hwaro::Utils::FileSafe.mkdir_p(output_dir)
+  rescue ex : File::Error
+    # `-o` pointing at an existing plain file (or /dev/null), a read-only
+    # parent, a name the filesystem rejects: ordinary misconfiguration the
+    # user can fix. Unclassified it reached the CLI as HWARO_E_INTERNAL /
+    # exit 70 — the code reserved for hwaro bugs — so CI that alerts on
+    # internal faults fired on a typo. Name the path and say what to do.
+    raise Hwaro::HwaroError.new(
+      code: Hwaro::Errors::HWARO_E_IO,
+      message: "Cannot create output directory #{output_dir.inspect}: #{ex.message}",
+      hint: "Remove or rename whatever occupies that path, or build into a different directory with -o/--output.",
+      cause: ex,
+    )
   end
 
   # Directories a build READS. `output_dir` is wiped before a cold build, so
@@ -178,25 +270,25 @@ module Hwaro::Core::Build::Phases::Initialize
     expanded = File.expand_path(output_dir)
     # expand_path keeps a trailing separator, and `content/` must be
     # recognized as the same directory as `content`.
-    expanded = expanded.rstrip(File::SEPARATOR) unless expanded == File::SEPARATOR_STRING
+    expanded = Hwaro::Utils::PathUtils.chomp_separator(expanded)
     # expand_path is also purely LEXICAL — it never follows symlinks — so a
     # single symlinked component hid the real destination from every rule
     # below: `ln -s content pub && hwaro build -o pub/archive` passed the
     # guard and let the cold `rm_rf` delete `content/archive`, and
     # `ln -s templates public && hwaro build --cache` overwrote the site's
     # own templates with rendered HTML. Judge the RESOLVED destination.
-    expanded = resolved_real_path(expanded)
-    cwd = resolved_real_path(File.expand_path(Dir.current))
+    expanded = Hwaro::Utils::PathUtils.resolved_real_path(expanded)
+    cwd = Hwaro::Utils::PathUtils.resolved_real_path(File.expand_path(Dir.current))
 
     reason =
       if expanded == "/" || Path[expanded].parent.to_s == expanded
         "the filesystem root"
-      elsif expanded == resolved_real_path(Path.home.to_s)
+      elsif expanded == Hwaro::Utils::PathUtils.resolved_real_path(Path.home.to_s)
         # Resolved on both sides: `$HOME` is itself a symlink on plenty of
         # setups (/home/u -> /data/u), and comparing a resolved destination
         # against the unresolved `Path.home` would let `-o $HOME` through.
         "the home directory"
-      elsif cwd == expanded || cwd.starts_with?(expanded + File::SEPARATOR)
+      elsif Hwaro::Utils::PathUtils.within?(cwd, expanded)
         "the project directory (or a parent of it)"
       elsif input_dir = protected_input_dir(expanded, cwd)
         "the project's #{input_dir.inspect} directory (hwaro reads it as build input)"
@@ -221,33 +313,9 @@ module Hwaro::Core::Build::Phases::Initialize
   # would otherwise never match the lexical `<cwd>/content`.
   private def protected_input_dir(expanded : String, cwd : String) : String?
     PROTECTED_INPUT_DIRS.find do |dir|
-      root = resolved_real_path(File.join(cwd, dir))
-      expanded == root || expanded.starts_with?(root + File::SEPARATOR)
+      root = Hwaro::Utils::PathUtils.resolved_real_path(File.join(cwd, dir))
+      Hwaro::Utils::PathUtils.within?(expanded, root)
     end
-  end
-
-  # `path` with every symlink resolved, including when it does not exist yet:
-  # resolve the deepest existing ancestor and re-append the missing tail. A
-  # not-yet-created output directory is the normal case (`-o public` on a
-  # fresh checkout), so bailing out on a missing leaf would leave exactly the
-  # paths this guard exists for unresolved. Falls back to the given path when
-  # resolution fails (broken link, symlink loop, unreadable ancestor) —
-  # lexical matching is what we had before, so a failure never loosens the
-  # guard below the old behavior.
-  private def resolved_real_path(path : String) : String
-    suffix = [] of String
-    current = path
-    until File.exists?(current)
-      parent = File.dirname(current)
-      return path if parent == current
-      suffix << File.basename(current)
-      current = parent
-    end
-    real = File.realpath(current)
-    suffix.reverse_each { |part| real = File.join(real, part) }
-    real
-  rescue File::Error | IO::Error
-    path
   end
 
   private def copy_static_files(output_dir : String, verbose : Bool, incremental : Bool = false)
@@ -304,6 +372,58 @@ module Hwaro::Core::Build::Phases::Initialize
   # (FAT/exFAT store 2-second resolution).
   MTIME_SKIP_TOLERANCE = 2.seconds
 
+  # The `File::Info` of a publishable file under `static/`, or nil (after
+  # warning where a warning is due) when `src_path` must be skipped. One
+  # rule for the cold build and the serve watcher — the two used to carry
+  # separate copies of it.
+  #
+  # lstat first: for the common regular-file case one syscall covers the
+  # directory check AND proves it isn't a symlink. Only actual symlinks pay
+  # the follow-up target stat and realpath cost:
+  #
+  # - dangling links (`info?` nil), directories and unresolvable links
+  #   (symlink cycles — see `static_target_info`) are skipped silently;
+  # - a symlinked file whose target escapes the project would publish
+  #   content from outside the site (e.g. `static/leak -> ~/.ssh/id_rsa`),
+  #   so it is skipped with a warning; in-repo symlinks resolve back within
+  #   the project root and are still copied;
+  # - only regular files are publishable. `static/` can also hold a FIFO, a
+  #   unix socket or a device node (a stray `mkfifo`, an editor/daemon socket
+  #   left in the tree): `FileUtils.cp` opens the source for reading and
+  #   `open(2)` on a FIFO with no writer BLOCKS FOREVER, so one such entry
+  #   hung the whole build with no output at all. Anything that isn't a file
+  #   is unpublishable and worth saying out loud.
+  private def publishable_static_info(src_path : String) : File::Info?
+    lstat = File.info?(src_path, follow_symlinks: false)
+    return if lstat.nil?
+
+    if lstat.symlink?
+      info = static_target_info(src_path)
+      return if info.nil?
+      # The walk does not descend into a linked directory; say so instead of
+      # dropping every file under it without a trace.
+      if info.directory?
+        Logger.warn "Skipping static directory symlink (directory symlinks are not followed): #{src_path}"
+        return
+      end
+
+      unless Hwaro::Utils::PathUtils.resolves_within?(src_path, Dir.current)
+        Logger.warn "Skipping static symlink pointing outside the project: #{src_path}"
+        return
+      end
+    else
+      return if lstat.directory?
+      info = lstat
+    end
+
+    unless info.type.file?
+      Logger.warn "Skipping non-regular static file: #{src_path}"
+      return
+    end
+
+    info
+  end
+
   private def collect_static_files(
     src_dir : String,
     output_dir : String,
@@ -312,47 +432,15 @@ module Hwaro::Core::Build::Phases::Initialize
   ) : Array({String, String, Time})
     files_to_copy = [] of {String, String, Time}
     glob_match = File::MatchOptions.glob_default | File::MatchOptions::DotFiles
+    now = Time.utc.to_unix_ms
 
     Dir.glob(File.join(src_dir, "**", "*"), match: glob_match) do |src_path|
       # lstat first: for the common regular-file case one syscall covers
       # the directory check AND proves it isn't a symlink (previously every
       # file paid a stat plus an lstat). Only actual symlinks pay the
       # follow-up target stat and realpath cost.
-      lstat = File.info?(src_path, follow_symlinks: false)
-      next if lstat.nil?
-
-      if lstat.symlink?
-        # Skip dangling symlinks (`info?` nil when the target is missing) so
-        # the copy worker doesn't log a spurious failure, and directories.
-        # Unresolvable links (symlink cycles) also come back nil here — see
-        # `static_target_info`.
-        info = static_target_info(src_path)
-        next if info.nil? || info.directory?
-
-        # A symlinked file whose target escapes the project would publish
-        # content from outside the site (e.g. `static/leak -> ~/.ssh/id_rsa`).
-        # Skip those; in-repo symlinks resolve back within the project root
-        # and are still copied.
-        unless Hwaro::Utils::PathUtils.resolves_within?(src_path, Dir.current)
-          Logger.warn "Skipping static symlink pointing outside the project: #{src_path}"
-          next
-        end
-      else
-        next if lstat.directory?
-        info = lstat
-      end
-
-      # Only regular files are publishable. `static/` can also hold a FIFO, a
-      # unix socket or a device node (a stray `mkfifo`, an editor/daemon
-      # socket left in the tree): `FileUtils.cp` opens the source for reading
-      # and `open(2)` on a FIFO with no writer BLOCKS FOREVER, so one such
-      # entry hung the whole build with no output at all. Directories are
-      # already filtered above, so anything reaching here that isn't a file is
-      # unpublishable and worth saying out loud.
-      unless info.type.file?
-        Logger.warn "Skipping non-regular static file: #{src_path}"
-        next
-      end
+      info = publishable_static_info(src_path)
+      next unless info
 
       relative = Path[src_path].relative_to(src_dir).to_s
       next if static_config.excluded?(relative)
@@ -361,23 +449,43 @@ module Hwaro::Core::Build::Phases::Initialize
       next if @config.try(&.sass_source?(relative))
 
       dest_path = File.join(output_dir, relative)
+      # Claimed BEFORE the unchanged-skip below: the claim list records what
+      # this build PUBLISHES, not what it copied. A `--cache` build never
+      # wipes the output directory and no cache entry covers a static file,
+      # so without the claim a file deleted from `static/` kept being served
+      # (and deployed) forever; with it, Finalize deletes exactly the copies
+      # whose source is gone (see Phases::Finalize#stale_generated_outputs).
+      claim_generated_output(dest_path, static_copy: true)
       # `info` from above already carries the source mtime — re-statting
       # src_path here tripled the stat count over static/ on watch rebuilds.
       #
-      # Skip on SIZE equality plus mtime equality within a tolerance, the same
-      # shape the Write phase uses for bundle assets. Two reasons it is not an
-      # ordering test and not exact:
-      #   * `source <= destination` skipped any source whose mtime moved
-      #     BACKWARDS — what `git checkout`, `git stash pop` and
-      #     `rsync --times` do — serving the previous revision's asset forever.
-      #   * exact equality never holds when the DESTINATION filesystem stores
-      #     coarser timestamps than the source (exFAT/FAT32 2s, HFS+ 1s, some
-      #     SMB/NFS and Docker bind mounts), which would re-copy the whole
-      #     `static/` tree on every incremental build and every serve rebuild.
+      # Skip on SIZE equality plus mtime equality, the same shape the Write
+      # phase uses for bundle assets. It is not an ordering test:
+      # `source <= destination` skipped any source whose mtime moved
+      # BACKWARDS — what `git checkout`, `git stash pop` and `rsync --times`
+      # do — serving the previous revision's asset forever.
+      #
+      # The copy stamps the destination with the SOURCE mtime, so an EXACT
+      # match proves the destination already holds this exact source version
+      # and nothing is read. A near-match does not prove that: it is equally
+      # a DESTINATION filesystem storing coarser timestamps than the source
+      # (exFAT/FAT32 2s, HFS+ 1s, some SMB/NFS and Docker bind mounts,
+      # where exact equality never holds) and a real edit made within
+      # `MTIME_SKIP_TOLERANCE` of the previous build. Treating the whole
+      # window as "unchanged" silently dropped the second case whenever the
+      # edit kept the byte size — `#fff` → `#eee` in a stylesheet saved a
+      # second after the last build was never published, and stayed
+      # unpublished until some later edit moved the mtime clear of the
+      # window. Compare the bytes in that narrow window instead: coarse
+      # destinations still skip the copy, real edits still land.
+      # Racy-git: an exact match that copy_stamp_trusted? refuses falls
+      # through to the byte compare.
+      trusted = copy_stamp_trusted?(dest_path, info.modification_time, now)
       if incremental && (dest_info = File.info?(dest_path)) &&
-         info.size == dest_info.size &&
-         (info.modification_time - dest_info.modification_time).abs <= MTIME_SKIP_TOLERANCE
-        next
+         info.size == dest_info.size
+        delta = (info.modification_time - dest_info.modification_time).abs
+        next if delta.zero? && trusted
+        next if delta <= MTIME_SKIP_TOLERANCE && same_contents?(src_path, dest_path)
       end
 
       files_to_copy << {src_path, dest_path, info.modification_time}
@@ -386,51 +494,96 @@ module Hwaro::Core::Build::Phases::Initialize
     files_to_copy
   end
 
+  # Cache#copy_stamp_trusted?, or the bare racy-git rule before a cache exists.
+  private def copy_stamp_trusted?(dest : String, src_mtime : Time, now_ms : Int64) : Bool
+    mtime_ms = src_mtime.to_unix_ms
+    if cache = @cache
+      cache.copy_stamp_trusted?(dest, mtime_ms, now_ms)
+    else
+      Cache.stable_mtime?(mtime_ms, now_ms)
+    end
+  end
+
+  # Byte-compare two files already known to be the same size.
+  #
+  # Only reached in the narrow "mtimes differ but sit inside
+  # MTIME_SKIP_TOLERANCE" window, so a warm build on a filesystem that can
+  # store the stamped source mtime exactly (the overwhelmingly common case)
+  # never reads a byte. A read failure answers "not identical" so the caller
+  # falls back to copying — the safe direction.
+  private def same_contents?(src_path : String, dest_path : String) : Bool
+    File.same_content?(src_path, dest_path)
+  rescue ex : File::Error | IO::Error
+    Logger.debug "Static copy: failed to compare #{src_path} with #{dest_path}: #{ex.message}"
+    false
+  end
+
   # Copy the given `{src, dest}` pairs using a parallel worker pool. Directory
   # creation stays sequential to avoid the check-then-create race that fires
   # under the multi-threaded runtime.
   private def copy_static_pairs(files_to_copy : Array({String, String, Time}))
-    files_to_copy.each { |_, dest, _| Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest)) }
+    files_to_copy.each do |_, dest, _|
+      mkdir_output(File.dirname(dest))
+      # A kept tree can also hold a DIRECTORY where this file now goes (the
+      # source was `static/x/…` last build, or a page published `/x/`), and
+      # `FileUtils.cp` copies INTO a directory: `public/x/x` instead of
+      # `public/x`. Nothing has been written this build yet, so whatever is
+      # there is the previous build's.
+      if (kept = @kept_output_dir) && File.info?(dest, follow_symlinks: false).try(&.directory?) &&
+         Utils::OutputGuard.safe_to_delete_directory?(dest, kept)
+        FileUtils.rm_rf(dest)
+      end
+    end
+
+    # One `getcwd` for the whole copy rather than one per file: the canonical
+    # form recorded below is only needed so filter_changed_pages can compare
+    # against `get_output_path` without expanding per page.
+    cwd = Dir.current
 
     config = ParallelConfig.new(enabled: true)
     worker_count = config.calculate_workers(files_to_copy.size)
 
-    work_queue = Channel({String, String, Time}).new(files_to_copy.size)
-    done = Channel(Nil).new(worker_count)
+    # The first copy failure, re-raised once every copy has drained: only
+    # logging it let the build exit 0 and deploy a site missing the file,
+    # where an unreadable page-bundle asset fails the build.
+    failure : Exception? = nil
+    failure_mutex = Mutex.new
 
-    files_to_copy.each { |pair| work_queue.send(pair) }
-    work_queue.close
-
-    worker_count.times do
-      spawn do
-        while pair = work_queue.receive?
-          src, dest, src_mtime = pair
-          begin
-            FileUtils.cp(src, dest)
-            # Stamp the source mtime onto the copy so the incremental skip in
-            # collect_static_files can compare timestamps at all — that is what
-            # makes a source whose mtime moved BACKWARDS (git checkout, stash
-            # pop, rsync --times) still count as changed. `src_mtime` comes
-            # from the stat collect_static_files already did; re-stating here
-            # tripled the stat count over static/ on watch rebuilds.
-            begin
-              File.utime(Time.utc, src_mtime, dest)
-            rescue ex : File::Error
-              # Stamping is an optimization; a failure just means the next
-              # build recopies this file. It must NOT be reported as a copy
-              # failure — the copy above already succeeded — but it should be
-              # discoverable when someone is asking why nothing is cached.
-              Logger.debug "Could not stamp mtime on #{dest}: #{ex.message}"
-            end
-          rescue ex
-            Logger.error "Copy failed #{src} -> #{dest}: #{ex.message}"
-          end
-        end
-      ensure
-        done.send(nil)
+    ParallelHelper.each_concurrently(files_to_copy, worker_count) do |(src, dest, src_mtime), _worker_id|
+      FileUtils.cp(src, dest)
+      # A page can render to this very path; the render runs after this
+      # copy and must win, which it only does if it is not skipped as a
+      # cache hit (see Builder#note_static_copy). Canonical form, so the
+      # comparison against `get_output_path` in filter_changed_pages
+      # needs no per-page expansion.
+      note_static_copy(File.expand_path(dest, cwd))
+      # Stamp the source mtime onto the copy so the incremental skip in
+      # collect_static_files can compare timestamps at all — that is what
+      # makes a source whose mtime moved BACKWARDS (git checkout, stash
+      # pop, rsync --times) still count as changed. `src_mtime` comes
+      # from the stat collect_static_files already did; re-stating here
+      # tripled the stat count over static/ on watch rebuilds. Always the
+      # true source mtime: sync tools (rsync, `aws s3 sync`) decide on it.
+      begin
+        File.utime(Time.utc, src_mtime, dest)
+      rescue ex : File::Error
+        # Stamping is an optimization; a failure just means the next
+        # build recopies this file. It must NOT be reported as a copy
+        # failure — the copy above already succeeded — but it should be
+        # discoverable when someone is asking why nothing is cached.
+        Logger.debug "Could not stamp mtime on #{dest}: #{ex.message}"
       end
+    rescue ex
+      # A source deleted since the scan (an editor's swap file under serve)
+      # is simply gone; only a file that is still there must not be lost.
+      if ex.is_a?(File::NotFoundError) && !File.exists?(src)
+        Logger.warn "Static file vanished before it was copied: #{src}"
+        next
+      end
+      Logger.error "Copy failed #{src} -> #{dest}: #{ex.message}"
+      failure_mutex.synchronize { failure ||= ex }
     end
-    worker_count.times { done.receive }
+    failure.try { |ex| raise ex }
   end
 
   private def load_templates : Hash(String, String)
@@ -576,9 +729,13 @@ module Hwaro::Core::Build::Phases::Initialize
   # serve, the watcher's removed-file detection follows up with a full
   # rebuild once the filesystem settles.
   private def read_template_source(path : String) : String?
+    # A FIFO (or a directory named `x.html`) matching the glob would block
+    # or fail `File.read`; it is not a template. A path that is missing
+    # right now falls through to the retry loop below (mid-save window).
+    return if (info = (File.info?(path) rescue nil)) && !info.file?
     attempts = 0
     loop do
-      source = File.read(path)
+      source = Utils::TextUtils.strip_bom(File.read(path))
       # `File.read` does not validate UTF-8, so a single stray byte (0xff from
       # a latin-1 paste, a truncated multi-byte sequence) used to travel into
       # the templates hash intact — and the first PCRE2 pass over it
@@ -591,7 +748,9 @@ module Hwaro::Core::Build::Phases::Initialize
         Logger.warn "Template #{path} contains invalid UTF-8; the offending bytes were replaced."
         source = source.scrub
       end
-      return source
+      # Windows editors prepend a BOM; a BOM'd partial or shortcode template
+      # would inject an invisible U+FEFF wherever it is expanded.
+      return Utils::TextUtils.strip_bom(source)
     rescue ex : IO::Error
       attempts += 1
       if attempts >= TEMPLATE_READ_RETRIES
@@ -617,26 +776,57 @@ module Hwaro::Core::Build::Phases::Initialize
       closure = deps.closure(name)
       sources = closure.compact_map { |dep| templates[dep]? }
       next unless sources.size == closure.size
-      next unless sources.all? { |src| @template_shortcode_scan[src.hash]? == false }
+      # A template that may hold shortcodes keeps every SEO/JSON-LD variable:
+      # shortcodes render with the same vars. The closure already holds each
+      # user shortcode it invokes (names are always literal; the built-ins
+      # never read `section`), so the lexed `section` check below holds.
+      shortcode_free = sources.all? { |src| @template_shortcode_scan[src.hash]? == false }
 
       union = sources.join('\n')
       # NOTE: "og_all_tags" is NOT a substring of "og_tags" (or vice versa) —
       # both must be listed, or a template using only {{ og_all_tags }}
       # would lose its OG block.
       @template_var_features[name] = Builder::TemplateVarFeatures.new(
-        needs_seo: union.includes?("og_tags") || union.includes?("og_all_tags") ||
+        needs_seo: !shortcode_free || union.includes?("og_tags") || union.includes?("og_all_tags") ||
                    union.includes?("twitter_tags") ||
                    union.includes?("canonical_tag") || union.includes?("hreflang_tags") ||
                    union.includes?("alternate_output_tags") ||
                    union.includes?("seo"),
-        needs_jsonld: union.includes?("jsonld"),
-        needs_section_pages: union.includes?("section"),
+        needs_jsonld: !shortcode_free || union.includes?("jsonld"),
+        # A user shortcode's output is compiled into the template that calls
+        # it, so any `section` text it prints (raw, quoted) is a read too.
+        needs_section_pages: closure.any? { |dep|
+          src = templates[dep]
+          dep.starts_with?("shortcodes/") ? src.includes?("section") : template_reads_variable?(src, "section")
+        },
         # Targeted on purpose — see the record's doc comment. These feed the
         # render worker heuristic, where a false positive costs parallelism.
         listing_fanout_site: union.includes?("site.pages"),
         listing_fanout_section: union.includes?("section.pages"),
       )
     end
+  end
+
+  # Whether `source` can read the top-level variable `name`. A substring test
+  # also hit `page.section`, `<section>` and comments, so nearly every
+  # template paid the O(section size) per-page `section.pages` copy —
+  # quadratic on a large section. Lexed instead: only an identifier token
+  # that is not an attribute (`x.section`) counts. Over-approximates
+  # (`{% set section = … %}` counts) and a lexer error counts as a read.
+  private def template_reads_variable?(source : String, name : String) : Bool
+    return false unless source.includes?(name)
+    lexer = Crinja::Parser::TemplateLexer.new(Content::Processors::Template.engine.env.config, source)
+    after_point = false
+    # Each token consumes input; the cap only guards against a lexer stall.
+    (source.bytesize + 2).times do
+      token = lexer.next_token
+      return false if token.kind.eof?
+      return true if token.kind.identifier? && token.value == name && !after_point
+      after_point = token.kind.point?
+    end
+    true
+  rescue
+    true
   end
 
   # Setup Crinja environment with custom filters, tests, and functions
@@ -691,15 +881,35 @@ module Hwaro::Core::Build::Phases::Initialize
     end
   end
 
-  # Tree node used while assembling `site.data` from the `data/` directory.
-  # Each node can hold a leaf value (a parsed data file) and/or a map of
-  # children (subdirectory entries). When both are present the children
-  # win — see `load_data_files`.
-  private class DataTreeNode
-    getter children : Hash(String, DataTreeNode) = {} of String => DataTreeNode
-    property value : Crinja::Value? = nil
-    property source_path : String? = nil
+  # Tree node type used while assembling `site.data` — the disk walk and
+  # its precedence rules live in Core::Build::DataDisk (shared with
+  # non-build callers); the remote/serve/digest halves stay here.
+  private alias DataTreeNode = DataDisk::Node
+
+  # Content digest of everything that feeds `site.data`, for cache
+  # invalidation: the `data/` directory (and i18n/) plus any fetched
+  # `[[data.remote]]` payloads.
+  private def compute_data_hash : String
+    disk = compute_disk_data_hash
+    # Remote payloads feed `site.data` exactly like `data/` files, so their
+    # bytes (captured by load_remote_data earlier in this phase) must feed
+    # the cache invalidation digest the same way — a changed payload has to
+    # invalidate cached pages. Empty (the "" no-remote-sources case) keeps
+    # the hash byte-identical to what it was before this feature existed.
+    remote = @remote_data_digest
+    return disk if remote.empty?
+    "#{disk}-remote:#{remote}"
   end
+
+  # Extensions the digest below covers. WIDER than `DataDisk.load_tree`'s
+  # glob on purpose: `site.data` never reads CSV, but `load_data()` does
+  # (see the template function's `data_format`), and a template
+  # calling `load_data(path="data/team.csv")` renders from a file that the
+  # digest has to see. Missing it meant editing a `data/*.csv` moved nothing
+  # in the cache key, so `build --cache` re-published every page with the
+  # previous CSV's values — forever, until an unrelated edit.
+  # Compared lowercased: the loaders read `Team.JSON` too.
+  DATA_DIGEST_EXTENSIONS = {".yml", ".yaml", ".json", ".toml", ".csv"}
 
   # Compute a content digest of the `data/` directory for cache invalidation.
   #
@@ -709,7 +919,7 @@ module Hwaro::Core::Build::Phases::Initialize
   # cache, while any real edit, add, or rename changes the digest and triggers
   # the existing "config change invalidates all entries" path. Returns "" when
   # there is no `data/` directory.
-  private def compute_data_hash : String
+  private def compute_disk_data_hash : String
     return "" unless Dir.exists?("data") || Dir.exists?("i18n")
 
     paths = [] of String
@@ -717,9 +927,12 @@ module Hwaro::Core::Build::Phases::Initialize
     # feed templates — an i18n edit must invalidate cached pages too, or
     # `build --cache` ships stale translations while `serve` (which watches
     # i18n/) rebuilds correctly.
-    Dir.glob("data/**/*.{yml,yaml,json,toml}", "i18n/**/*.{yml,yaml,json,toml}") do |path|
-      next if File.directory?(path)
-      paths << path
+    Dir.glob("data/**/*", "i18n/**/*") do |path|
+      next unless DATA_DIGEST_EXTENSIONS.includes?(File.extname(path).downcase)
+      # Regular files only: a FIFO would block `File.read` below forever.
+      # `readable_file?` is not used because the loaders warn about the same
+      # dangling links, and this digest runs only under `--cache`.
+      paths << path if (File.info?(path).try(&.file?) rescue false)
     end
     return "" if paths.empty?
 
@@ -727,8 +940,16 @@ module Hwaro::Core::Build::Phases::Initialize
     paths.sort!.each do |path|
       # Length-prefixed (see DigestUtils) so adjacent path/content pairs
       # can't collide across boundaries.
+      # An unreadable file is skipped with a warning by the data and i18n
+      # loaders; leave it out of the digest the same way instead of aborting
+      # `build --cache`. It re-enters the digest once it becomes readable.
+      content = begin
+        File.read(path)
+      rescue IO::Error
+        next
+      end
       Utils::DigestUtils.update_length_prefixed(digest, path)
-      Utils::DigestUtils.update_length_prefixed(digest, File.read(path))
+      Utils::DigestUtils.update_length_prefixed(digest, content)
     end
     digest.final.hexstring
   end
@@ -741,97 +962,117 @@ module Hwaro::Core::Build::Phases::Initialize
   # sibling file share the same stem (e.g. `data/users.yml` alongside
   # `data/users/`), the directory wins and a warning is emitted for the
   # shadowed file.
-  private def load_data_files(site : Models::Site)
+  private def load_data_files(site : Models::Site, config : Models::Config, serve_mode : Bool = false)
     site.data.clear
+    @remote_data_digest = ""
 
-    return unless Dir.exists?("data")
-
-    root = DataTreeNode.new
-
-    # Process deeper paths first so directory namespaces are established
-    # before any same-stem root-level file can claim the key.
-    entries = [] of {Array(String), String, String}
-    Dir.glob("data/**/*.{yml,yaml,json,toml}") do |path|
-      next if File.directory?(path)
-      rel = Path[path].relative_to("data")
-      parts = rel.parts
-      stem = Path[parts.last].stem
-      dir_parts = parts[0...-1]
-      entries << {dir_parts, stem, path}
-    end
-    entries.sort_by! { |(dir_parts, _, _)| -dir_parts.size }
-
-    entries.each do |(dir_parts, stem, path)|
-      value = parse_data_file(path)
-      next unless value
-
-      node = root
-      dir_parts.each do |segment|
-        node = node.children[segment] ||= DataTreeNode.new
-      end
-
-      existing = node.children[stem]?
-      if existing && !existing.children.empty?
-        Logger.warn "Data file '#{path}' is shadowed by directory 'data/#{(dir_parts + [stem]).join('/')}/'; directory takes precedence."
-        next
-      end
-
-      leaf = existing || DataTreeNode.new
-      if prior = leaf.source_path
-        Logger.warn "Duplicate data key for 'site.data.#{(dir_parts + [stem]).join('.')}': '#{path}' overwrites '#{prior}'."
-      end
-      leaf.value = value
-      leaf.source_path = path
-      node.children[stem] = leaf
-      Logger.debug "Loaded data file: #{path} as site.data.#{(dir_parts + [stem]).join('.')}"
-    end
+    # Disk walk + precedence rules live in DataDisk (shared with tool
+    # callers); everything remote/serve/digest-shaped stays below.
+    root = DataDisk.load_tree
 
     root.children.each do |key, child|
-      site.data[key] = data_tree_to_crinja(child)
+      site.data[key] = DataDisk.tree_to_crinja(child)
     end
+
+    load_remote_data(site, config, root, serve_mode)
   end
 
-  private def data_tree_to_crinja(node : DataTreeNode) : Crinja::Value
-    if node.children.empty?
-      node.value || Crinja::Value.new(nil)
-    else
-      # Invariant: depth-first processing + directory-wins collision
-      # handling means a node with children must never also carry a
-      # leaf value — the leaf would have been rejected with a warning.
-      # Guard here so a future change to the sort or conflict rules
-      # fails loudly instead of silently dropping data.
-      if source = node.source_path
-        raise "load_data_files invariant broken: node at '#{source}' has both leaf value and children"
-      end
-      converted = {} of String => Crinja::Value
-      node.children.each do |k, child|
-        converted[k] = data_tree_to_crinja(child)
-      end
-      Crinja::Value.new(converted)
-    end
+  # `[git]`: one `git log` over content/ per full build. Reset first so a
+  # serve session whose config toggled the feature off never keeps serving
+  # the previous map.
+  private def collect_git_info(config : Models::Config)
+    @git_info = nil
+    return unless config.git.enabled
+    @git_info = GitInfo.collect
   end
 
-  private def parse_data_file(path : String) : Crinja::Value?
-    ext = File.extname(path).downcase
-    # JSON and TOML both reject a leading BOM outright, so a data file saved
-    # by a Windows editor would warn-and-skip and leave `site.data.<key>`
-    # undefined — which then fails the whole render.
-    content = Utils::TextUtils.strip_bom(File.read(path))
-    case ext
-    when ".yml", ".yaml"
-      Utils::CrinjaUtils.from_yaml(YAML.parse(content))
-    when ".json"
-      Utils::CrinjaUtils.from_json(JSON.parse(content))
-    when ".toml"
-      Utils::CrinjaUtils.from_toml(TOML.parse(content))
+  # `[[data.remote]]` sources, fetched once per build AFTER the disk tree is
+  # assembled so a key collision can name the exact disk source it clashes
+  # with. A collision is a hard config error rather than a precedence rule —
+  # silently preferring either side would make `site.data.<key>` depend on
+  # network state. Collisions are checked for every entry before the first
+  # fetch so the error never costs a network round-trip.
+  private def load_remote_data(site : Models::Site, config : Models::Config, root : DataTreeNode,
+                               serve_mode : Bool = false)
+    entries = config.data_remote
+    return if entries.empty?
+
+    entries.each do |entry|
+      next unless node = root.children[entry.key]?
+      disk_source = node.source_path || "data/#{entry.key}/"
+      raise Hwaro::HwaroError.new(
+        code: Hwaro::Errors::HWARO_E_CONFIG,
+        message: "site.data.#{entry.key} has two sources: '#{disk_source}' on disk and [[data.remote]] \"#{entry.key}\" (#{RemoteData.sanitized_url(entry.url)}).",
+        hint: "Rename the [[data.remote]] key or the data/ file — each site.data key must have exactly one source.",
+      )
     end
-  rescue ex
-    # This rescue also covers read errors and value-conversion failures, not
-    # just parse errors, so it must not assert the file is malformed — it once
-    # blamed the author for a "parse error" on a TOML file that parsed
-    # perfectly. Name the consequence instead: the key disappears from
-    # site.data, and templates dereferencing it then fail the whole render.
-    Logger.warn "Skipping data file #{path} (site.data entry dropped): #{ex.message}"
-    nil
+
+    live_memo_keys = Set({String, String}).new if serve_mode
+    digest = Digest::MD5.new
+    entries.each do |entry|
+      memo_key = {entry.key, RemoteData.request_digest(entry)}
+      live_memo_keys.try(&.add(memo_key))
+      result = serve_mode ? load_remote_entry_for_serve(entry, memo_key) : RemoteData.load(entry)
+      Utils::DigestUtils.update_length_prefixed(digest, entry.key)
+      if result
+        site.data[entry.key] = result.value
+        Utils::DigestUtils.update_length_prefixed(digest, result.body)
+      else
+        # warn-and-skip left the key unset: fold the absence too, so a
+        # payload that disappears invalidates cached pages the same way an
+        # edit does.
+        Utils::DigestUtils.update_length_prefixed(digest, "<skipped>")
+      end
+    end
+    # Drop payloads for entries the user has since edited or deleted — a long
+    # serve session must not accumulate every url it ever pointed at.
+    live_memo_keys.try { |live| @remote_data_memo.select! { |k, _| live.includes?(k) } }
+    @remote_data_digest = digest.final.hexstring
+  end
+
+  # Serve-only wrapper around `RemoteData.load`, tuned for the dev loop
+  # rather than for a deployable build:
+  #
+  # - An entry with no TTL is fetched ONCE per session. Without a `cache`
+  #   duration `hwaro build` refetches every time, which is right for a
+  #   one-shot build and wrong for a server that rebuilds on every save.
+  # - An entry with a TTL reuses the memo while the TTL is fresh, so the
+  #   session honors the configured freshness without re-reading the disk
+  #   cache each rebuild.
+  # - A refetch FAILURE with a memo in hand warns and reuses it, whatever
+  #   `on_error` says. `on_error` is a policy for a build that has to be
+  #   correct or fail; a serve session that already has the payload should
+  #   keep the editor working when the wifi drops, not stop rebuilding.
+  private def load_remote_entry_for_serve(entry : Models::RemoteDataConfig,
+                                          memo_key : {String, String}) : RemoteData::Result?
+    # Before the memo is even consulted: an unresolved `${VAR}` is a config
+    # error, and no cached payload makes it not one.
+    RemoteData.require_resolved_env_vars!(entry)
+
+    memoed = @remote_data_memo[memo_key]?
+    if memoed
+      ttl = entry.cache_ttl
+      if ttl.nil? || (Time.utc - memoed[1]) < ttl
+        Logger.debug "Remote data site.data.#{entry.key}: reusing this serve session's payload; skipping fetch"
+        return memoed[0]
+      end
+    end
+
+    result = begin
+      RemoteData.load(entry)
+    rescue ex : Hwaro::HwaroError
+      # Only a fetch/parse failure is softened. A config error (a disk/remote
+      # key collision, an unresolved variable) still fails the rebuild.
+      raise ex unless memoed && ex.code == Hwaro::Errors::HWARO_E_NETWORK
+      Logger.warn "Remote data site.data.#{entry.key} (#{RemoteData.sanitized_url(entry.url)}): #{ex.message} — reusing this serve session's last payload so the rebuild can finish."
+      return memoed[0]
+    end
+
+    # nil means the fetch failed under on_error = "warn-and-skip", which has
+    # already warned; the memo is still the better answer for a dev loop.
+    return memoed.try(&.[0]) unless result
+
+    @remote_data_memo[memo_key] = {result, Time.utc}
+    result
   end
 end

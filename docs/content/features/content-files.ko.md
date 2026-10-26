@@ -47,6 +47,18 @@ content/
 
 파일은 대응하는 출력 경로로 그대로 복사되며, `content/` 접두사는 자동으로 제거됩니다.
 
+### 게시되지 않는 번들
+
+게시되지 않는 페이지의 페이지 번들 안에 있는 파일도 복사되지 않습니다. 초안(`--drafts`로 빌드하지 않은 경우), 날짜가 미래인 페이지(`--include-future` 없이), 만료된 페이지(`--include-expired` 없이)가 해당합니다. 위 예시에서 `blog/my-post/index.md`에 `draft = true`를 설정하면 `diagram.svg`와 `screenshot.png`도 게시되지 않습니다. 게시되지 않는 번들 안에 중첩된, 게시되는 번들은 자신의 파일을 그대로 게시합니다.
+
+### JSON과 XML 파일
+
+`content/` 아래의 `.json`과 `.xml` 파일은 `allow_extensions`에 없어도 원본 파일로 게시됩니다(`--minify` 시 축소). 다만 아래의 차단 규칙(`disallow_extensions`, `disallow_paths`)과 위의 게시되지 않는 번들 규칙은 그대로 적용됩니다.
+
+### 출력 경로 충돌
+
+콘텐츠 파일은 페이지나 생성된 파일을 덮어쓰지 않습니다. 렌더링된 페이지(`content/about.md` 옆의 `content/about/index.html`), 별칭 리다이렉트, 피드, 사이트맵, `robots.txt` 등 생성된 파일과 같은 출력 경로에 놓이게 되면 생성된 출력이 유지되고, 빌드는 `Not publishing content/…` 경고를 출력합니다. `static/`의 파일도 같은 규칙을 따릅니다.
+
 ## 확장자 매칭
 
 ### 허용 목록
@@ -87,7 +99,7 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 | `**/_*` | 밑줄로 시작하는 모든 파일 |
 | `private/**` | `content/private/` 아래 모든 파일 |
 
-경로는 `content/` 디렉터리 기준 상대 경로로 매칭됩니다.
+경로는 `content/` 디렉터리 기준 상대 경로로 매칭됩니다. 거부 규칙(`disallow_extensions`, `disallow_paths`)은 `allow_extensions` 설정 여부와 관계없이 페이지 번들 안의 파일에도 적용됩니다.
 
 ## 콘텐츠 파일 참조
 
@@ -125,11 +137,11 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 | 경로 필터링 | ✅ 지원 (`disallow_paths`) | ✅ 지원 (`[static]` `exclude`) |
 | 적합한 용도 | 페이지별 에셋 | 사이트 전역 에셋 |
 
-특정 페이지에 속한 에셋(스크린샷, 다이어그램, 첨부 파일)에는 **콘텐츠 파일**을, 사이트 전역 에셋(CSS, JS, 로고, 파비콘)에는 **정적 파일**을 사용합니다. 불필요한 파일이나 특정 경로를 제외하는 방법은 [설정](/ko/start/config/)의 `[static]` 섹션을 참고하면 됩니다.
+특정 페이지에 속한 에셋(스크린샷, 다이어그램, 첨부 파일)에는 **콘텐츠 파일**을, 사이트 전역 에셋(CSS, JS, 로고, 파비콘)에는 **정적 파일**을 사용합니다. 불필요한 파일이나 특정 경로를 제외하는 방법은 [설정](/ko/start/config/#정적-파일)의 `[static]` 섹션을 참고하면 됩니다.
 
 ## 팁
 
-- **페이지 번들**: 구성을 깔끔하게 유지하려면 [페이지 번들](/ko/writing/pages/)을 사용합니다 — `index.md`와 그 에셋을 한 디렉터리에 함께 둡니다.
+- **페이지 번들**: 구성을 깔끔하게 유지하려면 [페이지 번들](/ko/writing/pages/#에셋-코로케이션)을 사용합니다. `index.md`와 그 에셋을 한 디렉터리에 함께 둡니다.
 - **이미지 포맷**: 일반적인 웹 이미지 포맷을 포함합니다: `["jpg", "jpeg", "png", "gif", "svg", "webp"]`.
 - **보안**: `disallow_paths`로 소스 파일이나 초안이 게시되지 않게 막습니다.
 - **최소한만 허용**: 실제로 필요한 확장자만 허용합니다. 대용량 소스 파일이 실수로 게시되는 일을 막을 수 있습니다.
@@ -137,6 +149,6 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 ## 함께 보기
 
 - [이미지 처리](/ko/features/image-processing/) — 자동 이미지 리사이즈
-- [페이지](/ko/writing/pages/) — 페이지 번들과 에셋 배치
-- [섹션](/ko/writing/sections/) — 섹션 에셋
+- [페이지](/ko/writing/pages/#에셋-코로케이션) — 페이지 번들과 에셋 배치
+- [섹션](/ko/writing/sections/#에셋-코로케이션) — 섹션 에셋
 - [설정](/ko/start/config/) — 전체 설정 레퍼런스

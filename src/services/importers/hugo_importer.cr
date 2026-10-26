@@ -1,3 +1,4 @@
+require "json"
 require "yaml"
 require "toml"
 require "./base"
@@ -6,6 +7,13 @@ module Hwaro
   module Services
     module Importers
       class HugoImporter < Base
+        # Source bundle directory → output section it was written under, so
+        # every translation of a bundle lands in the same directory.
+        @bundle_sections = Hash(String, String).new
+
+        # Source directories whose co-located assets were already copied.
+        @copied_asset_dirs = Set(String).new
+
         def run(options : Config::Options::ImportOptions) : ImportResult
           hugo_path = options.path
           output_dir = options.output_dir
@@ -14,6 +22,8 @@ module Hwaro
           force = options.force
 
           reset_written_paths
+          @bundle_sections.clear
+          @copied_asset_dirs.clear
 
           content_dir = File.join(hugo_path, "content")
 
@@ -24,44 +34,21 @@ module Hwaro
             )
           end
 
-          imported = 0
-          skipped = 0
-          errors = 0
-          wrapped = 0
-
-          scan_markdown_files(content_dir).each do |file_path|
-            result = process_file(file_path, content_dir, output_dir, include_drafts, verbose, force)
-            case result
-            when :imported
-              imported += 1
-            when :imported_wrapped
-              imported += 1
-              wrapped += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error processing #{file_path}: #{ex.message}"
+          import_each(scan_markdown_files(content_dir, hugo_path), "Hugo", wrapped_note: "contained Hugo shortcodes. Imports kept the raw syntax — each will render as literal text until you hand-convert them.") do |file_path|
+            process_file(file_path, content_dir, output_dir, include_drafts, verbose, force)
           end
-
-          if wrapped > 0
-            Logger.warn "#{wrapped} file(s) contained Hugo shortcodes. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
-          end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Imported #{imported} items, skipped #{skipped}, errors #{errors}",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors
-          )
         end
 
-        private def scan_markdown_files(content_dir : String) : Array(String)
-          walk_files(content_dir)
+        protected def import_error_message(item : String, ex : Exception) : String
+          "Error processing #{item}: #{ex.message}"
+        end
+
+        protected def summary_message(engine : String, imported : Int32, skipped : Int32, errors : Int32) : String
+          "Imported #{imported} items, skipped #{skipped}, errors #{errors}"
+        end
+
+        private def scan_markdown_files(content_dir : String, source_root : String) : Array(String)
+          walk_files(content_dir, source_root: source_root)
         end
 
         private def process_file(
@@ -74,6 +61,9 @@ module Hwaro
         ) : Symbol
           raw = read_text(file_path)
           fm_data, body = extract_frontmatter(raw)
+          source_data = fm_data
+          fm_data = fm_data.try { |data| downcase_keys(data) }
+          local_keys = toml_local_datetime_keys(raw)
 
           # Check draft status (only if frontmatter exists)
           is_draft = fm_data.try { |d| d["draft"]?.try { |v| truthy?(v) } } || false
@@ -100,16 +90,19 @@ module Hwaro
             end
 
             # date (falling back to Hugo's publishDate so a page dated only
-            # via publishDate doesn't lose its date entirely)
-            if date_str = string_value(data, "date") || string_value(data, "publishDate")
-              parsed = parse_date(date_str)
-              fields["date"] = format_date(parsed) if parsed
+            # via publishDate doesn't lose its date entirely). Hugo withholds
+            # a page until its publishDate; hwaro withholds a future `date`,
+            # so a post scheduled with a future publishDate (and a past date)
+            # takes publishDate as its date — keeping `date` published it
+            # immediately.
+            date_key = time_value(data, "publishdate").try { |t| t > Time.utc } ? "publishdate" : "date"
+            if date = date_string(data, date_key, local_keys) || date_string(data, "publishdate", local_keys)
+              fields["date"] = date
             end
 
             # updated (from lastmod)
-            if lastmod_str = string_value(data, "lastmod")
-              parsed = parse_date(lastmod_str)
-              fields["updated"] = format_date(parsed) if parsed
+            if updated = date_string(data, "lastmod", local_keys)
+              fields["updated"] = updated
             end
 
             # draft
@@ -149,9 +142,15 @@ module Hwaro
             # and every imported page loses its ordering.
             if weight_val = data["weight"]?
               case weight_raw = weight_val.raw
-              when Int64   then fields["weight"] = weight_raw
-              when Float64 then fields["weight"] = weight_raw.to_i64
-              when String  then fields["weight"] = weight_raw.to_i64?
+              when Int64 then fields["weight"] = weight_raw
+              when Float64
+                # Guard the conversion: 1e300 / Infinity / NaN would raise
+                # OverflowError out of `to_i64` and error the whole file.
+                # An absurd weight is ignored instead.
+                if weight_raw.finite? && weight_raw.in?(-9.0e18..9.0e18)
+                  fields["weight"] = weight_raw.to_i64
+                end
+              when String then fields["weight"] = weight_raw.to_i64?
               end
             end
 
@@ -162,29 +161,71 @@ module Hwaro
             aliases = array_string_value(data, "aliases")
             fields["aliases"] = aliases unless aliases.empty?
 
+            # Hugo's `url` sets the page's whole published path; dropping it
+            # moved the page and broke every link to it.
+            apply_source_url(fields, string_value(data, "url"), file_path)
+
             # image (from images[0] or featured_image)
             image = extract_image(data)
             fields["image"] = image if image
 
             # expires (from expiryDate)
-            if expires_str = string_value(data, "expiryDate")
-              parsed = parse_date(expires_str)
-              fields["expires"] = format_date(parsed) if parsed
+            if expires = date_string(data, "expirydate", local_keys)
+              fields["expires"] = expires
+            end
+
+            # A Hugo page with no output — `headless = true`, or `build` /
+            # `_build` with `render = "never"`/`"link"` (`false` in older
+            # Hugo) — is hwaro's `render = false`; carried into [extra] only,
+            # the page was published. `sitemap.disable = true` is
+            # `in_sitemap = false`. The inverse of `tool export hugo`.
+            build_render = (data["build"]? || data["_build"]?).try(&.as_h?).try(&.["render"]?).try(&.raw)
+            if data["headless"]?.try(&.raw) == true || build_render.in?("never", "link", false)
+              fields["render"] = false
+            end
+            if data["sitemap"]?.try(&.as_h?).try(&.["disable"]?).try(&.raw) == true
+              fields["in_sitemap"] = false
+            end
+
+            # Hugo's `layout` picks the page template, hwaro's `template` —
+            # the Jekyll importer's mapping. An authored `template` wins.
+            if (layout = string_value(data, "layout")) && !data.has_key?("template")
+              fields["template"] = layout
             end
           end
 
           frontmatter = generate_frontmatter(fields)
+          frontmatter = append_frontmatter(frontmatter, carried_fields(source_data, fields)) if source_data
 
           # Determine section and filename
           section, filename = section_from_path(file_path, content_dir, "")
 
-          # Determine slug for the file
-          if filename == "_index.md" || filename == "_index.markdown"
-            file_slug = "_index"
+          # Determine slug for the file. A translation carries its language in
+          # the filename (`about.ko.md`, `index.ko.md`) and hwaro reads it from
+          # there alone, so every branch below works on the name WITHOUT the
+          # suffix and puts it back on whatever filename it settles on.
+          name = filename.sub(/\.(md|markdown)$/, "")
+          base_name, lang = split_language_suffix(name)
+          lang_suffix = lang ? ".#{lang}" : ""
+          leaf_bundle = !section.empty? && base_name == "index"
+          if base_name == "_index"
+            file_slug = "_index#{lang_suffix}"
+          elsif leaf_bundle
+            # A leaf bundle's `slug` renames the bundle's URL segment
+            # (`posts/trip/index.md` + `slug = "my-trip"` → /posts/my-trip/).
+            # Writing it as `posts/trip/my-trip.md` published the page at
+            # /posts/trip/my-trip/, away from its copied resources, so every
+            # relative image in it broke. Keep the bundle shape instead.
+            #
+            # All translations of a bundle share its directory, so the first
+            # file of the bundle to be processed decides it for the rest.
+            bundle_dir = File.dirname(file_path)
+            section = (@bundle_sections[bundle_dir] ||= bundle_section(file_path, section, slug_val, lang, content_dir, output_dir))
+            file_slug = "index#{lang_suffix}"
           elsif slug_val && !slug_val.empty?
-            file_slug = slug_val
+            file_slug = "#{slug_val}#{lang_suffix}"
           else
-            file_slug = filename.sub(/\.(md|markdown)$/, "")
+            file_slug = name
           end
 
           body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
@@ -205,12 +246,124 @@ module Hwaro
           # `section` must be non-empty: a bare `content/index.md` is the site
           # root, not a bundle, and sweeping the whole content root's loose
           # files into the output is not what the author asked for.
-          if dest_path && !section.empty? && (filename == "index.md" || filename == "index.markdown")
+          #
+          # A branch bundle (`docs/_index.md`) publishes its sibling files the
+          # same way, and every translation of a bundle sits in one directory,
+          # so the directory is copied once per run.
+          if dest_path && (leaf_bundle || (base_name == "_index" && !section.empty?)) && @copied_asset_dirs.add?(File.dirname(file_path))
             copy_bundle_assets(File.dirname(file_path), File.dirname(dest_path), output_dir, verbose, force)
           end
 
           return :skipped unless written
           has_shortcodes ? :imported_wrapped : :imported
+        end
+
+        # `name` (a filename without `.md`) split into its base and the language
+        # code of a translation suffix: `about.ko` → {"about", "ko"}. Hugo's
+        # languages are declared in a site config this importer does not read,
+        # so the shape decides: two or three letters with optional region
+        # subtags (`ko`, `zh-tw`). `release.notes` is not a translation.
+        # ponytail: `setup.mac.md` with a front matter slug reads as language
+        # "mac"; parse the site's declared languages if that ever bites.
+        private def split_language_suffix(name : String) : {String, String?}
+          if match = /\A(.+)\.([A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*)\z/.match(name)
+            {match[1], match[2]}
+          else
+            {name, nil}
+          end
+        end
+
+        # The output directory (relative to the content root) of the bundle
+        # `file_path` belongs to. Its front matter `slug` renames the
+        # directory, but a translation follows the bundle's default-language
+        # `index.md`, which is the page that names the bundle.
+        private def bundle_section(file_path : String, section : String, own_slug : String?, lang : String?, content_dir : String, output_dir : String) : String
+          slug_val = own_slug
+          if lang
+            dir = File.dirname(file_path)
+            {"index.md", "index.markdown"}.each do |default_name|
+              default_path = File.join(dir, default_name)
+              next unless File.file?(default_path)
+              data, _ = extract_frontmatter(read_text(default_path))
+              slug_val = data.try { |d| string_value(downcase_keys(d), "slug") }
+              break
+            end
+          end
+          return section if slug_val.nil? || slug_val.empty?
+
+          parent = File.dirname(section)
+          target = parent == "." ? slug_val : File.join(parent, slug_val)
+          # The slugged directory may already be another bundle — a
+          # sibling source directory, or a bundle this run already moved
+          # there. Merging into it would write `index-1.md` beside the
+          # other bundle's resources, so this page keeps its own
+          # directory (and its own URL) instead.
+          target_index = resolve_content_path(output_dir, target, "index")
+          if target != section &&
+             (Dir.exists?(File.join(content_dir, target)) || (target_index && destination_claimed?(target_index)))
+            Logger.warn "#{file_path}: slug #{slug_val.inspect} names an existing bundle (#{target}/); keeping the bundle at #{section}/."
+            section
+          else
+            target
+          end
+        end
+
+        # Keys `process_file` maps explicitly (lowercase).
+        MAPPED_KEYS = Set{
+          "title", "date", "publishdate", "lastmod", "draft", "description",
+          "summary", "tags", "categories", "authors", "series", "weight", "slug",
+          "aliases", "url", "images", "featured_image", "expirydate", "layout",
+        }
+
+        # The front matter `process_file` does not map: CARRIED_KEYS as-is,
+        # and every other key — Hugo page params, top-level or under
+        # `[params]` — into `[extra]`, where hwaro templates read custom
+        # fields. A `[extra]` table (from `tool export hugo`) merges in last.
+        # A key the mapping already filled goes to `[extra]` too. These were
+        # all silently dropped.
+        private def carried_fields(source : Hash(String, TOML::Any), mapped : Hash(String, FieldValue)) : Hash(String, YAML::Any)
+          carried = {} of String => YAML::Any
+          extra = {} of YAML::Any => YAML::Any
+          params = nil
+          own_extra = nil
+          source.each do |key, value|
+            lower = key.downcase
+            # The spelling `downcase_keys` kept wins, as for mapped keys.
+            next if key != lower && source.has_key?(lower)
+            next if MAPPED_KEYS.includes?(lower)
+            case lower
+            when "params" then params = value.as_h?
+            when "extra"  then own_extra = value.as_h?
+            end
+            next if (lower == "params" && params) || (lower == "extra" && own_extra)
+
+            converted = Hwaro::Utils::FrontmatterWriter.toml_to_yaml_any(value)
+            if Base::CARRIED_KEYS.includes?(lower) && !mapped.has_key?(lower)
+              carried[lower] = converted
+            else
+              extra[YAML::Any.new(key)] = converted
+            end
+          end
+          {params, own_extra}.each do |table|
+            table.try &.each { |key, value| extra[YAML::Any.new(key)] = Hwaro::Utils::FrontmatterWriter.toml_to_yaml_any(value) }
+          end
+          carried["extra"] = YAML::Any.new(extra) unless extra.empty?
+          carried
+        end
+
+        # Hugo front matter keys are case-insensitive (`Title`, `Draft`,
+        # `publishDate`/`publishdate` all work), and sites migrated from
+        # other generators often capitalise them. Exact-case lookups dropped
+        # every such field, and a `Draft = true` page was imported as
+        # published. Lookups use the lowercase key; when a file spells a key
+        # twice, the all-lowercase spelling wins.
+        private def downcase_keys(data : Hash(String, TOML::Any)) : Hash(String, TOML::Any)
+          result = {} of String => TOML::Any
+          data.each do |key, value|
+            lower = key.downcase
+            result[lower] = value if key == lower || !data.has_key?(lower)
+          end
+          result
         end
 
         # Regex for TOML frontmatter: +++ on first line, +++ on its own line.
@@ -226,6 +379,22 @@ module Hwaro
                 data = TOML.parse(toml_str)
                 return {data, body}
               rescue TOML::ParseException
+                return {nil, raw}
+              end
+            end
+          elsif raw.starts_with?("{")
+            # Hugo also reads JSON front matter: a JSON object at the top of
+            # the file. Unrecognised, it landed in the imported body verbatim
+            # and the page lost its title, date, tags and draft flag.
+            if end_idx = Utils::FrontmatterScanner.find_json_end(raw)
+              begin
+                if h = JSON.parse(raw.byte_slice(0, end_idx)).as_h?
+                  data = {} of String => TOML::Any
+                  h.each { |k, v| data[k] = json_any_to_toml_any(v) }
+                  return {data, raw.byte_slice(end_idx).lstrip('\n').lstrip("\r\n")}
+                end
+              rescue ex : JSON::ParseException
+                Logger.debug "JSON front matter parse failed: #{ex.message}"
                 return {nil, raw}
               end
             end
@@ -262,6 +431,23 @@ module Hwaro
 
         # `depth` guards a cyclic YAML::Any (self-referencing anchor); see
         # `Utils::Nesting`.
+        private def json_any_to_toml_any(value : JSON::Any, depth : Int32 = 0) : TOML::Any
+          Utils::Nesting.check!(depth)
+          case raw = value.raw
+          when String, Int64, Float64, Bool
+            TOML::Any.new(raw)
+          when Array
+            TOML::Any.new(raw.map { |item| json_any_to_toml_any(item, depth + 1) })
+          when Hash
+            hash = {} of String => TOML::Any
+            raw.each { |k, v| hash[k] = json_any_to_toml_any(v, depth + 1) }
+            TOML::Any.new(hash)
+          else
+            # null, like YAML's `~` in yaml_any_to_toml_any.
+            TOML::Any.new("")
+          end
+        end
+
         private def yaml_any_to_toml_any(value : YAML::Any, depth : Int32 = 0) : TOML::Any
           Utils::Nesting.check!(depth)
           raw = value.raw
@@ -303,12 +489,67 @@ module Hwaro
             when String
               return raw.empty? ? nil : raw
             when Time
-              return raw.to_s("%Y-%m-%dT%H:%M:%S%:z")
+              return Utils::FrontmatterWriter.serialize_time(raw)
             when Int64, Float64
               return raw.to_s
             end
           end
           nil
+        end
+
+        # A date-valued field, rendered for hwaro's front matter, or nil.
+        #
+        # A parsed TOML/YAML time is used as is: rendering it to an offset
+        # string first turned a bare TOML date (`date = 2024-05-02`, a local
+        # date) into a timestamp pinned to the importing machine's zone
+        # (`2024-05-02T00:00:00+09:00`).
+        #
+        # A TOML local date-time (`date = 2024-05-02T10:00:00`, no offset)
+        # is lexed in the machine's zone too, and its offset is not in the
+        # source — writing one pinned the importing machine's zone into the
+        # file. Whether a value was local can't be told from the parsed Time
+        # (on a UTC machine it looks exactly like `…Z`), so `local_keys`
+        # comes from the source text (`toml_local_datetime_keys`); those
+        # values are written zone-less, which hwaro reads as local time just
+        # as Hugo does.
+        private def date_string(data : Hash(String, TOML::Any), key : String, local_keys : Set(String)) : String?
+          return unless time = time_value(data, key)
+          if local_keys.includes?(key)
+            time.to_s(time.nanosecond == 0 ? "%Y-%m-%dT%H:%M:%S" : "%Y-%m-%dT%H:%M:%S.%N")
+          else
+            format_date(time)
+          end
+        end
+
+        # A top-level TOML key assigned a local date-time: date and time,
+        # no `Z` or offset (optionally followed by a comment).
+        LOCAL_DATETIME_LINE_RE = /\A[ \t]*([A-Za-z0-9_-]+)[ \t]*=[ \t]*\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?[ \t]*(?:#.*)?\z/
+
+        # The (lowercased) top-level keys of a TOML front matter block whose
+        # value is a local date-time. Empty for YAML/JSON front matter: JSON
+        # dates are strings, and a zone-less YAML timestamp parses in the local
+        # zone, which `serialize_time` already writes zone-less.
+        private def toml_local_datetime_keys(raw : String) : Set(String)
+          keys = Set(String).new
+          return keys unless raw.starts_with?("+++") && (match = TOML_FM_REGEX.match(raw))
+          match[1].each_line do |line|
+            # Keys after the first `[table]` header aren't top-level fields.
+            break if line.lstrip.starts_with?('[')
+            if m = LOCAL_DATETIME_LINE_RE.match(line)
+              keys << m[1].downcase
+            end
+          end
+          keys
+        end
+
+        private def time_value(data : Hash(String, TOML::Any), key : String) : Time?
+          return unless val = data[key]?
+          case raw = val.raw
+          when Time
+            raw
+          when String
+            Utils::DateUtils.parse_import(raw) unless raw.empty?
+          end
         end
 
         private def array_string_value(data : Hash(String, TOML::Any), key : String) : Array(String)

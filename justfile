@@ -17,10 +17,15 @@ build:
     shards install
     shards build
 
-# Update shards.nix.
+# Update packaging/nix/shards.nix. Run this whenever shard.lock changes — the
+# Nix build resolves dependencies offline from it, and CI gates on the two
+# agreeing. `nix develop` pins crystal2nix via flake.lock so the output matches
+# what CI regenerates. crystal2nix takes no output path and always writes
+# ./shards.nix, so the file is moved into place afterwards.
 [group('build')]
 nix-update:
-    nix-shell -p crystal2nix --run crystal2nix
+    nix develop --command crystal2nix
+    mv shards.nix packaging/nix/shards.nix
 
 # Clean build artifacts.
 [group('build')]
@@ -28,6 +33,7 @@ clean:
     rm -f src/ext/stb_impl.o
     rm -rf bin/
     rm -rf lib/
+    rm -rf "${TMPDIR:-/tmp}/hwaro-spec-cache"
 
 # Serve docs site with the built binary.
 [group('documents')]
@@ -35,32 +41,133 @@ dev:
     @[ -f bin/hwaro ] || just build
     bin/hwaro serve -i docs
 
+# ameba 1.7 ships no executable, and a cached bin/ameba is much faster than
+# recompiling lib/ameba/src/cli.cr on every run.
+#
+# Build the ameba linter binary.
+[group('development')]
+ameba:
+    @[ -x bin/ameba ] || { [ -d lib/ameba ] || shards install; mkdir -p bin; crystal build lib/ameba/src/cli.cr -o bin/ameba --release; }
+
 # Auto-format code and fix lint issues.
 [group('development')]
-fix:
+fix: ameba
     crystal tool format
-    lib/ameba/bin/ameba.cr --fix
+    bin/ameba --fix
 
 # Check code format and lint without changes.
 [group('development')]
-check:
+check: ameba
     crystal tool format --check
-    lib/ameba/bin/ameba.cr
+    bin/ameba
 
+# Linux only: `-rdynamic` exports every symbol, and GNU ld reads the `@file:line`
+# Crystal puts in closure names as a symbol VERSION, one per closure. The spec
+# binary passed ld's 32767-version limit (33k) and died at load with "symbol
+# lookup error ... version <garbage>"; nothing needs its dynamic exports.
+spec_link_flags := if os() == "linux" { "--link-flags=-Wl,--no-export-dynamic" } else { "" }
+
+# Always ONE `crystal spec` process per cache dir: two concurrent runs sharing
+# ~/.cache/crystal clobber each other's spec binary (see AGENTS.md).
+#
 # Run all tests.
 [group('development')]
 test:
-    crystal spec
+    crystal spec {{ spec_link_flags }}
+
+# Per-target compiler caches for the two recipes below.
+#
+# They used to `mktemp -d` a fresh directory per invocation, which bought
+# isolation at the price of a fully cold compile every time: nothing was reused,
+# including the two `macro run` sub-compilations (baked_file_system's loader via
+# tartrazine, ecr's processor via HTTP::StaticFileHandler) that alone cost ~8s.
+# Keying the directory on the target instead keeps every bit of that isolation --
+# `crystal spec` names its binary after the spec ROOT, not the file passed to it,
+# so two targets sharing one cache dir would still clobber each other's binary --
+# while letting a re-run of the same target reuse the last one (measured: 10.9s
+# -> 5.5s on a single spec file). `just clean` removes them.
+#
+# The `:line` suffix is stripped because it selects examples at run time and
+# compiles the identical program; it must not fork a second cache.
+
+#     just test-file spec/unit/models/config_spec.cr
+#     just test-file spec/unit/models/config_spec.cr:42
+#
+# Run one spec file (or file:line) in its own compiler cache, safe alongside `just test`.
+[group('development')]
+test-file TARGET:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _warn-stale-binary
+    target="{{ TARGET }}"
+    export CRYSTAL_CACHE_DIR="${CRYSTAL_CACHE_DIR:-${TMPDIR:-/tmp}/hwaro-spec-cache/$(printf '%s' "${target%%:*}" | tr -c 'A-Za-z0-9' '-')}"
+    mkdir -p "$CRYSTAL_CACHE_DIR"
+    crystal spec {{ spec_link_flags }} "$target"
+
+#     just test-dir spec/unit/assets/sass
+#
+# Run every spec under a directory (same isolation as test-file).
+[group('development')]
+test-dir DIR:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _warn-stale-binary
+    dir="{{ DIR }}"
+    export CRYSTAL_CACHE_DIR="${CRYSTAL_CACHE_DIR:-${TMPDIR:-/tmp}/hwaro-spec-cache/$(printf '%s' "$dir" | tr -c 'A-Za-z0-9' '-')}"
+    mkdir -p "$CRYSTAL_CACHE_DIR"
+    crystal spec {{ spec_link_flags }} "$dir"
+
+# Functional specs spawn bin/hwaro: a stale binary makes them test old code.
+[private]
+_warn-stale-binary:
+    #!/usr/bin/env bash
+    if [ ! -x bin/hwaro ]; then
+        echo "note: bin/hwaro is not built — functional specs that spawn it will be skipped (run: shards build)" >&2
+    elif [ -n "$(find src -newer bin/hwaro -name '*.cr' -print -quit)" ]; then
+        echo "warning: bin/hwaro is older than src/ — functional specs will run the OLD binary (run: shards build)" >&2
+    fi
+
+#     just baseline            # → ../hwaro-baseline/bin/hwaro
+#     just baseline v0.20.1    # any ref
+#
+# Build a baseline hwaro binary from a ref (default main) in ../hwaro-baseline for byte-identity checks.
+[group('development')]
+baseline REF="main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$(dirname "$PWD")/hwaro-baseline"
+    if [ -d "$dir" ]; then
+        git -C "$dir" checkout --detach "{{ REF }}"
+    else
+        git worktree add --detach "$dir" "{{ REF }}"
+    fi
+    [ -e "$dir/lib" ] || ln -s "$PWD/lib" "$dir/lib"
+    (cd "$dir" && shards build)
+    echo "baseline: $dir/bin/hwaro"
+
+#     just verify
+#     just verify --serve --deploy
+#
+# Byte-identity gate: diff -r everything the baseline and current binaries produce (args → script).
+[group('development')]
+verify *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base="${HWARO_BASELINE_BIN:-$(dirname "$PWD")/hwaro-baseline/bin/hwaro}"
+    [ -x "$base" ] || { echo "no baseline binary at $base — run: just baseline" >&2; exit 1; }
+    shards build
+    scripts/check_no_toplevel_effects.sh
+    scripts/verify_byte_identity.sh "$base" bin/hwaro {{ ARGS }}
 
 # Check version consistency across all files.
 [group('development')]
 version-check:
     crystal run scripts/version_check.cr
 
-# Update version across all files.
+# Update version across all files (`just vu 1.2.3`, or prompt without one).
 [group('development')]
-version-update:
-    crystal run scripts/version_update.cr
+version-update *VERSION:
+    crystal run scripts/version_update.cr -- {{ VERSION }}
 
 # Test known external hwaro-powered sites ("friends") to prevent regressions.
 # This ensures that changes to hwaro don't accidentally break real user sites.

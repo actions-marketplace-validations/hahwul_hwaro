@@ -1,3 +1,4 @@
+require "html"
 require "xml"
 require "../../utils/logger"
 require "../../content/processors/inline_markdown"
@@ -18,37 +19,106 @@ module Hwaro
         # Longest anchor TEXT the link conversion will match. Bounding the lazy
         # body is what actually makes an unclosed-anchor document linear — see
         # the anchor pass below. Far above any real inline link.
+        #
+        # The bound is needed exactly where a pass's tail carries MORE THAN
+        # ONE closing literal (the anchor pass: `["'][^>]*>` then `</a>`;
+        # the pre+code pass: `</code>` then `</pre>`). A failed attempt then
+        # rescans between the literals from every opening tag — measured
+        # O(n^2), minutes of CPU inside the 4 MB cap. Passes whose tail is a
+        # SINGLE closing literal (`(.*?)</p>` and friends) are deliberately
+        # left open: PCRE2 satisfies those in linear time (the required-
+        # literal scan is memoized across bump-along attempts), and bounding
+        # them defeats that optimization — measured ~200x SLOWER on
+        # unclosed-tag spam with a `{0,n}?` body than with `(.*?)`.
         MAX_INLINE_BODY_CHARS = 4096
 
+        # Longest <pre><code> body the fenced-code pass will match — the
+        # bounded-lazy-body treatment for the one other multi-literal-tail
+        # pass (see MAX_INLINE_BODY_CHARS above), sized up because real code
+        # samples run far longer than inline spans. 65535 is PCRE2's {n,m}
+        # quantifier ceiling. An over-long body keeps its text: the plain
+        # `<pre>` pass right after has a single-literal tail and no bound.
+        MAX_CODE_BODY_CHARS = 65_535
+
+        # Innermost-list matcher (see the list pass below). The body is
+        # consumed in CHUNKS — possessive runs of non-`<` plus single `<`
+        # guarded against opening a nested list — rather than the previous
+        # per-character `(?:(?!<[uo]l[^>]*>).)*?`: PCRE2's JIT pushes a
+        # backtrack frame per lazy iteration onto a fixed-size JIT stack,
+        # and per-character iteration crashed the whole conversion with
+        # "JIT stack limit reached" on list bodies only a few thousand
+        # characters long. Chunking makes the frame count scale with the
+        # number of tags instead of characters; the language matched is
+        # identical (only `<` could ever start a nested-list open, and a
+        # match can only ever end before the `<` of the closing tag, which
+        # is always a chunk boundary). A `{0,n}` bound is no alternative —
+        # PCRE2 unrolls bounded GROUP repeats and the pattern blows the
+        # compile-size limit. A tag-spam body can still overflow the JIT
+        # stack, which raises Regex::Error — `convert` catches that and
+        # falls back to the linear tag strip.
+        INNERMOST_LIST_RE = /<(ul|ol)([^>]*)>((?:[^<]++|<(?![uo]l[^>]*>))*?)<\/\1>/mi
+
+        # Maximum innermost-list conversion passes (one per nesting level).
+        # Real content nests a handful of levels; a crafted thousand-deep
+        # nest costs a full-document gsub per level, so cap it — deeper
+        # levels fall through to `strip_tags`, which keeps their text.
+        MAX_LIST_PASSES = 64
+
         # Cheap short-circuit for the anchor pass: a document with no closing
-        # anchor tag has no link to convert. Exposed so the skip is assertable
-        # without a wall-clock measurement.
+        # anchor tag has no link to convert.
         ANCHOR_CLOSE_RE = /<\/a>/i
         ANCHOR_RE       = Regex.new(
           "<a[^>]*\\bhref=[\"']([^\"']+)[\"'][^>]*>(.{0,#{MAX_INLINE_BODY_CHARS}}?)</a>",
           Regex::Options::IGNORE_CASE | Regex::Options::MULTILINE
         )
 
-        # True when `convert` will run the (bounded) anchor conversion pass on
-        # this document.
-        def self.anchor_pass_applicable?(html : String) : Bool
-          html.matches?(ANCHOR_CLOSE_RE)
-        end
-
         def self.convert(html : String) : String
           return "" if html.empty?
 
           if html.bytesize > MAX_REGEX_HTML_BYTES
             Logger.warn "HTML content is very large (#{html.bytesize} bytes); converting as plain text to avoid excessive processing time."
-            return html.gsub(/<[^>]*>/, " ").gsub(/[ \t]+/, " ").strip
+            return strip_to_text(html)
           end
 
+          convert_via_regexes(html)
+        rescue Regex::Error
+          # Belt and suspenders: pathological markup can still error inside
+          # PCRE2 (e.g. "JIT stack limit reached") despite the bounded
+          # passes. Fall back to the same linear tag strip as the size cap
+          # rather than dropping the whole item.
+          Logger.warn "HTML content is too complex to convert; converting as plain text."
+          strip_to_text(html)
+        end
+
+        # The plain-text fallback shared by the size cap and the
+        # Regex::Error rescue in `convert`: linear tag strip, no Markdown.
+        private def self.strip_to_text(html : String) : String
+          html.gsub(/<[^>]*>/, " ").gsub(/[ \t]+/, " ").strip
+        end
+
+        private def self.convert_via_regexes(html : String) : String
           result = html
 
           # Normalize line endings
           result = result.gsub("\r\n", "\n")
 
-          # Convert block elements first (order matters)
+          # Script and style elements are not content: drop them with their
+          # bodies. `strip_tags` alone kept the CSS/JS text, and a literal `<`
+          # inside a script made its tag regex swallow the real text after it.
+          # One pass per tag, so each has a single closing literal (linear).
+          result = result.gsub(/<script\b[^>]*>.*?<\/script\s*>/mi, "")
+          result = result.gsub(/<style\b[^>]*>.*?<\/style\s*>/mi, "")
+
+          # Prose is escaped while tags still delimit it, so the Markdown the
+          # passes below generate is never touched.
+          result = escape_prose(result)
+
+          # Convert block elements first (order matters).
+          #
+          # Lazy-body policy: a pass whose tail is a single closing literal
+          # keeps an open `(.*?)` body — linear under PCRE2, and bounding it
+          # is a measured ~200x regression. A pass with a multi-literal tail
+          # is bounded. See the MAX_INLINE_BODY_CHARS comment.
 
           # Headings
           (1..6).each do |level|
@@ -62,23 +132,90 @@ module Hwaro
           # decode) would otherwise run INSIDE the code sample, converting or
           # stripping the HTML it demonstrates and double-decoding entities.
           code_stash = [] of String
-          result = result.gsub(/<pre[^>]*>\s*<code[^>]*>(.*?)<\/code>\s*<\/pre>/mi) do
-            code = decode_html_entities($1)
-            code_stash << "```\n#{code.strip}\n```\n\n"
+          # Indices of the stash entries that are inline code spans (the rest
+          # are fenced blocks), for the table pass's pipe escaping.
+          inline_code = Set(Int32).new
+
+          # Embeds (YouTube iframes, <video>, <audio>) have no Markdown form
+          # and were stripped without a trace. Hwaro passes raw HTML through,
+          # so keep them — but rebuilt from the validated `src` alone, never
+          # the original attributes, so an untrusted export cannot smuggle
+          # event handlers or a `javascript:` source into the page.
+          {"iframe", "video", "audio"}.each do |tag|
+            result = result.gsub(/<#{tag}\b([^>]*)>(.*?)<\/#{tag}\s*>/mi) do
+              embed = rebuild_embed(tag, $1, $2)
+              next "" unless embed
+              code_stash << "#{embed}\n\n"
+              code_placeholder(code_stash.size - 1)
+            end
+          end
+          result = result.gsub(/<pre([^>]*)>\s*<code([^>]*)>(.{0,#{MAX_CODE_BODY_CHARS}}?)<\/code>\s*<\/pre>/mi) do
+            pre_attrs, code_attrs, body = $1, $2, $3
+            lang = code_language(code_attrs) || code_language(pre_attrs)
+            code = decode_html_entities(body)
+            code_stash << "```#{lang}\n#{code.strip}\n```\n\n"
             code_placeholder(code_stash.size - 1)
           end
-          result = result.gsub(/<pre[^>]*>(.*?)<\/pre>/mi) do
-            code = decode_html_entities($1)
-            code_stash << "```\n#{code.strip}\n```\n\n"
+          result = result.gsub(/<pre([^>]*)>(.*?)<\/pre>/mi) do
+            # A <pre><code> body longer than MAX_CODE_BODY_CHARS falls through
+            # to this pass with its <code> wrapper still attached — strip it
+            # here (both tags have single-literal tails, so this stays linear).
+            pre_attrs, inner = $1, $2
+            code_attrs = inner[/\A\s*<code([^>]*)>/mi, 1]?
+            body = inner.sub(/\A\s*<code[^>]*>/mi, "").sub(/<\/code>\s*\z/mi, "")
+            lang = code_attrs.try { |a| code_language(a) } || code_language(pre_attrs)
+            code = decode_html_entities(body)
+            code_stash << "```#{lang}\n#{code.strip}\n```\n\n"
             code_placeholder(code_stash.size - 1)
           end
 
-          # Blockquotes
+          # Inline code is stashed too, for the same reason: its text is
+          # literal, so it is entity-decoded exactly once here and must not
+          # be touched by the prose escaping in `decode_prose_entities`
+          # (Markdown shows `&lt;` inside a code span verbatim).
+          result = result.gsub(/<code\b[^>]*>(.*?)<\/code>/mi) do
+            code_stash << "`#{decode_html_entities(strip_tags($1))}`"
+            inline_code << code_stash.size - 1
+            code_placeholder(code_stash.size - 1)
+          end
+
+          # WordPress's "Read more" tag (`<!--more-->`, optionally with custom
+          # link text) is the post's excerpt separator. hwaro reads the same
+          # marker as `<!-- more -->`, so keep it instead of letting
+          # `strip_tags` delete it with every other comment. Only that tag:
+          # an author's `<!-- more of the same -->` is just a comment.
+          result = result.gsub(MORE_TAG_RE, MORE_PLACEHOLDER)
+
+          # `[caption]` shortcode (classic-editor images): unwrap it, putting
+          # the caption text in its own paragraph under the image. Left as
+          # is, the shortcode rendered as literal `[caption id=…]` text.
+          # Pre-3.4 exports carry the text in a `caption="…"` attribute instead.
+          result = result.gsub(/\[caption\b([^\]]*)\](.*?)\[\/caption\]/mi) do
+            attrs = $1
+            inner = $2.strip
+            if m = inner.match(/\A((?:<a\b[^>]*>\s*)?<img\b[^>]*>(?:\s*<\/a>)?)\s*(.*)\z/mi)
+              caption = m[2].strip
+              caption = attrs.match(/\bcaption=["']([^"']*)["']/i).try(&.[1].strip) || "" if caption.empty?
+              caption.empty? ? "#{m[1]}\n\n" : "#{m[1]}\n\n#{caption}\n\n"
+            else
+              "#{inner}\n\n"
+            end
+          end
+
+          # Blockquotes. Paragraph boundaries inside the quote (and a
+          # Gutenberg `<cite>`) become quoted blank lines — deleting the
+          # `<p>` tags outright glued every paragraph into one run-on line.
           result = result.gsub(/<blockquote[^>]*>(.*?)<\/blockquote>/mi) do
+            # An excerpt marker can't split a quote (nor, below, a list
+            # item or a table cell) without breaking it apart; drop it there.
             inner = $1.strip
-            # Strip inner <p> tags
-            inner = inner.gsub(/<\/?p[^>]*>/i, "")
-            lines = inner.split("\n").map { |l| "> #{l.strip}" }
+              .gsub(MORE_PLACEHOLDER, "")
+              .gsub(/<\/p\s*>/i, "\n\n")
+              .gsub(/<p\b[^>]*>/i, "")
+              .gsub(/<cite\b[^>]*>/i, "\n\n")
+              .strip
+              .gsub(/\n[ \t]*(?:\n[ \t]*)+/, "\n\n")
+            lines = inner.split("\n").map { |l| l.strip.empty? ? ">" : "> #{l.strip}" }
             lines.join("\n") + "\n\n"
           end
 
@@ -91,14 +228,23 @@ module Hwaro
           # so without those two things `<li>b<ul><li>b1</li></ul></li>`
           # collapsed to the single line `- b- b1` (and `2. second1. s1` for
           # ordered lists), which renders as literal text.
-          innermost_list = /<(ul|ol)[^>]*>((?:(?!<[uo]l[^>]*>).)*?)<\/\1>/mi
-          while result.matches?(innermost_list)
+          innermost_list = INNERMOST_LIST_RE
+          passes = 0
+          while (passes += 1) <= MAX_LIST_PASSES && result.matches?(innermost_list)
             result = result.gsub(innermost_list) do
-              kind = $1.downcase
-              items = $2.scan(/<li[^>]*>(.*?)<\/li>/mi)
+              kind, list_attrs, list_body = $1.downcase, $2, $3
+              # `<ol start="3">` continues an earlier list; numbering it from
+              # 1 changed what the reader sees. CommonMark takes the first
+              # item's number as the start (at most 9 digits, never negative).
+              start = attr_value(list_attrs, "start").try(&.strip.to_i?).try(&.clamp(0, 999_999_999)) || 1
+              items = list_body.scan(/<li[^>]*>(.*?)<\/li>/mi)
               lines = items.map_with_index do |m, i|
-                marker = kind == "ol" ? "#{i + 1}. " : "- "
-                "#{marker}#{indent_continuation(strip_tags(m[1]).strip, marker.size)}"
+                marker = kind == "ol" ? "#{start + i}. " : "- "
+                # Inline markup first: a bare `strip_tags` here ran before
+                # the document-wide inline passes, so every link, image and
+                # emphasis inside a list item was flattened to plain text.
+                item = strip_tags(convert_inline(m[1])).gsub(MORE_PLACEHOLDER, "").strip
+                "#{marker}#{indent_continuation(item, marker.size)}"
               end
               "\n" + lines.join("\n") + "\n\n"
             end
@@ -114,7 +260,16 @@ module Hwaro
             inner = $1
             rows = inner.scan(/<tr[^>]*>(.*?)<\/tr>/mi).map do |m|
               m[1].scan(/<(?:th|td)[^>]*>(.*?)<\/(?:th|td)>/mi).map do |cell|
-                strip_tags(cell[1]).strip.gsub(/\s+/, " ").gsub("|", "\\|")
+                # Same as list items: convert inline markup before stripping.
+                text = strip_tags(convert_inline(cell[1])).gsub(MORE_PLACEHOLDER, "").strip.gsub(/\s+/, " ").gsub("|", "\\|")
+                # A stashed code span sits in the cell as a placeholder, so
+                # its pipes have to be escaped in the stash itself. Only a
+                # span's: in a fenced block `\|` is literal text.
+                text.scan(CODE_PLACEHOLDER_RE) do |pm|
+                  idx = pm[1].to_i
+                  code_stash[idx] = code_stash[idx].gsub("|", "\\|") if inline_code.includes?(idx)
+                end
+                text
               end
             end
             rows.reject!(&.empty?)
@@ -140,12 +295,37 @@ module Hwaro
           result = result.gsub(/<hr\b[^>]*>/i, "\n---\n\n")
 
           # Paragraphs
-          result = result.gsub(/<p[^>]*>(.*?)<\/p>/mi) { "#{$1.strip}\n\n" }
+          result = result.gsub(/<p[^>]*>(.*?)<\/p>/mi) { "#{escape_block_start($1.strip)}\n\n" }
 
           # Line breaks
           result = result.gsub(/<br\b[^>]*>/i, "  \n")
 
           # Inline elements
+          result = convert_inline(result)
+
+          # Strip remaining HTML tags
+          result = strip_tags(result)
+
+          # Decode HTML entities
+          result = decode_prose_entities(result)
+
+          # Restore stashed code (already entity-decoded exactly once) and
+          # the excerpt marker.
+          code_stash.each_with_index do |block, i|
+            result = result.sub(code_placeholder(i), block)
+          end
+          result = result.gsub(MORE_PLACEHOLDER, "\n\n<!-- more -->\n\n")
+
+          # Clean up whitespace
+          result = result.gsub(/\n{3,}/, "\n\n") # Max 2 consecutive newlines
+          result.strip
+        end
+
+        # The inline passes (images, links, emphasis, strikethrough). Run on
+        # the whole document and, before their own `strip_tags`, on list
+        # items and table cells.
+        private def self.convert_inline(html : String) : String
+          result = html
 
           # Images (before links to avoid nested match issues).
           # Drop the URL (keep the alt text) when the scheme is unsafe so an
@@ -184,31 +364,131 @@ module Hwaro
           end
 
           # Bold
-          result = result.gsub(/<(?:strong|b)>(.*?)<\/(?:strong|b)>/mi) { "**#{$1}**" }
+          result = result.gsub(/<(?:strong|b)>(.*?)<\/(?:strong|b)>/mi) { emphasize($1, "**") }
 
           # Italic
-          result = result.gsub(/<(?:em|i)>(.*?)<\/(?:em|i)>/mi) { "*#{$1}*" }
-
-          # Inline code
-          result = result.gsub(/<code>(.*?)<\/code>/mi) { "`#{$1}`" }
+          result = result.gsub(/<(?:em|i)>(.*?)<\/(?:em|i)>/mi) { emphasize($1, "*") }
 
           # Strikethrough
-          result = result.gsub(/<(?:del|s|strike)>(.*?)<\/(?:del|s|strike)>/mi) { "~~#{$1}~~" }
+          result = result.gsub(/<(?:del|s|strike)>(.*?)<\/(?:del|s|strike)>/mi) { emphasize($1, "~~") }
 
-          # Strip remaining HTML tags
-          result = strip_tags(result)
+          result
+        end
 
-          # Decode HTML entities
-          result = decode_html_entities(result)
+        # Wrap `inner` in an emphasis delimiter, moving its edge whitespace
+        # outside: WordPress's visual editor routinely leaves the space
+        # inside the tag (`<strong>bold </strong>text`), and `**bold **text`
+        # is not emphasis in Markdown — the asterisks render literally.
+        # A no-break space (`&nbsp;`, `&#160;`, U+00A0) counts as edge
+        # whitespace too — the editor inserts it just as often.
+        private def self.emphasize(inner : String, delim : String) : String
+          lead = inner[EDGE_SPACE_LEAD_RE]? || ""
+          rest = inner[lead.size..]
+          trail = rest[EDGE_SPACE_TRAIL_RE]? || ""
+          core = rest[0, rest.size - trail.size]
+          return inner if core.empty?
+          "#{lead}#{delim}#{core}#{delim}#{trail}"
+        end
 
-          # Restore stashed code fences (already entity-decoded exactly once).
-          code_stash.each_with_index do |block, i|
-            result = result.sub(code_placeholder(i), block)
+        EDGE_SPACE          = "(?:\\s|\\x{A0}|&nbsp;|&#0*160;|&#x0*a0;)"
+        EDGE_SPACE_LEAD_RE  = Regex.new("\\A#{EDGE_SPACE}+", Regex::Options::IGNORE_CASE)
+        EDGE_SPACE_TRAIL_RE = Regex.new("#{EDGE_SPACE}+\\z", Regex::Options::IGNORE_CASE)
+
+        # `<tag src="…">` for an embed, from its safe `src` (its own attribute,
+        # or a nested `<source>`), or nil when it has none or an unsafe one.
+        private def self.rebuild_embed(tag : String, attrs : String, inner : String) : String?
+          src = attr_value(attrs, "src") || inner[/<source\b[^>]*>/i]?.try { |source| attr_value(source, "src") }
+          return unless src
+          src = decode_html_entities(src)
+          return unless Hwaro::Content::Processors::InlineMarkdown.safe_url?(src)
+          extra = tag == "iframe" ? " allowfullscreen" : " controls"
+          dims = ["width", "height"].compact_map do |name|
+            value = attr_value(attrs, name)
+            %( #{name}="#{value}") if value && value.matches?(/\A\d+%?\z/)
+          end.join
+          %(<#{tag} src="#{HTML.escape(src)}"#{dims}#{extra}></#{tag}>)
+        end
+
+        # Backslash-escape the characters Markdown reads as inline markup in
+        # the prose of `html`: text outside tags and outside `<pre>`/`<code>`
+        # elements (which become code, where a backslash is literal). A post
+        # saying `2*3*4 = 24` imported as `2<em>3</em>4`. `_` is escaped only
+        # where it could delimit emphasis, so `snake_case` stays readable.
+        #
+        # A byte scan rather than a regex: every search starts where the last
+        # ended, and a closer once found missing is never searched for again,
+        # so unclosed-tag spam stays linear.
+        private def self.escape_prose(html : String) : String
+          lower = html.downcase(Unicode::CaseOptions::ASCII)
+          missing = Set(String).new
+          String.build(html.bytesize) do |io|
+            pos = 0
+            while pos < html.bytesize
+              lt = lower.byte_index('<'.ord.to_u8, pos)
+              gt = lt.try { |i| lower.byte_index('>'.ord.to_u8, i) }
+              unless lt && gt
+                escape_prose_text(html.byte_slice(pos), io)
+                break
+              end
+              escape_prose_text(html.byte_slice(pos, lt - pos), io)
+              stop = gt + 1
+              name = {"pre", "code"}.find do |tag|
+                lower.byte_slice(lt + 1, tag.bytesize) == tag &&
+                  !lower.byte_at?(lt + 1 + tag.bytesize).try(&.unsafe_chr.ascii_alphanumeric?)
+              end
+              if name && !missing.includes?(name)
+                close = lower.byte_index("</#{name}", stop).try { |i| lower.byte_index('>'.ord.to_u8, i) }
+                close ? (stop = close + 1) : missing << name
+              end
+              io << html.byte_slice(lt, stop - lt)
+              pos = stop
+            end
           end
+        end
 
-          # Clean up whitespace
-          result = result.gsub(/\n{3,}/, "\n\n") # Max 2 consecutive newlines
-          result.strip
+        private def self.escape_prose_text(text : String, io : IO) : Nil
+          prev = ' '
+          reader = Char::Reader.new(text)
+          while reader.has_next?
+            char = reader.current_char
+            nxt = reader.peek_next_char
+            case char
+            when '*', '`'
+              io << '\\'
+            when '\\'
+              # Before punctuation it would escape it, and at the end of the
+              # text it would escape the markup generated next.
+              io << '\\' if nxt == '\0' || (nxt.ord.in?(33..126) && !nxt.ascii_alphanumeric?)
+            when '_'
+              io << '\\' unless prev.alphanumeric? && nxt.alphanumeric?
+            end
+            io << char
+            prev = char
+            reader.next_char
+          end
+        end
+
+        # A paragraph opening with what Markdown reads as a block marker
+        # (`- `, `+ `, `# `, `> `, `2024. `) is escaped so it stays a
+        # paragraph instead of turning into a list, heading or quote.
+        private def self.escape_block_start(text : String) : String
+          text
+            .sub(/\A([-+>]|\#{1,6})(?=[ \t]|\z)/) { "\\#{$1}" }
+            .sub(/\A&gt;(?=[ \t]|\z)/) { "\\>" }
+            .sub(/\A(\d{1,9})([.)])(?=[ \t]|\z)/) { "#{$1}\\#{$2}" }
+        end
+
+        # The fence info string for a code block: the `language-ruby` /
+        # `lang-ruby` class highlighters (Prism, highlight.js, Gutenberg
+        # code-block plugins) put on `<code>` or `<pre>`. Dropping it left
+        # every imported sample unhighlighted.
+        private def self.code_language(attrs : String) : String?
+          attr_value(attrs, "class").try(&.[/(?<![\w-])lang(?:uage)?-([\w+#.-]+)/i, 1]?)
+        end
+
+        private def self.attr_value(attrs : String, name : String) : String?
+          match = attrs.match(/(?<![\w-])#{name}\s*=\s*(?:"([^"]*)"|'([^']*)')/i)
+          match && (match[1]? || match[2]?)
         end
 
         # NUL-delimited placeholder: survives every regex pass (no `<>`, no
@@ -216,6 +496,30 @@ module Hwaro
         private def self.code_placeholder(index : Int32) : String
           "\u0000hwaro-code-#{index}\u0000"
         end
+
+        CODE_PLACEHOLDER_RE = /\x{0}hwaro-code-(\d+)\x{0}/
+        MORE_PLACEHOLDER    = "\u0000hwaro-more\u0000"
+        MORE_TAG_RE         = /<!--more(?:\s.*?)?-->|<!--\s*more\s*-->/mi
+
+        # Entity-decode prose for Markdown. Decoding is what makes the output
+        # readable, but a decoded `&lt;script&gt;` — text the author wrote to
+        # be SHOWN — turned into a live `<script>` tag that swallowed the
+        # rest of the page. Re-escape exactly the characters Markdown would
+        # read as markup: a `<` that could open an HTML tag, comment or
+        # declaration, and an `&amp;` whose decoded `&` would start an entity
+        # reference (`&amp;copy;` is the literal text "&copy;"). Named
+        # entities this decoder doesn't know stay encoded; Markdown decodes
+        # those itself.
+        private def self.decode_prose_entities(text : String) : String
+          decode_html_entities(text.gsub(/#{AMP_ENTITY}(?=#?[A-Za-z0-9]+;)/i, AMP_PLACEHOLDER))
+            .gsub(/<(?=[A-Za-z\/!?])/, "&lt;")
+            .gsub(AMP_PLACEHOLDER, "&amp;")
+        end
+
+        AMP_PLACEHOLDER = "\u0000hwaro-amp\u0000"
+
+        # Every spelling of an encoded `&`: WordPress writes `&#038;` often.
+        AMP_ENTITY = /&(?:amp|#0*38|#x0*26);/i
 
         private def self.strip_tags(html : String) : String
           html.gsub(/<[^>]*>/, "")
@@ -264,8 +568,11 @@ module Hwaro
               # import. The range check below already rejects it, but to_i
               # would raise before we ever get there.
               code = $1.to_i?
-              # Validate Unicode range (exclude surrogates 0xD800..0xDFFF)
-              if code && code > 0 && code <= 0x10FFFF && !(0xD800 <= code <= 0xDFFF)
+              # Validate Unicode range (exclude surrogates 0xD800..0xDFFF).
+              # An encoded `&` (38) is left for the final AMP_ENTITY pass.
+              if code == 38
+                $~[0]
+              elsif code && code > 0 && code <= 0x10FFFF && !(0xD800 <= code <= 0xDFFF)
                 code.chr.to_s
               else
                 ""
@@ -273,16 +580,18 @@ module Hwaro
             end
             .gsub(/&#[xX]([0-9a-fA-F]+);/) do
               code = $1.to_i?(16)
-              if code && code > 0 && code <= 0x10FFFF && !(0xD800 <= code <= 0xDFFF)
+              if code == 0x26
+                $~[0]
+              elsif code && code > 0 && code <= 0x10FFFF && !(0xD800 <= code <= 0xDFFF)
                 code.chr.to_s
               else
                 ""
               end
             end
-            .gsub("&amp;", "&")
-          # `&amp;` LAST: decoding it first turned `&amp;lt;` (a literal
-          # "&lt;" in the source text) into a real `<` — the classic
-          # double-unescape.
+            .gsub(AMP_ENTITY, "&")
+          # An encoded `&` (`&amp;`, `&#038;`, `&#x26;`) LAST: decoding it
+          # first turned `&amp;lt;` (a literal "&lt;" in the source text)
+          # into a real `<` — the classic double-unescape.
         end
       end
     end

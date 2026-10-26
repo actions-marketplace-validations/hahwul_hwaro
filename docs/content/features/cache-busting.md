@@ -9,7 +9,7 @@ Cache busting automatically appends a `?v=<hash>` query parameter to locally ser
 
 ## How It Works
 
-Hwaro computes an MD5 content hash of your local CSS/JS files and appends the first 8 characters as a query parameter. The hash only changes when file contents actually change, so browsers keep using their cache until a real update occurs.
+Hwaro computes one MD5 content hash over all of your local CSS/JS files and appends the first 8 characters as a query parameter. The hash only changes when file contents actually change, so browsers keep using their cache until a real update occurs.
 
 ```html
 <!-- With cache busting (default) -->
@@ -27,7 +27,7 @@ Hwaro computes an MD5 content hash of your local CSS/JS files and appends the fi
 
 Hwaro uses a **content-based hash** rather than a build timestamp. This means:
 
-- The hash stays the same across builds if files haven't changed — no unnecessary cache invalidation
+- The hash stays the same across builds if files haven't changed, so there is no unnecessary cache invalidation
 - The hash changes immediately when any CSS/JS file content is modified
 - Different build machines produce the same hash for identical files
 
@@ -55,6 +55,7 @@ Cache busting applies to the following template variables:
 | `auto_includes_css` | Auto-included CSS files |
 | `auto_includes_js` | Auto-included JS files |
 | `auto_includes` | Combined auto-included CSS + JS |
+| `search_tags` | Built-in search UI CSS + JS (`[search] ui = true`; versioned by the bundled files' own hash) |
 
 ## Disabling Cache Busting
 

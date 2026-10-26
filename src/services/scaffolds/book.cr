@@ -18,7 +18,7 @@ module Hwaro
           "Book-style structure with chapters, prev/next navigation, and keyboard shortcuts"
         end
 
-        protected def config_title : String
+        def config_title : String
           "My Book"
         end
 
@@ -55,11 +55,11 @@ module Hwaro
         # book-container so `footer.html`'s closing tags match the
         # body's open tags.
         #
-        # Taxonomy templates are not shipped by default because the book
-        # config no longer enables `[[taxonomies]]` (book scaffolds are
-        # ordered chapter-style and don't use tags). They're still emitted
-        # if the user opts in via `--include-taxonomies` (skip_taxonomies
-        # = false is the default; the flag flips this to true).
+        # Taxonomy templates are never shipped: the book config enables no
+        # `[[taxonomies]]` (book scaffolds are ordered chapter-style and
+        # don't use tags — see `ships_taxonomies?`), so the templates would
+        # be dead files. Users who want taxonomies can copy them from the
+        # simple/blog scaffolds along with a `[[taxonomies]]` block.
         def template_files(skip_taxonomies : Bool = false) : Hash(String, String)
           {
             "header.html"               => header_template,
@@ -80,44 +80,22 @@ module Hwaro
         # template from being emitted as dead chrome (it's also dropped
         # from `template_files`). Users who want taxonomies can copy from
         # the simple/blog scaffolds.
-        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
-          config = String.build do |str|
-            str << base_config(config_title, config_description)
-            str << multilingual_config(multilingual_languages)
-            str << plugins_config
-            str << content_files_config
-            str << highlight_config
-            str << og_config
-            str << search_config
-            str << pagination_config
-            str << series_config
-            str << related_config
-            str << sitemap_config
-            str << robots_config
-            str << llms_config
-            str << feeds_config(feed_sections)
-            str << permalinks_config
-            str << auto_includes_config
-            str << assets_config
-            str << markdown_config
-            str << content_new_config
-            str << image_processing_config
-            str << build_hooks_config
-            str << pwa_config
-            str << amp_config
-            str << og_auto_image_config
-            str << doctor_config
-            str << deployment_config
-          end
-          config
-        end
-
         # `book` ships no `[[taxonomies]]` block, so emit `[related]` as a
         # commented placeholder rather than the default enabled snippet
         # (which references `tags`, triggering a doctor warning out of the
         # box). Users who add taxonomies can uncomment it.
         protected def related_config : String
           ConfigSnippets.related(commented: true)
+        end
+
+        # No `[[taxonomies]]` anywhere in book's config — the DEFAULT
+        # (balanced/minimal) path previously still emitted the block via
+        # `minimal_taxonomies_toml`, contradicting the full-config opt-out
+        # above. This hook also keeps multilingual `[languages.<code>]`
+        # blocks from carrying dead per-language `taxonomies = [...]`
+        # lists (see `Base`).
+        protected def ships_taxonomies? : Bool
+          false
         end
 
         # Book header — `page.title` and `page.description` are guarded
@@ -139,6 +117,7 @@ module Hwaro
               {{ jsonld }}
               {{ hreflang_tags }}
               {{ pagination_seo_links }}
+              {{ pwa_tags }}
               #{styles}
               {# The syntax theme is inlined in css/style.css, so no highlight theme
                  stylesheet link is emitted here (sub-path safe). Highlight.js itself
@@ -182,7 +161,7 @@ module Hwaro
             MD
         end
 
-        # The stylesheet opens with the shared ember `:root` prelude (see
+        # The stylesheet opens with the shared flare `:root` prelude (see
         # DesignTokens): every color token carries both schemes, so this
         # one sheet serves light and dark — the theme switcher pins one
         # side via `data-theme`. Book's geometry (header
@@ -258,6 +237,11 @@ module Hwaro
               justify-content: flex-end;
               gap: var(--space-1);
             }
+
+            .lang-switcher { display: flex; gap: 0.25rem; margin-right: var(--space-1); font-size: var(--step--1); }
+            .lang-switcher a { color: var(--text-muted); text-decoration: none; padding: 0.15rem 0.4rem; border-radius: var(--radius-sm); }
+            .lang-switcher a:hover { color: var(--text); background: var(--bg-subtle); }
+            .lang-switcher a[aria-current="true"] { color: var(--text); font-weight: 600; }
 
             /* ── Icon Button (shared by toggle, search, fullscreen) ── */
             .icon-btn {
@@ -520,7 +504,7 @@ module Hwaro
               left: 0;
               bottom: 0;
               width: 2.75rem;
-              height: 3px;
+              height: 4px;
               border-radius: 999px;
               background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
             }
@@ -1128,28 +1112,7 @@ module Hwaro
                page, driven entirely by CSS scroll-driven animation. Browsers
                without animation-timeline (and reduced-motion readers) simply
                never see it. */
-            .reading-progress { display: none; }
-            @supports (animation-timeline: scroll()) {
-              @media (prefers-reduced-motion: no-preference) {
-                .reading-progress {
-                  display: block;
-                  position: fixed;
-                  top: 0;
-                  left: 0;
-                  right: 0;
-                  height: 2px;
-                  z-index: 110;
-                  transform-origin: 0 50%;
-                  background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
-                  animation: reading-progress linear both;
-                  animation-timeline: scroll(root);
-                }
-                @keyframes reading-progress {
-                  from { transform: scaleX(0); }
-                  to { transform: scaleX(1); }
-                }
-              }
-            }
+            #{reading_progress_css}
 
             @media (prefers-reduced-motion: reduce) {
               *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
@@ -1158,8 +1121,13 @@ module Hwaro
             CSS
         end
 
+        # book.js = keyboard navigation + active-chapter highlight, then the
+        # shared search overlay (`Base#search_js_body`), then fullscreen — one
+        # script, one IIFE. The search section used to be a verbatim copy.
         private def book_js_content : String
-          <<-'JS'
+          # Raw heredoc on purpose: the `\/` in the path regexes below must reach
+          # the browser byte-for-byte (an unescaped heredoc turns `\/` into `/`).
+          head = <<-'JS' # ameba:disable Style/HeredocEscape
             (function () {
               // ── Keyboard Navigation (← →) ──
               var prevLink = document.querySelector('.book-nav-arrow--prev');
@@ -1171,6 +1139,9 @@ module Hwaro
                 if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
                 if (e.target.isContentEditable) return;
                 if (document.querySelector('.search-overlay.active')) return;
+                // Alt+← is the browser's Back, Cmd+← / Shift+← / Ctrl+← move the
+                // caret or selection: never take those for chapter navigation.
+                if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
 
                 if (e.key === 'ArrowLeft' && prevLink) {
                   e.preventDefault();
@@ -1195,7 +1166,10 @@ module Hwaro
                   sidebar.classList.remove('open');
                 } else {
                   // On desktop: respect stored preference (default: collapsed)
-                  var stored = localStorage.getItem(SIDEBAR_KEY);
+                  // Storage can throw (blocked site data, sandboxed iframe);
+                  // an uncaught error here would abort the whole script.
+                  var stored = null;
+                  try { stored = localStorage.getItem(SIDEBAR_KEY); } catch (err) {}
                   if (stored === 'open') {
                     sidebar.classList.remove('collapsed');
                   } else {
@@ -1226,7 +1200,7 @@ module Hwaro
                     sidebar.classList.toggle('open');
                   } else {
                     var collapsed = sidebar.classList.toggle('collapsed');
-                    localStorage.setItem(SIDEBAR_KEY, collapsed ? 'collapsed' : 'open');
+                    try { localStorage.setItem(SIDEBAR_KEY, collapsed ? 'collapsed' : 'open'); } catch (err) {}
                   }
                   updatePrevArrowPosition();
                 });
@@ -1256,153 +1230,8 @@ module Hwaro
               }
 
               // ── Search ──
-              var searchData = null;
-              var activeIndex = -1;
-              var overlay = document.getElementById('searchOverlay');
-              var input = document.getElementById('searchInput');
-              var resultsEl = document.getElementById('searchResults');
-
-              function loadSearchData(cb) {
-                if (searchData) return cb(searchData);
-                var link = document.querySelector('link[rel="stylesheet"][href*="/css/"]');
-                var path = link ? new URL(link.href, document.baseURI).pathname : '/css/';
-                var searchUrl = path.substring(0, path.indexOf('/css/')) + '/search.json';
-                fetch(searchUrl)
-                  .then(function (r) { return r.json(); })
-                  .then(function (data) { searchData = data; cb(data); })
-                  .catch(function () { searchData = []; cb([]); });
-              }
-
-              window.openSearch = function () {
-                overlay.classList.add('active');
-                input.value = '';
-                resultsEl.innerHTML = '';
-                activeIndex = -1;
-                input.focus();
-                loadSearchData(function () {});
-              };
-
-              window.closeSearch = function () {
-                overlay.classList.remove('active');
-                activeIndex = -1;
-              };
-
-              document.addEventListener('keydown', function (e) {
-                if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-                  e.preventDefault();
-                  if (overlay.classList.contains('active')) {
-                    closeSearch();
-                  } else {
-                    openSearch();
-                  }
-                }
-                if (e.key === 'Escape' && overlay.classList.contains('active')) {
-                  closeSearch();
-                }
-              });
-
-              function escapeHtml(s) {
-                var d = document.createElement('div');
-                d.textContent = s;
-                return d.innerHTML;
-              }
-
-              function highlightMatch(text, query) {
-                if (!query) return escapeHtml(text);
-                var escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-                var re = new RegExp('(' + escaped + ')', 'gi');
-                return escapeHtml(text).replace(re, '<mark>$1</mark>');
-              }
-
-              function getSnippet(content, query) {
-                var lower = content.toLowerCase();
-                var idx = lower.indexOf(query.toLowerCase());
-                var start = Math.max(0, idx - 60);
-                var end = Math.min(content.length, idx + query.length + 100);
-                var snippet = content.substring(start, end).replace(/\\s+/g, ' ').trim();
-                if (start > 0) snippet = '...' + snippet;
-                if (end < content.length) snippet = snippet + '...';
-                return snippet;
-              }
-
-              function search(query) {
-                if (!searchData || !query.trim()) {
-                  resultsEl.innerHTML = '';
-                  activeIndex = -1;
-                  return;
-                }
-                var q = query.trim().toLowerCase();
-                var pageLang = document.documentElement.lang || '';
-                var results = [];
-                for (var i = 0; i < searchData.length; i++) {
-                  var item = searchData[i];
-                  if (pageLang && item.lang && item.lang !== pageLang) continue;
-                  var titleIdx = item.title.toLowerCase().indexOf(q);
-                  var contentIdx = item.content.toLowerCase().indexOf(q);
-                  if (titleIdx !== -1 || contentIdx !== -1) {
-                    var score = titleIdx !== -1 ? 100 - titleIdx : contentIdx;
-                    results.push({ item: item, score: score });
-                  }
-                }
-                results.sort(function (a, b) { return b.score - a.score; });
-                results = results.slice(0, 10);
-
-                if (results.length === 0) {
-                  resultsEl.innerHTML = '<div class="search-no-results">No results for "' + escapeHtml(query) + '"</div>';
-                  activeIndex = -1;
-                  return;
-                }
-
-                var html = '';
-                for (var j = 0; j < results.length; j++) {
-                  var r = results[j].item;
-                  var snippet = getSnippet(r.content, query.trim());
-                  html += '<a class="search-result-item" href="' + encodeURI(r.url) + '" data-index="' + j + '">'
-                    + '<div class="search-result-title">' + highlightMatch(r.title, query.trim()) + '</div>'
-                    + '<div class="search-result-snippet">' + highlightMatch(snippet, query.trim()) + '</div>'
-                    + '</a>';
-                }
-                html += '<div class="search-hint"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>ESC</kbd> close</span></div>';
-                resultsEl.innerHTML = html;
-                activeIndex = -1;
-              }
-
-              function updateActive() {
-                var items = resultsEl.querySelectorAll('.search-result-item');
-                for (var i = 0; i < items.length; i++) {
-                  items[i].classList.toggle('active', i === activeIndex);
-                }
-                if (activeIndex >= 0 && items[activeIndex]) {
-                  items[activeIndex].scrollIntoView({ block: 'nearest' });
-                }
-              }
-
-              if (input) {
-                input.addEventListener('input', function () {
-                  loadSearchData(function () { search(input.value); });
-                });
-
-                input.addEventListener('keydown', function (e) {
-                  var items = resultsEl.querySelectorAll('.search-result-item');
-                  var count = items.length;
-                  if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    activeIndex = (activeIndex + 1) % count;
-                    updateActive();
-                  } else if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    activeIndex = (activeIndex - 1 + count) % count;
-                    updateActive();
-                  } else if (e.key === 'Enter') {
-                    e.preventDefault();
-                    if (activeIndex >= 0 && items[activeIndex]) {
-                      window.location.href = items[activeIndex].href;
-                    } else if (items.length > 0) {
-                      window.location.href = items[0].href;
-                    }
-                  }
-                });
-              }
+            JS
+          tail = <<-JS
               // ── Fullscreen ──
               window.toggleFullscreen = function () {
                 if (!document.fullscreenElement) {
@@ -1416,6 +1245,10 @@ module Hwaro
                 }
               };
 
+              document.querySelectorAll('[data-fullscreen-toggle]').forEach(function (el) {
+                el.addEventListener('click', function () { toggleFullscreen(); });
+              });
+
               document.addEventListener('fullscreenchange', function () {
                 if (!document.fullscreenElement) {
                   document.body.classList.remove('fullscreen-active');
@@ -1423,6 +1256,7 @@ module Hwaro
               });
             })();
             JS
+          head + "\n" + search_js_body + "\n" + tail
         end
 
         # Footer template
@@ -1455,10 +1289,11 @@ module Hwaro
                 <a href="{{ base_url }}{{ lang_prefix }}/" class="logo">{{ site.title | e }}</a>
               </div>
               <div class="header-right">
-                <button class="icon-btn" onclick="openSearch()" title="Search (⌘K)" aria-label="Search">
+                #{lang_switcher_html}
+                <button class="icon-btn" data-search-open title="Search (⌘K)" aria-label="Search">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                 </button>
-                <button class="icon-btn fullscreen-toggle" onclick="toggleFullscreen()" title="Toggle fullscreen" aria-label="Toggle fullscreen">
+                <button class="icon-btn fullscreen-toggle" data-fullscreen-toggle title="Toggle fullscreen" aria-label="Toggle fullscreen">
                   <svg class="fs-enter" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
                   <svg class="fs-exit" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
                 </button>
@@ -1504,14 +1339,14 @@ module Hwaro
                   {# sec.pages already arrives in the section's sort_by order
                      (weight for chapters), matching the prev/next chain; a
                      second Crinja sort here would be unstable on weight ties. #}
-                  {% for p in sec.pages | rejectattr("is_index") %}
+                  {% for p in sec.pages | rejectattr("is_section") %}
                   <li><a href="{{ base_url }}{{ p.url }}"><span class="num">{{ chapter_index }}.{{ loop.index }}</span> {{ p.title | e }}</a></li>
                   {% endfor %}
                   {# Nested subsections render one level deeper, mirroring the
                      prev/next chain's depth-first nesting. #}
                   {% for sub in sec.subsections | sort(attribute="path") | sort(attribute="weight") %}
                   <li><a href="{{ base_url }}{{ sub.url }}"><span class="num">{{ chapter_index }}.{{ loop.index }}</span> {{ sub.title | e }}</a></li>
-                  {% for sp in sub.pages | rejectattr("is_index") %}
+                  {% for sp in sub.pages | rejectattr("is_section") %}
                   <li><a href="{{ base_url }}{{ sp.url }}"><span class="num">{{ chapter_index }}.{{ loop.index }}</span> {{ sp.title | e }}</a></li>
                   {% endfor %}
                   {% endfor %}
@@ -1581,7 +1416,7 @@ module Hwaro
                   {# Only render the chapter listing when the section has at
                      least one non-index child page — an empty chapter would
                      otherwise show an orphan heading over an empty list. #}
-                  {% if section.pages | rejectattr("is_index") | length %}
+                  {% if section.pages | rejectattr("is_section") | length %}
                   <h2>In This Chapter</h2>
                   <ul class="section-list">
                     {{ section.list }}

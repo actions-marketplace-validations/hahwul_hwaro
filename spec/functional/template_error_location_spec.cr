@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 
 # =============================================================================
 # Template errors must point at the source file (file:line:col + excerpt),
@@ -61,6 +61,54 @@ describe "Template error location reporting" do
     err.message.not_nil!.should contain("templates/page.html")
   end
 
+  # Regression: `Crinja::Evaluator#name_for_expression` only handled
+  # identifier/member/index nodes; every other AST node hit a catch-all that
+  # did `raise "not implemented for ..."`. Because that is a bare Exception
+  # (not a Crinja::Error) it escaped the whole located-error path and killed
+  # the build with `not implemented for Crinja::AST::CallExpression` and no
+  # file:line. Attribute access on a call result / literal must behave like
+  # Jinja2 instead: undefined, i.e. empty output.
+  it "renders empty (not a crash) for attribute access on a missing get_page()" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+      template_files: {
+        "page.html" => "<html>[{{ get_page(path=\"nope.md\").title }}]</html>",
+      },
+    ) do
+      File.read("public/index.html").should contain("[]")
+    end
+  end
+
+  it "renders empty for attribute access on none and on literals" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+      template_files: {
+        "page.html" => "<html>[{{ none.foo }}][{{ none[0] }}][{{ [1, 2].foo }}][{{ {\"a\": 1}.foo }}]</html>",
+      },
+    ) do
+      File.read("public/index.html").should contain("[][][][]")
+    end
+  end
+
+  it "reports file:line:col for attribute access on a string literal" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {
+          "page.html" => "<html>\n<body>\n{{ \"abc\".foo }}\n</body>\n</html>",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("\"abc\".foo is undefined")
+    message.should contain("templates/page.html:3:")
+  end
+
   it "reports the included template's filename when the error is inside an include" do
     err = expect_raises(Hwaro::HwaroError) do
       build_site(
@@ -77,5 +125,178 @@ describe "Template error location reporting" do
     # Included templates load through Crinja's FileSystemLoader, which
     # attaches their own filename to errors raised inside them.
     err.message.not_nil!.should contain("partials/head.html")
+  end
+
+  # Regression: a plain Crystal exception raised inside a filter/function
+  # (`slice(0)` → DivisionByZeroError, `[] | random` → IndexError) is not a
+  # Crinja::Error, so nothing attached the node and the build died with
+  # `Render failed ...: Division by 0` and no template name or line. The
+  # src/ext evaluator patch wraps it into a located Crinja::RuntimeError.
+  it "locates a plain Crystal exception raised inside a filter" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {
+          "page.html" => "<html>\n{{ [1, 2, 3] | slice(0) }}\n</html>",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("Division by 0")
+    message.should contain("templates/page.html:2:")
+    message.should contain("slice(0)")
+  end
+
+  # `range(0, 10, 0)` used to allocate forever (zero step never advances the
+  # iterator) — the src/ext patch makes it raise a plain ArgumentError, which
+  # the evaluator wrap then locates.
+  it "locates a plain Crystal exception raised inside a function call" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {
+          "page.html" => "<html>\n\n{{ range(0, 10, 0) }}\n</html>",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("step must be a non-zero integer")
+    message.should contain("templates/page.html:3:")
+  end
+
+  # Regression: a template whose FIRST character is a newline reported every
+  # location one line early (`page.html:1:2` for a tag on line 2, the caret
+  # painted on a phantom line). Crinja's CharacterStream counts a newline when
+  # the reader arrives at it, and the first character is never arrived at.
+  it "counts a leading newline as a line break in error locations" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {
+          "page.html" => "\n{% for x in %}\n",
+        },
+      ) { }
+    end
+
+    message = err.message.not_nil!
+    message.should contain("templates/page.html:2:1")
+    message.should_not contain("templates/page.html:1:")
+  end
+end
+
+# Review follow-ups on #775: the located-error wrap covered filters, tests and
+# calls, but not operators, and `Crinja::TemplateNotFoundError` inherits
+# `Exception` so a missing include/extends target escaped every rescue.
+describe "Template error location: operators and missing templates" do
+  it "locates a division by zero in a binary expression" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {"page.html" => "<html>\n\n{{ 10 // 0 }}\n</html>"},
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("Division by 0")
+    message.should contain("templates/page.html:3:")
+  end
+
+  it "locates a missing {% include %} target at the referencing tag" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {"page.html" => "<html>\n\n{% include \"missing.html\" %}\n</html>"},
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("missing.html")
+    message.should contain("templates/page.html:3:")
+  end
+
+  it "prints a wrapped cause once, not as message plus cause" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {"page.html" => "<html>\n\n{{ [1, 2] | slice(0) }}\n</html>"},
+      ) { }
+    end
+
+    message = err.message.not_nil!
+    message.should contain("Division by 0")
+    message.should_not contain("cause: Division by 0")
+  end
+end
+
+# A shortcode template is a template: a runtime error inside one must fail the
+# build (HWARO_E_TEMPLATE, exit 4) exactly like a page template, naming the
+# shortcode file and line. Downgrading it to a warning plus an HTML comment
+# let `hwaro build --json` report `status: ok` and ship the broken page.
+describe "Template error location: shortcodes" do
+  it "fails the build on a runtime error inside a content shortcode" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello {{ bad(text=\"x\") }}"},
+        template_files: {
+          "page.html"           => "<html>{{ content }}</html>",
+          "shortcodes/bad.html" => "<b>\n{{ text.foo.bar }}</b>",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("text.foo is undefined")
+    message.should contain("templates/shortcodes/bad.html:2:")
+    message.should contain("{{ text.foo.bar }}")
+  end
+
+  it "fails the build on a missing include inside a content shortcode" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello {{ bad() }}"},
+        template_files: {
+          "page.html"           => "<html>{{ content }}</html>",
+          "shortcodes/bad.html" => "{% include \"nope.html\" %}",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("nope.html")
+    message.should contain("templates/shortcodes/bad.html:1:")
+  end
+
+  it "fails the build on a runtime error inside a shortcode called from a page template" do
+    err = expect_raises(Hwaro::HwaroError) do
+      build_site(
+        BASIC_CONFIG,
+        content_files: {"index.md" => "---\ntitle: Home\n---\nhello"},
+        template_files: {
+          "page.html"           => "<html>{{ bad(text=\"x\") }}{{ content }}</html>",
+          "shortcodes/bad.html" => "{{ text.foo.bar }}",
+        },
+      ) { }
+    end
+
+    err.code.should eq(Hwaro::Errors::HWARO_E_TEMPLATE)
+    message = err.message.not_nil!
+    message.should contain("text.foo is undefined")
+    message.should contain("templates/shortcodes/bad.html:1:")
   end
 end

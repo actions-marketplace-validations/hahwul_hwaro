@@ -27,6 +27,9 @@ module Hwaro::Core::Build::Phases::Transform
     # Compute related posts based on taxonomy similarity
     compute_related_posts(site) if site.config.related.enabled
 
+    # Pages linking to each page (`[content] backlinks`)
+    compute_backlinks(site) if site.config.backlinks
+
     # Build optimized lookup indices
     site.build_lookup_index
 
@@ -55,19 +58,24 @@ module Hwaro::Core::Build::Phases::Transform
   # (build_subsections) and section listings (Site#pages_for_section) are
   # already scoped. Single-language sites (language nil everywhere) collapse
   # to one partition and keep the previous order exactly.
+  #
+  # Versions partition the same way: each `[[versions.list]]` directory is
+  # its own chain (a v1 page's "next" must never be a v2 page), keyed by
+  # {language, version name}. Unversioned content keeps the nil-version
+  # partition, so sites without versions are unaffected.
   private def build_reading_orders(
     sections : Array(Models::Section),
     pages : Array(Models::Page),
     default_lang : String,
   ) : Array(Array(Models::Page))
-    sections_by_lang = sections.group_by { |s| s.language || default_lang }
-    pages_by_lang = pages.group_by { |p| p.language || default_lang }
+    sections_by_lang = sections.group_by { |s| {s.language || default_lang, s.version.try(&.name)} }
+    pages_by_lang = pages.group_by { |p| {p.language || default_lang, p.version.try(&.name)} }
 
-    (sections_by_lang.keys | pages_by_lang.keys).map do |lang|
+    (sections_by_lang.keys | pages_by_lang.keys).map do |key|
       build_language_reading_order(
-        sections_by_lang[lang]? || [] of Models::Section,
-        pages_by_lang[lang]? || [] of Models::Page,
-        lang, default_lang)
+        sections_by_lang[key]? || [] of Models::Section,
+        pages_by_lang[key]? || [] of Models::Page,
+        key[0], default_lang)
     end
   end
 
@@ -86,9 +94,12 @@ module Hwaro::Core::Build::Phases::Transform
     # in `sections` and are interleaved separately by
     # `flatten_section_tree`. Page bundles set `is_index = true` for URL
     # generation, but for navigation they're ordinary pages within their
-    # parent section.
+    # parent section. Headless (`render = false`) pages are never written,
+    # so they are no one's prev/next — the rule flatten_section_tree already
+    # applies to section indexes and Site#pages_for_section to listings.
     pages_by_section = {} of String => Array(Models::Page)
     pages.each do |page|
+      next unless page.render
       section = page.section
       pages_by_section[section] ||= [] of Models::Page
       pages_by_section[section] << page
@@ -105,7 +116,19 @@ module Hwaro::Core::Build::Phases::Transform
 
     # Find top-level sections (no parent) and sort by weight (path tiebreaker
     # so equal weights keep a stable, deterministic reading order).
-    top_sections = sections.select { |s| !s.section.includes?("/") }
+    #
+    # The top level is every section whose parent directory is not itself a
+    # section of the partition: the literal top-level sections, a version
+    # root (`docs/v2`), plus any subtree with a missing intermediate `_index`
+    # (`guide/basics/_index.md` without `guide/_index.md`). Taking only the
+    # sections without a "/" left such a subtree unwalked — and
+    # append_orphan_pages skips a known section's pages — so it dropped out
+    # of prev/next entirely. With every parent present this is exactly the
+    # literal top-level set, so complete trees keep their reading order.
+    top_sections = sections.select do |s|
+      idx = s.section.rindex('/')
+      idx.nil? || !sections_by_path.has_key?(s.section[0, idx])
+    end
     top_sections.sort! { |a, b| compare_sections_by_weight(a, b) }
 
     # Recursively flatten sections into reading order
@@ -114,10 +137,10 @@ module Hwaro::Core::Build::Phases::Transform
 
     # Add any orphan pages not belonging to any section, leading with the
     # site root index so prev/next starts at the homepage. Pages whose
-    # section has no `_index` in this language land here too, in source
-    # order — better a tail entry than absence from the chain.
+    # section has no `_index` in this language land here too — better a
+    # tail entry than absence from the chain.
     section_names = sections_by_path.keys.to_set
-    append_orphan_pages(pages, section_names, flat_list)
+    append_orphan_pages(pages_by_section, section_names, flat_list)
     flat_list
   end
 
@@ -137,10 +160,18 @@ module Hwaro::Core::Build::Phases::Transform
   # entry point of the reading order, not a trailing page — without this it was
   # pushed to the END, so the book scaffold's prev/next chain wrapped (the home
   # "Introduction" page landed last and the first chapter lost its prev link).
-  # Prepend such root index pages; keep every other true orphan in source order
-  # at the tail.
+  # Prepend such root index pages; every other true orphan follows at the tail.
+  #
+  # Orphans are taken from `pages_by_section` — grouped by section, sections
+  # in path order, each group already sorted like a section's own pages
+  # (`sort_pages`: default `date`, path tiebreak) — never from the order of
+  # the input list. That order is filesystem discovery order for the cold
+  # build (`ctx.pages`) and the site model's order for the serve relink
+  # (`site.pages`): the chain differed between hosts (ext4 hash order vs
+  # APFS), and a relink right after a build saw neighbours "move", so a serve
+  # edit re-rendered pages it never touched.
   private def append_orphan_pages(
-    pages : Array(Models::Page),
+    pages_by_section : Hash(String, Array(Models::Page)),
     section_names : Set(String),
     flat_list : Array(Models::Page),
   )
@@ -148,15 +179,19 @@ module Hwaro::Core::Build::Phases::Transform
     # scan per page, O(n²) on sites with no `_index.md` sections at all
     # (every page an orphan), and this runs again on every incremental relink.
     seen_paths = flat_list.each_with_object(Set(String).new) { |p, set| set << p.path }
-    pages.each do |page|
-      next if section_names.includes?(page.section)
-      next if seen_paths.includes?(page.path)
-      if page.is_index && page.section.empty?
-        flat_list.unshift(page)
-      else
-        flat_list << page
+    root_indexes = [] of Models::Page
+    pages_by_section.keys.sort!.each do |section|
+      next if section_names.includes?(section)
+      pages_by_section[section].each do |page|
+        next unless seen_paths.add?(page.path)
+        if page.home?
+          root_indexes << page
+        else
+          flat_list << page
+        end
       end
     end
+    flat_list[0, 0] = root_indexes unless root_indexes.empty?
   end
 
   # Recursively flatten a list of sections into depth-first reading order.
@@ -182,8 +217,10 @@ module Hwaro::Core::Build::Phases::Transform
       # cross languages — build_subsections attaches a translated subsection
       # to the default-language parent when its own language has no parent
       # `_index` — so keep only this language's subtree.
-      if section.subsections.size > 0
-        same_lang = section.subsections.select { |sub| (sub.language || default_lang) == lang }
+      # The root section's subsections are the top-level sections, which the
+      # caller already walks as `top_sections` — recursing would list them twice.
+      if section.subsections.size > 0 && !section.section.empty?
+        same_lang = section.subsections.select { |sub| (sub.language || default_lang) == lang && sub.version.same?(section.version) }
         # Path tiebreak mirrors top-level sections (compare_sections_by_weight):
         # equal-weight subsections otherwise follow insertion/glob order and
         # can flip prev/next blocks across rebuilds.
@@ -224,11 +261,28 @@ module Hwaro::Core::Build::Phases::Transform
 
     ctx.sections.each do |section|
       path_parts = section.section.split("/")
-      next if path_parts.size <= 1
+      if path_parts.size <= 1
+        # A top-level section is a direct child of the root `_index.md` (the
+        # section named ""), which is not a breadcrumb ancestor — templates
+        # render "Home" themselves — but must list it in `subsections`. Same
+        # language only: a translated top-level section must not show up on
+        # the default-language homepage when its language has no root index.
+        next if section.section.empty?
+        if (root = lookup_ancestor_section(sections_by_path, "", section.language, default_lang)) &&
+           (root.language || default_lang) == (section.language || default_lang) &&
+           root.version.same?(section.version)
+          root.add_subsection(section)
+        end
+        next
+      end
 
       # Link to the immediate parent section when it exists (same-language first).
+      # Never across a version boundary: an unversioned `docs/_index.md` is
+      # not the parent of `docs/v1/_index.md` in any listing, and a version
+      # root's breadcrumb stops at the version.
       parent_path = path_parts[0..-2].join("/")
-      if parent = lookup_ancestor_section(sections_by_path, parent_path, section.language, default_lang)
+      if (parent = lookup_ancestor_section(sections_by_path, parent_path, section.language, default_lang)) &&
+         parent.version.same?(section.version)
         parent.add_subsection(section)
       end
 
@@ -240,7 +294,8 @@ module Hwaro::Core::Build::Phases::Transform
       current_path = ""
       path_parts[0..-2].each do |part|
         current_path = current_path.empty? ? part : "#{current_path}/#{part}"
-        if ancestor = lookup_ancestor_section(sections_by_path, current_path, section.language, default_lang)
+        if (ancestor = lookup_ancestor_section(sections_by_path, current_path, section.language, default_lang)) &&
+           ancestor.version.same?(section.version)
           section.ancestors << ancestor
         end
       end
@@ -254,7 +309,8 @@ module Hwaro::Core::Build::Phases::Transform
       current_path = ""
       path_parts.each do |part|
         current_path = current_path.empty? ? part : "#{current_path}/#{part}"
-        if ancestor = lookup_ancestor_section(sections_by_path, current_path, page.language, default_lang)
+        if (ancestor = lookup_ancestor_section(sections_by_path, current_path, page.language, default_lang)) &&
+           ancestor.version.same?(page.version)
           page.ancestors << ancestor
         end
       end
@@ -297,11 +353,18 @@ module Hwaro::Core::Build::Phases::Transform
     site.taxonomies.clear
 
     pages.each do |page|
+      # The generator reads site.pages only: a section `_index.md` carrying
+      # `tags` never gets onto a term page, so it must not inflate
+      # get_taxonomy counts or yield a get_taxonomy_url to an unwritten term.
+      next if page.is_a?(Models::Section)
       # Match Content::Taxonomies.build_taxonomy_index: draft / unpublished
       # (--include-future/--include-expired) / generated pages must not inflate
       # get_taxonomy counts or terms_sort_by="count" relative to written
       # /tags/… pages and term feeds.
       next if page.excluded_from_listings?
+      # `[versions] taxonomies = "latest"` (default): older versions stay off
+      # the term pages, mirroring Content::Taxonomies.build_taxonomy_index.
+      next unless site.config.versions.in_taxonomies?(page)
 
       page.taxonomies.each do |name, terms|
         site.taxonomies[name] ||= {} of String => Array(Models::Page)
@@ -413,7 +476,9 @@ module Hwaro::Core::Build::Phases::Transform
       # skip unpublished/draft/generated pages so get_taxonomy membership
       # stays aligned with build_taxonomy_index (and rebuild_taxonomies).
       next if excluded_paths.includes?(page_path)
+      next if page.is_a?(Models::Section) # see rebuild_taxonomies
       next if page.excluded_from_listings?
+      next unless site.config.versions.in_taxonomies?(page)
 
       page.taxonomies.each do |name, terms|
         site.taxonomies[name] ||= {} of String => Array(Models::Page)
@@ -520,26 +585,30 @@ module Hwaro::Core::Build::Phases::Transform
     return affected_series if affected_series.empty?
 
     # Rebuild groups only for affected series
-    groups = {} of String => Array(Models::Page)
+    default_lang = site.config.default_language
+    groups = {} of {String, String, String} => Array(Models::Page)
     site.pages.each do |page|
       next if page.draft || page.unpublished || !page.render
-      if name = page.series
-        next unless affected_series.includes?(name)
-        (groups[name] ||= [] of Models::Page) << page
+      if (key = series_group_key(page, default_lang)) && affected_series.includes?(key[0])
+        (groups[key] ||= [] of Models::Page) << page
       end
     end
 
     assign_series_groups(groups)
 
-    # Clear series data for pages whose series became empty
-    affected_series.each do |series_name|
-      next if groups.has_key?(series_name)
-      site.pages.each do |page|
-        if page.series == series_name
-          page.series_index = 0
-          page.series_pages = [] of Models::Page
-        end
+    # Clear series data for every page outside the rebuilt groups: one whose
+    # group became empty, one left out of its group (draft, render = false)
+    # and one that left every series (no group key any more) — an old index
+    # must not outlive the membership.
+    site.pages.each do |page|
+      if key = series_group_key(page, default_lang)
+        next unless affected_series.includes?(key[0])
+        next if groups[key]?.try(&.any?(&.same?(page)))
+      else
+        next if page.series_index == 0 && page.series_pages.empty?
       end
+      page.series_index = 0
+      page.series_pages = [] of Models::Page
     end
 
     affected_series
@@ -557,10 +626,10 @@ module Hwaro::Core::Build::Phases::Transform
 
     taxonomy_names = config.taxonomies
     limit = config.limit
-    all_pages = site.pages.reject { |p| p.draft || p.unpublished || p.is_index || p.generated || !p.render }
+    all_pages = site.pages.select { |p| related_candidate?(p) }
 
     # Build inverted index first (needed for both candidate discovery and scoring)
-    inverted, page_lookup = build_related_index(all_pages, taxonomy_names)
+    inverted, index_of = build_related_index(all_pages, taxonomy_names)
 
     # Collect paths of pages that need related_posts recomputed:
     # 1. Changed pages themselves
@@ -568,6 +637,13 @@ module Hwaro::Core::Build::Phases::Transform
     # 3. Pages sharing any taxonomy term with changed pages (may become newly related)
     changed_paths = changed_pages.map(&.path).to_set
     pages_to_update = Set(String).new(changed_paths)
+
+    # A changed page that just left the candidate set (an --include-future
+    # preview, render = false) is skipped by the loop below; drop the list it
+    # carried over, as a cold build never gives it one.
+    changed_pages.each do |page|
+      page.related_posts = [] of Models::Page unless index_of.has_key?(page.path)
+    end
 
     # A page turned draft/future/expired is removed from site.pages, so it is
     # neither a changed page nor in the inverted index — but pages that listed it
@@ -584,47 +660,23 @@ module Hwaro::Core::Build::Phases::Transform
     # Include pages sharing taxonomy terms with changed pages
     changed_pages.each do |page|
       taxonomy_names.each do |tax_name|
-        values = page.taxonomy_values(tax_name)
+        values = page.taxonomy_values(tax_name).uniq
         inv_tax = inverted[tax_name]?
         next unless inv_tax
         values.each do |term|
           if candidates = inv_tax[term]?
-            candidates.each { |path| pages_to_update << path }
+            candidates.each { |j| pages_to_update << all_pages[j].path }
           end
         end
       end
     end
 
     # Recompute only for affected pages
+    scores = Array(Int32).new(all_pages.size, 0)
+    touched = [] of Int32
     pages_to_update.each do |page_path|
-      page = page_lookup[page_path]?
-      next unless page
-
-      scores = Hash(String, Int32).new(0)
-      taxonomy_names.each do |tax_name|
-        values = page.taxonomy_values(tax_name)
-        inv_tax = inverted[tax_name]?
-        next unless inv_tax
-        values.each do |term|
-          if candidates = inv_tax[term]?
-            candidates.each do |other_path|
-              next if other_path == page.path
-              scores[other_path] += 1
-            end
-          end
-        end
-      end
-
-      if scores.empty?
-        page.related_posts = [] of Models::Page
-        next
-      end
-
-      page.related_posts = scores.to_a
-        .select { |path, _| page_lookup[path]?.try(&.language) == page.language }
-        .sort_by! { |_, s| -s }
-        .first(limit)
-        .map { |path, _| page_lookup[path] }
+      next unless i = index_of[page_path]?
+      all_pages[i].related_posts = top_related_posts(i, all_pages, inverted, taxonomy_names, limit, scores, touched)
     end
 
     pages_to_update
@@ -640,12 +692,13 @@ module Hwaro::Core::Build::Phases::Transform
       pages: Array(Models::Page),
       extra: Hash(String, Crinja::Value))
 
-    # 1. Collect authors from all pages. Skip drafts/generated to match the
-    # /authors/ taxonomy generator (build_taxonomy_index skips both); otherwise
-    # under `--drafts` site.authors would list draft posts the generated author
-    # page omits — two views of the same author disagreeing.
+    # 1. Collect authors from all pages. Skip what the /authors/ taxonomy
+    # generator skips (build_taxonomy_index): otherwise under `--drafts`
+    # site.authors would list draft posts the generated author page omits,
+    # and a headless (`render = false`) page — never written — showed up as
+    # a dead link in `author.pages`.
     site.pages.each do |page|
-      next if page.draft || page.unpublished || page.generated
+      next if page.excluded_from_listings?
       page.authors.each do |author_id|
         # Normalize ID: lower case, stripped
         id = author_id.strip.downcase
@@ -674,9 +727,20 @@ module Hwaro::Core::Build::Phases::Transform
       # an author as a template variable, implied a template was involved, and
       # never mentioned the data file. Enrichment is optional metadata, so a
       # wrong shape degrades to a warning naming the file instead.
-      if authors_data.raw.is_a?(Hash)
+      if (data_hash = authors_data.raw).is_a?(Hash)
+        # Author ids are normalized (stripped, downcased) above, so the data
+        # keys are too: `authors = ["JohnDoe"]` with a `JohnDoe:` entry — the
+        # id exactly as written — never matched the lookup of "johndoe" and
+        # the author silently lost its name and fields. An exact lowercase key
+        # wins over a differently cased one.
+        by_id = {} of String => Crinja::Value
+        data_hash.each do |key, value|
+          raw_key = key.to_s
+          id = raw_key.strip.downcase
+          by_id[id] = value if raw_key == id || !by_id.has_key?(id)
+        end
         temp_authors.each_key do |id|
-          author_info = authors_data[id]
+          author_info = by_id[id]? || next
           next if author_info.raw.nil?
 
           # Normalize Crinja hash entries to {String, Crinja::Value} pairs
@@ -704,7 +768,7 @@ module Hwaro::Core::Build::Phases::Transform
     # 3. Convert to Crinja Values and store in site.authors
     temp_authors.each do |id, data|
       # Sort pages by date descending
-      sorted_pages = Utils::SortUtils.sort_pages(data[:pages], "date", true)
+      sorted_pages = Utils::SortUtils.sort_pages(data[:pages], "date")
 
       page_values = sorted_pages.map do |p|
         # Expose the same common leaf fields a section/term page list provides,
@@ -713,16 +777,17 @@ module Hwaro::Core::Build::Phases::Transform
         # computed after this phase, and permalink lazily during render, so both
         # are intentionally omitted.)
         Crinja::Value.new({
-          "title"        => Crinja::Value.new(p.title),
-          "url"          => Crinja::Value.new(p.url),
-          "date"         => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
-          "description"  => Crinja::Value.new(p.description || ""),
-          "image"        => Crinja::Value.new(p.image || ""),
-          "summary"      => Crinja::Value.new(p.summary_html || p.effective_summary || ""),
-          "tags"         => Crinja::Value.new(p.tags.map { |t| Crinja::Value.new(t) }),
-          "reading_time" => Crinja::Value.new(p.reading_time),
-          "word_count"   => Crinja::Value.new(p.word_count),
-          "language"     => Crinja::Value.new(p.language || site.config.default_language),
+          "title"             => Crinja::Value.new(p.title),
+          "url"               => Crinja::Value.new(p.url),
+          "date"              => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
+          "description"       => Crinja::Value.new(p.description || ""),
+          "image"             => Crinja::Value.new(p.image || ""),
+          "summary"           => Crinja::Value.new(p.summary_html || p.effective_summary || ""),
+          "summary_truncated" => Crinja::Value.new(p.summary_truncated),
+          "tags"              => Crinja::Value.new(p.tags.map { |t| Crinja::Value.new(t) }),
+          "reading_time"      => Crinja::Value.new(p.reading_time),
+          "word_count"        => Crinja::Value.new(p.word_count),
+          "language"          => Crinja::Value.new(p.language || site.config.default_language),
         })
       end
 
@@ -744,10 +809,15 @@ module Hwaro::Core::Build::Phases::Transform
   # Sort each series group by weight/date/title and assign series_index and
   # series_pages. A single-post series gets empty series_pages so the
   # template's `page.series_pages` guard skips the orphan series-nav box.
-  private def assign_series_groups(groups : Hash(String, Array(Models::Page)))
+  private def assign_series_groups(groups : Hash({String, String, String}, Array(Models::Page)))
     groups.each do |_name, pages|
+      # An undated part sorts after the dated ones (as in SortUtils) rather
+      # than as 1970-01-01, which put it ahead of every part dated after
+      # that. Path last so equal weight/date/title still order the same
+      # way on every build.
       sorted = pages.sort_by do |p|
-        {p.series_weight, p.date || Time::UNIX_EPOCH, p.title}
+        date = p.date
+        {p.series_weight, date ? 0 : 1, date || Time::UNIX_EPOCH, p.title, p.path}
       end
 
       sorted.each_with_index do |page, idx|
@@ -757,41 +827,116 @@ module Hwaro::Core::Build::Phases::Transform
     end
   end
 
-  # Group pages by series name and assign series_index, series_pages.
+  # A series is scoped to one language and one version, like related posts
+  # and the prev/next chain: `hello.md` and its translation `hello.ko.md`
+  # sharing `series = "intro"` are two parallel series, not one interleaved
+  # four-part series. nil for pages outside every series.
+  private def series_group_key(page : Models::Page, default_lang : String) : {String, String, String}?
+    return unless name = page.series
+    {name, page.language || default_lang, page.version.try(&.name) || ""}
+  end
+
+  # Group pages by series and assign series_index, series_pages.
   # Pages within a series are sorted by series_weight, then date, then title.
   private def compute_series(site : Models::Site)
-    groups = {} of String => Array(Models::Page)
+    default_lang = site.config.default_language
+    groups = {} of {String, String, String} => Array(Models::Page)
 
     site.pages.each do |page|
       next if page.draft || page.unpublished || !page.render
-      if name = page.series
-        (groups[name] ||= [] of Models::Page) << page
+      if key = series_group_key(page, default_lang)
+        (groups[key] ||= [] of Models::Page) << page
       end
     end
 
     assign_series_groups(groups)
   end
 
-  # Build the taxonomy inverted index ({tax_name => {term => [page_path]}}) and a
-  # path->page lookup for the given candidate pages. Shared by the full and
-  # incremental related-posts computations.
-  private def build_related_index(pages : Array(Models::Page), taxonomy_names : Array(String)) : {Hash(String, Hash(String, Array(String))), Hash(String, Models::Page)}
-    inverted = {} of String => Hash(String, Array(String))
-    page_lookup = {} of String => Models::Page
+  # Related-post candidates. A page bundle (`post/index.md`) is `is_index`
+  # too, but it is an ordinary post; only home pages and section indexes
+  # (`_index.md`) are left out with drafts, headless and generated pages.
+  private def related_candidate?(page : Models::Page) : Bool
+    return false if page.draft || page.unpublished || page.generated || !page.render || page.home?
+    !(page.is_index && File.basename(page.path).starts_with?("_index"))
+  end
 
-    pages.each do |page|
-      page_lookup[page.path] = page
+  # Build the taxonomy inverted index ({tax_name => {term => [page index]}})
+  # and a path->index lookup for the given candidate pages. Shared by the
+  # full and incremental related-posts computations.
+  private def build_related_index(pages : Array(Models::Page), taxonomy_names : Array(String)) : {Hash(String, Hash(String, Array(Int32))), Hash(String, Int32)}
+    inverted = {} of String => Hash(String, Array(Int32))
+    index_of = {} of String => Int32
+
+    pages.each_with_index do |page, i|
+      index_of[page.path] = i
       taxonomy_names.each do |tax_name|
-        values = page.taxonomy_values(tax_name)
+        # uniq: a term repeated in front matter is still one shared term,
+        # as on the taxonomy pages; counting it twice inflated scores.
+        values = page.taxonomy_values(tax_name).uniq
         values.each do |term|
-          inv_tax = inverted[tax_name]? || (inverted[tax_name] = {} of String => Array(String))
-          arr = inv_tax[term]? || (inv_tax[term] = [] of String)
-          arr << page.path
+          inv_tax = inverted[tax_name]? || (inverted[tax_name] = {} of String => Array(Int32))
+          arr = inv_tax[term]? || (inv_tax[term] = [] of Int32)
+          arr << i
         end
       end
     end
 
-    {inverted, page_lookup}
+    {inverted, index_of}
+  end
+
+  # The `limit` pages most related to `pages[i]`: those sharing a taxonomy
+  # term with it in its own language and version, by shared-term count, ties
+  # in first-seen order (pages/taxonomy iteration order). `scores` (one zero
+  # per page) and `touched` are scratch buffers reused across calls and left
+  # zeroed/empty. A term nearly every page carries (`tags = ["blog"]`) makes
+  # this walk O(pages²) site-wide, so the pair loop stays on array slots: a
+  # string-keyed hash insert per pair took ~8s at 4,000 posts.
+  private def top_related_posts(
+    i : Int32,
+    pages : Array(Models::Page),
+    inverted : Hash(String, Hash(String, Array(Int32))),
+    taxonomy_names : Array(String),
+    limit : Int32,
+    scores : Array(Int32),
+    touched : Array(Int32),
+  ) : Array(Models::Page)
+    return [] of Models::Page if limit <= 0
+    page = pages[i]
+    page_lang = page.language
+    taxonomy_names.each do |tax_name|
+      next unless inv_tax = inverted[tax_name]?
+      page.taxonomy_values(tax_name).uniq.each do |term|
+        next unless candidates = inv_tax[term]?
+        candidates.each do |j|
+          next if j == i
+          other = pages[j]
+          next unless other.language == page_lang
+          # Related posts never cross a version boundary either — a v2
+          # page recommending its own v1 twin is noise, not a relation.
+          next unless other.version.same?(page.version)
+          touched << j if scores[j] == 0
+          scores[j] += 1
+        end
+      end
+    end
+
+    # Bounded top-k selection — a stable descending sort's first `limit`,
+    # in O(n*k). Every touched slot is reset on the way through.
+    top = [] of {Int32, Int32}
+    touched.each do |j|
+      score = scores[j]
+      scores[j] = 0
+      next if top.size == limit && score <= top[-1][1]
+      idx = 0
+      while idx < top.size && score <= top[idx][1]
+        idx += 1
+      end
+      next if idx >= limit
+      top.insert(idx, {j, score})
+      top.pop if top.size > limit
+    end
+    touched.clear
+    top.map { |j, _| pages[j] }
   end
 
   # Compute related posts for each page based on shared taxonomy terms.
@@ -801,55 +946,128 @@ module Hwaro::Core::Build::Phases::Transform
     taxonomy_names = config.taxonomies
     limit = config.limit
     return if limit <= 0
-    pages = site.pages.reject { |p| p.draft || p.unpublished || p.is_index || p.generated || !p.render }
+    pages = site.pages.select { |p| related_candidate?(p) }
 
-    # Build inverted index: {taxonomy_name => {term => Array(page_path)}}
-    # This avoids the O(N²) pairwise comparison
-    inverted, page_lookup = build_related_index(pages, taxonomy_names)
+    inverted, _ = build_related_index(pages, taxonomy_names)
+    scores = Array(Int32).new(pages.size, 0)
+    touched = [] of Int32
 
-    pages.each do |page|
-      # Count co-occurrences via inverted index: O(terms * avg_pages_per_term).
-      # Filter by language during accumulation — cross-language candidates are
-      # discarded from the final output anyway, so skipping them here produces
-      # identical results while reducing work for multilingual sites.
-      scores = Hash(String, Int32).new(0)
-      page_lang = page.language
-      taxonomy_names.each do |tax_name|
-        values = page.taxonomy_values(tax_name)
-        inv_tax = inverted[tax_name]?
-        next unless inv_tax
-        values.each do |term|
-          if candidates = inv_tax[term]?
-            candidates.each do |other_path|
-              next if other_path == page.path
-              # page_lookup[other_path] is guaranteed present: the inverted
-              # index is populated from the same `pages` iteration above.
-              next unless page_lookup[other_path].language == page_lang
-              scores[other_path] += 1
-            end
-          end
-        end
-      end
-
-      next if scores.empty?
-
-      # Bounded top-k selection — equivalent to `.sort_by { -s }.first(limit)`
-      # but O(n*k) instead of O(n log n) with fewer allocations. Ties break by
-      # scores-hash insertion order (which mirrors pages/taxonomy iteration),
-      # matching a stable descending sort. Optimal when limit is small
-      # (default 5); parity with sort near limit ≈ log₂(n).
-      top = [] of {String, Int32}
-      scores.each do |path, score|
-        idx = 0
-        while idx < top.size && score <= top[idx][1]
-          idx += 1
-        end
-        next if idx >= limit
-        top.insert(idx, {path, score})
-        top.pop if top.size > limit
-      end
-
-      page.related_posts = top.map { |path, _| page_lookup[path] }
+    pages.each_with_index do |page, i|
+      related = top_related_posts(i, pages, inverted, taxonomy_names, limit, scores, touched)
+      page.related_posts = related unless related.empty?
     end
+  end
+
+  # A shortcode call (`{{ x() }}`) or block tag (`{% x() %}`) on one line.
+  SHORTCODE_TAG_RE = /\{\{.*?\}\}|\{%.*?%\}/
+  # A block shortcode opened and closed on one line, body included.
+  SHORTCODE_LINE_BLOCK_RE = Regex.new(
+    "#{Hwaro::Core::Build::ShortcodeProcessor::BLOCK_OPEN_RE.source}.*?#{Hwaro::Core::Build::ShortcodeProcessor::BLOCK_ANY_CLOSE_RE.source}",
+    Regex::Options::IGNORE_CASE)
+
+  # `raw` without its shortcode calls and block bodies, the way the
+  # shortcode pass sees them: fenced code stays (FenceTracker, fed outside
+  # bodies only, as process_shortcodes_jinja does) and the bodies are the
+  # matched pairs block_body_lines finds. On the other lines a one-line
+  # block goes whole, and an opener whose body runs on takes the rest of
+  # its line with it (that text is body too).
+  private def strip_shortcode_spans(raw : String) : String
+    body = block_body_lines(raw)
+    tracker = Content::Processors::FenceTracker.new(raw_html_code: false)
+    String.build(raw.bytesize) do |io|
+      raw.each_line(chomp: false).each_with_index do |line, i|
+        next if body[i]?
+        if tracker.fence_line?(line)
+          io << line
+          next
+        end
+        text = line.gsub(SHORTCODE_LINE_BLOCK_RE, "")
+        if body[i + 1]?
+          opener = nil
+          text.scan(ShortcodeProcessor::BLOCK_OPEN_RE) do |m|
+            opener = m unless ShortcodeProcessor::BLOCK_ANY_CLOSE_RE.matches?(m[0])
+          end
+          text = "#{text[0, opener.begin(0)]}\n" if opener
+        end
+        io << text.gsub(SHORTCODE_TAG_RE, "")
+      end
+    end
+  end
+
+  private def site_math? : Bool
+    @site.try(&.config.markdown.math) || false
+  end
+
+  # `page.backlinks`: every rendered page in the same language whose SOURCE
+  # Markdown links here through an `@/` link, a wikilink (with `[markdown]
+  # wikilinks`) or a Markdown/HTML link whose URL is a page's URL. Links a
+  # shortcode or template produces are not seen, nor links written inside a
+  # shortcode call or body (the wikilink rewrite never reaches those either).
+  # Sorted by date (newest first, undated last), then path.
+  #
+  # ponytail: rescans every page's raw content on each call (serve calls it
+  # per content save); memoize per-page targets by raw_content if it shows.
+  private def compute_backlinks(site : Models::Site) : Nil
+    pages = (site.pages + site.sections).as(Array(Models::Page))
+    pages_by_path = build_pages_by_path(site)
+    by_url = {} of String => Models::Page
+    pages.each { |p| by_url[p.url] ||= p }
+    incoming = {} of String => Array(Models::Page)
+    pages.each do |source|
+      next unless source.render
+      outbound_link_targets(source, pages_by_path, by_url, site.config.base_path).each do |target|
+        next if target.same?(source) || target.language != source.language
+        (incoming[target.path] ||= [] of Models::Page) << source
+      end
+    end
+    pages.each do |page|
+      page.backlinks = incoming[page.path]?.try(&.sort_by { |p| {p.date ? 0 : 1, -(p.date.try(&.to_unix_ms) || 0_i64), p.path} }) || [] of Models::Page
+    end
+  end
+
+  private def outbound_link_targets(
+    source : Models::Page,
+    pages_by_path : Hash(String, Models::Page),
+    by_url : Hash(String, Models::Page),
+    base_path : String,
+  ) : Set(Models::Page)
+    targets = Set(Models::Page).new
+    index = @wikilink_index
+    raw = source.raw_content
+    raw = strip_shortcode_spans(raw) if content_may_contain_shortcodes?(raw)
+    Content::Processors::Wikilinks.each_link(raw, math: site_math?) do |link|
+      target = case link
+               in Content::Processors::Wikilinks::Link
+                 index.try(&.resolve(link.target, source)) unless link.image? || link.target.empty?
+               in String
+                 page_for_link_url(link, source, pages_by_path, by_url, base_path)
+               end
+      targets << target if target
+    end
+    targets
+  end
+
+  # The page a link URL in `source`'s Markdown points at, if any: an `@/`
+  # content path, or a root- or document-relative URL equal to a page URL.
+  private def page_for_link_url(
+    url : String,
+    source : Models::Page,
+    pages_by_path : Hash(String, Models::Page),
+    by_url : Hash(String, Models::Page),
+    base_path : String,
+  ) : Models::Page?
+    path = url.partition('#')[0].partition('?')[0]
+    return if path.empty?
+    if path.starts_with?("@/")
+      return Content::Processors::InternalLinkResolver.page_for(pages_by_path, path.lchop("@/"))
+    end
+    return if Content::Processors::InternalLinkResolver.has_own_origin?(path)
+    unless path.starts_with?('/')
+      base = source.url.ends_with?('/') ? source.url : "#{source.url}/"
+      path = Path.posix(base, path).normalize.to_s
+      path += "/" if url.partition('#')[0].partition('?')[0].ends_with?('/') && !path.ends_with?('/')
+    end
+    path = path.lchop(base_path) if !base_path.empty? && path.starts_with?("#{base_path}/")
+    by_url[path]? || by_url["#{path}/"]?
   end
 end

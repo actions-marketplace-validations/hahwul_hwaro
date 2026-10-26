@@ -1,5 +1,6 @@
 require "file_utils"
 require "../../ext/stb_bindings"
+require "../processors/image_processor"
 require "../../models/config"
 require "../../models/page"
 require "../../utils/logger"
@@ -130,11 +131,6 @@ module Hwaro
           nil
         end
 
-        # Check if PNG rendering is available (always true thanks to bundled fonts)
-        def self.available? : Bool
-          true
-        end
-
         # Pre-decoded and resized RGBA image for reuse across render calls.
         class CachedImage
           getter data : Pointer(UInt8)
@@ -149,18 +145,30 @@ module Hwaro
           end
         end
 
-        # Decode an image file and resize it to target dimensions. Returns nil on failure.
-        def self.load_image(path : String, target_w : Int32, target_h : Int32) : CachedImage?
+        # Scale (w, h) to fit inside a box without distortion — the raster
+        # equivalent of SVG's default `preserveAspectRatio="xMidYMid meet"`.
+        def self.fit_dimensions(src_w : Int32, src_h : Int32, box_w : Int32, box_h : Int32) : {Int32, Int32}
+          return {box_w, box_h} if src_w <= 0 || src_h <= 0
+          scale = Math.min(box_w.to_f / src_w, box_h.to_f / src_h)
+          {Math.max((src_w * scale).round.to_i, 1), Math.max((src_h * scale).round.to_i, 1)}
+        end
+
+        # Decode an image file and resize it to target dimensions. Returns nil
+        # on failure. With `fit: true` the target is a bounding box the image
+        # is scaled into without distortion (its own dimensions come back on
+        # the CachedImage); otherwise it is stretched to exactly
+        # `target_w x target_h`.
+        def self.load_image(path : String, target_w : Int32, target_h : Int32,
+                            fit : Bool = false) : CachedImage?
           return unless File.exists?(path)
 
-          src_w = uninitialized LibC::Int
-          src_h = uninitialized LibC::Int
-          channels = uninitialized LibC::Int
-          src_pixels = LibStb.stbi_load(path, pointerof(src_w), pointerof(src_h), pointerof(channels), 4)
-          return if src_pixels.null?
+          return unless loaded = load_rgba_upright(path)
+          src_pixels, src_w, src_h = loaded
 
           begin
-            return if src_w <= 0 || src_h <= 0
+            if fit
+              target_w, target_h = fit_dimensions(src_w.to_i32, src_h.to_i32, target_w, target_h)
+            end
 
             buf_size = target_w.to_i64 * target_h.to_i64 * 4
             return if buf_size > 64_000_000_i64 * 4
@@ -179,8 +187,31 @@ module Hwaro
 
             CachedImage.new(resized, target_w, target_h)
           ensure
-            LibStb.stbi_image_free(src_pixels.as(Void*))
+            LibC.free(src_pixels.as(Void*))
           end
+        end
+
+        # Decodes *path* as RGBA, turned upright by its EXIF orientation: a
+        # phone photo used as the background or logo shows rotated in the
+        # browser (and in the SVG card, which embeds the original), so the
+        # PNG card must not draw the raw sideways rows. The buffer is
+        # malloc'ed either way (stb's allocator is libc's); free it with
+        # `LibC.free`.
+        private def self.load_rgba_upright(path : String) : {UInt8*, Int32, Int32}?
+          w = uninitialized LibC::Int
+          h = uninitialized LibC::Int
+          channels = uninitialized LibC::Int
+          pixels = LibStb.stbi_load(path, pointerof(w), pointerof(h), pointerof(channels), 4)
+          return if pixels.null?
+          if w <= 0 || h <= 0
+            LibStb.stbi_image_free(pixels.as(Void*))
+            return
+          end
+          upright = Processors::ImageProcessor.reorient(pixels, w.to_i32, h.to_i32, 4, Processors::ImageProcessor.orientation(path))
+          # `reorient` frees the input once it has turned it; on a failed
+          # allocation it hands nothing back and leaves the input to us.
+          LibStb.stbi_image_free(pixels.as(Void*)) unless upright
+          upright
         end
 
         # One loaded font: the opaque stbtt_fontinfo pointer plus the raw
@@ -263,7 +294,9 @@ module Hwaro
         # deferred passes, or watch rebuilds) do not re-scan the filesystem
         # or re-parse TTF data.
         def self.load_fonts(custom_font_path : String? = nil, prefer_cjk : Bool = false) : FontContext?
-          key = "#{custom_font_path}|#{prefer_cjk}"
+          # The file's content digest is part of the key: a font replaced in
+          # place must not be served from the memo for the rest of a `serve`.
+          key = "#{custom_font_path}|#{prefer_cjk}|#{OgImage.asset_digest(custom_font_path)}"
 
           if @@cached_font_key == key && (cached = @@cached_font_ctx)
             return cached
@@ -273,7 +306,7 @@ module Hwaro
           # every role (it may be a CJK font — that's the documented use).
           custom : FontEntry? = nil
           if cfp = custom_font_path
-            abs = cfp.starts_with?("/") ? cfp : File.join(Dir.current, cfp)
+            abs = File.expand_path(cfp)
             custom = load_font_file(abs)
             unless custom
               Logger.warn "  Custom font '#{cfp}' not found or failed to load. Using bundled fonts."
@@ -454,7 +487,8 @@ module Hwaro
           # accent_bars gates the baked-in top accent bar, so it must be part of
           # the key — otherwise a serve-session toggle reuses a stale base layer.
           key = "#{ai.background}|#{ai.accent_color}|#{ai.secondary_color}|#{ai.style}|#{ai.pattern_opacity}|" \
-                "#{ai.pattern_scale}|#{ai.overlay_opacity}|#{bg_image_path}|#{ai.logo_position}|#{ai.accent_bars}"
+                "#{ai.pattern_scale}|#{ai.overlay_opacity}|#{bg_image_path}|#{OgImage.asset_digest(bg_image_path)}|" \
+                "#{ai.logo_position}|#{ai.accent_bars}"
 
           if @@last_base_key == key && (cached = @@last_base_layer)
             return cached
@@ -470,16 +504,7 @@ module Hwaro
           base = Bytes.new(WIDTH * HEIGHT * CHANNELS)
           pixels = base.to_unsafe
 
-          fill_rect(pixels, 0, 0, WIDTH, HEIGHT, bg_color)
-
-          if bg_image_path
-            if cbg = cached_bg
-              blit_cached_image(pixels, cbg, 0, 0)
-            else
-              composite_image(pixels, bg_image_path, 0, 0, WIDTH, HEIGHT)
-            end
-            fill_rect_alpha(pixels, 0, 0, WIDTH, HEIGHT, bg_color, ai.overlay_opacity)
-          end
+          paint_background(pixels, bg_color, bg_image_path, cached_bg, ai.overlay_opacity)
 
           render_pattern(pixels, ai.style, accent_color, ai.pattern_opacity, ai.pattern_scale)
 
@@ -537,19 +562,8 @@ module Hwaro
               # already baked into `base`; memcpy them in.
               base.to_unsafe.copy_to(pixels, base.size)
             else
-              # 1. Fill background
-              fill_rect(pixels, 0, 0, WIDTH, HEIGHT, bg_color)
-
-              # 2. Background image (if configured)
-              if bg_image_path
-                if cbg = cached_bg
-                  blit_cached_image(pixels, cbg, 0, 0)
-                else
-                  composite_image(pixels, bg_image_path, 0, 0, WIDTH, HEIGHT)
-                end
-                # Overlay
-                fill_rect_alpha(pixels, 0, 0, WIDTH, HEIGHT, bg_color, ai.overlay_opacity)
-              end
+              # 1-2. Background colour, then the background image + overlay
+              paint_background(pixels, bg_color, bg_image_path, cached_bg, ai.overlay_opacity)
 
               # 3. Style pattern
               render_pattern(pixels, ai.style, accent_color, ai.pattern_opacity, ai.pattern_scale)
@@ -568,13 +582,21 @@ module Hwaro
               render_text_content(pixels, page, config, ctx, text_color, accent_color, bg_color)
             end
 
-            # 6. Logo image
+            # 6. Logo image. The logo occupies a LOGO_SIZE square box but is
+            # scaled to FIT it and centred inside, matching what the SVG
+            # renderer's `<image>` already does (its default
+            # preserveAspectRatio is "xMidYMid meet"). Stretching to the full
+            # square instead squashed every non-square logo — a 400x100
+            # wordmark came out as a 48x48 blob.
             if logo_image_path
               logo_x, logo_y = OgImage.logo_coordinates(ai.logo_position)
               if clogo = cached_logo
-                blit_cached_image(pixels, clogo, logo_x, logo_y)
+                blit_cached_image(pixels, clogo,
+                  logo_x + (OgImage::LOGO_SIZE - clogo.width) // 2,
+                  logo_y + (OgImage::LOGO_SIZE - clogo.height) // 2)
               else
-                composite_image(pixels, logo_image_path, logo_x, logo_y, OgImage::LOGO_SIZE, OgImage::LOGO_SIZE)
+                composite_image_fit(pixels, logo_image_path, logo_x, logo_y,
+                  OgImage::LOGO_SIZE, OgImage::LOGO_SIZE)
               end
             end
 
@@ -666,7 +688,7 @@ module Hwaro
           # Sanitize every string the fonts will draw: codepoints without a
           # glyph in any chain font (emoji, mostly) would render as tofu
           # boxes otherwise.
-          title_text = drop_missing_glyphs(title_chain, page.title)
+          title_text = drop_missing_glyphs(title_chain, OgImage.display_title(page, config))
           site_title = drop_missing_glyphs(brand_chain, config.title)
 
           title_lines = balanced_wrap_chain(title_chain, font_size, title_text, wrap_width)
@@ -928,7 +950,12 @@ module Hwaro
 
         # Word-wrap using incremental chain-measured text width.
         # Handles CJK characters by allowing breaks between any CJK characters.
-        private def self.word_wrap_chain(chain : Array(FontEntry), px_size : Float32, text : String, max_width : Int32) : Array(String)
+        # A segment wider than `break_width` on its own (a URL, a file path)
+        # is hard-broken at the last glyph that fits, like the SVG
+        # `word_wrap`; otherwise it ran off the canvas. `balanced_wrap_chain`
+        # narrows `max_width` but keeps `break_width` at the real limit, so
+        # balancing never splits a word that already fits.
+        private def self.word_wrap_chain(chain : Array(FontEntry), px_size : Float32, text : String, max_width : Int32, break_width : Int32 = max_width) : Array(String)
           return [] of String if text.empty?
           segments = Content::Seo::OgImage.split_into_segments(text)
           lines = [] of String
@@ -948,6 +975,21 @@ module Hwaro
               current_line = seg.lstrip
               current_width = chain_measure(chain, px_size, current_line)
             end
+
+            if current_width > break_width && current_line.size > 1
+              piece = ""
+              current_line.each_char do |ch|
+                candidate = piece + ch
+                if !piece.empty? && chain_measure(chain, px_size, candidate) > break_width
+                  lines << piece.strip
+                  piece = ch.to_s
+                else
+                  piece = candidate
+                end
+              end
+              current_line = piece
+              current_width = chain_measure(chain, px_size, piece)
+            end
           end
           lines << current_line.strip unless current_line.strip.empty?
           lines
@@ -964,7 +1006,7 @@ module Hwaro
           widest = widths.max
           return lines if widest <= 0 || widths.last >= widest * 0.55_f32
           target = Math.max(widths.sum / lines.size * 1.08_f32, widest * 0.6_f32)
-          rebalanced = word_wrap_chain(chain, px_size, text, to_px(target))
+          rebalanced = word_wrap_chain(chain, px_size, text, to_px(target), max_width)
           rebalanced.size <= lines.size ? rebalanced : lines
         end
 
@@ -1123,6 +1165,23 @@ module Hwaro
           end
         end
 
+        # Fill the canvas with `bg_color`, then — when a background image is
+        # configured — blit the cached decode (or decode+composite it) and dim
+        # it with the colour at `overlay_opacity`. Shared by the cached-base
+        # and the per-image render paths so the two cannot drift.
+        private def self.paint_background(pixels : UInt8*, bg_color : UInt32, bg_image_path : String?, cached_bg : CachedImage?, overlay_opacity : Float64)
+          fill_rect(pixels, 0, 0, WIDTH, HEIGHT, bg_color)
+
+          if bg_image_path
+            if cbg = cached_bg
+              blit_cached_image(pixels, cbg, 0, 0)
+            else
+              composite_image(pixels, bg_image_path, 0, 0, WIDTH, HEIGHT)
+            end
+            fill_rect_alpha(pixels, 0, 0, WIDTH, HEIGHT, bg_color, overlay_opacity)
+          end
+        end
+
         # Alpha-blend a pre-decoded CachedImage onto the pixel buffer
         private def self.blit_cached_image(pixels : UInt8*, cached : CachedImage, dx : Int32, dy : Int32)
           dw = cached.width
@@ -1148,18 +1207,25 @@ module Hwaro
         end
 
         # Composite an image file onto the pixel buffer, scaled to fit
+        # `composite_image` bounded by a box: the image is scaled to fit
+        # (no distortion) and centred inside `dw x dh` at `dx, dy`. Shares
+        # the decode+fit path with the cached-logo branch so both spellings
+        # place the logo identically.
+        private def self.composite_image_fit(pixels : UInt8*, image_path : String,
+                                             dx : Int32, dy : Int32, dw : Int32, dh : Int32)
+          fitted = load_image(image_path, dw, dh, fit: true)
+          return composite_image(pixels, image_path, dx, dy, dw, dh) unless fitted
+          blit_cached_image(pixels, fitted,
+            dx + (dw - fitted.width) // 2, dy + (dh - fitted.height) // 2)
+        end
+
         private def self.composite_image(pixels : UInt8*, image_path : String, dx : Int32, dy : Int32, dw : Int32, dh : Int32)
           return unless File.exists?(image_path)
 
-          src_w = uninitialized LibC::Int
-          src_h = uninitialized LibC::Int
-          channels = uninitialized LibC::Int
-          src_pixels = LibStb.stbi_load(image_path, pointerof(src_w), pointerof(src_h), pointerof(channels), 4) # force RGBA
-          return if src_pixels.null?
+          return unless loaded = load_rgba_upright(image_path)
+          src_pixels, src_w, src_h = loaded
 
           begin
-            return if src_w <= 0 || src_h <= 0
-
             # Resize to destination dimensions
             buf_size = dw.to_i64 * dh.to_i64 * 4
             return if buf_size > 64_000_000_i64 * 4
@@ -1195,7 +1261,7 @@ module Hwaro
               LibC.free(resized.as(Void*))
             end
           ensure
-            LibStb.stbi_image_free(src_pixels.as(Void*))
+            LibC.free(src_pixels.as(Void*))
           end
         end
 
@@ -1371,8 +1437,7 @@ module Hwaro
         # A quiet hairline color derived from the background: slightly
         # lighter on dark backgrounds, slightly darker on light ones.
         private def self.neutral_line(bg : UInt32) : UInt32
-          _, _, l = OgImage.hex_to_hsl("#%06x" % bg)
-          shifted_lightness(bg, l > 0.5 ? -0.30 : 0.32)
+          parse_hex_color(OgImage.neutral_line_hex("#%06x" % bg))
         end
 
         # Rotate a packed RGB color's hue by `degrees` (HSL round-trip).

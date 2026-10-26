@@ -19,18 +19,43 @@ module Hwaro
         end
       end
 
+      # The command line to hand `Process` with `shell: true`. That is
+      # `sh -c` on POSIX but a bare CreateProcess on Windows: no `&&`, pipes
+      # or redirects, and no `.cmd` shims (`npm`, `npx`). Wrap it in cmd.exe
+      # there, the way Node's `shell: true` does: %ComSpec% (not a `cmd.exe`
+      # found in the current directory), `/s` strips the outer quotes, `/d`
+      # skips AutoRun.
+      def self.shell_command(command : String) : String
+        {% if flag?(:windows) %}
+          %("#{windows_comspec}" /d /s /c "#{command}")
+        {% else %}
+          command
+        {% end %}
+      end
+
+      {% if flag?(:windows) %}
+        private def self.windows_comspec : String
+          if shell = ENV["ComSpec"]?
+            return shell if Path[shell].absolute?
+          end
+          if root = ENV["SystemRoot"]?
+            return File.join(root, "System32", "cmd.exe").gsub('/', '\\') if Path[root].absolute?
+          end
+          raise ArgumentError.new("Cannot locate cmd.exe: ComSpec or SystemRoot must be an absolute path")
+        end
+      {% end %}
+
       # Execute a single command and return the result
-      def self.run(command : String, working_dir : String? = nil, env : Hash(String, String)? = nil) : Result
+      def self.run(command : String, working_dir : String? = nil) : Result
         stdout = IO::Memory.new
         stderr = IO::Memory.new
 
         process_args = {
-          command: command,
+          command: shell_command(command),
           shell:   true,
           output:  stdout,
           error:   stderr,
           chdir:   working_dir,
-          env:     env,
         }
 
         status = Process.run(**process_args)
@@ -39,19 +64,21 @@ module Hwaro
           success: status.success?,
           output: stdout.to_s,
           error: stderr.to_s,
-          exit_code: status.exit_code
+          # A killed or crashed hook (or, on Windows, a negative exit code)
+          # has no exit code; `exit_code` would raise and abort as internal.
+          exit_code: status.exit_code? || -1
         )
       end
 
       # Execute multiple commands sequentially
       # Returns true if all commands succeed, false otherwise
-      def self.run_all(commands : Array(String), working_dir : String? = nil, label : String = "hook", env : Hash(String, String)? = nil) : Bool
+      def self.run_all(commands : Array(String), working_dir : String? = nil, label : String = "hook") : Bool
         return true if commands.empty?
 
         commands.each_with_index do |command, index|
           Logger.action(:Running, "#{label} [#{index + 1}/#{commands.size}]: #{command}")
 
-          result = run(command, working_dir, env)
+          result = run(command, working_dir)
 
           unless result.output.empty?
             result.output.each_line do |line|
@@ -68,38 +95,38 @@ module Hwaro
             end
             return false
           end
+
+          # A successful command's stderr is still its output: compiler
+          # warnings, deprecation notices and most tools' progress lines go
+          # there, and they used to vanish without a trace.
+          result.error.each_line do |line|
+            Logger.info "  #{line}"
+          end
         end
 
         true
       end
 
       # Execute pre-build hooks
-      def self.run_pre_hooks(commands : Array(String), working_dir : String? = nil, env : Hash(String, String)? = nil) : Bool
-        return true if commands.empty?
-
-        Logger.info "Running pre-build hooks..."
-        success = run_all(commands, working_dir, "pre-build", env)
-
-        if success
-          Logger.success "Pre-build hooks completed successfully."
-        else
-          Logger.error "Pre-build hooks failed."
-        end
-
-        success
+      def self.run_pre_hooks(commands : Array(String)) : Bool
+        run_hooks(commands, "pre-build")
       end
 
       # Execute post-build hooks
-      def self.run_post_hooks(commands : Array(String), working_dir : String? = nil, env : Hash(String, String)? = nil) : Bool
+      def self.run_post_hooks(commands : Array(String)) : Bool
+        run_hooks(commands, "post-build")
+      end
+
+      private def self.run_hooks(commands : Array(String), phase : String) : Bool
         return true if commands.empty?
 
-        Logger.info "Running post-build hooks..."
-        success = run_all(commands, working_dir, "post-build", env)
+        Logger.info "Running #{phase} hooks..."
+        success = run_all(commands, label: phase)
 
         if success
-          Logger.success "Post-build hooks completed successfully."
+          Logger.success "#{phase.capitalize} hooks completed successfully."
         else
-          Logger.error "Post-build hooks failed."
+          Logger.error "#{phase.capitalize} hooks failed."
         end
 
         success

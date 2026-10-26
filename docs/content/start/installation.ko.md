@@ -14,6 +14,16 @@ brew tap hahwul/hwaro
 brew install hwaro
 ```
 
+## Chocolatey (Windows)
+
+```powershell
+choco install hwaro
+```
+
+v0.20.2 다음 릴리스(Windows x86_64 바이너리가 처음 포함되는 릴리스)부터 배포되며,
+새 패키지의 첫 버전은 Chocolatey 커뮤니티 검수를 통과한 뒤 설치할 수 있습니다.
+업데이트는 `choco upgrade hwaro`로 합니다(실행 중인 `hwaro serve`는 먼저 종료하세요).
+
 ## Snapcraft
 
 ```bash
@@ -70,12 +80,34 @@ nix run github:hahwul/hwaro -- --version
 nix develop github:hahwul/hwaro
 ```
 
+개발 셸에는 Crystal, `shards`, `just`, `crystal2nix`가 함께 들어 있어 다른 것을
+설치하지 않아도 `just build`와 `just test`를 바로 실행할 수 있습니다.
+
+### 플레이크 입력으로 사용하기
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.hwaro.url = "github:hahwul/hwaro";
+
+  outputs = { nixpkgs, hwaro, ... }: {
+    # `hwaro.packages.<system>.hwaro`를 쓰거나, `hwaro.overlays.default`를
+    # nixpkgs 오버레이에 추가한 뒤 `pkgs.hwaro`로 사용하세요.
+  };
+}
+```
+
+지원 시스템은 `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`입니다
+(nixpkgs-unstable가 Intel macOS 지원을 중단했습니다). 플레이크가 공식 Crystal
+툴체인을 고정해 두므로 컴파일러를 소스에서 빌드할 필요가 없습니다.
+
 ## 사전 빌드 바이너리
 
-macOS와 Linux용 사전 빌드 바이너리를 [GitHub Releases](https://github.com/hahwul/hwaro/releases) 페이지에서 받을 수 있습니다.
+macOS, Linux, Windows용 사전 빌드 바이너리를 [GitHub Releases](https://github.com/hahwul/hwaro/releases) 페이지에서 받을 수 있습니다.
 
 1. [최신 릴리스](https://github.com/hahwul/hwaro/releases/latest)에서 플랫폼에 맞는 바이너리를 내려받습니다.
-2. PATH에 포함된 디렉터리로 바이너리를 옮깁니다.
+2. PATH에 포함된 디렉터리로 바이너리를 옮깁니다. **macOS 배포물은 단일 바이너리가
+   아니라 tarball이므로, 옮기기 전에 아래 [macOS](#macos) 항목을 먼저 확인하세요.**
 
 ```bash
 # Linux(amd64) 예시
@@ -83,12 +115,67 @@ chmod +x hwaro-v*-linux-x86_64
 sudo mv hwaro-v*-linux-x86_64 /usr/local/bin/hwaro
 ```
 
+### macOS
+
+macOS 배포물은 단일 바이너리가 아니라 tarball입니다. 압축을 풀면 `hwaro`와
+번들된 OpenSSL이 담긴 `lib/` 디렉터리가 나오고, 바이너리는 이 dylib들을
+`@executable_path/lib` 경로로 읽습니다. 따라서 **`lib/`를 항상 바이너리와 함께
+옮겨야 합니다.** 바이너리만 떼어 옮기면 실행되지 않습니다.
+
+```bash
+tar -xzf hwaro-v*-osx-arm64.tar.gz
+sudo mkdir -p /usr/local/libexec/hwaro
+sudo cp -R hwaro lib /usr/local/libexec/hwaro/
+sudo ln -sf /usr/local/libexec/hwaro/hwaro /usr/local/bin/hwaro
+```
+
+심볼릭 링크는 안전합니다. macOS가 `@executable_path`를 계산하기 전에 링크를
+먼저 해석하므로 dylib을 그대로 찾습니다. Homebrew도 같은 방식으로 설치합니다.
+
+> **v0.20.0 한정.** 이 릴리스의 macOS tarball은 번들된 dylib의 코드 서명이 깨진
+> 상태로 배포되어, Apple Silicon에서는 실행 즉시 프로세스가 종료됩니다
+> (`zsh: killed hwaro`, 다른 메시지는 나오지 않습니다). quarantine 속성만 지워서는
+> 해결되지 않습니다. 서명 자체가 깨져 있기 때문입니다. 반대로 다시 서명만 해도
+> 막힐 수 있습니다. quarantine이 걸린 파일을 재서명하면 승인 상태가 초기화되기
+> 때문입니다. 압축을 푼 디렉터리에서 아래 순서로 둘 다 실행하세요.
+>
+> ```bash
+> xattr -dr com.apple.quarantine hwaro lib
+> codesign --force --sign - lib/*.dylib hwaro
+> ```
+>
+> v0.20.1부터는 올바르게 서명된 tarball이 배포되므로 이 과정이 필요 없습니다.
+
+### Windows
+
+Windows 배포물은 Visual C++ 재배포 패키지 없이 실행되는 단일 정적 `.exe`(x86_64)
+입니다. PowerShell에서 현재 사용자용으로 설치하고 PATH에 추가합니다.
+
+```powershell
+# 내려받은 파일 이름을 쓰세요. 예: hwaro-v0.21.0-windows-x86_64.exe
+$exe = ".\hwaro-v0.21.0-windows-x86_64.exe"
+$dir = "$env:LOCALAPPDATA\hwaro"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Move-Item -Force $exe "$dir\hwaro.exe"
+$path = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($path -split ";") -notcontains $dir) {
+  [Environment]::SetEnvironmentVariable("Path", "$path;$dir", "User")
+}
+```
+
+설치 후 새 터미널을 여세요. 업데이트할 때는 새로 내려받은 파일로 같은 명령을
+다시 실행합니다(실행 중인 `hwaro serve`는 먼저 종료하세요). Windows에서는
+[빌드 훅](/ko/features/build-hooks/)과 배포 명령이 `cmd.exe`로 실행됩니다.
+
 ## 소스 빌드
 
 ### 사전 요구 사항
 
-- [Crystal](https://crystal-lang.org/install/) 1.19+
+- [Crystal](https://crystal-lang.org/install/) 1.21+
 - Git
+- Windows 한정: Git Bash 터미널에서 빌드하고(번들된 이미지 코드를 `sh`로
+  빌드), LLVM의 `clang-cl`이 `PATH`에 있어야 합니다(Visual Studio의 "C++ Clang
+  tools" 구성 요소 또는 LLVM 설치 프로그램)
 
 ### 빌드
 
@@ -99,7 +186,7 @@ shards install
 shards build --release --no-debug
 ```
 
-바이너리는 `./bin/hwaro`에 생성됩니다.
+바이너리는 `./bin/hwaro`(Windows에서는 `bin\hwaro.exe`)에 생성됩니다.
 
 > Crystal **1.21 이상**이 필요합니다. 병렬 페이지 렌더링은 `src/main.cr`에서
 > Crystal 기본 실행 컨텍스트 크기를 조정해 켜지므로 별도 빌드 플래그가
@@ -113,7 +200,7 @@ shards build --release --no-debug
 > 빌드 중 피크 메모리 사용량이 늘어납니다. 두 환경 변수를 직접
 > export하면 내장 기본값보다 우선하고, `--memory-limit` 사용 시 힙
 > 프리사이즈는 자동으로 비활성화됩니다. 자세한 내용은
-> [전역 플래그 표](@/start/cli.md)를 참고하세요.
+> [전역 플래그 표](/ko/start/cli/#전역-플래그)를 참고하세요.
 
 ### PATH 등록 (선택)
 

@@ -29,7 +29,7 @@ hooks.post = ["npm run minify", "npx pagefind --site public"]
 빌드 전 훅은 콘텐츠 처리가 시작되기 **전에** 실행됩니다. 다음 작업에 적합합니다.
 
 - 의존성 설치
-- 에셋 컴파일(TypeScript, Tailwind/PostCSS 등 — SCSS는 [Sass/SCSS](/ko/features/sass/) 내장 컴파일러로 처리합니다)
+- 에셋 컴파일(TypeScript, Tailwind/PostCSS 등. SCSS는 [Sass/SCSS](/ko/features/sass/) 내장 컴파일러로 처리합니다)
 - 데이터 가져오기 스크립트 실행
 - 콘텐츠 전처리
 
@@ -77,21 +77,39 @@ hooks.pre = ["echo Step 1", "echo Step 2", "echo Step 3"]
 출력:
 
 ```
-Running pre-build hook: echo Step 1
-Step 1
-Running pre-build hook: echo Step 2
-Step 2
-Running pre-build hook: echo Step 3
-Step 3
+Running pre-build hooks...
+     Running  pre-build [1/3]: echo Step 1
+  Step 1
+     Running  pre-build [2/3]: echo Step 2
+  Step 2
+     Running  pre-build [3/3]: echo Step 3
+  Step 3
+Pre-build hooks completed successfully.
 ```
+
+각 명령의 출력은 stdout과 stderr 모두, 명령이 끝난 뒤 해당 줄 아래에 들여쓰기로 표시됩니다. `--quiet`에서는 실패한 명령의 stderr만 표시됩니다.
 
 ## serve 모드
 
-빌드 훅은 `hwaro serve` 중에도 실행됩니다.
+빌드 훅은 `hwaro serve` 중에도 실행되지만, **전체 재빌드**에서만 실행됩니다.
 
 - 서버 시작 시 **최초 빌드**에서 훅이 실행됩니다
-- 파일 변경으로 트리거되는 **재빌드마다 다시 실행**됩니다
-- 설정 변경은 자동으로 반영됩니다 — `config.toml`의 `hooks.pre`나 `hooks.post`를 수정하면 다음 재빌드부터 새 명령이 적용됩니다
+- **전체 재빌드**에서 다시 실행됩니다. `config.toml` 변경, 파일 추가나 삭제, `data/` 아래 파일 변경이 여기에 해당합니다
+- **부분 재빌드에서는 건너뜁니다** — 기존 콘텐츠나 템플릿 파일을 수정하면 영향받는 페이지만 다시 렌더링하고 훅 명령은 다시 실행하지 않습니다
+- 설정 변경은 자동으로 반영됩니다. `config.toml`의 `hooks.pre`나 `hooks.post`를 수정하면 다음 재빌드부터 새 명령이 적용됩니다
+
+덕분에 저장 후 새로고침이 빠르게 유지됩니다. 서버가 켜져 있는 동안 훅의 결과물을 갱신해야 한다면 `config.toml`을 건드리거나 `hwaro serve`를 재시작해 전체 재빌드를 유도하세요.
+
+### 재빌드 루프
+
+감시 대상 디렉터리(`content/`, `templates/`, `static/`, `data/`, `i18n/`)나 `config.toml` 자체에 쓰는 훅은 자기 결과물을 다시 감시자에게 흘려보냅니다. 무해한 경우는 Hwaro가 알아서 처리합니다. 빌드가 이미 읽은 것과 **같은 바이트**를 다시 쓰는 실행(변하지 않은 응답을 받아오는 `curl -o data/team.json`, 동일한 결과물을 다시 내보내는 번들러, `config.toml`의 시각만 건드리는 훅)은 무한 재빌드로 이어지지 않고 잦아듭니다. 파일 위치에 따라 그 변경은 아예 무시되거나, 훅을 다시 실행하지 않는 부분 재빌드로 흡수됩니다.
+
+반면 다음 두 가지는 감시자 입장에서 실제 변경이므로 매번 재빌드를 유발합니다.
+
+- 실행할 때마다 **다른 바이트**를 쓰는 경우. 타임스탬프, 빌드 카운터, 비결정적 번들 해시 등
+- 실행할 때마다 감시 대상 디렉터리에 파일을 **만들었다 지우는** 경우
+
+결과물을 결정적으로 만들거나, 감시하지 않는 위치에 쓰세요(`.hwaro/`는 무시되며, 위에 나열한 디렉터리 밖도 마찬가지입니다).
 
 ## 활용 사례
 
@@ -110,6 +128,32 @@ hooks.pre = [
   "npx tailwindcss -i src/styles.css -o static/assets/css/styles.css --minify"
 ]
 ```
+
+### API에서 데이터 가져오기
+
+가장 흔한 경우, 즉 GET 요청 하나의 페이로드를 `site.data`에 넣는 것이라면 훅이 필요 없습니다. `config.toml`에 [`[[data.remote]]` 소스](/ko/features/remote-data/)를 선언하면 Hwaro가 빌드당 한 번 가져오며, 디스크 캐싱과 명시적인 오류 처리가 내장되어 있습니다.
+
+가져오기가 요청 하나로 끝나지 않을 때는 여전히 사전 빌드 훅이 맞는 도구입니다. `load_data()`는 디스크만 읽습니다. 따라서 원격 데이터는 빌드 전에 `data/`로 내려받아 정적으로 굽습니다. `data/` 아래 파일은 그대로 `site.data`로 노출됩니다.
+
+```toml
+[build]
+hooks.pre = ["curl -sfL https://api.example.com/team -o data/team.json"]
+```
+
+```jinja
+{% for member in site.data.team %}
+  <li>{{ member.name }}</li>
+{% endfor %}
+```
+
+`curl -f`는 HTTP 오류에서 0이 아닌 코드로 종료하므로, 데이터가 빠진 사이트를 배포하는 대신 빌드가 중단됩니다. 페이지네이션, 인증 헤더, 응답 가공처럼 요청 하나로 끝나지 않는 작업은 스크립트로 분리해 호출하세요.
+
+```toml
+[build]
+hooks.pre = ["./scripts/fetch-data.sh"]
+```
+
+오프라인에서도 동일한 빌드를 원한다면 내려받은 파일을 커밋하고, 항상 최신 데이터를 원한다면 `.gitignore`에 추가하세요.
 
 ### Pagefind 검색
 
@@ -163,7 +207,8 @@ hooks.post = [
 
 ## 팁
 
-- **훅은 빠르게 유지**: 느린 훅은 `hwaro serve` 중 재빌드할 때마다 실행됩니다. 캐싱이나 조건부 실행을 고려합니다.
+- **Windows**: 훅은 `sh`가 아니라 `cmd.exe`(`cmd /d /s /c`)로 실행됩니다. `&&`, 파이프, `npm`/`npx`는 동작하지만, POSIX 전용 명령(`rm -rf`, `command -v`, `./script.sh`)은 hwaro를 Git Bash에서 실행해도 동작하지 않습니다. 대신 셸을 명시적으로 호출하세요: `powershell -File scripts/setup.ps1`, `.cmd` 스크립트, 또는 Git Bash가 `PATH`에 있다면 `bash scripts/setup.sh`. `cmd /c`는 첫 줄바꿈에서 멈추므로 명령은 한 줄로 작성하세요.
+- **훅은 빠르게 유지**: 느린 훅은 `hwaro serve` 중 전체 재빌드마다 실행됩니다. 캐싱이나 조건부 실행을 고려합니다.
 - **복잡한 작업은 스크립트로**: 여러 단계가 필요하면 셸 스크립트를 작성해 훅에서 호출합니다: `hooks.pre = ["./scripts/setup.sh"]`
 - **의존성 확인**: 도구를 실행하기 전에 `command -v`로 사용 가능 여부를 확인합니다:
   ```bash

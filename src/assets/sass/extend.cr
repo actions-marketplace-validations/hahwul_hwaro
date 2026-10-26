@@ -32,7 +32,13 @@ module Hwaro
         # One `@extend` directive: the extending rule's resolved selectors,
         # one target selector, and the location for error reporting.
         record Request, extenders : Array(String), target : String,
-          optional : Bool, path : String, line : Int32, column : Int32
+          optional : Bool, path : String, line : Int32, column : Int32,
+          # Line-break flags of the extending rule's selector list —
+          # additions carry the extender's own line structure into the
+          # extended rule (dart-sass: `.x,\n.y { @extend .t }` emits
+          # `.t, .x,\n.y`). May be shorter than `extenders`; missing
+          # entries read false.
+          breaks : Array(Bool) = [] of Bool
 
         # One parsed piece of a complex selector.
         record Compound, simples : Array(String)
@@ -43,19 +49,28 @@ module Hwaro
         # simple selector; otherwise every extension of `selector` by
         # `extenders` (possibly empty when no extender unifies — the
         # target still counts as found).
+        # Each result pairs the added selector with the index of the
+        # extender that produced it (-1 for a pseudo-argument extension,
+        # which rewrites the extended selector itself) so the caller can
+        # carry the extender's line-break flag.
         def extend_selector(selector : String, target : String,
-                            extenders : Array(String)) : Array(String)?
+                            extenders : Array(String)) : Array({String, Int32})?
           items = parse_items(selector)
           return unless items
           found = false
-          results = [] of String
+          results = [] of {String, Int32}
+          # Every pseudo-argument extension lands in ONE rewritten selector
+          # (`.w:not(.a):not(.a)` gets both `:not()`s extended together), so
+          # the caller can fold later requests into it without dropping one.
+          pseudo_items = items.dup
+          pseudo_at : Int32? = nil
           items.each_with_index do |item, idx|
             next unless item.is_a?(Compound)
             if slot = item.simples.index(target)
               found = true
               rest = item.simples.dup
               rest.delete_at(slot)
-              extenders.each do |ext_sel|
+              extenders.each_with_index do |ext_sel, ext_i|
                 ext_items = parse_items(ext_sel)
                 next unless ext_items
                 last = ext_items.last?
@@ -64,7 +79,7 @@ module Hwaro
                 next unless merged
                 prefix = merge_prefixes(items[0...idx], ext_items[0...-1])
                 new_items = prefix + [Compound.new(merged).as(Item)] + items[idx + 1..]
-                results << serialize_items(new_items)
+                results << {serialize_items(new_items), ext_i}
               end
             end
             # A target inside a selector pseudo-class argument
@@ -76,12 +91,14 @@ module Hwaro
               next unless extended
               found = true
               next if extended == simple
-              new_simples = item.simples.dup
+              new_simples = pseudo_items[idx].as(Compound).simples.dup
               new_simples[si] = extended
-              new_items = items.dup
-              new_items[idx] = Compound.new(new_simples)
-              results << serialize_items(new_items)
+              pseudo_items[idx] = Compound.new(new_simples)
+              pseudo_at ||= results.size
             end
+          end
+          if at = pseudo_at
+            results.insert(at, {serialize_items(pseudo_items), -1})
           end
           found ? results : nil
         end
@@ -102,7 +119,7 @@ module Hwaro
             results = extend_selector(arg, target, extenders)
             next unless results
             found = true
-            results.each do |sel|
+            results.each do |(sel, _)|
               additions << sel unless args.includes?(sel) || additions.includes?(sel)
             end
           end
@@ -151,8 +168,15 @@ module Hwaro
             next if element?(s) || pseudo?(s)
             merged << s unless merged.includes?(s)
           end
+          # Pseudo-classes before pseudo-elements: `.icon::before` extending
+          # `.btn:hover` is `.icon:hover::before` — a pseudo-class after a
+          # pseudo-element matches nothing.
           (ext + rest).each do |s|
-            next unless pseudo?(s)
+            next if !pseudo?(s) || pseudo_element?(s)
+            merged << s unless merged.includes?(s)
+          end
+          (ext + rest).each do |s|
+            next unless pseudo_element?(s)
             merged << s unless merged.includes?(s)
           end
           merged
@@ -195,7 +219,19 @@ module Hwaro
           nodes.reject! do |node|
             case node
             when Css::Rule
-              node.selectors.reject! { |s| placeholder?(s) }
+              if node.selectors.any? { |s| placeholder?(s) }
+                # Remove selectors and their line-break flags in tandem —
+                # a bare reject! would shift flags onto the wrong selector.
+                kept = [] of String
+                kept_breaks = [] of Bool
+                node.selectors.each_with_index do |s, i|
+                  next if placeholder?(s)
+                  kept << s
+                  kept_breaks << (node.breaks[i]? || false)
+                end
+                node.selectors.replace(kept)
+                node.breaks.replace(kept_breaks)
+              end
               node.selectors.empty?
             when Css::AtRule
               scrub_placeholders(node.children) unless keyframes_name?(node.name)
@@ -241,6 +277,11 @@ module Hwaro
           i = start
           while i < chars.size
             c = chars[i]
+            if c == '\\'
+              # An escaped character (`.sm\:flex`, `.a\ b`) is part of the name.
+              i = {i + 2, chars.size}.min
+              next
+            end
             break if c.ascii_whitespace? || c == '>' || c == '+' || c == '~'
             case c
             when '['
@@ -269,6 +310,8 @@ module Hwaro
           start = 0
           while i < chars.size
             case c = chars[i]
+            when '\\'
+              i += 2
             when '['
               j = skip_bracket(chars, i)
               return unless j
@@ -316,6 +359,13 @@ module Hwaro
 
         private def pseudo?(simple : String) : Bool
           simple.starts_with?(':')
+        end
+
+        # `::x` plus the four legacy single-colon pseudo-elements.
+        private def pseudo_element?(simple : String) : Bool
+          return true if simple.starts_with?("::")
+          return false unless simple.starts_with?(':')
+          {":before", ":after", ":first-line", ":first-letter"}.includes?(simple.downcase)
         end
 
         private def skip_string(chars : Array(Char), start : Int32) : Int32?

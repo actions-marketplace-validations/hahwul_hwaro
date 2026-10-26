@@ -28,31 +28,31 @@ taxonomies = ["tags"]
 1. Hwaro가 택소노미 항목 → 페이지의 역색인을 만듭니다
 2. 각 페이지마다 다른 페이지와 공유하는 택소노미 항목 수를 셉니다
 3. 공유 항목이 많은 페이지가 더 높은 순위를 받습니다
-4. 결과는 언어별로 필터링됩니다(다국어 사이트는 같은 언어의 글만 보여줌)
+4. 결과는 언어와 버전으로 필터링됩니다(다국어 사이트는 같은 언어의 글만 보여 주고, [버전별 문서](/ko/features/versioned-docs/)는 버전 경계를 넘지 않음)
 5. 상위 N개(`limit`까지)가 관련 글로 지정됩니다
 
-초안 페이지, 인덱스 페이지, 생성된 페이지는 관련 글 계산에서 제외됩니다.
+초안 페이지, 홈 페이지, 섹션 인덱스 페이지(`_index.md`), 헤드리스 페이지(`render = false`), 생성된 페이지는 관련 글 계산에서 제외됩니다. 페이지 번들(`post/index.md`)은 일반 글로 취급되어 포함됩니다.
 
 ## 템플릿 변수
 
-각 페이지는 관련 페이지를 관련도 순으로 담은 `related_posts` 배열을 갖습니다.
+각 페이지는 관련 페이지를 관련도 순으로 담은 `page.related_posts` 배열을 갖습니다.
 
 | 변수 | 타입 | 설명 |
 |----------|------|-------------|
-| related_posts | array | 현재 페이지와 관련된 페이지들, 공유 항목 수 순 정렬 |
+| page.related_posts | array | 현재 페이지와 관련된 페이지들, 공유 항목 수 순 정렬 |
 
-`related_posts`의 각 항목은 완전한 페이지 객체이므로 모든 페이지 변수(`title`, `url`, `description`, `date`, `tags` 등)에 접근할 수 있습니다.
+`page.related_posts`의 각 항목은 완전한 페이지 객체이므로 모든 페이지 변수(`title`, `url`, `description`, `date`, `tags` 등)에 접근할 수 있습니다.
 
 ## 템플릿에서 사용
 
 ### 기본 관련 글
 
 ```jinja
-{% if related_posts | length > 0 %}
+{% if page.related_posts | length > 0 %}
 <section class="related-posts">
   <h2>Related Posts</h2>
   <ul>
-    {% for post in related_posts %}
+    {% for post in page.related_posts %}
     <li>
       <a href="{{ post.url }}">{{ post.title }}</a>
       {% if post.description %}
@@ -68,10 +68,10 @@ taxonomies = ["tags"]
 ### 태그와 함께 표시
 
 ```jinja
-{% if related_posts | length > 0 %}
+{% if page.related_posts | length > 0 %}
 <aside class="related">
   <h3>You might also like</h3>
-  {% for post in related_posts %}
+  {% for post in page.related_posts %}
   <article>
     <a href="{{ post.url }}">{{ post.title }}</a>
     <div class="tags">

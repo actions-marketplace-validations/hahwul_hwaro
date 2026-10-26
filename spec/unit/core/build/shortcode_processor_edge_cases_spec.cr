@@ -1,0 +1,824 @@
+require "../../../spec_helper"
+require "../../../../src/core/build/builder"
+
+# Edge-case coverage for ShortcodeProcessor that complements
+# `builder_shortcode_spec.cr`. Focuses on malformed input, error paths,
+# and uncommon nesting patterns called out in issue #328.
+module Hwaro::Core::Build
+  class Builder
+    def test_sc_process(content, templates = {} of String => String, context = {} of String => Crinja::Value)
+      process_shortcodes_jinja(content, templates, context)
+    end
+
+    def test_sc_process_with_results(content, templates, context, results)
+      process_shortcodes_jinja(content, templates, context, results)
+    end
+
+    def test_sc_render_jinja(template, args, context = {} of String => Crinja::Value, warnings = nil)
+      render_shortcode_jinja(template, args, context, warnings: warnings)
+    end
+
+    def test_sc_parse_args(s)
+      parse_shortcode_args_jinja(s)
+    end
+
+    def test_content_may_contain_shortcodes?(s)
+      content_may_contain_shortcodes?(s)
+    end
+  end
+end
+
+describe Hwaro::Core::Build::ShortcodeProcessor do
+  it "stays linear in the block shortcode count on a long page" do
+    # PCRE2 re-validated the whole page's UTF-8 for every tag scanned.
+    builder = Hwaro::Core::Build::Builder.new
+    templates = {"shortcodes/note" => %(<b>{{ body }}</b>)}
+    content = "Café {% note() %}x{% end %}\n\n" * 30_000
+    t = Time.instant
+    result = builder.test_sc_process(content, templates)
+    (Time.instant - t).should be < 10.seconds # quadratic took 17s
+    result.scan("<b>x</b>").size.should eq(30_000)
+  end
+
+  describe "block shortcodes with arguments" do
+    it "passes named args from a block shortcode opening tag" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/alert" => %(<div class="{{ kind }}">{{ body }}</div>),
+      }
+      result = builder.test_sc_process(
+        %({% alert(kind="warning") %}careful{% end %}),
+        templates,
+      )
+      result.should contain(%(<div class="warning">))
+      result.should contain("careful")
+    end
+
+    it "passes positional args from a block shortcode opening tag" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/wrap" => %(<div class="{{ _0 }}">{{ body }}</div>),
+      }
+      result = builder.test_sc_process(
+        %({% wrap("box") %}content{% end %}),
+        templates,
+      )
+      result.should contain(%(<div class="box">))
+    end
+  end
+
+  describe "built-in positional arguments" do
+    it "keeps an explicitly empty positional slot when mapping later arguments" do
+      builder = Hwaro::Core::Build::Builder.new
+
+      result = builder.test_sc_process(%({{ gist("", "abc123") }}))
+
+      result.should contain("https://gist.github.com//abc123.js")
+      result.should_not contain("https://gist.github.com/abc123/.js")
+
+      block = builder.test_sc_process(%({% alert("", "Heads up") %}Body{% end %}))
+      block.should contain("sc-alert--info")
+      block.should contain(%(sc-alert__title">Heads up</div>))
+    end
+  end
+
+  describe "unknown shortcodes" do
+    # Regression for https://github.com/hahwul/hwaro/issues/480
+    # The old behavior left `{{ unknown(...) }}` literally in the output
+    # and the search index. Now we replace the call with an HTML comment
+    # so readers don't see broken text and `strip_html` drops it from
+    # `search.json`. The warning still fires (see "warns when ..." below).
+    it "replaces direct-call references with an HTML comment when no template matches" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = %(text {{ unknown(arg="x") }} more)
+      result = builder.test_sc_process(content, {} of String => String)
+      result.should_not contain("{{ unknown")
+      result.should contain("<!-- hwaro: missing shortcode 'unknown' -->")
+    end
+
+    it "replaces explicit shortcode() calls with an HTML comment when template missing" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = %({{ shortcode("missing", arg="x") }})
+      result = builder.test_sc_process(content, {} of String => String)
+      result.should_not contain("{{ shortcode")
+      result.should contain("<!-- hwaro: missing shortcode 'missing' -->")
+    end
+
+    it "replaces block shortcodes with an HTML comment when template missing" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = %({% missing %}body{% end %})
+      result = builder.test_sc_process(content, {} of String => String)
+      result.should_not contain("{% missing %}")
+      result.should contain("<!-- hwaro: missing shortcode 'missing' -->")
+    end
+
+    it "warns when a direct-call shortcode name is not a registered template or Crinja function" do
+      builder = Hwaro::Core::Build::Builder.new
+      sink = IO::Memory.new
+      previous_io = Hwaro::Logger.io
+      Hwaro::Logger.io = sink
+      begin
+        builder.test_sc_process(%(text {{ typo_sc(arg="x") }} more), {} of String => String)
+      ensure
+        Hwaro::Logger.io = previous_io
+      end
+      sink.to_s.should contain("Shortcode template 'shortcodes/typo_sc' not found.")
+    end
+
+    it "does not warn when a direct call matches a registered Crinja function name" do
+      # `env`, `asset`, `url_for`, `get_url`, `resize_image`, … are
+      # registered on the shared Crinja env by the template processor.
+      # Direct-call syntax in content ({{ env(\"X\") }}) is a legitimate
+      # template-function reference, not a typo'd shortcode, so the
+      # shortcode processor must silent-pass-through.
+      builder = Hwaro::Core::Build::Builder.new
+      sink = IO::Memory.new
+      previous_io = Hwaro::Logger.io
+      Hwaro::Logger.io = sink
+      begin
+        builder.test_sc_process(%({{ env("FOO") }} {{ asset(name="x.css") }}), {} of String => String)
+      ensure
+        Hwaro::Logger.io = previous_io
+      end
+      sink.to_s.should_not contain("Shortcode template")
+    end
+
+    it "dedupes missing-template warnings across multiple invocations" do
+      builder = Hwaro::Core::Build::Builder.new
+      sink = IO::Memory.new
+      previous_io = Hwaro::Logger.io
+      Hwaro::Logger.io = sink
+      begin
+        # Same missing shortcode used three times, in two syntaxes.
+        builder.test_sc_process(
+          %({{ missing_sc(a="1") }} {{ missing_sc(a="2") }} {% missing_sc %}b{% end %}),
+          {} of String => String,
+        )
+      ensure
+        Hwaro::Logger.io = previous_io
+      end
+      # Exactly one warning line per unique missing template key.
+      output = sink.to_s
+      output.scan("Shortcode template 'shortcodes/missing_sc' not found.").size.should eq(1)
+    end
+  end
+
+  describe "malformed shortcodes" do
+    it "returns a visible HTML-comment marker when the shortcode template has a Crinja error" do
+      builder = Hwaro::Core::Build::Builder.new
+      # Unbalanced/invalid Jinja syntax in the template. Not an empty
+      # string: silently vanishing output made mid-edit template errors
+      # invisible during serve (the rebuild "succeeded").
+      result = builder.test_sc_render_jinja(
+        "{% if %}",
+        {} of String => String,
+        {} of String => Crinja::Value,
+      )
+      result.should eq("<!-- hwaro: template error in shortcode -->")
+    end
+
+    it "propagates a render-time Crinja error instead of downgrading it" do
+      builder = Hwaro::Core::Build::Builder.new
+      # This compiles, but traversing a missing field on a string raises
+      # Crinja::UndefinedError while rendering. Runtime errors are fatal,
+      # like page-template errors: only syntax errors get the marker.
+      warnings = [] of String
+      err = expect_raises(Crinja::Error) do
+        builder.test_sc_render_jinja(
+          "{{ text.foo.bar }}",
+          {"text" => "value"},
+          {} of String => Crinja::Value,
+          warnings,
+        )
+      end
+      err.message.not_nil!.should contain("text.foo is undefined")
+      warnings.should be_empty
+    end
+
+    it "treats a stray {% end %} preceding shortcodes as literal text" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      result = builder.test_sc_process(
+        "{% end %} normal text {% note %}body{% end %}",
+        templates,
+      )
+      result.should contain("{% end %}")
+      result.should contain("<span>body</span>")
+    end
+
+    it "handles unclosed code fence — content after open fence is left untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      content = "before\n```\n{% note %}skipped{% end %}\nno close fence"
+      result = builder.test_sc_process(content, templates)
+      # The shortcode inside the never-closed fence stays raw
+      result.should contain("{% note %}skipped{% end %}")
+      result.should_not contain("<span>")
+    end
+  end
+
+  describe "code fences" do
+    it "leaves shortcodes inside indented backtick fences untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      content = "  ```\n  {% note %}body{% end %}\n  ```"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("{% note %}body{% end %}")
+      result.should_not contain("<span>")
+    end
+
+    it "processes shortcodes between adjacent fences" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      content = "```\nfenced1\n```\n{% note %}live{% end %}\n```\nfenced2\n```"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<span>live</span>")
+      result.should contain("fenced1")
+      result.should contain("fenced2")
+    end
+
+    # CommonMark fence semantics now come from the shared FenceTracker
+    # (same rules as the table/definition/math walkers and Markd itself).
+    # The three specs below pin the divergences the old ad-hoc regex had.
+    it "does not treat a 4-space-indented ``` as a fence opener (indented code is literal)" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      # In CommonMark "    ```" is indented-code content, not a delimiter —
+      # the old scanner opened a fence here and silently stopped expanding
+      # shortcodes for the rest of the document.
+      content = "    ```\n\n{% note %}live{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<span>live</span>")
+    end
+
+    it "closes a fence on a longer closer run (CommonMark closer-length rule)" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      # ```` validly closes a ``` fence; the old exact-length comparison
+      # never closed it, so everything below stayed unexpanded.
+      content = "```\nfenced\n````\n{% note %}live{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<span>live</span>")
+      result.should contain("fenced")
+    end
+
+    it "does not open a backtick fence whose info string contains a backtick" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      # CommonMark: "``` a`b" is not a fence opener (inline code instead).
+      content = "``` a`b\n{% note %}live{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<span>live</span>")
+    end
+
+    it "leaves shortcodes inside blockquoted fences untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      # Markd opens a fence behind "> ```", so the example must stay raw.
+      content = "> ```\n> {% note %}body{% end %}\n> ```\n\n{% note %}live{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("{% note %}body{% end %}")
+      result.should contain("<span>live</span>")
+    end
+
+    it "keeps fence protection after an unbalanced opener in inline code" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      # The literal `{% note %}` in backticks must not count as an open
+      # block tag — that used to pin block_depth > 0 and disable fence
+      # protection for every later fence in the document.
+      content = "Start with `{% note %}`.\n\n```\n{% note %}fenced{% end %}\n```"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("{% note %}fenced{% end %}")
+      result.should_not contain("<span>fenced</span>")
+    end
+
+    # The unmatched opener was emitted as literal text with nothing in the
+    # log, so `{% alert() %}` with a forgotten closer shipped the raw tag into
+    # the page. Warn once per name per build.
+    it "warns once when a block shortcode opener never finds its closer" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      result = nil
+      log = with_captured_log do
+        result = builder.test_sc_process("{% note %}\nforgot the closer\n\n{% note %}again\n", templates)
+      end
+      result.not_nil!.should contain("{% note %}")
+      log.scan("Block shortcode '{% note %}' is never closed").size.should eq(1)
+      log.should contain("{% endnote %}")
+    end
+
+    it "keeps fence protection after an unclosed block shortcode opener" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      results = {} of String => String
+      # The only `{% end %}` on the page is documentation inside a fenced
+      # example. Counting the opener the author never closed used to pin the
+      # depth counter above zero, so the fence was never recognized again:
+      # the fenced example expanded and Markd escaped its placeholder
+      # comment inside <pre><code>, where the restore pass can't find it.
+      content = "{% note %}\nforgot the closer\n\n```markdown\n{% note %}Hello{% end %}\n```\n"
+      result = builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      result.should contain("{% note %}Hello{% end %}")
+      result.should_not contain("HWARO-SHORTCODE-PLACEHOLDER")
+      results.should be_empty
+    end
+
+    it "leaves a shortcode inside indented code that follows a heading untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/t" => "<b>{{ _0 }}</b>"}
+      results = {} of String => String
+      # Indented code may not interrupt a paragraph, but it may follow a
+      # heading with no blank line — Markd opens <pre><code> here, so
+      # expanding the call stranded an escaped placeholder inside it.
+      content = %(## Example\n    {{ t("hello") }}\n\ntext\n)
+      result = builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      result.should contain(%({{ t("hello") }}))
+      result.should_not contain("HWARO-SHORTCODE-PLACEHOLDER")
+      results.should be_empty
+    end
+
+    it "does not count a fence opener's info string toward block depth" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      content = "``` {% note %}\ncode\n```\n{% note %}live{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<span>live</span>")
+    end
+
+    # Regression for https://github.com/hahwul/hwaro/issues/477
+    # Single-backtick inline code spans should be opaque to the shortcode
+    # processor, the same way fenced code blocks already are. The bug was
+    # that the call WAS substituted with a placeholder, then Markdown
+    # wrapped that placeholder in `<code>` and the post-processor never
+    # restored it (because of HTML-escaping inside `<code>`), leaving
+    # `<code>&lt;!--HWARO-SHORTCODE-PLACEHOLDER-N--&gt;</code>` in the
+    # rendered HTML and the search index.
+    it "leaves shortcodes inside single-backtick inline code spans untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe src="https://yt/embed/{{ id }}"></iframe>)}
+      content = %(Inline `{{ youtube(id="x") }}` should be literal.)
+      result = builder.test_sc_process(content, templates)
+      result.should contain(%(`{{ youtube(id="x") }}`))
+      result.should_not contain("HWARO-SHORTCODE-PLACEHOLDER")
+      result.should_not contain("<iframe")
+    end
+
+    it "still processes shortcodes outside the inline code span on the same line" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe src="https://yt/embed/{{ id }}"></iframe>)}
+      content = %(Live: {{ youtube(id="real") }} and literal: `{{ youtube(id="x") }}`.)
+      result = builder.test_sc_process(content, templates)
+      result.should contain("https://yt/embed/real")
+      result.should contain(%(`{{ youtube(id="x") }}`))
+    end
+
+    it "honors longer backtick fences (`` ` `` inside a double-backtick span)" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe></iframe>)}
+      # Double-backtick span lets the user include literal backticks inside.
+      content = %(Doc: ``a `b` {{ youtube(id="x") }}`` end.)
+      result = builder.test_sc_process(content, templates)
+      result.should contain(%(``a `b` {{ youtube(id="x") }}``))
+      result.should_not contain("<iframe")
+    end
+
+    it "leaves a shortcode inside a hard-wrapped (two-line) code span untouched" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe></iframe>)}
+      content = %(Wrapped: `start {{ youtube(id="x") }}\ncontinues here` done.)
+      result = builder.test_sc_process(content, templates)
+      result.should eq(content)
+      result.should_not contain("HWARO-SHORTCODE-PLACEHOLDER")
+    end
+
+    it "does not let a code span run across a blank line" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe></iframe>)}
+      # The first backtick has no closer in its paragraph, so the call in
+      # the next paragraph is live even though a later paragraph has a tick.
+      content = %(A stray ` tick.\n\n{{ youtube(id="x") }}\n\nAnother ` tick.)
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<iframe></iframe>")
+    end
+
+    it "survives a stray backtick above a very long paragraph (PCRE2 JIT stack)" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/youtube" => %(<iframe></iframe>)}
+      body = (1..4000).map { |i| "word#{i} lorem ipsum dolor sit amet" }.join("\n")
+      content = %(A stray ` tick.\n#{body}\n\n{{ youtube(id="x") }})
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<iframe></iframe>")
+    end
+
+    # Regression: inline code spans used to SPLIT the content into chunks,
+    # so a block shortcode whose body contained `code` had its opener and
+    # closer land in different chunks — the pair never matched and both
+    # tags leaked into the rendered HTML as literal text. Spans are now
+    # masked during pairing and restored before the body is rendered.
+    it "processes a block shortcode whose body contains an inline code span" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/alert" => %(<div class="alert">{{ body }}</div>)}
+      content = "{% alert %}\nuse `code` here.\n{% end %}"
+      result = builder.test_sc_process(content, templates)
+      result.should_not contain("{% alert %}")
+      result.should_not contain("{% end %}")
+      result.should_not contain("HWARO-INLINE-CODE")
+      result.should contain(%(<div class="alert">use `code` here.</div>))
+    end
+
+    it "restores the inline code span verbatim inside the rendered body" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/alert" => %(<div class="alert">{{ body }}</div>)}
+      results = {} of String => String
+      content = "{% alert %}\nuse `code` here.\n{% end %}"
+      builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      results.size.should eq(1)
+      results.values.first.should contain("use `code` here.")
+      results.values.first.should_not contain("HWARO-INLINE-CODE")
+    end
+
+    it "keeps a literal shortcode example inside inline code within a block body" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/alert"   => %(<div class="alert">{{ body }}</div>),
+        "shortcodes/youtube" => %(<iframe></iframe>),
+      }
+      results = {} of String => String
+      content = %({% alert %}\nliteral `{{ youtube(id="x") }}` example.\n{% end %})
+      builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      results.size.should eq(1)
+      results.values.first.should contain(%(`{{ youtube(id="x") }}`))
+      results.values.first.should_not contain("<iframe")
+    end
+
+    it "restores inline code spans in shortcode arguments" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/echo" => %(<span>{{ msg }}</span>)}
+      results = {} of String => String
+      content = %({{ echo(msg="tick `x` tock") }})
+      builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      results.values.first.should_not contain("HWARO-INLINE-CODE")
+    end
+
+    # A fenced example inside a block body was live text to the block
+    # parser: the fenced `{% alert %}…{% end %}` paired as a nested block and
+    # expanded, leaving its placeholder escaped inside the rendered code.
+    it "keeps shortcode examples fenced inside a block body literal" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/note"  => %(<div class="note">{{ body }}</div>),
+        "shortcodes/alert" => %(<b>ALERT</b>),
+        "shortcodes/say"   => %(<i>SAY</i>),
+      }
+      results = {} of String => String
+      fenced = %(```markdown\n{% alert(type="info") %}Hi{% end %}\n{{ say() }}\n```)
+      content = %({% note() %}\nShow:\n\n#{fenced}\n\n{{ say() }} live\n{% endnote %}\n\nafter)
+      out = builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      results.size.should eq(2)
+      note = results.values.find!(&.starts_with?(%(<div class="note">)))
+      note.should contain(fenced)
+      note.should_not contain("ALERT")
+      note.should_not contain("HWARO-INLINE-CODE")
+      out.should contain("after")
+      out.should_not contain("{% endnote %}")
+    end
+
+    it "keeps a fenced block closer inside a block body from closing the block" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => %(<div class="note">{{ body }}</div>)}
+      results = {} of String => String
+      content = "{% note() %}\n```\n{% if x %}{% end %}\n```\ntail\n{% end %}\n\nafter"
+      out = builder.test_sc_process_with_results(content, templates, {} of String => Crinja::Value, results)
+      results.size.should eq(1)
+      results.values.first.should contain("{% if x %}{% end %}\n```\ntail")
+      out.should contain("after")
+    end
+  end
+
+  describe "nested shortcodes" do
+    it "renders nested explicit calls inside a block body" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/box"   => %(<div class="box">{{ body }}</div>),
+        "shortcodes/badge" => %(<i>{{ _0 }}</i>),
+      }
+      content = %({% box %}label: {{ badge("v1") }}{% end %})
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<div class=\"box\">")
+      result.should contain("<i>v1</i>")
+    end
+
+    it "allows mixed block/inline nesting in a single body" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/box"   => %(<div>{{ body }}</div>),
+        "shortcodes/note"  => %(<p>{{ body }}</p>),
+        "shortcodes/badge" => %(<i>{{ _0 }}</i>),
+      }
+      content = %({% box %}{% note %}{{ badge("a") }}{% end %}{% end %})
+      result = builder.test_sc_process(content, templates)
+      result.should contain("<div>")
+      result.should contain("<p>")
+      result.should contain("<i>a</i>")
+    end
+  end
+
+  describe "block bodies inside containers" do
+    templates = {"shortcodes/box" => %([{{ body }}])}
+
+    it "strips the blockquote markers the opener line carries" do
+      content = "> {% box %}\n> Use **this**.\n>\n> More.\n> {% end %}\n"
+      result = Hwaro::Core::Build::Builder.new.test_sc_process(content, templates)
+      result.should eq("> [Use **this**.\n\nMore.]\n")
+    end
+
+    it "strips list indentation and list markers from the body" do
+      indented = "- item\n\n    {% box %}\n    First.\n\n    Second.\n    {% end %}\n"
+      Hwaro::Core::Build::Builder.new.test_sc_process(indented, templates)
+        .should eq("- item\n\n    [First.\n\nSecond.]\n")
+      marker = "- {% box %}\n  First.\n\n  Second.\n  {% end %}\n"
+      Hwaro::Core::Build::Builder.new.test_sc_process(marker, templates)
+        .should eq("- [First.\n\nSecond.]\n")
+    end
+
+    it "keeps the body as written when the opener follows other text" do
+      content = "Text {% box %}\n  a\n{% end %}"
+      Hwaro::Core::Build::Builder.new.test_sc_process(content, templates).should eq("Text [a]")
+    end
+  end
+
+  describe "argument parsing edge cases" do
+    it "preserves spaces inside double-quoted values" do
+      builder = Hwaro::Core::Build::Builder.new
+      args = builder.test_sc_parse_args(%(title="Hello, World"))
+      args["title"].should eq("Hello, World")
+    end
+
+    it "treats a value with embedded equals correctly" do
+      builder = Hwaro::Core::Build::Builder.new
+      args = builder.test_sc_parse_args(%(query="a=b&c=d"))
+      args["query"].should eq("a=b&c=d")
+    end
+
+    it "preserves spaces inside single-quoted values" do
+      builder = Hwaro::Core::Build::Builder.new
+      args = builder.test_sc_parse_args(%(title='Hello World'))
+      args["title"].should eq("Hello World")
+    end
+
+    it "ignores leading/trailing whitespace in positional values" do
+      builder = Hwaro::Core::Build::Builder.new
+      args = builder.test_sc_parse_args("  alpha , beta  ")
+      args["_0"].should eq("alpha")
+      args["_1"].should eq("beta")
+    end
+
+    # A call that mixes a leading positional with a trailing named arg keeps
+    # BOTH. This used to drop the positional (the named-arg branch fired once
+    # any `key=` was present and the positional fallback was gated on
+    # `args.empty?`) — the old characterization spec pinned that as the
+    # "current contract" and anticipated exactly this flip.
+    it "keeps a leading positional when a named arg is also present" do
+      builder = Hwaro::Core::Build::Builder.new
+      args = builder.test_sc_parse_args(%("/img.jpg", caption="hi"))
+      args["caption"].should eq("hi")
+      args["_0"].should eq("/img.jpg")
+    end
+
+    it "renders figure with the positional src for a mixed positional+named call" do
+      builder = Hwaro::Core::Build::Builder.new
+      result = builder.test_sc_process(
+        %({{ figure("/img.jpg", caption="hi") }}),
+      )
+      result.should contain(%(<img src="/img.jpg" ))
+      result.should contain("<figcaption>hi</figcaption>")
+    end
+  end
+
+  describe "placeholders" do
+    it "stores rendered output behind placeholders when shortcode_results provided" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      results = {} of String => String
+
+      output = builder.test_sc_process_with_results(
+        "{% note %}placeheld{% end %}",
+        templates,
+        {} of String => Crinja::Value,
+        results,
+      )
+
+      output.should contain("<!--HWARO-SHORTCODE-PLACEHOLDER-")
+      results.size.should eq(1)
+      results.first_value.should contain("<span>placeheld</span>")
+    end
+
+    it "produces unique placeholder ids for multiple shortcodes" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => "<span>{{ body }}</span>"}
+      results = {} of String => String
+
+      builder.test_sc_process_with_results(
+        "{% note %}a{% end %} and {% note %}b{% end %}",
+        templates,
+        {} of String => Crinja::Value,
+        results,
+      )
+
+      results.size.should eq(2)
+      results.keys.uniq!.size.should eq(2)
+    end
+  end
+
+  describe "content_may_contain_shortcodes? pre-filter (D2 optimization #562)" do
+    # These tests verify that the cheap pre-filter used in render_page
+    # correctly identifies pages that need full shortcode processing vs.
+    # pages that only contain example syntax inside code regions.
+
+    it "returns false for content with no {{ or {% at all" do
+      builder = Hwaro::Core::Build::Builder.new
+      builder.test_content_may_contain_shortcodes?("plain text and **markdown**").should be_false
+    end
+
+    it "returns true for real shortcode outside any code" do
+      builder = Hwaro::Core::Build::Builder.new
+      builder.test_content_may_contain_shortcodes?("Hello {% note %}world{% end %}").should be_true
+      builder.test_content_may_contain_shortcodes?("{{ youtube(id=\"x\") }}").should be_true
+    end
+
+    it "returns true for shortcodes inside raw HTML code blocks" do
+      # Only the Markdown extensions treat raw <pre>/<script>/<textarea>
+      # blocks as opaque; shortcode expansion runs inside them.
+      builder = Hwaro::Core::Build::Builder.new
+      %w[pre script textarea].each do |tag|
+        content = "<#{tag}>\n{{ youtube(id=\"x\") }}\n</#{tag}>"
+        builder.test_content_may_contain_shortcodes?(content).should be_true
+      end
+    end
+
+    it "returns false when {{ and {% only appear inside fenced code blocks" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = <<-MD
+        Example:
+
+        ```jinja
+        {% alert(kind="warning") %}careful{% end %}
+        ```
+
+        More docs:
+
+        ~~~
+        {{ youtube(id="abc") }}
+        ~~~
+        MD
+      builder.test_content_may_contain_shortcodes?(content).should be_false
+    end
+
+    it "returns true when a real shortcode appears between fenced examples" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = <<-MD
+        ```example
+        {% fake %}
+        ```
+        {% real %}this one counts{% end %}
+        ```
+        {% another_fake %}
+        ```
+        MD
+      builder.test_content_may_contain_shortcodes?(content).should be_true
+    end
+
+    it "returns false for shortcode syntax only inside inline code spans" do
+      builder = Hwaro::Core::Build::Builder.new
+      builder.test_content_may_contain_shortcodes?("Use `{% note %}...{% end %}` in your content.").should be_false
+      builder.test_content_may_contain_shortcodes?("See `` {{ asset(name=\"x\") }} `` for details.").should be_false
+    end
+
+    it "returns true when real shortcode is on same line as inline code example" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = %(Live: {{ alert("hi") }} and example: `{% note %}`)
+      builder.test_content_may_contain_shortcodes?(content).should be_true
+    end
+
+    it "handles tilde fences correctly" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = "~~~\n{% example %}skipped{% end %}\n~~~"
+      builder.test_content_may_contain_shortcodes?(content).should be_false
+    end
+
+    it "handles mixed backtick and tilde fences" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = "```\n{% a %}\n```\nreal: {% b %}{% end %}\n~~~\n{% c %}\n~~~"
+      builder.test_content_may_contain_shortcodes?(content).should be_true
+    end
+
+    it "is not fooled by {{ or {% inside fenced blocks with language tags" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = "```html\n<div>{{ must_be_literal }}</div>\n```"
+      builder.test_content_may_contain_shortcodes?(content).should be_false
+    end
+
+    it "still detects shortcodes that happen to contain backticks in arguments (outside code)" do
+      builder = Hwaro::Core::Build::Builder.new
+      # The token is outside any fence or inline code
+      builder.test_content_may_contain_shortcodes?(%({% codeblock(lang="crystal") %} `code` {% end %})).should be_true
+    end
+
+    # Pre-filter must agree with process_shortcodes_jinja's FenceTracker:
+    # the same CommonMark rules decide fencing in both, or the skip
+    # decision and the actual expansion drift apart.
+    it "returns true when a shortcode follows a 4-space-indented ``` line" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = "    ```\n\n{% note %}live{% end %}"
+      builder.test_content_may_contain_shortcodes?(content).should be_true
+    end
+
+    it "returns true when a shortcode follows a fence closed by a longer run" do
+      builder = Hwaro::Core::Build::Builder.new
+      content = "```\nfenced\n````\n{% note %}live{% end %}"
+      builder.test_content_may_contain_shortcodes?(content).should be_true
+    end
+  end
+
+  describe "fence protection with hyphenated keyword-prefixed block names" do
+    it "keeps a fenced code block inside a {% include-code %} body intact" do
+      # The outer depth scan must classify openers/closers with the same
+      # EXACT keyword matching as the block parser. The old prefix regex
+      # treated `-` as a word boundary, so `include-code` read as the Jinja
+      # `include` control tag: the fence line split the buffer and both the
+      # opener and `{% end %}` leaked into the output as literal text.
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {
+        "shortcodes/include-code" => %(<div class="inc">{{ body }}</div>),
+      }
+      content = <<-MD
+        {% include-code(lang="js") %}
+        before
+
+        ```
+        literal fence
+        ```
+
+        after
+        {% end %}
+        MD
+      result = builder.test_sc_process(content, templates)
+      result.should contain(%(<div class="inc">))
+      result.should_not contain("{% include-code")
+      result.should_not contain("{% end %}")
+    end
+  end
+
+  describe "explicit shortcode() call with single-quoted name" do
+    it "renders {{ shortcode('name', args) }} like the double-quoted form" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/note" => %(<em>{{ text }}</em>)}
+      result = builder.test_sc_process(%({{ shortcode('note', text="hi") }}), templates)
+      result.should contain("<em>hi</em>")
+      result.should_not contain("missing shortcode")
+    end
+
+    it "renders a single-quoted name with no further args" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/hr" => %(<hr class="fancy">)}
+      result = builder.test_sc_process(%({{ shortcode('hr') }}), templates)
+      result.should contain(%(<hr class="fancy">))
+    end
+  end
+
+  describe "builtin alert markdown body" do
+    it "markdownifies the builtin alert body (parity with the scaffold override)" do
+      builder = Hwaro::Core::Build::Builder.new
+      result = builder.test_sc_process(
+        %({% alert(type="info") %}some **bold** text{% end %}),
+        {} of String => String,
+      )
+      result.should contain("<strong>bold</strong>")
+    end
+
+    it "markdownifies the builtin callout body" do
+      builder = Hwaro::Core::Build::Builder.new
+      result = builder.test_sc_process(
+        %({% callout(type="tip") %}a [link](https://example.com){% end %}),
+        {} of String => String,
+      )
+      result.should contain(%(<a href="https://example.com">link</a>))
+    end
+  end
+
+  describe "many block shortcodes on one page" do
+    # Every tag search re-validated the UTF-8 of the rest of the page, so
+    # the block pass was quadratic in the number of tags.
+    it "pairs thousands of blocks in linear time" do
+      builder = Hwaro::Core::Build::Builder.new
+      templates = {"shortcodes/box" => "{{ body }}"}
+      n = 20_000
+      content = "{% box() %}\nx\n{% end %}\n\n" * n
+      result = ""
+      elapsed = Time.measure { result = builder.test_sc_process(content, templates) }
+      result.should_not contain("{% end %}")
+      elapsed.should be < 3.seconds # ~0.2s; quadratic before
+    end
+  end
+end

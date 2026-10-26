@@ -25,7 +25,7 @@ exclude = ["/private", "/drafts"]
 |-----|------|---------|-------------|
 | enabled | bool | false | Generate `sitemap.xml` |
 | filename | string | "sitemap.xml" | Output filename |
-| changefreq | string | "weekly" | Default change frequency for all pages |
+| changefreq | string | "weekly" | Default change frequency for all pages: `always`, `hourly`, `daily`, `weekly`, `monthly`, `yearly` or `never` (any other value warns and keeps `"weekly"`; `""` omits the tag) |
 | priority | float | 0.5 | Default priority for all pages (0.0 to 1.0) |
 | exclude | array | [] | Path prefixes to exclude (e.g., `["/private"]` excludes `/private`, `/private/page.html`) |
 
@@ -37,9 +37,13 @@ exclude = ["/private", "/drafts"]
   <url>
     <loc>https://example.com/</loc>
     <lastmod>2024-01-15</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.5</priority>
   </url>
   <url>
     <loc>https://example.com/about/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.5</priority>
   </url>
 </urlset>
 ```
@@ -66,24 +70,49 @@ Generate RSS feeds for your site and sections.
 ```toml
 [feeds]
 enabled = true
-type = "rss"              # "rss" or "atom"
+type = "rss"              # "rss", "atom" or "json"
 limit = 20                # Maximum number of items
 truncate = 0              # Truncate to N characters (0 = no truncation)
 full_content = true       # true = full HTML body, false = description/summary only
-filename = ""             # Leave empty for default (rss.xml or atom.xml)
+filename = ""             # Leave empty for default (rss.xml, atom.xml or feed.json)
 sections = []             # Limit to specific sections, e.g., ["posts"]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `false` | Enable feed generation |
-| `type` | `"rss"` | Feed format: `"rss"` or `"atom"` |
+| `type` | `"rss"` | Feed format: `"rss"`, `"atom"` or `"json"` ([JSON Feed 1.1](https://www.jsonfeed.org/version/1.1/)) |
 | `limit` | `10` | Maximum number of items in feed |
 | `truncate` | `0` | Truncate content to N characters (0 = full content) |
 | `full_content` | `true` | `true` = full HTML in feed, `false` = use front matter `description` or auto-generated summary |
-| `filename` | `""` | Custom filename (empty = `rss.xml` or `atom.xml`) |
+| `filename` | `""` | Custom filename of the main feed (empty = `rss.xml`, `atom.xml` or `feed.json`). Section, language and taxonomy term feeds always use the default name |
 | `sections` | `[]` | Limit feed to specific sections |
 | `default_language_only` | `true` | Multilingual: main feed includes default language only |
+
+### JSON Feed
+
+`type = "json"` writes a [JSON Feed 1.1](https://www.jsonfeed.org/version/1.1/) document named `feed.json` (an explicit `filename` still wins). It is written everywhere RSS and Atom are: the main feed, section feeds, per-language feeds and taxonomy term feeds, and it honors the same `limit`, `truncate`, `full_content`, `sections` and `default_language_only` settings.
+
+Each item carries `id` and `url` (the page permalink), `title`, `summary` (the same text as the RSS `<description>`), `date_published`, `date_modified` (from `updated`), `tags`, `authors` and `image` (absolute). The body is `content_html`, or `content_text` when `truncate` or `full_content = false` makes it plain text. Optional fields are left out when the page has no value for them.
+
+```json
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "My Site",
+  "home_page_url": "https://example.com/",
+  "feed_url": "https://example.com/feed.json",
+  "items": [
+    {
+      "id": "https://example.com/posts/hello/",
+      "url": "https://example.com/posts/hello/",
+      "title": "Hello",
+      "content_html": "<p>…</p>",
+      "date_published": "2026-03-05T00:00:00Z",
+      "tags": ["crystal"]
+    }
+  ]
+}
+```
 
 ### Section Feeds
 
@@ -97,6 +126,8 @@ generate_feeds = true
 ```
 
 Generates `/blog/rss.xml`.
+
+On the root `content/_index.md` (or a language root such as `_index.ko.md`), `generate_feeds` has no effect: its feed would land on the site (or language) feed's own `/rss.xml`, so that fuller feed is kept and the build prints a warning.
 
 ### Output
 
@@ -134,7 +165,7 @@ language_name = "日本語"
 generate_feed = false   # No /ja/rss.xml will be generated
 ```
 
-Language feeds share the same `sections`, `limit`, `truncate`, and `full_content` settings from `[feeds]` config. RSS language feeds include a `<language>` tag, and Atom feeds include an `xml:lang` attribute. The feed title includes the language name (e.g., `"My Site (한국어)"`).
+Language feeds share the same `sections`, `limit`, `truncate`, and `full_content` settings from `[feeds]` config. RSS language feeds include a `<language>` tag, Atom feeds include an `xml:lang` attribute, and JSON feeds include a top-level `"language"` field. The feed title includes the language name (e.g., `"My Site (한국어)"`).
 
 ### Custom Feed Templates
 
@@ -144,8 +175,9 @@ To take full control of the feed markup, create a template named after the feed 
 |-----------|---------------|---------------|
 | RSS | `templates/rss.xml.jinja` | `rss.xml` |
 | Atom | `templates/atom.xml.jinja` | `atom.xml` |
+| JSON Feed | `templates/feed.json.jinja` | `feed.json` |
 
-Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`) — only the final extension is stripped, so `rss.xml.jinja` loads under the key `rss.xml`. Whatever the extension, the file is always rendered as **Jinja** (an `.ecr` file is picked up too, but ECR `<%= %>` tags pass through as literal text — use Jinja syntax). The template file itself is the opt-in: when it's absent, Hwaro emits its built-in feed exactly as before, and deleting the template falls back to the built-in output. The override applies to **all four feed kinds** — the main feed, per-section feeds, per-language feeds, and per-taxonomy-term feeds — and a custom `[feeds] filename` still controls the output path.
+Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`). Only the final extension is stripped, so `rss.xml.jinja` loads under the key `rss.xml`. Whatever the extension, the file is always rendered as **Jinja** (an `.ecr` file is picked up too, but ECR `<%= %>` tags pass through as literal text, so use Jinja syntax). The template file itself is the opt-in: when it's absent, Hwaro emits its built-in feed exactly as before, and deleting the template falls back to the built-in output. The override applies to **all four feed kinds** (the main feed, per-section feeds, per-language feeds, and per-taxonomy-term feeds), and a custom `[feeds] filename` still controls the main feed's output path.
 
 `{% include %}` works inside feed templates, and a broken template fails the build with a template error naming the file.
 
@@ -155,7 +187,7 @@ Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`) — only the 
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| `feed.type` | string | `"rss"` or `"atom"` (follows `[feeds] type`) |
+| `feed.type` | string | `"rss"`, `"atom"` or `"json"` (follows `[feeds] type`) |
 | `feed.kind` | string | `"main"`, `"section"`, `"language"`, or `"taxonomy"` |
 | `feed.title` | string | Feed title (site title, `Site - Section`, `Site (한국어)`, …) |
 | `feed.description` | string | Site description |
@@ -178,6 +210,7 @@ Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`) — only the 
 | `url` | string | Absolute, percent-encoded page URL |
 | `date` / `updated` | time? | Raw front-matter dates (usable with the `date` filter) |
 | `date_rfc822` | string? | Preformatted RFC 822 date; none for dateless pages |
+| `date_rfc3339` | string? | `date` as RFC 3339 UTC (JSON Feed `date_published`); none for dateless pages |
 | `updated_rfc3339` | string | RFC 3339 timestamp from `updated`/`date` (epoch fallback) |
 | `description` | string? | Front-matter description |
 | `summary` | string | Plain-text summary (description → `<!-- more -->` summary → excerpt) |
@@ -185,13 +218,14 @@ Any template extension works (`.jinja`, `.j2`, `.jinja2`, `.html`) — only the 
 | `content_html` | string | Full HTML body with links absolutized for out-of-context readers |
 | `content_is_html` | bool | Whether `content` is HTML (`false` under `truncate`/`full_content = false`) |
 | `authors` | array | Front-matter authors |
+| `image` | string? | Page `image` as an absolute, percent-encoded URL |
 | `categories` | array | Taxonomy terms — `tags` first, then other taxonomies, deduplicated |
 | `section` | string | Page section path |
 | `language` | string? | Page language code |
 
 #### Example
 
-Values are **not** pre-escaped — applying `xml_escape` (or emitting CDATA) is the template author's job:
+Values are **not** pre-escaped. Applying `xml_escape` (or emitting CDATA) is the template author's job; in a `feed.json` template, use the `tojson` filter:
 
 ```jinja
 <?xml version="1.0" encoding="UTF-8"?>
@@ -230,6 +264,14 @@ Values are **not** pre-escaped — applying `xml_escape` (or emitting CDATA) is 
 {% endif %}
 ```
 
+For a JSON Feed, use `type="application/feed+json"` and `feed.json`:
+
+```jinja
+<link rel="alternate" type="application/feed+json"
+      href="{{ base_url }}/feed.json"
+      title="{{ site.title }}">
+```
+
 ---
 
 ## Robots.txt
@@ -261,6 +303,31 @@ rules = [
 | rules | array | [] | List of user-agent rules with `allow` and `disallow` paths |
 
 When no rules are configured, Hwaro generates a default allow-all rule. If a rule has both `allow` and `disallow` empty, an explicit `Allow: /` is added to prevent ambiguous behavior.
+
+### Content Signals
+
+A rule can carry a `content_signal` table to publish a [Content Signals](https://contentsignals.org/) line, which tells crawlers how the content may be used after it is fetched:
+
+```toml
+[robots]
+rules = [
+  { user_agent = "*", allow = ["/"], content_signal = { search = true, ai_input = true, ai_train = false } },
+]
+```
+
+```
+User-agent: *
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+Allow: /
+```
+
+| Key | Signal | Meaning |
+|-----|--------|---------|
+| `search` | `search` | Building a search index and showing links and short excerpts |
+| `ai_input` | `ai-input` | Feeding the content into an AI model as input (retrieval, grounding) |
+| `ai_train` | `ai-train` | Training or fine-tuning AI models |
+
+Each value is `true` (`yes`) or `false` (`no`). A key you leave out is not emitted, and the line always lists the signals in the order above. An unknown key or a non-boolean value is a config error. Rules without `content_signal` produce exactly the output they did before.
 
 ### Output
 
@@ -351,7 +418,7 @@ twitter_creator = "@authorusername"
 
 | Key | Description |
 |-----|-------------|
-| twitter_card | Card type: summary, summary_large_image |
+| twitter_card | Card type: summary, summary_large_image (a page with no image gets `summary`, since a large card without one renders blank) |
 | twitter_site | Site's Twitter handle |
 | twitter_creator | Author's Twitter handle |
 
@@ -385,7 +452,7 @@ Or include both OG and Twitter:
 
 ## JSON-LD Structured Data
 
-Hwaro automatically generates Article and BreadcrumbList JSON-LD for every page.
+Hwaro automatically generates page-level JSON-LD for every page: Article for content pages (CollectionPage for listing pages, WebSite on the home page) plus BreadcrumbList.
 
 ```jinja
 <head>
@@ -410,7 +477,7 @@ These variables output ready-to-use HTML tags:
 | og_all_tags | Both OG and Twitter tags |
 | canonical_tag | Canonical link tag |
 | hreflang_tags | Hreflang alternate link tags |
-| jsonld | Article + BreadcrumbList JSON-LD |
+| jsonld | Article (or CollectionPage/WebSite) + BreadcrumbList JSON-LD |
 | jsonld_article | Article JSON-LD only |
 | jsonld_breadcrumb | BreadcrumbList JSON-LD only |
 | page_description | Page description (fallback: site) |
@@ -425,7 +492,7 @@ The `seo` object provides individual field access for building custom meta tags:
 | seo.canonical_url | String | Full canonical URL |
 | seo.og_type | String | OpenGraph type (default: "article") |
 | seo.og_image | String | Resolved absolute image URL |
-| seo.twitter_card | String | Twitter card type |
+| seo.twitter_card | String | Twitter card type, as `twitter_tags` emits it for this page |
 | seo.twitter_site | String | Twitter site handle |
 | seo.twitter_creator | String | Twitter creator handle |
 | seo.fb_app_id | String | Facebook App ID |

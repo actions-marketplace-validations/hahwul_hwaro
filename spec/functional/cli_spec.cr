@@ -7,19 +7,19 @@ describe "CLI Commands" do
     Hwaro::CLI::Runner.new
 
     it "has init command registered" do
-      Hwaro::CLI::CommandRegistry.has?("init").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("init").should be_true
     end
 
     it "has build command registered" do
-      Hwaro::CLI::CommandRegistry.has?("build").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("build").should be_true
     end
 
     it "has serve command registered" do
-      Hwaro::CLI::CommandRegistry.has?("serve").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("serve").should be_true
     end
 
     it "has deploy command registered" do
-      Hwaro::CLI::CommandRegistry.has?("deploy").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("deploy").should be_true
     end
   end
 
@@ -34,7 +34,7 @@ describe "CLI Commands" do
         # Run hwaro init
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: output_io, error: error_io)
+        status = Process.run(hwaro_binary, ["init", project_dir], output: output_io, error: error_io)
 
         status.success?.should be_true
 
@@ -70,12 +70,12 @@ describe "CLI Commands" do
         # Initialize project
         init_output_io = IO::Memory.new
         init_error_io = IO::Memory.new
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: init_output_io, error: init_error_io)
+        Process.run(hwaro_binary, ["init", project_dir], output: init_output_io, error: init_error_io)
 
         # Run hwaro build
         build_output_io = IO::Memory.new
         build_error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["build"], chdir: project_dir, output: build_output_io, error: build_error_io)
+        status = Process.run(hwaro_binary, ["build"], chdir: project_dir, output: build_output_io, error: build_error_io)
 
         status.success?.should be_true
 

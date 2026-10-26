@@ -1,10 +1,11 @@
 # Parallel processing utilities for concurrent page rendering
 #
 # Uses Crystal Fibers and Channels for efficient parallel processing.
-# Supports batch processing and worker pool patterns.
+# Supports worker pool patterns.
 
 require "../../utils/errors"
 require "../../utils/logger"
+require "../../ext/execution_context_wake"
 
 module Hwaro
   module Core
@@ -16,12 +17,15 @@ module Hwaro
       struct ParallelConfig
         property enabled : Bool
         property max_workers : Int32
-        property batch_size : Int32
+        # Wake idle threads for the workers (see ParallelHelper.wake_workers).
+        # Only for CPU-bound work that prints nothing from its workers: its
+        # warnings and results are handled in item order afterwards.
+        property wake_idle : Bool
 
         def initialize(
           @enabled : Bool = true,
           @max_workers : Int32 = 0, # 0 = auto-detect based on CPU count
-          @batch_size : Int32 = 10,
+          @wake_idle : Bool = false,
         )
         end
 
@@ -83,12 +87,6 @@ module Hwaro
           results.select(&.success).compact_map(&.value)
         end
 
-        # Process items in parallel, counting successes
-        def count_success(items : Array(T), &block : T, Int32 -> R) : Int32
-          results = process(items, &block)
-          results.count(&.success)
-        end
-
         private def process_sequential(items : Array(T), &block : T, Int32 -> R) : Array(WorkResult(R))
           results = [] of WorkResult(R)
           items.each_with_index do |item, idx|
@@ -126,6 +124,7 @@ module Hwaro
               end
             end
           end
+          ParallelHelper.wake_workers(worker_count) if @config.wake_idle
 
           # Collect results
           collected = [] of WorkResult(R)
@@ -140,18 +139,55 @@ module Hwaro
       module ParallelHelper
         extend self
 
-        # Process pages in parallel with automatic worker configuration
-        def process_pages(pages : Array(T), parallel : Bool = true, &block : T, Int32 -> Bool) : Int32 forall T
-          config = ParallelConfig.new(enabled: parallel)
-          processor = Parallel(T, Bool).new(config)
-          processor.count_success(pages, &block)
-        end
-
         # Parallel map with default configuration
         def map(items : Array(T), parallel : Bool = true, &block : T -> R) : Array(R) forall T, R
           config = ParallelConfig.new(enabled: parallel)
           processor = Parallel(T, R).new(config)
           processor.map(items, &block)
+        end
+
+        # Run `block` once per item on `workers` fibers pulling from a shared
+        # queue; the block also gets the worker's index (0...workers) so it
+        # can use per-worker state. Returns once every item has been handled.
+        # Callers rescue inside the block: an exception that escapes it still
+        # signals its item (from an `ensure`) but ends that worker fiber.
+        def each_concurrently(items : Array(T), workers : Int32, &block : T, Int32 ->) : Nil forall T
+          queue = Channel(T).new(items.size)
+          items.each { |item| queue.send(item) }
+          queue.close
+          done = Channel(Nil).new(items.size)
+          workers.times do |worker_id|
+            spawn do
+              while item = queue.receive?
+                begin
+                  block.call(item, worker_id)
+                ensure
+                  done.send(nil)
+                end
+              end
+            end
+          end
+          items.size.times { done.receive }
+        end
+
+        @@wake_idle_threads = false
+
+        # `hwaro build` turns this on. `serve` keeps the stock scheduling: a
+        # wake also pulls the thread waiting on the event loop into the
+        # workers, and serve must keep answering HTTP during a rebuild.
+        def wake_idle_threads=(value : Bool) : Nil
+          @@wake_idle_threads = value
+        end
+
+        # Wake idle threads to run fibers this fiber just spawned; see
+        # src/ext/execution_context_wake.cr. Called after spawning the
+        # workers, and only for the `wake_idle` fan-outs (OG images, image
+        # resizing): woken threads make completion order vary on every
+        # build, which the others' first-error pick and warning order
+        # would show.
+        def wake_workers(count : Int32) : Nil
+          return unless @@wake_idle_threads
+          Fiber::ExecutionContext.current?.as?(Fiber::ExecutionContext::Parallel).try(&.wake_idle_schedulers(count))
         end
 
         # Execute multiple independent tasks in parallel.
@@ -204,8 +240,11 @@ module Hwaro
           return unless raise_on_error
           if err = first_error
             raise err if err.is_a?(Hwaro::HwaroError)
+            # A generator that could not write its file (permission denied,
+            # disk full, a directory in the way) is an I/O failure, exit 6 —
+            # not the "unrecoverable bug" HWARO_E_INTERNAL stands for.
             raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_INTERNAL,
+              code: err.is_a?(IO::Error) ? Hwaro::Errors::HWARO_E_IO : Hwaro::Errors::HWARO_E_INTERNAL,
               message: "Parallel task failed: #{err.message}",
               cause: err,
             )

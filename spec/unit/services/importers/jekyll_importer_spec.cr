@@ -1,0 +1,911 @@
+require "../../../spec_helper"
+require "../../../../src/services/importers/jekyll_importer"
+
+describe Hwaro::Services::Importers::JekyllImporter do
+  it "maps sitemap: false to in_sitemap = false" do
+    Dir.mktmpdir do |dir|
+      posts_dir = File.join(dir, "_posts")
+      FileUtils.mkdir_p(posts_dir)
+      File.write(File.join(posts_dir, "2024-01-01-hidden.md"), "---\ntitle: Hidden\nsitemap: false\n---\nX\n")
+
+      output_dir = File.join(dir, "output")
+      Hwaro::Services::Importers::JekyllImporter.new.run(
+        Hwaro::Config::Options::ImportOptions.new(source_type: "jekyll", path: dir, output_dir: output_dir))
+
+      File.read(File.join(output_dir, "posts", "hidden.md")).should contain("in_sitemap = false")
+    end
+  end
+
+  describe "#run" do
+    it "imports a basic Jekyll post with YAML frontmatter" do
+      Dir.mktmpdir do |dir|
+        # Set up fake Jekyll directory
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Hello World"
+          date: 2024-01-15
+          layout: post
+          categories:
+            - ruby
+            - web
+          tags:
+            - tutorial
+          ---
+          This is my first post.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-01-15-hello-world.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.success.should be_true
+        result.imported_count.should eq(1)
+        result.skipped_count.should eq(0)
+        result.error_count.should eq(0)
+
+        output_file = File.join(output_dir, "posts", "hello-world.md")
+        File.exists?(output_file).should be_true
+
+        content = File.read(output_file)
+        content.should contain("+++")
+        content.should contain("title = \"Hello World\"")
+        content.should contain("template = \"post\"")
+        content.should contain(%(categories = ["ruby", "web"]))
+        content.should contain(%(tags = ["tutorial"]))
+        content.should contain("This is my first post.")
+      end
+    end
+
+    it "imports a post whose `header` frontmatter is a scalar string" do
+      # Regression: `header: banner.jpg` (scalar, not a hash) made
+      # `header["image"]?` raise "Expected Array or Hash, not String", which
+      # the per-file rescue swallowed — silently dropping the whole post.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Scalar Header"
+          header: banner.jpg
+          ---
+          Post body.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-02-02-scalar-header.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        result = Hwaro::Services::Importers::JekyllImporter.new.run(options)
+        result.imported_count.should eq(1)
+        result.error_count.should eq(0)
+        File.exists?(File.join(output_dir, "posts", "scalar-header.md")).should be_true
+      end
+    end
+
+    it "extracts slug from Jekyll filename" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "My Great Post"
+          ---
+          Content here.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2023-06-10-my-great-post.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        File.exists?(File.join(output_dir, "posts", "my-great-post.md")).should be_true
+      end
+    end
+
+    it "extracts date from filename when not in frontmatter" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "No Date Post"
+          ---
+          Content.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2023-12-25-no-date-post.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "no-date-post.md"))
+        content.should contain("date = \"2023-12-25\"")
+      end
+    end
+
+    it "marks published: false as draft" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Unpublished Post"
+          published: false
+          ---
+          Draft content.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-02-01-unpublished.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "unpublished.md"))
+        content.should contain("draft = true")
+      end
+    end
+
+    it "keeps unmapped front matter in [extra]" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+        File.write(File.join(posts_dir, "2024-02-01-custom.md"), <<-JEKYLL)
+          ---
+          title: "Custom"
+          layout: post
+          toc: true
+          author: Jane
+          gallery:
+            - a.png
+            - b.png
+          ---
+          Body.
+          JEKYLL
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(source_type: "jekyll", path: dir, output_dir: output_dir)
+        Hwaro::Services::Importers::JekyllImporter.new.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "custom.md"))
+        content.should contain(%(template = "post"))
+        fm = TOML.parse(content.split("+++")[1])
+        extra = fm["extra"].as_h
+        extra["author"].as_s.should eq("Jane")
+        fm["toc"].as_bool.should be_true
+        extra["gallery"].as_a.map(&.as_s).should eq(["a.png", "b.png"])
+        extra.has_key?("layout").should be_false
+      end
+    end
+
+    it "imports drafts when options.drafts is true" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        drafts_dir = File.join(dir, "_drafts")
+        FileUtils.mkdir_p(posts_dir)
+        FileUtils.mkdir_p(drafts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-published.md"), <<-JEKYLL
+          ---
+          title: "Published"
+          ---
+          Published content.
+          JEKYLL
+        )
+
+        File.write(File.join(drafts_dir, "my-draft.md"), <<-JEKYLL
+          ---
+          title: "My Draft"
+          ---
+          Draft content.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+          drafts: true,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(2)
+
+        draft_content = File.read(File.join(output_dir, "posts", "my-draft.md"))
+        draft_content.should contain("draft = true")
+        draft_content.should contain("title = \"My Draft\"")
+      end
+    end
+
+    it "does not import drafts when options.drafts is false" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        drafts_dir = File.join(dir, "_drafts")
+        FileUtils.mkdir_p(posts_dir)
+        FileUtils.mkdir_p(drafts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-published.md"), <<-JEKYLL
+          ---
+          title: "Published"
+          ---
+          Content.
+          JEKYLL
+        )
+
+        File.write(File.join(drafts_dir, "secret-draft.md"), <<-JEKYLL
+          ---
+          title: "Secret Draft"
+          ---
+          Secret.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+          drafts: false,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        File.exists?(File.join(output_dir, "posts", "secret-draft.md")).should be_false
+      end
+    end
+
+    it "maps excerpt to description" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "With Excerpt"
+          excerpt: "A short summary of the post"
+          ---
+          Full content here.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-03-01-with-excerpt.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "with-excerpt.md"))
+        content.should contain("description = \"A short summary of the post\"")
+      end
+    end
+
+    it "maps header.image to image" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "With Header Image"
+          header:
+            image: /assets/images/hero.jpg
+          ---
+          Content.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-04-01-with-image.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "with-image.md"))
+        content.should contain("image = \"/assets/images/hero.jpg\"")
+      end
+    end
+
+    it "reports how many files contain unconverted Liquid constructs" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-liquid.md"), <<-JEKYLL
+          ---
+          title: "Liquid"
+          ---
+          Body with {% include header.html %}.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-01-02-clean.md"), <<-JEKYLL
+          ---
+          title: "Clean"
+          ---
+          Plain body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        # Capture the warning stream so the spec sees the summary log.
+        err = IO::Memory.new
+        original = Hwaro::Logger.err_io
+        Hwaro::Logger.err_io = err
+        begin
+          importer = Hwaro::Services::Importers::JekyllImporter.new
+          result = importer.run(options)
+          result.imported_count.should eq(2)
+        ensure
+          Hwaro::Logger.err_io = original
+        end
+
+        # Summary must include the count and the platform name so a user
+        # skimming the log knows how many files need manual cleanup.
+        err.to_s.should contain("1 file(s) contained unconverted Liquid")
+        # The clean file must not trip the per-file warning.
+        err.to_s.scan(/Liquid tags detected/).size.should eq(1)
+      end
+    end
+
+    it "keeps categories and tags as separate taxonomy fields" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Split Taxonomies"
+          category: programming
+          tags:
+            - crystal
+            - tutorial
+          ---
+          Content.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-05-01-split-taxonomies.md"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        importer.run(options)
+
+        content = File.read(File.join(output_dir, "posts", "split-taxonomies.md"))
+        content.should contain(%(categories = ["programming"]))
+        content.should contain(%(tags = ["crystal", "tutorial"]))
+      end
+    end
+
+    it "handles .markdown file extension" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        post_content = <<-JEKYLL
+          ---
+          title: "Markdown Extension"
+          ---
+          Content.
+          JEKYLL
+
+        File.write(File.join(posts_dir, "2024-06-01-markdown-ext.markdown"), post_content)
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        File.exists?(File.join(output_dir, "posts", "markdown-ext.md")).should be_true
+      end
+    end
+
+    it "returns error result for non-existent directory" do
+      options = Hwaro::Config::Options::ImportOptions.new(
+        source_type: "jekyll",
+        path: "/non/existent/path",
+        output_dir: "/tmp/output",
+      )
+
+      importer = Hwaro::Services::Importers::JekyllImporter.new
+      result = importer.run(options)
+
+      result.success.should be_false
+      result.message.should contain("not found")
+    end
+
+    it "returns success with zero imports when no posts exist" do
+      Dir.mktmpdir do |dir|
+        # No _posts directory
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.success.should be_true
+        result.imported_count.should eq(0)
+      end
+    end
+
+    it "skips file that already exists in output" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-existing.md"), <<-JEKYLL
+          ---
+          title: "Existing"
+          ---
+          Content.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        # Pre-create the output file
+        FileUtils.mkdir_p(File.join(output_dir, "posts"))
+        File.write(File.join(output_dir, "posts", "existing.md"), "already here")
+
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(0)
+        result.skipped_count.should eq(1)
+      end
+    end
+
+    it "overwrites existing output file when force is true" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-existing.md"), <<-JEKYLL
+          ---
+          title: "Existing"
+          ---
+          Fresh content.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        FileUtils.mkdir_p(File.join(output_dir, "posts"))
+        File.write(File.join(output_dir, "posts", "existing.md"), "stale")
+
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+          force: true,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        result.skipped_count.should eq(0)
+
+        content = File.read(File.join(output_dir, "posts", "existing.md"))
+        content.should contain("Fresh content.")
+        content.should_not contain("stale")
+      end
+    end
+
+    it "imports multiple posts" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        3.times do |i|
+          File.write(File.join(posts_dir, "2024-01-0#{i + 1}-post-#{i + 1}.md"), <<-JEKYLL
+            ---
+            title: "Post #{i + 1}"
+            ---
+            Content #{i + 1}.
+            JEKYLL
+          )
+        end
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(3)
+      end
+    end
+
+    it "disambiguates two source files that collide on the same date-stripped slug" do
+      # Two distinct posts whose date-stripped slug is identical ("hello")
+      # used to both map to posts/hello.md, silently dropping the second in
+      # a one-shot migration; the later file now gets a date-suffixed slug.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-hello.md"), <<-JEKYLL
+          ---
+          title: "First Hello"
+          ---
+          First post body.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-06-02-hello.md"), <<-JEKYLL
+          ---
+          title: "Second Hello"
+          ---
+          Second post body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        # Both survive; the later (sorted) file gets a date-suffixed slug.
+        result.imported_count.should eq(2)
+        result.skipped_count.should eq(0)
+
+        first = File.read(File.join(output_dir, "posts", "hello.md"))
+        first.should contain("First post body.")
+        second = File.read(File.join(output_dir, "posts", "hello-2024-06-02.md"))
+        second.should contain("Second post body.")
+      end
+    end
+
+    it "counts a malformed-YAML post as an error while still importing valid posts" do
+      # Jekyll's YAML.parse has no local rescue, so a malformed `---` block
+      # raises YAML::ParseException and the entire post (body included) is
+      # dropped via run's per-file rescue (error_count++). The valid post in
+      # the same run still imports. Unlike Hugo, the broken-YAML body is lost.
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-bad.md"), <<-JEKYLL
+          ---
+          title: "unterminated
+          ---
+          Bad post body.
+          JEKYLL
+        )
+        File.write(File.join(posts_dir, "2024-01-02-good.md"), <<-JEKYLL
+          ---
+          title: "Good Post"
+          ---
+          Good post body.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        result.error_count.should eq(1)
+        # success = imported > 0 || errors == 0 -> true here.
+        result.success.should be_true
+
+        File.exists?(File.join(output_dir, "posts", "good.md")).should be_true
+        File.exists?(File.join(output_dir, "posts", "bad.md")).should be_false
+      end
+    end
+
+    it "handles post without frontmatter" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        FileUtils.mkdir_p(posts_dir)
+
+        File.write(File.join(posts_dir, "2024-07-01-no-frontmatter.md"), "Just plain content.\n")
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(1)
+        content = File.read(File.join(output_dir, "posts", "no-frontmatter.md"))
+        content.should contain("+++")
+        content.should contain("Just plain content.")
+      end
+    end
+
+    it "imports standalone root pages and subfolder pages" do
+      Dir.mktmpdir do |dir|
+        posts_dir = File.join(dir, "_posts")
+        docs_dir = File.join(dir, "docs")
+        FileUtils.mkdir_p(posts_dir)
+        FileUtils.mkdir_p(docs_dir)
+
+        File.write(File.join(posts_dir, "2024-01-01-post.md"), <<-JEKYLL
+          ---
+          title: "My Post"
+          ---
+          Post content.
+          JEKYLL
+        )
+
+        File.write(File.join(dir, "about.md"), <<-JEKYLL
+          ---
+          title: "About Me"
+          layout: page
+          ---
+          About page content.
+          JEKYLL
+        )
+
+        File.write(File.join(docs_dir, "guide.md"), <<-JEKYLL
+          ---
+          title: "Guide"
+          ---
+          Guide content.
+          JEKYLL
+        )
+
+        output_dir = File.join(dir, "output")
+        options = Hwaro::Config::Options::ImportOptions.new(
+          source_type: "jekyll",
+          path: dir,
+          output_dir: output_dir,
+        )
+
+        importer = Hwaro::Services::Importers::JekyllImporter.new
+        result = importer.run(options)
+
+        result.imported_count.should eq(3)
+        result.error_count.should eq(0)
+
+        # Post is in posts/
+        File.exists?(File.join(output_dir, "posts", "post.md")).should be_true
+        # Root page is in root output
+        File.exists?(File.join(output_dir, "about.md")).should be_true
+        about_content = File.read(File.join(output_dir, "about.md"))
+        about_content.should contain("title = \"About Me\"")
+        about_content.should contain("template = \"page\"")
+        about_content.should contain("About page content.")
+        # Subfolder page is in docs/
+        File.exists?(File.join(output_dir, "docs", "guide.md")).should be_true
+        guide_content = File.read(File.join(output_dir, "docs", "guide.md"))
+        guide_content.should contain("title = \"Guide\"")
+        guide_content.should contain("Guide content.")
+      end
+    end
+  end
+end
+
+private def import_jekyll(dir : String) : String
+  output_dir = File.join(dir, "output")
+  options = Hwaro::Config::Options::ImportOptions.new(source_type: "jekyll", path: dir, output_dir: output_dir)
+  Hwaro::Services::Importers::JekyllImporter.new.run(options).success.should be_true
+  output_dir
+end
+
+describe "Jekyll import: published addresses" do
+  # Regression: a literal per-document `permalink` is the page's address,
+  # but it was dropped, so the imported page moved.
+  it "maps a literal permalink to path and keeps a .html address as an alias" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "_posts"))
+      File.write(File.join(dir, "_posts", "2024-01-02-hello.md"), "---\ntitle: Hello\npermalink: /blog/hello/\n---\nbody\n")
+      File.write(File.join(dir, "about.md"), "---\ntitle: About\npermalink: /about-us.html\n---\nabout\n")
+      File.write(File.join(dir, "pattern.md"), "---\ntitle: P\npermalink: /:categories/:title/\n---\np\n")
+
+      out_dir = import_jekyll(dir)
+      File.read(File.join(out_dir, "posts", "hello.md")).should contain(%(path = "blog/hello"))
+      about = File.read(File.join(out_dir, "about.md"))
+      about.should contain(%(path = "about-us"))
+      about.should contain(%(aliases = ["/about-us.html"]))
+      File.read(File.join(out_dir, "pattern.md")).should_not contain("path =")
+    end
+  end
+end
+
+describe "Jekyll import: redirect_from" do
+  # Regression: jekyll-redirect-from addresses (a widely used plugin,
+  # allow-listed on GitHub Pages) were dropped, so every deliberately kept
+  # old link broke.
+  it "maps redirect_from to aliases" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "_posts"))
+      File.write(File.join(dir, "_posts", "2024-01-02-hello.md"),
+        "---\ntitle: Hello\nredirect_from:\n  - /old-hello/\n  - /2019/hello.html\n---\nbody\n")
+      File.write(File.join(dir, "about.md"),
+        "---\ntitle: About\npermalink: /about-us.html\nredirect_from: /team/\n---\nabout\n")
+
+      out_dir = import_jekyll(dir)
+      File.read(File.join(out_dir, "posts", "hello.md")).should contain(%(aliases = ["/old-hello/", "/2019/hello.html"]))
+      File.read(File.join(out_dir, "about.md")).should contain(%(aliases = ["/about-us.html", "/team/"]))
+    end
+  end
+end
+
+describe "Jekyll import: last_modified_at" do
+  # Regression: jekyll-seo-tag's `last_modified_at` was dropped, so imported
+  # pages lost their modification date (feeds, sitemap lastmod, JSON-LD).
+  it "maps last_modified_at to updated" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "_posts"))
+      File.write(File.join(dir, "_posts", "2024-01-02-hello.md"),
+        "---\ntitle: Hello\nlast_modified_at: 2024-02-01\n---\nbody\n")
+
+      out_dir = import_jekyll(dir)
+      File.read(File.join(out_dir, "posts", "hello.md")).should contain(%(updated = "2024-02-01"))
+    end
+  end
+end
+
+describe "Jekyll import: image object" do
+  # Regression: jekyll-seo-tag's `image: {path: …}` object form was matched
+  # and then ignored, dropping the page's social image.
+  it "maps image.path to image" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "_posts"))
+      File.write(File.join(dir, "_posts", "2024-01-02-hello.md"),
+        "---\ntitle: Hello\nimage:\n  path: /img/a.png\n  alt: A\n---\nbody\n")
+
+      out_dir = import_jekyll(dir)
+      File.read(File.join(out_dir, "posts", "hello.md")).should contain(%(image = "/img/a.png"))
+    end
+  end
+end
+
+describe "Jekyll import: index.html permalinks" do
+  # A permalink ending in `index.html` names the directory itself (Jekyll
+  # serves `/docs/index.html` at `/docs/`); mapping it to `path = "docs/index"`
+  # moved the page to /docs/index/ and left /docs/ as a redirect stub.
+  it "maps a trailing index.html to the directory path with no alias" do
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "docs.md"), "---\ntitle: Docs\npermalink: /docs/index.html\n---\nd\n")
+      out_dir = import_jekyll(dir)
+      docs = File.read(File.join(out_dir, "docs.md"))
+      docs.should contain(%(path = "docs"\n))
+      docs.should_not contain("aliases")
+    end
+  end
+end
+
+describe "Jekyll import: non-page permalinks" do
+  # A permalink naming another kind of file (`/feed.xml`) cannot be a page
+  # path — mapped anyway it published `feed.xml/index.html`. It is left
+  # unmapped with a warning, as before `path` mapping existed.
+  it "leaves a non-HTML file permalink unmapped and warns" do
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "feed.md"), "---\ntitle: Feed\npermalink: /feed.xml\n---\nf\n")
+      log = with_captured_log { import_jekyll(dir) }
+      File.read(File.join(dir, "output", "feed.md")).should_not contain("path =")
+      log.should contain("/feed.xml")
+    end
+  end
+end
+
+describe "Hwaro::Services::Importers::JekyllImporter symlink boundary" do
+  it "imports posts linked elsewhere inside the site and counts links outside it as skipped" do
+    Dir.mktmpdir do |root|
+      site = File.join(root, "site")
+      posts_dir = File.join(site, "_posts")
+      shared_dir = File.join(site, "_shared")
+      FileUtils.mkdir_p(posts_dir)
+      FileUtils.mkdir_p(shared_dir)
+      post = "---\ntitle: \"%s\"\n---\nBody.\n"
+      File.write(File.join(posts_dir, "2024-01-01-local.md"), post % "Local")
+      File.write(File.join(shared_dir, "2024-01-02-shared.md"), post % "Shared")
+      File.symlink("../_shared/2024-01-02-shared.md", File.join(posts_dir, "2024-01-02-shared.md"))
+      File.write(File.join(root, "secret.md"), post % "Secret")
+      File.symlink(File.join(root, "secret.md"), File.join(posts_dir, "2024-01-03-leak.md"))
+
+      output_dir = File.join(root, "out")
+      options = Hwaro::Config::Options::ImportOptions.new(source_type: "jekyll", path: site, output_dir: output_dir)
+      log = with_captured_log do
+        result = Hwaro::Services::Importers::JekyllImporter.new.run(options)
+        result.imported_count.should eq(2)
+        result.skipped_count.should eq(1)
+      end
+
+      File.exists?(File.join(output_dir, "posts", "shared.md")).should be_true
+      File.exists?(File.join(output_dir, "posts", "leak.md")).should be_false
+      log.should contain("2024-01-03-leak.md")
+      log.should_not contain("2024-01-02-shared.md")
+    end
+  end
+end

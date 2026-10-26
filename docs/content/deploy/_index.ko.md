@@ -19,9 +19,11 @@ hwaro build
 hwaro build --minify
 ```
 
-보수적인 최적화만 수행합니다. HTML 주석과 줄 끝 공백을 제거하고 JSON/XML 공백을 줄이며, 코드 블록과 콘텐츠 구조는 모두 그대로 유지됩니다.
+보수적인 최적화만 수행합니다. HTML 주석을 제거하고 태그 안과 태그 사이의 공백을 줄이며 JSON/XML 공백을 압축합니다. 공백이 의미를 갖는 요소(`<pre>`, `<code>`, `<script>`, `<style>` 등)와 콘텐츠 구조는 그대로 유지됩니다. 자세한 내용은 [CLI](/ko/start/cli/#build)를 참고합니다.
 
-`static/`의 모든 파일은 `public/`으로 복사되어 함께 배포됩니다. `.well-known/security.txt`, `.domains` 같은 숨김 dot 경로도 포함되며, 콜드 빌드와 `--cache`/증분 빌드에서 동일하게 동작합니다. `.DS_Store`, `.git/` 같은 OS·에디터·VCS 잔여 파일은 자동으로 걸러집니다. 조정 방법은 [설정](/ko/start/config/) 문서의 정적 파일 항목을 참고합니다.
+`static/`의 모든 파일은 `public/`으로 복사되어 함께 배포됩니다. `.well-known/security.txt`, `.domains` 같은 숨김 dot 경로도 포함되며, 콜드 빌드와 `--cache`/증분 빌드에서 동일하게 동작합니다. `.DS_Store`, `.git/` 같은 OS·에디터·VCS 잔여 파일은 자동으로 걸러집니다. 조정 방법은 [설정](/ko/start/config/#정적-파일) 문서의 정적 파일 항목을 참고합니다.
+
+> **`hwaro serve` 출력은 절대 배포하지 마세요.** 개발 서버는 전용 디렉터리 `.hwaro/serve/`에 빌드하고(`public/`은 건드리지 않습니다), 모든 링크에 개발용 `base_url`(예: `http://127.0.0.1:3000`)을 박아 넣으며, 그 디렉터리에 `.hwaro-dev` 마커를 찍습니다. `hwaro deploy`는 마커가 있는 소스 디렉터리를 거부합니다. 이 에러를 만나면 `hwaro build`를 실행해 새로 빌드한 출력을 배포하세요.
 
 ## 기본 절차
 
@@ -34,7 +36,7 @@ hwaro build --minify
 Hwaro에는 설정해 둔 타깃으로 배포하는 `hwaro deploy` 명령이 내장되어 있습니다:
 
 ```bash
-hwaro deploy              # 첫 번째로 설정된 타깃에 배포
+hwaro deploy              # [deployment] target에, 없으면 첫 번째로 설정된 타깃에 배포
 hwaro deploy s3           # 이름으로 특정 타깃에 배포
 hwaro deploy s3 backup    # 여러 타깃에 배포
 hwaro deploy --dry-run    # 변경 사항 미리 보기

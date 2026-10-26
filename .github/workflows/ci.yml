@@ -7,8 +7,30 @@ on:
       - .github/workflows/ci.yml
       - shard.yml
       - shard.lock
-      - docker/Dockerfile
+      - packaging/docker/Dockerfile
+      - packaging/docker/Dockerfile.dockerignore
+      # The image smoke test in build-docker exercises these two, so a PR that
+      # touches only them still has to run it — otherwise the job that exists
+      # to catch entrypoint/action regressions is skipped on exactly the PRs
+      # that can introduce one, and the failure lands on main instead.
+      - packaging/docker/entrypoint.sh
+      - action.yml
       - "**/*.cr"
+      # The Nix packaging silently rotted for several releases because nothing
+      # built it; build-nix exists to catch that, so it has to run when these
+      # change too.
+      - flake.nix
+      - flake.lock
+      - packaging/nix/shards.nix
+      # package-macos.sh only ever ran during a release before, so a break in
+      # it was discovered by users rather than by CI. These are the two files
+      # that decide what the macOS tarball contains -- the script itself and
+      # the workflow that chooses its arguments. (This list gates the whole
+      # workflow, not the package-macos job alone, so that job also runs on
+      # the `**/*.cr` PRs above; that is deliberate -- a source change can
+      # alter what the binary links.)
+      - scripts/package-macos.sh
+      - .github/workflows/release-binary.yml
   push:
     branches: [main]
   workflow_dispatch:
@@ -17,30 +39,73 @@ on:
         description: manual run
         required: false
         default: ""
+# A PR is superseded by its own next push far more often than a full matrix run
+# is worth. Pushes to main are never cancelled: they are the full-fidelity gate
+# and the only writer of the compiler cache the other jobs read.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  build-crystal:
+  # Which slice of the two heavy matrices this event needs. build-nix costs
+  # ~5 minutes per system and build-docker ~4 per arch, and running all five on
+  # every PR made packaging -- not compiling or testing -- the critical path. A
+  # PR runs one of each, which still proves the packaging compiles, links and
+  # runs; the full matrices run on every push to main, before anything can be
+  # released from it, and on the PRs that edit the packaging inputs themselves.
+  plan:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        crystal-version: [1.21.0]
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      nix: ${{ steps.matrices.outputs.nix }}
+      docker: ${{ steps.matrices.outputs.docker }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: crystal-lang/install-crystal@v1
-        with:
-          crystal: ${{ matrix.crystal-version }}
-      - name: Install dependencies
-        run: shards install
-      - name: Build
-        run: shards build
+      - id: matrices
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          nix_all='{"include":[{"system":"x86_64-linux","runner":"ubuntu-latest"},{"system":"aarch64-linux","runner":"ubuntu-24.04-arm"},{"system":"aarch64-darwin","runner":"macos-latest"}]}'
+          nix_one='{"include":[{"system":"x86_64-linux","runner":"ubuntu-latest"}]}'
+          docker_all='{"include":[{"arch":"linux/amd64","runner":"ubuntu-latest"},{"arch":"linux/arm64","runner":"ubuntu-24.04-arm"}]}'
+          docker_one='{"include":[{"arch":"linux/amd64","runner":"ubuntu-latest"}]}'
+
+          # Anything that is not a PR -- a push to main, a manual dispatch --
+          # gets everything.
+          nix="$nix_all"
+          docker="$docker_all"
+
+          if [ "$EVENT" = pull_request ]; then
+            nix="$nix_one"
+            docker="$docker_one"
+            # Both matrices are multi-platform to catch platform-specific
+            # breakage -- a bad release-tarball hash or a link failure for nix,
+            # an arch-specific stage package for the image -- and that risk
+            # arrives through the files each one is built from. A PR that edits
+            # any of them gets its full matrix back. A `gh` failure widens both:
+            # losing coverage must never be the quiet outcome of an API hiccup.
+            if files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
+              grep -qE '^(flake\.nix|flake\.lock|packaging/nix/shards\.nix|shard\.lock|shard\.yml|\.github/workflows/ci\.yml)$' <<<"$files" && nix="$nix_all"
+              grep -qE '^(packaging/docker/[^/]+|action\.yml|shard\.lock|shard\.yml|\.github/workflows/ci\.yml)$' <<<"$files" && docker="$docker_all"
+            else
+              echo "::warning::could not list the PR's files; building the full matrices"
+              nix="$nix_all"
+              docker="$docker_all"
+            fi
+          fi
+
+          echo "nix=$nix" >> "$GITHUB_OUTPUT"
+          echo "docker=$docker" >> "$GITHUB_OUTPUT"
   build-docker:
+    needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: linux/amd64
-            runner: ubuntu-latest
-          - arch: linux/arm64
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.plan.outputs.docker) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
@@ -57,13 +122,56 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: packaging/docker/Dockerfile
           push: false
-          tags: ${{ steps.meta.outputs.tags }}
+          # A fixed local tag (rather than the metadata tags) so the smoke test
+          # below has a deterministic name to run. `load: true` puts the image
+          # in the runner's docker daemon; each matrix arch builds natively, so
+          # the single-platform load is valid.
+          load: true
+          tags: hwaro:ci
           labels: ${{ steps.meta.outputs.labels }}
           platforms: ${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      # Building the image proves it compiles; it does not prove it runs. The
+      # builder and the runner stage are different distros, so a glibc or
+      # SONAME mismatch (or a missing stage-package) surfaces only on `docker
+      # run` — which, without this, first happened in a user's workflow because
+      # this image is exactly what the composite action executes.
+      - name: Smoke test the image
+        env:
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          # Both containers below run as uid 0 into the bind mount, so the tree
+          # comes out root-owned. Harmless on ephemeral hosted runners, but it
+          # would break the next run's checkout cleanup on a self-hosted one.
+          # Trap rather than a trailing rm so a failed assertion still cleans up.
+          trap 'sudo rm -rf smoke' EXIT
+
+          # 1. The binary links and starts.
+          docker run --rm hwaro:ci --version
+
+          # 2. Without GITHUB_ACTIONS the entrypoint passes through to the CLI.
+          mkdir -p smoke
+          docker run --rm -v "$PWD/smoke":/w -w /w hwaro:ci init --scaffold blog -q
+
+          # 3. With GITHUB_ACTIONS set, run the real action path end to end.
+          #    OUT_DIR is deliberately not the default, so this also covers the
+          #    build writing where the deploy step will look for it.
+          docker run --rm -v "$PWD/smoke":/github/workspace -w /github/workspace \
+            -e GITHUB_ACTIONS=true \
+            -e GITHUB_REPOSITORY="$REPO" \
+            -e GITHUB_ACTOR="$ACTOR" \
+            -e BUILD_ONLY=true \
+            -e OUT_DIR=dist \
+            hwaro:ci
+
+          test -f smoke/dist/index.html
+          echo "Smoke test passed."
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -71,21 +179,214 @@ jobs:
       - name: Run Ameba linter
         uses: crystal-ameba/github-action@master
   tests:
+    # Also the compile gate. `shards build` here is exactly what a separate
+    # build-only job used to run twice over, and spec/functional spawns the
+    # binary it produces, so a compile break already fails this job before a
+    # single example runs.
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crystal-version: [1.21.0]
+        crystal-version: [1.21.0, 1.22.0]
+    steps:
+      - uses: actions/checkout@v6
+      # install-crystal apt-installs its build deps with the image's cached
+      # package index; when Ubuntu supersedes a package (libevent, 2026-10)
+      # the cached URLs 404 until the runner image is rebuilt.
+      - name: Refresh apt index
+        run: sudo apt-get update -q
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: ${{ matrix.crystal-version }}
+      # Crystal keys its cache by absolute source path and the runner workspace
+      # path is stable, so a restored ~/.cache/crystal gives this job both
+      # halves of a warm compile. The expensive half is the two `macro run`
+      # programs -- baked_file_system's loader (via tartrazine) and ecr's
+      # processor (via HTTP::StaticFileHandler) -- which cost ~8s of every cold
+      # compile and are cached per macro program, so `shards build` and
+      # `crystal spec` share one copy. The per-module .o/.bc files then let
+      # codegen skip everything the commit did not touch (measured: >99% reuse
+      # after a one-file edit). Only pushes to main write the cache; PRs read
+      # it, so no PR can poison what the next one restores.
+      - name: Restore Crystal cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/crystal
+            lib
+          key: crystal-${{ runner.os }}-${{ matrix.crystal-version }}-${{ hashFiles('shard.lock') }}-${{ github.sha }}
+          restore-keys: |
+            crystal-${{ runner.os }}-${{ matrix.crystal-version }}-${{ hashFiles('shard.lock') }}-
+      # ameba is a development dependency and the lint job brings its own; not
+      # cloning it here also keeps the cached lib/ to what this job compiles.
+      - name: Install dependencies
+        run: shards install --without-development
+      - name: Build binary
+        run: shards build
+      # --no-export-dynamic: see `spec_link_flags` in the justfile (the spec
+      # binary overflows GNU ld's symbol-version limit with -rdynamic).
+      - name: Run tests
+        run: crystal spec --link-flags=-Wl,--no-export-dynamic
+      # Cached object files are named after a content hash, so a changed module
+      # adds a file rather than replacing one and the directory only grows.
+      # Dropping the ones a week of pushes has not regenerated bounds it without
+      # throwing away the entries that make the next restore worth downloading.
+      - name: Trim the Crystal cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          find ~/.cache/crystal -type f -mtime +7 -delete
+          find ~/.cache/crystal -type d -empty -delete
+          du -sh ~/.cache/crystal
+      - name: Save Crystal cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/crystal
+            lib
+          key: crystal-${{ runner.os }}-${{ matrix.crystal-version }}-${{ hashFiles('shard.lock') }}-${{ github.sha }}
+  build-nix:
+    # One runner per system flake.nix declares: a bad tarball hash or a
+    # platform-specific link failure must not reach a user's `nix profile
+    # install` just because CI only ever built x86_64-linux. `plan` decides how
+    # many of them this event needs -- all three whenever one could regress
+    # (any push to main, and PRs touching the flake or the lock files), one on
+    # an ordinary source PR, where the release-mode compile and the link are
+    # what is actually at risk and x86_64-linux proves both.
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.nix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      # Builds the package and runs its `hwaro --help` install check. shards.nix
+      # is consumed offline inside the sandbox, so a dependency missing from it
+      # fails here rather than in a user's `nix profile install`.
+      - name: Build flake package
+        run: nix build --print-build-logs .#packages.${{ matrix.system }}.hwaro
+      - name: Smoke test
+        run: ./result/bin/hwaro --version
+      - name: Check flake outputs
+        run: nix flake check --print-build-logs
+      # A stale shards.nix still builds -- it just builds against the wrong
+      # dependency revisions -- so drift from shard.lock has to be checked
+      # explicitly. `nix develop -c` runs the crystal2nix pinned by flake.lock,
+      # the same one `just nix-update` uses, so this gate cannot fail on a
+      # crystal2nix version the author never ran.
+      - name: packaging/nix/shards.nix matches shard.lock
+        if: matrix.system == 'x86_64-linux'
+        run: |
+          nix develop --command crystal2nix
+          mv shards.nix packaging/nix/shards.nix
+          git diff --exit-code -- packaging/nix/shards.nix
+  package-macos:
+    # scripts/package-macos.sh rewrites dylib load paths with install_name_tool,
+    # which invalidates the code signature of every Mach-O it touches. The
+    # linker-signed main binary is re-signed automatically; Homebrew's plainly
+    # ad-hoc-signed dylibs are not. arm64 SIGKILLs any process that maps a
+    # dylib with a stale signature, so the breakage is invisible on x86_64 and
+    # fatal for every Apple Silicon user -- that is how v0.20.0 shipped a
+    # tarball that could not run at all (#782). Packaging otherwise happens
+    # only in release-binary.yml, where the tag is already cut.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: crystal-lang/install-crystal@v1
         with:
-          crystal: ${{ matrix.crystal-version }}
-      - name: Install dependencies
-        run: shards install
+          crystal: 1.22.0
+      - name: Install build dependencies
+        run: brew install openssl@3 pkg-config
+      # Same warm-compile cache as the tests job, on its own key -- macOS
+      # runners are the slowest in the matrix and this job compiles the whole
+      # program just to look at what it links.
+      - name: Restore Crystal cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/crystal
+            lib
+          key: crystal-${{ runner.os }}-1.22.0-${{ hashFiles('shard.lock') }}-${{ github.sha }}
+          restore-keys: |
+            crystal-${{ runner.os }}-1.22.0-${{ hashFiles('shard.lock') }}-
+      - name: Install shards
+        run: shards install --without-development
+      # Not --release: this job is about linkage and signatures, which are
+      # identical either way, and a release build would triple the runtime.
       - name: Build binary
-        run: shards build
-      - name: Run tests
-        run: crystal spec
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
+          mkdir -p build
+          crystal build src/main.cr -o build/hwaro --no-debug
+      - name: Trim the Crystal cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          find ~/.cache/crystal -type f -mtime +7 -delete
+          find ~/.cache/crystal -type d -empty -delete
+          du -sh ~/.cache/crystal
+      - name: Save Crystal cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/crystal
+            lib
+          key: crystal-${{ runner.os }}-1.22.0-${{ hashFiles('shard.lock') }}-${{ github.sha }}
+      # The runtime half of this job only means anything on arm64: x86_64
+      # happily executes a stale signature. `macos-latest` is arm64 today but
+      # it is an alias GitHub has re-pointed before, and a silent move would
+      # leave the job green while testing nothing it exists to test.
+      - name: Assert the runner is arm64
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64 || {
+            echo "::error::package-macos must run on arm64; got $(uname -m)"
+            exit 1
+          }
+      - name: Package and smoke test the tarball
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          scripts/package-macos.sh build/hwaro build/hwaro-ci-osx.tar.gz hwaro
+
+          # package-macos.sh makes these assertions itself; repeating them
+          # against the extracted archive keeps the contract in CI, so a future
+          # edit to the script cannot quietly drop the guard that this job
+          # exists to enforce.
+          mkdir -p verify
+          tar -xzf build/hwaro-ci-osx.tar.gz -C verify
+
+          # Every signature check below is vacuous if nothing was bundled, and
+          # the smoke test would still pass because brew's own OpenSSL is
+          # installed on this runner. Assert the archive actually carries the
+          # dylibs before trusting anything else about it.
+          libs=(verify/lib/*.dylib)
+          test "${#libs[@]}" -gt 0 || {
+            echo "::error::tarball bundled no dylibs; packaging silently stopped working"
+            exit 1
+          }
+          for want in libssl libcrypto; do
+            test -n "$(echo "verify/lib/$want".*.dylib)" || {
+              echo "::error::tarball is missing $want"
+              exit 1
+            }
+          done
+
+          codesign --verify --strict verify/hwaro
+          for lib in "${libs[@]}"; do
+            codesign --verify --strict "$lib"
+          done
+
+          # Runs the packaged layout the way a user does: extracted tree,
+          # dylibs resolved via @executable_path/lib.
+          test -n "$(verify/hwaro version)" || {
+            echo "::error::packaged binary printed no version"
+            exit 1
+          }
+          verify/hwaro version
   build-snapcraft:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

@@ -81,6 +81,13 @@ module Hwaro
           while i < chars.size
             c = chars[i]
             case c
+            when '\\'
+              # `.c\,d` — an escaped character is part of the identifier.
+              current << c
+              if i + 1 < chars.size
+                i += 1
+                current << chars[i]
+              end
             when '(', '['
               depth += 1
               current << c
@@ -226,11 +233,10 @@ module Hwaro
             nodes << parse_forward(line, column)
           when "content"
             @s.skip_ws
-            if @s.peek == '('
-              @s.error("@content arguments are not supported", line, column)
-            end
+            args = @s.peek == '(' ? parse_args : [] of Ast::Arg
+            @s.skip_ws
             @s.advance if @s.peek == ';'
-            nodes << Ast::ContentNode.new(line, column)
+            nodes << Ast::ContentNode.new(line, column, args)
           else
             nodes << parse_raw_at_rule(name, line, column)
           end
@@ -430,11 +436,14 @@ module Hwaro
 
         private def parse_at_root(line : Int32, column : Int32) : Ast::Node
           @s.skip_ws
+          query = nil
           if @s.peek == '('
-            @s.error("@at-root (with: ...) / (without: ...) queries are not supported", line, column)
+            query = parse_at_root_query(line, column)
+            @s.skip_ws
+            @s.error("expected \"{\" after @at-root (...)", line, column) unless @s.peek == '{'
           end
           if @s.peek == '{'
-            Ast::AtRootNode.new(nil, parse_block, line, column)
+            Ast::AtRootNode.new(nil, parse_block, line, column, query)
           else
             scan = read_template(stops: "{;}", value_vars: true)
             @s.error("expected \"{\" after @at-root", line, column) unless scan.terminator == '{'
@@ -442,6 +451,31 @@ module Hwaro
             @s.error("expected selector or \"{\" after @at-root", line, column) if selector.empty?
             Ast::AtRootNode.new(selector, parse_block, line, column)
           end
+        end
+
+        # `(with: media supports)` / `(without: media)`.
+        private def parse_at_root_query(line : Int32, column : Int32) : Ast::AtRootQuery
+          @s.advance # '('
+          @s.skip_ws
+          keyword = @s.read_ident
+          unless keyword == "with" || keyword == "without"
+            @s.error("expected \"with\" or \"without\" in @at-root query", line, column)
+          end
+          @s.skip_ws
+          @s.error("expected \":\" after @at-root (#{keyword}", line, column) unless @s.peek == ':'
+          @s.advance
+          names = [] of String
+          loop do
+            @s.skip_ws
+            break if @s.peek == ')'
+            @s.error("unterminated @at-root query", line, column) if @s.eof?
+            name = @s.read_ident
+            @s.error("expected an at-rule name in @at-root query", line, column) if name.empty?
+            names << name.downcase
+          end
+          @s.advance # ')'
+          @s.error("expected at least one name in @at-root (#{keyword}: ...)", line, column) if names.empty?
+          Ast::AtRootQuery.new(keyword == "with" ? :with : :without, names)
         end
 
         # `@extend .target[, .other] [!optional];` — the selector template
@@ -717,12 +751,21 @@ module Hwaro
           args = @s.peek == '(' ? parse_args : [] of Ast::Arg
           @s.skip_ws
           body = nil
+          using_params = [] of Ast::Param
           if @s.ident_start?(@s.peek)
             word_line = @s.line
             word_col = @s.column
             word = @s.read_ident
             if word == "using"
-              @s.error("@include ... using (...) is not supported", word_line, word_col)
+              @s.skip_ws
+              unless @s.peek == '('
+                @s.error("expected \"(\" after \"using\"", word_line, word_col)
+              end
+              using_params = parse_params
+              @s.skip_ws
+              unless @s.peek == '{'
+                @s.error("expected a content block after @include ... using (...)", word_line, word_col)
+              end
             else
               @s.error("unexpected \"#{word}\" after @include #{name}", word_line, word_col)
             end
@@ -732,7 +775,7 @@ module Hwaro
           elsif @s.peek == ';'
             @s.advance
           end
-          Ast::IncludeNode.new(name, namespace, args, body, line, column)
+          Ast::IncludeNode.new(name, namespace, args, body, line, column, using_params)
         end
 
         private def parse_args : Array(Ast::Arg)
@@ -747,7 +790,7 @@ module Hwaro
               # `$name: value` is a keyword argument; a bare `$var` is a
               # positional value. Peek past the identifier for the colon.
               offset = 1
-              while @s.ident_char?(@s.peek(offset))
+              while Scanner.ident_char?(@s.peek(offset))
                 offset += 1
               end
               while @s.peek(offset).try(&.ascii_whitespace?)
@@ -805,26 +848,38 @@ module Hwaro
         private def parse_rule_or_declaration : Ast::Node
           line = @s.line
           column = @s.column
-          scan = read_template(stops: "{;}", value_vars: true)
+          # Custom-property values are raw token streams: `//` is text
+          # there (`--api: https://x`), not a silent comment.
+          scan = read_template(stops: "{;}", value_vars: true,
+            line_comments: !(@s.peek == '-' && @s.peek(1) == '-'))
 
           if scan.terminator == '{'
-            if (colon = scan.first_decl_colon) && blank_after?(scan.template, colon)
-              cp_name = trim_template(split_at(scan.template, colon)[0])
-              if cp_name.pieces[0]?.as?(String).try(&.starts_with?("--"))
-                # `--x: { ... }` is a custom property whose value happens to
-                # be a brace block — legal CSS, since custom-property values
-                # are an almost free-form token stream. Only the
-                # `font: { family: x }` nested-property shape is unsupported,
-                # so `--` names must not be swept up by that check. The block
-                # is kept fully verbatim.
-                raw = read_raw_block
-                @s.skip_ws { }
-                @s.advance if @s.peek == ';'
-                return Ast::DeclarationNode.new(
-                  cp_name, Ast::TextTemplate.new(Array(Ast::Piece){raw}, line, column),
-                  false, true, line, column)
+            if colon = scan.first_decl_colon
+              name_t, value_t = split_at(scan.template, colon)
+              name_t = trim_template(name_t)
+              if name_t.pieces[0]?.as?(String).try(&.starts_with?("--"))
+                if blank_after?(scan.template, colon)
+                  # `--x: { ... }` is a custom property whose value happens
+                  # to be a brace block — legal CSS, since custom-property
+                  # values are an almost free-form token stream. `--` names
+                  # must not be swept up by the nested-property handling
+                  # below. The block is kept fully verbatim.
+                  raw = read_raw_block
+                  @s.skip_ws { }
+                  @s.advance if @s.peek == ';'
+                  return Ast::DeclarationNode.new(
+                    name_t, Ast::TextTemplate.new(Array(Ast::Piece){raw}, line, column),
+                    false, true, line, column)
+                end
+              elsif !name_t.empty?
+                # `font: { family: x }` / `margin: auto { top: 1px }` —
+                # a nested property block, with an optional leading value.
+                value_t, flags = strip_flags(value_t, {"important"})
+                value_t = trim_template(value_t)
+                return Ast::NestedPropsNode.new(
+                  name_t, value_t.empty? ? nil : value_t,
+                  flags.includes?("important"), parse_block, line, column)
               end
-              @s.error("nested properties are not supported", line, column)
             end
             selector = trim_template(scan.template)
             @s.error("expected selector", line, column) if selector.empty?
@@ -898,7 +953,7 @@ module Hwaro
           end
         end
 
-        private def read_template(stops : String, value_vars : Bool) : TemplateScan
+        private def read_template(stops : String, value_vars : Bool, line_comments : Bool = true) : TemplateScan
           start_line = @s.line
           start_col = @s.column
           pieces = [] of Ast::Piece
@@ -927,7 +982,7 @@ module Hwaro
               if @s.peek(1) == '*'
                 @s.read_loud_comment
                 buf << ' '
-              elsif @s.peek(1) == '/'
+              elsif line_comments && @s.peek(1) == '/'
                 @s.advance
                 @s.advance
                 until @s.eof? || @s.peek == '\n'
@@ -974,7 +1029,11 @@ module Hwaro
               if depth == 0
                 first_colon ||= {pieces.size, buf.size}
                 nxt = @s.peek(1)
-                pseudo_like = @s.ident_start?(nxt) || nxt == ':'
+                # `:#{...}` with no space counts as pseudo-like too: a
+                # dynamic pseudo selector (`.btn:#{$state} { }`) must stay
+                # a selector, not become a nested property block.
+                pseudo_like = @s.ident_start?(nxt) || nxt == ':' ||
+                              (nxt == '#' && @s.peek(2) == '{')
                 first_decl_colon ||= {pieces.size, buf.size} unless pseudo_like
               end
               buf << @s.advance
@@ -996,6 +1055,15 @@ module Hwaro
                   read_url_span(buf, pieces)
                 else
                   buf.append(ident)
+                end
+              elsif @s.ident_start?(c)
+                # Idents are consumed whole so an unquoted `url(` span is
+                # still recognised where `$var` doesn't substitute
+                # (`@import url(//fonts…)`): its `//` is not a comment.
+                ident = @s.read_ident
+                buf.append(ident)
+                if ident.compare("url", case_insensitive: true) == 0 && @s.peek == '('
+                  read_url_span(buf, pieces, vars: false)
                 end
               else
                 buf << @s.advance
@@ -1034,32 +1102,111 @@ module Hwaro
         # Raw `url(...)` span (cursor on '('): unquoted url contents are
         # token soup (data URIs contain `;` and `,`), so everything up to
         # the closing paren is verbatim except quoted strings and `#{...}`.
-        private def read_url_span(buf : Buf, pieces : Array(Ast::Piece)) : Nil
+        # `url($v)` / `url(ns.$img)` substitute the variable — `$` is not
+        # valid in a raw CSS url-token, and dart-sass reads such contents
+        # as SassScript. ONLY the whole-token spelling substitutes: a `$`
+        # embedded in a larger token (`url(plain$x.png)`, `url($h:8080/)`)
+        # is valid plain CSS, so it passes through byte-identical (dart
+        # hard-errors there; leniency wins). `url($a + $b)` stays verbatim
+        # for the same reason.
+        private def read_url_span(buf : Buf, pieces : Array(Ast::Piece), vars : Bool = true) : Nil
           start_line = @s.line
           start_col = @s.column
           buf << @s.advance # '('
+          # Inner content collected separately so the whole-token decision
+          # can be made after the closing paren.
+          inner = [] of Ast::Piece
+          ibuf = Buf.new
           loop do
             c = @s.peek || @s.error("unterminated url(", start_line, start_col)
             case c
             when '\\'
-              buf << @s.advance
-              buf << @s.advance unless @s.eof?
+              ibuf << @s.advance
+              ibuf << @s.advance unless @s.eof?
             when ')'
-              buf << @s.advance
+              @s.advance
               break
             when '"', '\''
-              read_string_into(buf, pieces)
+              read_string_into(ibuf, inner)
             when '#'
               if @s.peek(1) == '{'
-                buf.flush_into(pieces)
-                pieces << parse_interp
+                ibuf.flush_into(inner)
+                inner << parse_interp
               else
-                buf << @s.advance
+                ibuf << @s.advance
+              end
+            when '$'
+              if vars && @s.ident_start?(@s.peek(1))
+                var_line = @s.line
+                var_col = @s.column
+                @s.advance
+                name = @s.read_ident
+                @s.error("expected identifier after \"$\"", var_line, var_col) if name.empty?
+                ibuf.flush_into(inner)
+                inner << Ast::VarRef.new(name, nil, var_line, var_col)
+              else
+                ibuf << @s.advance
               end
             else
-              buf << @s.advance
+              if @s.ident_start?(c)
+                ident = @s.read_ident
+                if vars && @s.peek == '.' && @s.peek(1) == '$'
+                  var_line = @s.line
+                  var_col = @s.column
+                  @s.advance # '.'
+                  @s.advance # '$'
+                  name = @s.read_ident
+                  @s.error("expected identifier after \"#{ident}.$\"", var_line, var_col) if name.empty?
+                  ibuf.flush_into(inner)
+                  inner << Ast::VarRef.new(name, ident, var_line, var_col)
+                else
+                  ibuf.append(ident)
+                end
+              else
+                ibuf << @s.advance
+              end
             end
           end
+          ibuf.flush_into(inner)
+
+          if whole_token_var?(inner)
+            # Padding whitespace goes with the substitution — dart prints
+            # `url( $v )` as `url(5px)`.
+            inner = inner.reject(String)
+          else
+            # Degrade every VarRef back to its literal `$name` spelling.
+            inner = inner.map do |piece|
+              piece.is_a?(Ast::VarRef) ? piece.lexeme.as(Ast::Piece) : piece
+            end
+          end
+          inner.each do |piece|
+            if piece.is_a?(String)
+              buf.append(piece)
+            else
+              buf.flush_into(pieces)
+              pieces << piece
+            end
+          end
+          buf << ')'
+        end
+
+        # True when the url() content is exactly one `$var` / `ns.$var`
+        # (surrounding whitespace allowed) — the only shape that
+        # substitutes.
+        private def whole_token_var?(inner : Array(Ast::Piece)) : Bool
+          saw_var = false
+          inner.each do |piece|
+            case piece
+            when Ast::VarRef
+              return false if saw_var
+              saw_var = true
+            when String
+              return false unless piece.blank?
+            else
+              return false # interpolation piece: not a bare-var span
+            end
+          end
+          saw_var
         end
 
         # Splits a loud comment's text into literal runs and `#{...}`

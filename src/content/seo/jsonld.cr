@@ -11,25 +11,61 @@ module Hwaro
 
         # Join `path` onto `base` as a root-relative absolute URL.
         private def abs_path(base : String, path : String) : String
-          "#{base}#{path.starts_with?("/") ? path : "/#{path}"}"
+          "#{base}#{Utils::PathUtils.root_relative(path)}"
+        end
+
+        # A page's own URL, percent-encoded like its canonical/og:url (a raw
+        # space or non-ASCII slug is not a valid schema.org URL).
+        private def page_url(base : String, page : Models::Page, url_override : String? = nil) : String
+          raw = if u = url_override
+                  abs_path(base, u)
+                else
+                  page.permalink || abs_path(base, page.url)
+                end
+          Utils::TextUtils.encode_url_path(raw)
+        end
+
+        # ISO 8601 for datePublished/dateModified. A bare `date = 2026-03-05`
+        # parses as LOCAL midnight, so the full timestamp carried the build
+        # machine's offset: the same post claimed `T00:00:00+09:00` on one
+        # laptop and `+00:00` in CI — a different instant each time, and not
+        # the UTC midnight the feeds publish for it. A date-only value is
+        # written as the date it was authored (schema.org accepts a Date).
+        private def iso_date(time : Time) : String
+          if time.location == Time::Location.local &&
+             time.hour == 0 && time.minute == 0 && time.second == 0 && time.nanosecond == 0
+            time.to_s("%Y-%m-%d")
+          else
+            time.to_s("%Y-%m-%dT%H:%M:%S%:z")
+          end
         end
 
         # Like abs_path, but leaves a value that already carries its own origin
-        # (any `scheme:` URL, or a protocol-relative `//host/…`) untouched.
+        # (any `scheme:` URL, or a protocol-relative `//host/…`) untouched. A
+        # site path is percent-encoded like og:image (the Organization logo is
+        # the same `og.default_image`): `my logo.png` is not a valid URL raw.
         private def abs_or_external(base : String, value : String) : String
-          Processors::InternalLinkResolver.has_own_origin?(value) ? value : abs_path(base, value)
+          return value if Processors::InternalLinkResolver.has_own_origin?(value)
+          abs_path(base, Utils::TextUtils.encode_url_path_keep_query(value))
         end
 
         # Generate Article JSON-LD for a page
         def article(page : Models::Page, config : Models::Config, site : Models::Site? = nil) : String
-          base = config.base_url_stripped
-          url = page.permalink || abs_path(base, page.url)
+          base = config.base_url
+          url = page_url(base, page)
 
-          date_published = page.date.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z"))
-          updated_str = page.updated.try(&.to_s("%Y-%m-%dT%H:%M:%S%:z"))
+          date_published = page.date.try { |t| iso_date(t) }
+          updated_str = page.updated.try { |t| iso_date(t) }
           desc = page.description
-          image_url = if image = page.image
-                        abs_or_external(base, image)
+          image_url = if image = page.social_image
+                        # Resolved like og:image (OpenGraph#resolve_image_url):
+                        # an external URL as written, a site path with its
+                        # path component percent-encoded.
+                        if Processors::InternalLinkResolver.has_own_origin?(image)
+                          image
+                        else
+                          abs_path(base, Utils::TextUtils.encode_url_path_keep_query(image))
+                        end
                       end
           # Prefer the resolved display name from site.authors (data/authors
           # enrichment) so the schema.org author matches the visible author name
@@ -83,12 +119,8 @@ module Hwaro
         # instead of Article/`headline`, keeping JSON-LD consistent with the
         # og:type="website" emitted on the same page (gh#522 follow-up).
         def collection_page(page : Models::Page, config : Models::Config, url_override : String? = nil) : String
-          base = config.base_url_stripped
-          url = if u = url_override
-                  abs_path(base, u)
-                else
-                  page.permalink || abs_path(base, page.url)
-                end
+          base = config.base_url
+          url = page_url(base, page, url_override)
 
           json = JSON.build do |j|
             j.object do
@@ -106,29 +138,36 @@ module Hwaro
         end
 
         # Generate BreadcrumbList JSON-LD from page ancestors
-        def breadcrumb(page : Models::Page, config : Models::Config) : String
-          base = config.base_url_stripped
+        def breadcrumb(page : Models::Page, config : Models::Config, site : Models::Site? = nil) : String
+          base = config.base_url
 
           items = [] of Hash(String, String | Int32)
 
           # Home — language-prefixed so a non-default-language page's Home crumb
           # points at the localized homepage (/ko/, /ja/) rather than the
           # default-language root, matching the localized ancestor crumbs below.
-          lang_prefix = (l = page.language) && l != config.default_language && config.multilingual? ? "/#{l}" : ""
+          # A partial translation with no homepage of its own falls back to the
+          # site root, as its ancestors fall back to the default language's.
+          l = page.language
+          localized = l && l != config.default_language && config.multilingual? &&
+                      (site.nil? || site.home_language?(l))
+          lang_prefix = localized ? "/#{l}" : ""
           items << {
             "@type"    => "ListItem",
             "position" => 1,
             "name"     => config.title,
-            "item"     => "#{base}#{lang_prefix}/",
+            "item"     => Utils::TextUtils.encode_url_path("#{base}#{lang_prefix}/"),
           }
 
-          # Ancestors
-          page.ancestors.each_with_index do |ancestor, idx|
-            ancestor_url = abs_path(base, ancestor.url)
+          # Ancestors. A headless (`render = false`) section publishes no page,
+          # so its crumb would point `item` at a 404; it is left out.
+          page.ancestors.each do |ancestor|
+            next unless ancestor.render
+            ancestor_url = Utils::TextUtils.encode_url_path(abs_path(base, ancestor.url))
             items << {
               "@type"    => "ListItem",
-              "position" => idx + 2,
-              "name"     => ancestor.title,
+              "position" => items.size + 1,
+              "name"     => ancestor.breadcrumb_title,
               "item"     => ancestor_url,
             }
           end
@@ -137,7 +176,7 @@ module Hwaro
           items << {
             "@type"    => "ListItem",
             "position" => items.size + 1,
-            "name"     => page.title,
+            "name"     => page.breadcrumb_title,
           }
 
           json = JSON.build do |j|
@@ -207,8 +246,8 @@ module Hwaro
           steps = extract_howto_steps(page)
           return "" if steps.empty?
 
-          base = config.base_url_stripped
-          url = abs_path(base, page.url)
+          base = config.base_url
+          url = page_url(base, page)
 
           json = JSON.build do |j|
             j.object do
@@ -242,7 +281,7 @@ module Hwaro
 
         # Generate WebSite JSON-LD with optional SearchAction (sitelinks search box)
         def website(config : Models::Config) : String
-          base = config.base_url_stripped
+          base = config.base_url
           return "" if base.empty?
 
           has_search = config.search.enabled
@@ -278,7 +317,7 @@ module Hwaro
 
         # Generate Person JSON-LD from author info
         def person(name : String, config : Models::Config, url : String? = nil, image : String? = nil) : String
-          base = config.base_url_stripped
+          base = config.base_url
 
           json = JSON.build do |j|
             j.object do
@@ -299,7 +338,7 @@ module Hwaro
 
         # Generate Organization JSON-LD from site config
         def organization(config : Models::Config, logo : String? = nil) : String
-          base = config.base_url_stripped
+          base = config.base_url
           return "" if base.empty?
 
           json = JSON.build do |j|
@@ -338,7 +377,7 @@ module Hwaro
         def all_tags(page : Models::Page, config : Models::Config) : String
           parts = [] of String
           parts << article(page, config)
-          parts << breadcrumb(page, config) unless page.ancestors.empty? && page.is_index
+          parts << breadcrumb(page, config) unless page.home?
 
           extra_schema = for_page(page, config)
           parts << extra_schema unless extra_schema.empty?
@@ -405,8 +444,10 @@ module Hwaro
           # Also check faq_questions / faq_answers parallel arrays
           if questions = extra_string_array(page, "faq_questions")
             if answers = extra_string_array(page, "faq_answers")
-              questions.zip(answers).each do |q, a|
-                items << {question: q, answer: a}
+              # `zip` raises IndexError when `answers` is shorter; pair what
+              # lines up and drop the unanswered tail.
+              questions.zip?(answers).each do |q, a|
+                items << {question: q, answer: a} if a
               end
             end
           end
@@ -438,8 +479,8 @@ module Hwaro
           # Also check howto_names / howto_texts parallel arrays
           if names = extra_string_array(page, "howto_names")
             if texts = extra_string_array(page, "howto_texts")
-              names.zip(texts).each do |n, t|
-                steps << {name: n, text: t}
+              names.zip?(texts).each do |n, t|
+                steps << {name: n, text: t} if t
               end
             end
           end

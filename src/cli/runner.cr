@@ -14,41 +14,29 @@ require "../utils/command_suggester"
 
 module Hwaro
   module CLI
-    # Command registry for dynamic command management
-    # Allows plugins to register new commands at runtime
+    # Command registry: the built-in commands, filled by
+    # Runner#register_default_commands at startup.
     class CommandRegistry
-      @@commands = {} of String => Proc(Array(String), Nil)
-      @@metadata = {} of String => CommandInfo
+      @@entries = {} of String => {CommandInfo, Proc(Array(String), Nil)}
 
       # Register a command with its handler and metadata
       def self.register(metadata : CommandInfo, &handler : Array(String) -> Nil)
-        @@commands[metadata.name] = handler
-        @@metadata[metadata.name] = metadata
+        @@entries[metadata.name] = {metadata, handler}
       end
 
       # Get a command handler by name
       def self.get(name : String) : Proc(Array(String), Nil)?
-        @@commands[name]?
-      end
-
-      # Get command metadata by name
-      def self.get_metadata(name : String) : CommandInfo?
-        @@metadata[name]?
-      end
-
-      # Check if a command exists
-      def self.has?(name : String) : Bool
-        @@commands.has_key?(name)
+        @@entries[name]?.try(&.[1])
       end
 
       # Get all registered command names
       def self.names : Array(String)
-        @@commands.keys.sort!
+        @@entries.keys.sort!
       end
 
       # Get command description
       def self.description(name : String) : String
-        @@metadata[name]?.try(&.description) || ""
+        @@entries[name]?.try(&.[0].description) || ""
       end
 
       # List all commands with descriptions
@@ -58,7 +46,7 @@ module Hwaro
 
       # Get all command metadata
       def self.all_metadata : Array(CommandInfo)
-        @@metadata.values
+        @@entries.values.map(&.[0])
       end
     end
 
@@ -93,21 +81,7 @@ module Hwaro
           if handler = CommandRegistry.get(command)
             handler.call(args)
           else
-            # Classified usage error. The "Did you mean …" suggestion prints
-            # to stderr here (text mode only) so the final error line emitted
-            # by the rescue block below is the `Error [CODE]: …` form.
-            if args.any? { |a| a == "--json" }
-              @@json_mode = true
-            else
-              if suggestion = Utils::CommandSuggester.suggest(command, CommandRegistry.names)
-                STDERR.puts "Did you mean '#{suggestion}'?"
-              end
-            end
-            raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_USAGE,
-              message: "unknown command '#{command}'",
-              hint: "Run 'hwaro --help' to see all commands.",
-            )
+            Runner.unknown_command!(command, args)
           end
         end
       rescue ex : Hwaro::HwaroError
@@ -151,12 +125,21 @@ module Hwaro
         @@json_mode = true
       end
 
+      # `--json` failure exit: print the classified error payload on stdout
+      # and exit with the error's own code. Every command that handles
+      # `--json` itself funnels its HwaroError rescues through here so the
+      # envelope cannot drift between commands.
+      def self.exit_with_error_payload(err : Hwaro::HwaroError) : NoReturn
+        STDOUT.puts err.to_error_payload.to_json
+        exit(err.exit_code)
+      end
+
       # Emit a classified error in either the quiet/JSON machine shape or the
       # human-friendly `Error [CODE]: message` form. JSON mode is detected
       # from `Runner.json_mode?` (set by commands that saw `--json`) or from
       # the raw ARGV (unknown-command path, before any parser runs).
       def self.emit_hwaro_error(err : Hwaro::HwaroError, io : IO = STDERR)
-        json = @@json_mode || ARGV.includes?("--json")
+        json = @@json_mode || json_flag?(ARGV)
         if json
           STDOUT.puts err.to_error_payload.to_json
         else
@@ -168,18 +151,35 @@ module Hwaro
         end
       end
 
+      # `--json` or its documented short form `-j`, before any `--`. The
+      # raw-argv check for errors raised before a command's parser ran.
+      def self.json_flag?(argv : Array(String)) : Bool
+        flag_args(argv).any? { |a| a == "--json" || a == "-j" }
+      end
+
+      # The arguments that can be flags: everything before a `--` separator.
+      # Raw-argv scans for global flags must stop there, or `hwaro init -- -q`
+      # (a directory named `-q`) loses its only positional and falls back to
+      # `.` — with `--clean`, emptying the current directory.
+      def self.flag_args(argv : Array(String)) : Array(String)
+        (dash = argv.index("--")) ? argv[0, dash] : argv
+      end
+
       # Strip `--quiet` / `-q` from argv and enable Logger.quiet when present.
       # Mutates the given array in place so subsequent parsers don't see it.
+      # Arguments after `--` are positionals and are left alone.
       def self.apply_global_quiet!(argv : Array(String))
+        dash = argv.index("--") || argv.size
+        kept = [] of String
         found = false
-        argv.reject! do |arg|
-          if arg == "--quiet" || arg == "-q"
+        argv.each_with_index do |arg, i|
+          if i < dash && (arg == "--quiet" || arg == "-q")
             found = true
-            true
           else
-            false
+            kept << arg
           end
         end
+        argv.replace(kept)
         Logger.quiet = true if found
       end
 
@@ -234,27 +234,36 @@ module Hwaro
         # Without this, `help <command>` silently falls back to the generic
         # top-level help, which is confusing for users probing the CLI.
         CommandRegistry.register(CommandInfo.new(name: "help", description: "Show help")) do |args|
-          target = args.find { |a| !a.starts_with?("-") }
+          # `help tool <sub>` reaches the subcommand (`tool <sub> --help`),
+          # so an unknown one fails like `hwaro tool <sub>` instead of
+          # printing the tool overview with exit 0.
+          positional = args.reject(&.starts_with?("-"))
+          target = positional.shift?
           if target && (handler = CommandRegistry.get(target))
-            handler.call(["--help"])
+            handler.call(target == "tool" ? positional.first(1) + ["--help"] : ["--help"])
           elsif target
-            Runner.report_unknown_command(target)
-            exit Hwaro::Errors::EXIT_USAGE
+            Runner.unknown_command!(target, args)
           else
             Runner.print_help
           end
         end
       end
 
-      # Write a concise unknown-command error to stderr with an optional
-      # "Did you mean" suggestion. Intentionally avoids dumping the ASCII
-      # banner or full command list — users can run `hwaro --help` for that.
-      def self.report_unknown_command(command : String, io : IO = STDERR)
-        io.puts "Error: unknown command '#{command}'"
-        if suggestion = Utils::CommandSuggester.suggest(command, CommandRegistry.names)
-          io.puts "Did you mean '#{suggestion}'?"
+      # Classified usage error for an unknown top-level command, shared by
+      # `hwaro <command>` and `hwaro help <command>`. The "Did you mean …"
+      # suggestion prints to stderr (text mode only) so the final error line
+      # emitted by `run`'s rescue is the `Error [CODE]: …` form.
+      def self.unknown_command!(command : String, args : Array(String)) : NoReturn
+        if json_flag?(args)
+          @@json_mode = true
+        elsif suggestion = Utils::CommandSuggester.suggest(command, CommandRegistry.names)
+          STDERR.puts "Did you mean '#{suggestion}'?"
         end
-        io.puts "Run 'hwaro --help' to see all commands."
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_USAGE,
+          message: "unknown command '#{command}'",
+          hint: "Run 'hwaro --help' to see all commands.",
+        )
       end
 
       def self.print_help

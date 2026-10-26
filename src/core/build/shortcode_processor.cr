@@ -27,7 +27,14 @@ module Hwaro
         # the argument list was mis-split.
         SHORTCODE_ARGS_REGEX  = /(\w+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^,\s]+))/
         MAX_SHORTCODE_NESTING = 5
-        BLOCK_OPEN_RE         = /\{\%\s*([a-zA-Z_][\w\-]*)\s*(?:\((.*?)\)|((?:\w+\s*=\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,%\s]+)\s*,?\s*)*))\s*\%\}/
+        # Each value parses one way only — a quoted value when its closing
+        # quote is followed by a separator or the next `key=`, otherwise an
+        # unquoted run (so `title='Don't'` still opens the block) — and the
+        # separators are possessive. With either free to split differently,
+        # a failing tag (ten quoted args and a stray word, or a URL with a
+        # long query string and a `%`) backtracked exponentially into
+        # PCRE2's match limit, and the Regex::Error aborted the build.
+        BLOCK_OPEN_RE = /\{\%\s*([a-zA-Z_][\w\-]*)\s*(?:\((.*?)\)|((?:\w+\s*=\s*(?>"(?:[^"\\]|\\.)*"(?=[\s,%]|\w+\s*=)|'(?:[^'\\]|\\.)*'(?=[\s,%]|\w+\s*=)|[^,%\s]++)\s*+,?\s*+)*))\s*\%\}/
         # Support both bare {% end %} and named {% endNAME %}.
         BLOCK_CLOSE_RE = /\{\%\s*end(?:\s+[a-zA-Z_][\w\-]*)?\s*\%\}/i
         # Broader close matcher for the outer fence loop's block pairing: it
@@ -53,12 +60,18 @@ module Hwaro
         # PREFIX/SUFFIX so the two can't drift).
         SHORTCODE_PLACEHOLDER_RE = Content::Processors::InlineMarkdown::SHORTCODE_PLACEHOLDER_RE
 
-        # Matches CommonMark-style inline code spans on a single line
-        # (1 to 3 leading backticks; the same count must close the span).
-        # Multi-line inline spans are rare and intentionally not handled —
-        # those are usually fenced blocks, which the line-based outer
-        # loop in `process_shortcodes_jinja` already skips.
-        INLINE_CODE_RE = /(`{1,3})((?:(?!\1)[^\n])+?)\1/
+        # Matches CommonMark-style inline code spans (1 to 3 leading
+        # backticks; the same count must close the span). A span may wrap
+        # onto the next line, as a hard-wrapped paragraph does, but never
+        # across a blank line or into a fence line: a call on the first line
+        # of a wrapped span was expanded while Markd rendered the span as
+        # `<code>`, leaking the escaped placeholder comment into it. The
+        # per-line scanners only ever see one line, so for them the span
+        # simply has to close there. Runs of non-backtick characters are
+        # possessive: one backtracking frame per backtick/newline instead of
+        # per character, or a stray backtick in a long paragraph overflows
+        # PCRE2's JIT stack ("Regex match error") and fails the page.
+        INLINE_CODE_RE = /(`{1,3})((?:[^\n`]++|(?!\1)`|\n(?![ \t]*(?:\r?\n|\r?\z|`{3}|~{3})))+?)\1/
 
         # Fast pre-filter used by the render hot path (see render.cr).
         # Returns true only when {{ or {% appear *outside* fenced code blocks
@@ -67,12 +80,16 @@ module Hwaro
         # the very common case of documentation pages that only show literal
         # shortcode examples inside code regions.
         def content_may_contain_shortcodes?(content : String) : Bool
-          return false unless content.includes?("{{") || content.includes?("{%")
+          # Whole-document probes: memchr-anchored, not the stdlib's Rabin-Karp.
+          return false unless Utils::ByteScan.includes?(content, "{{") || Utils::ByteScan.includes?(content, "{%")
 
           # FenceTracker (shared with the table/definition/math walkers and,
           # critically, process_shortcodes_jinja below) so the skip decision
           # and the actual expansion can never disagree about what's fenced.
-          tracker = Content::Processors::FenceTracker.new
+          # Every shortcode walker passes `raw_html_code: false`: shortcodes
+          # expand inside raw <pre>/<script>/<textarea> blocks, which only
+          # the Markdown extensions treat as opaque.
+          tracker = Content::Processors::FenceTracker.new(raw_html_code: false)
 
           content.each_line(chomp: false) do |line|
             next if tracker.fence_line?(line)
@@ -113,8 +130,18 @@ module Hwaro
           # rule) — the previous ad-hoc regex opened on indented ``` (literal
           # text in CommonMark) and never closed on a longer closer run,
           # desyncing fence state for the rest of the document.
+          map_shortcode_chunks(content) do |chunk|
+            process_shortcodes_in_text(chunk, templates, context, shortcode_results, crinja_env_override: crinja_env_override, template_cache_override: template_cache_override, warnings: warnings)
+          end
+        end
+
+        # The fence walk of `process_shortcodes_jinja`, shared with the
+        # include pass (`expand_includes`) so both agree on what is fenced:
+        # fence lines pass through verbatim, every run of lines between them
+        # is replaced by the block's result.
+        private def map_shortcode_chunks(content : String, & : String -> String) : String
           String.build do |io|
-            tracker = Content::Processors::FenceTracker.new
+            tracker = Content::Processors::FenceTracker.new(raw_html_code: false)
             buffer = String::Builder.new
             # Lines that live inside a block-shortcode body. While inside one
             # we must NOT treat a fence line as a buffer boundary, otherwise a
@@ -133,10 +160,12 @@ module Hwaro
             # HWARO-SHORTCODE-PLACEHOLDER token then shipped in the HTML,
             # the feed and the search index).
             body_lines = block_body_lines(content)
+            raw_lines = raw_block_lines(content)
             line_no = 0
 
             content.each_line(chomp: false) do |line|
               in_body = body_lines[line_no]? || false
+              in_raw_region = raw_lines[line_no]? || false
               line_no += 1
 
               # Fence lines flush the pending chunk and pass through
@@ -145,8 +174,8 @@ module Hwaro
               # a chunk boundary (block_body_lines already guarantees the
               # fences inside a body are balanced, so the tracker resumes in
               # the same state on the far side).
-              if !in_body && tracker.fence_line?(line)
-                io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results, crinja_env_override: crinja_env_override, template_cache_override: template_cache_override, warnings: warnings)
+              if !in_body && tracker.fence_line?(line) && !in_raw_region
+                io << yield buffer.to_s
                 buffer = String::Builder.new
                 io << line
                 next
@@ -155,7 +184,7 @@ module Hwaro
               buffer << line
             end
 
-            io << process_shortcodes_in_text(buffer.to_s, templates, context, shortcode_results, crinja_env_override: crinja_env_override, template_cache_override: template_cache_override, warnings: warnings)
+            io << yield buffer.to_s
           end
         end
 
@@ -177,41 +206,17 @@ module Hwaro
         # not a closer. (The old loop honored that only at depth 0, which is
         # exactly how a fenced example came to close a real opener.)
         private def block_body_lines(content : String) : Array(Bool)
-          return [] of Bool unless content.includes?("{%")
+          return [] of Bool unless Utils::ByteScan.includes?(content, "{%")
 
-          tracker = Content::Processors::FenceTracker.new
           open_lines = [] of Int32
           pairs = [] of Tuple(Int32, Int32)
-          line_count = 0
-
-          content.each_line(chomp: false) do |line|
-            line_no = line_count
-            line_count += 1
-            next if tracker.fence_line?(line)
-
-            # Inline code spans are masked first: a literal `{% alert %}` in
-            # backticks must not count as an opener.
-            scan_line = line.includes?('`') ? mask_inline_code(line)[0] : line
-
-            # Crinja control tags (`{% set %}`, `{% if %}`/`{% endif %}`, …)
-            # are ignored — pairing them would desync the map (an unbalanced
-            # `{% set %}` would swallow a later `{% end %}`). Classification
-            # is EXACT-keyword (control_tag_open? / shortcode_closer?), the
-            # same rules as the block parser below — the prefix regex once
-            # used here treated `-`/`(` as word boundaries, so a shortcode
-            # named `include-code` counted as a control tag and its fenced
-            # body split at the fence line.
-            scan_line.scan(BLOCK_OPEN_RE) do |m|
-              next if control_tag_open?(m) || BLOCK_ANY_CLOSE_RE.matches?(m[0])
+          line_count = each_block_tag(content, Content::Processors::FenceTracker.new(raw_html_code: false)) do |line_no, opener|
+            if opener
               open_lines << line_no
-            end
-            scan_line.scan(BLOCK_ANY_CLOSE_RE) do |m|
-              next unless shortcode_closer?(m[0])
+            elsif opened = open_lines.pop?
               # A closer with nothing open is stray — the block parser emits
               # it as literal text too.
-              if opened = open_lines.pop?
-                pairs << {opened, line_no} if line_no > opened
-              end
+              pairs << {opened, line_no} if line_no > opened
             end
           end
 
@@ -235,6 +240,111 @@ module Hwaro
           body_map
         end
 
+        # The shortcode block tags of `content` outside fenced code, in order:
+        # yields each one's line and whether it opens. Returns the line count.
+        # `tracker` carries fence state, so a text cut in two can be walked
+        # as one.
+        private def each_block_tag(content : String, tracker : Content::Processors::FenceTracker, & : Int32, Bool ->) : Int32
+          line_count = 0
+          content.each_line(chomp: false) do |line|
+            line_no = line_count
+            line_count += 1
+            next if tracker.fence_line?(line)
+
+            # Inline code spans are masked first: a literal `{% alert %}` in
+            # backticks must not count as an opener.
+            scan_line = line.includes?('`') ? mask_inline_code(line)[0] : line
+
+            # Crinja control tags (`{% set %}`, `{% if %}`/`{% endif %}`, …)
+            # are ignored — pairing them would desync the map (an unbalanced
+            # `{% set %}` would swallow a later `{% end %}`). Classification
+            # is EXACT-keyword (control_tag_open? / shortcode_closer?), the
+            # same rules as the block parser below — the prefix regex once
+            # used here treated `-`/`(` as word boundaries, so a shortcode
+            # named `include-code` counted as a control tag and its fenced
+            # body split at the fence line.
+            scan_line.scan(BLOCK_OPEN_RE) do |m|
+              next if control_tag_open?(m) || BLOCK_ANY_CLOSE_RE.matches?(m[0])
+              yield line_no, true
+            end
+            scan_line.scan(BLOCK_ANY_CLOSE_RE) do |m|
+              yield line_no, false if shortcode_closer?(m[0])
+            end
+          end
+          line_count
+        end
+
+        # How many block shortcodes are open where `head` ends and closed in
+        # `tail` — a `<!-- more -->` summary cut inside their bodies needs
+        # that many closers, or the openers ship as literal text.
+        private def blocks_open_across(head : String, tail : String) : Int32
+          return 0 unless Utils::ByteScan.includes?(head, "{%")
+          tracker = Content::Processors::FenceTracker.new(raw_html_code: false)
+          open = 0
+          each_block_tag(head, tracker) { |_, opener| open = opener ? open + 1 : Math.max(open - 1, 0) }
+          inner = 0
+          closed = 0
+          each_block_tag(tail, tracker) do |_, opener|
+            break if open == 0
+            if opener
+              inner += 1
+            elsif inner > 0
+              inner -= 1
+            else
+              open -= 1
+              closed += 1
+            end
+          end
+          closed
+        end
+
+        # Matched raw blocks must stay in one processing chunk so
+        # `mask_raw_blocks` can protect the whole region. Fences inside raw
+        # content still feed the tracker, but do not flush that chunk; the
+        # tracker then resumes in the correct state after `{% endraw %}`.
+        private def raw_block_lines(content : String) : Array(Bool)
+          return [] of Bool unless Utils::ByteScan.includes?(content, "{%")
+
+          tracker = Content::Processors::FenceTracker.new
+          open_line : Int32? = nil
+          pairs = [] of Tuple(Int32, Int32)
+          line_count = 0
+
+          content.each_line(chomp: false) do |line|
+            line_no = line_count
+            line_count += 1
+            in_fence = tracker.fence_line?(line)
+            scan_line = line.includes?('`') ? mask_inline_code(line)[0] : line
+            next if in_fence && open_line.nil?
+
+            scan_line.scan(RAW_TAG_RE) do |match|
+              tag = match[1]
+              if tag == "raw"
+                open_line ||= line_no
+              elsif opened = open_line
+                pairs << {opened, line_no}
+                open_line = nil
+              end
+            end
+          end
+
+          return [] of Bool if pairs.empty?
+
+          deltas = Array(Int32).new(line_count + 1, 0)
+          pairs.each do |(opened, closed)|
+            deltas[opened] += 1
+            deltas[closed + 1] -= 1
+          end
+
+          depth = 0
+          raw_map = Array(Bool).new(line_count, false)
+          line_count.times do |i|
+            depth += deltas[i]
+            raw_map[i] = depth > 0
+          end
+          raw_map
+        end
+
         private def process_shortcodes_in_text(content : String, templates : Hash(String, String), context : Hash(String, Crinja::Value), shortcode_results : Hash(String, String)? = nil, crinja_env_override : Crinja? = nil, template_cache_override : Hash(UInt64, Crinja::Template)? = nil, depth : Int32 = 0, warnings : Array(String)? = nil) : String
           # Inline code spans (`…`, ``…``) are opaque to the shortcode
           # processor — running shortcodes inside `<code>` would both
@@ -250,7 +360,8 @@ module Hwaro
           # landed in different chunks and both leaked as literal text.
           # Tokens are restored on the shortcode body/args right before
           # rendering and on the final text before returning.
-          masked, spans = mask_inline_code(content)
+          spans = [] of String
+          masked, spans = mask_inline_code(mask_body_fences(content, spans), spans)
           # `{% raw %}` regions get the same treatment, for the same reason:
           # they are the construct an author uses to SHOW shortcode syntax
           # outside a code fence (see `mask_raw_blocks`).
@@ -261,16 +372,43 @@ module Hwaro
 
         # Token format for masked inline code spans. NUL bytes cannot appear
         # in markdown source, so the token can never collide with real text.
-        INLINE_CODE_MASK_RE = /\x00HWARO-INLINE-CODE-(\d+)\x00/
+        INLINE_CODE_MASK_RE = /\x00HWARO-INLINE-CODE-(\d{1,9})\x00/
 
-        private def mask_inline_code(content : String) : {String, Array(String)}
-          spans = [] of String
+        private def mask_inline_code(content : String, spans : Array(String) = [] of String) : {String, Array(String)}
           return {content, spans} unless content.includes?('`')
           masked = content.gsub(INLINE_CODE_RE) do |span|
             spans << span
             "\x00HWARO-INLINE-CODE-#{spans.size - 1}\x00"
           end
           {masked, spans}
+        end
+
+        # Fenced code inside a block-shortcode body. The chunk walk only
+        # splits at fences OUTSIDE bodies, so a body's ``` example reached the
+        # block parser as live text: a `{% alert %}…{% end %}` shown in a
+        # note's fence paired as a nested block and expanded, and its
+        # placeholder shipped HTML-escaped inside `<pre><code>`. Same rule as
+        # the include pass (`expand_include_lines`): a tracker fed only body
+        # lines decides what is fenced. Runs before inline-code masking, whose
+        # spans may start inside a fence line and hide it from the tracker;
+        # lines ride the shared span array with their newline left outside.
+        private def mask_body_fences(content : String, spans : Array(String)) : String
+          return content unless content.includes?("```") || content.includes?("~~~")
+          body_lines = block_body_lines(content)
+          return content if body_lines.empty?
+          tracker = Content::Processors::FenceTracker.new(raw_html_code: false)
+          String.build(content.bytesize) do |io|
+            content.each_line(chomp: false).with_index do |line, i|
+              unless (body_lines[i]? || false) && tracker.fence_line?(line)
+                io << line
+                next
+              end
+              newline = line.ends_with?('\n')
+              spans << (newline ? line.byte_slice(0, line.bytesize - 1) : line)
+              io << "\x00HWARO-INLINE-CODE-" << spans.size - 1 << "\x00"
+              io << '\n' if newline
+            end
+          end
         end
 
         private def unmask_inline_code(text : String, spans : Array(String)) : String
@@ -292,6 +430,10 @@ module Hwaro
         # in a template and in a markdown body has to survive identically, so
         # the two must never disagree about where a raw block starts and ends.
         RAW_BLOCK_RE = /\{\%-?\s*raw\s*-?\%\}.*?\{\%-?\s*end\s*raw\s*-?\%\}/m
+        # The single tags of RAW_BLOCK_RE, for `raw_block_lines`. Must stay
+        # case-sensitive like it: a region this marks but `mask_raw_blocks`
+        # does not mask loses its fence protection.
+        RAW_TAG_RE = /\{\%-?\s*(raw|end\s*raw)\s*-?\%\}/
 
         # Hide `{% raw %}` regions from the shortcode passes.
         #
@@ -322,10 +464,6 @@ module Hwaro
         # code spans already restored so no token ever nests inside another
         # (unmasking is a single gsub pass).
         #
-        # Known limit: a raw region straddling a fenced code block is split
-        # across chunks by the fence loop in `process_shortcodes_jinja` and
-        # stays unmasked — the fenced half is protected by the fence itself,
-        # and the rest behaves exactly as it did before.
         private def mask_raw_blocks(content : String, spans : Array(String)) : String
           # Substring probe first: raw blocks are rare and this runs on every
           # chunk of every page.
@@ -404,7 +542,7 @@ module Hwaro
         # named-closer normalization, an explicit/direct `{{ name(...) }}`
         # call, or a non-control `{% name %}` block opener.
         def shortcode_scan_needed?(text : String) : Bool
-          return false unless text.includes?("{{") || text.includes?("{%")
+          return false unless Utils::ByteScan.includes?(text, "{{") || Utils::ByteScan.includes?(text, "{%")
           return true if named_closer?(text)
           return true if SHORTCODE_CALL_SCAN_RE.matches?(text)
 
@@ -460,14 +598,55 @@ module Hwaro
         }
 
         # True when a BLOCK_OPEN_RE match is really a Jinja control tag, not a
-        # shortcode opener. Parenthesized args are decisive: no Jinja control
-        # form matching BLOCK_OPEN_RE carries `name(...)` (Jinja's own
-        # `{% include "x.html" %}` / `{% call(u) m(l) %}` don't match the
-        # regex at all), so `{% include(name="promo") %}` is a user shortcode
-        # named `include` and must keep expanding.
+        # shortcode opener. `{% include(name="promo") %}` — the keyword hugging
+        # one balanced argument group — is a user shortcode named `include`
+        # and must keep expanding; Jinja's own `{% include "x.html" %}` never
+        # matches the regex. But a keyword's CONDITION can be parenthesized
+        # too (`{% if (a and b) or (c) %}` in the blog scaffold), and the
+        # regex's `name(...)` branch swallows it whole, so the group shape is
+        # what decides.
         private def control_tag_open?(m : Regex::MatchData) : Bool
-          return false if m[2]? # `name(...)` form — unambiguously a shortcode call
-          CRINJA_CONTROL_KEYWORDS.includes?(m[1].downcase)
+          return false unless CRINJA_CONTROL_KEYWORDS.includes?(m[1].downcase)
+          args = m[2]?
+          return true unless args # bare / `key=value` form of a keyword
+          # `name(...)` form on a keyword. A shortcode call hugs its name and
+          # encloses every argument in ONE balanced group; a Jinja condition
+          # such as `{% if (a and b) or (c) %}` or `{% elif (x) %}` puts
+          # whitespace between the keyword and the group, or closes the group
+          # before the tag's last `)`. Either shape is Jinja, not a shortcode.
+          return true if m.byte_begin(2) - 1 > m.byte_end(1)
+          !single_paren_group?(args)
+        end
+
+        # True when `args` (the text between a tag's first `(` and last `)`)
+        # never returns to depth zero before its end, i.e. the surrounding
+        # parens form one group. Parens inside quoted strings are skipped.
+        private def single_paren_group?(args : String) : Bool
+          depth = 0
+          quote : Char? = nil
+          escaped = false
+          args.each_char do |ch|
+            if quote
+              if escaped
+                escaped = false
+              elsif ch == '\\'
+                escaped = true
+              elsif ch == quote
+                quote = nil
+              end
+              next
+            end
+            case ch
+            when '"', '\''
+              quote = ch
+            when '('
+              depth += 1
+            when ')'
+              return false if depth == 0
+              depth -= 1
+            end
+          end
+          true
         end
 
         # Next BLOCK_OPEN_RE match at or after byte offset `from` that is a
@@ -477,9 +656,9 @@ module Hwaro
         # counting them as block openers desynced the nesting scan — a block
         # shortcode whose body contained `{% if %}…{% endif %}` never found
         # its `{% end %}` and leaked its opening tag as literal text.
-        private def next_block_open(content : String, from : Int32) : Regex::MatchData?
+        private def next_block_open(content : String, from : Int32, options : Regex::MatchOptions = :none) : Regex::MatchData?
           pos = from
-          while m = BLOCK_OPEN_RE.match_at_byte_index(content, pos)
+          while m = BLOCK_OPEN_RE.match_at_byte_index(content, pos, options)
             return m unless control_tag_open?(m)
             pos = m.byte_begin + m[0].bytesize
           end
@@ -521,6 +700,10 @@ module Hwaro
           end
 
           close_re = BLOCK_CLOSE_RE
+          # PCRE2 re-validates the UTF-8 of the whole remaining subject on
+          # every match call, so a page with thousands of block shortcodes
+          # paid O(document) per tag — quadratic overall. Validate once.
+          match_opts = content.valid_encoding? ? Regex::MatchOptions::NO_UTF_CHECK : Regex::MatchOptions::None
 
           result = String::Builder.new
           pos = 0
@@ -539,13 +722,13 @@ module Hwaro
             open_match = if (c = cached_open) && c.byte_begin >= pos
                            c
                          else
-                           cached_open = next_block_open(content, pos)
+                           cached_open = next_block_open(content, pos, match_opts)
                          end
             # Find next closing tag (to handle stray {% end %} gracefully)
             close_match = if (c = cached_close) && c.byte_begin >= pos
                             c
                           else
-                            cached_close = close_re.match_at_byte_index(content, pos)
+                            cached_close = close_re.match_at_byte_index(content, pos, match_opts)
                           end
 
             # No more opening tags — append rest and done
@@ -597,12 +780,12 @@ module Hwaro
               next_open = if (c = nest_open) && c.byte_begin >= scan_pos
                             c
                           else
-                            nest_open = next_block_open(content, scan_pos)
+                            nest_open = next_block_open(content, scan_pos, match_opts)
                           end
               next_close = if (c = nest_close) && c.byte_begin >= scan_pos
                              c
                            else
-                             nest_close = close_re.match_at_byte_index(content, scan_pos)
+                             nest_close = close_re.match_at_byte_index(content, scan_pos, match_opts)
                            end
 
               break unless next_close
@@ -627,13 +810,20 @@ module Hwaro
             end
 
             unless body_end
-              # No matching {% end %} found — emit the opening tag as literal text
+              # No matching {% end %} found — emit the opening tag as literal
+              # text, and say so: `{% alert() %}` with a forgotten closer used
+              # to ship the raw tag into the page with nothing in the log.
+              warn_unclosed_shortcode(name)
               result << open_match[0]
               pos = body_start
               next
             end
 
-            body = content.byte_slice(body_start, body_end - body_start).strip
+            body = content.byte_slice(body_start, body_end - body_start)
+            if prefix = body_line_prefix(content, open_start)
+              body = dedent_body(body, prefix)
+            end
+            body = body.strip
 
             # Recursively process nested shortcodes in body (with depth limit).
             # The body is already masked by the caller, so recurse through the
@@ -658,6 +848,45 @@ module Hwaro
           result.to_s
         end
 
+        # What a block opener's line starts with when that is only container
+        # structure: blockquote markers, indentation, at most one list marker.
+        BODY_PREFIX_RE = /\A[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?\z/
+
+        # The container prefix the body's lines repeat — the opener line's
+        # prefix with any list marker turned into spaces (`> ` stays `> `,
+        # `- ` becomes `  `). Nil when the opener follows other text or
+        # starts its line.
+        private def body_line_prefix(content : String, open_start : Int32) : String?
+          line_start = open_start
+          while line_start > 0 && content.byte_at(line_start - 1) != '\n'.ord
+            line_start -= 1
+          end
+          return if line_start == open_start
+          prefix = content.byte_slice(line_start, open_start - line_start)
+          return unless BODY_PREFIX_RE.matches?(prefix)
+          prefix.gsub(/[^>\s]/, " ")
+        end
+
+        # Strips the opener's container prefix from every body line, so a
+        # block shortcode inside a blockquote or list item gets the body the
+        # author wrote rather than a nested blockquote or a code block. A line
+        # that is only the prefix's markers becomes blank; any other line
+        # (lazy continuation) is kept as written.
+        private def dedent_body(body : String, prefix : String) : String
+          bare = prefix.rstrip
+          String.build do |io|
+            body.each_line(chomp: false) do |line|
+              if line.starts_with?(prefix)
+                io << line.byte_slice(prefix.bytesize)
+              elsif line.rstrip == bare
+                io << '\n' if line.ends_with?('\n')
+              else
+                io << line
+              end
+            end
+          end
+        end
+
         # Shared helper: look up a shortcode template, render it, and either
         # return the HTML directly or store it behind a placeholder so that
         # Markdown processing doesn't mangle it.
@@ -675,7 +904,8 @@ module Hwaro
           warnings : Array(String)? = nil,
         ) : String
           template_key = "shortcodes/#{name}"
-          template = templates[template_key]? || BuiltinShortcodes.templates[template_key]?
+          user_template = templates[template_key]?
+          template = user_template || BuiltinShortcodes.templates[template_key]?
 
           unless template
             # Direct-call syntax (`{{ name(args) }}`) doubles as Crinja's
@@ -683,6 +913,10 @@ module Hwaro
             # legitimate references that the page-template engine will
             # resolve later. Pass those through untouched.
             return fallback if crinja_function?(name, crinja_env_override)
+            # The include pass (`expand_includes`) expands these inline calls
+            # before this pass; one still here sits where it keeps calls
+            # literal. The block form was never an include: it stays missing.
+            return fallback if fallback.starts_with?("{{") && name.in?("include_code", "include_md")
 
             warn_missing_shortcode(template_key) if warn_missing
 
@@ -719,6 +953,8 @@ module Hwaro
               pos_idx += 1
             end
           end
+
+          warn_missing_shortcode_args(name, template_key, args, warnings) unless user_template
 
           html = render_shortcode_jinja(template, args, context, crinja_env_override: crinja_env_override, template_cache_override: template_cache_override, shortcode_name: name, warnings: warnings)
 
@@ -774,7 +1010,9 @@ module Hwaro
               end
             else
               value = unquote_shortcode_arg(token)
-              next if value.empty?
+              # Preserve explicitly empty positional values. They still
+              # occupy their slot, so `gist("", "id")` must map the empty
+              # username to `_0` and the ID to `_1`.
               args["_#{idx}"] = value
               idx += 1
             end
@@ -872,8 +1110,9 @@ module Hwaro
               context[key] = Crinja::Value.new(value)
             end
 
-            # Cache compiled shortcode templates by content hash to avoid
-            # re-parsing the template AST on every shortcode invocation.
+            # Cache compiled shortcode templates by name and source hash to
+            # avoid re-parsing the AST while keeping each template bound to
+            # its own source filename for error locations.
             # XOR with a salt to avoid collisions with page template cache entries
             # that share the same cache map.
             #
@@ -886,11 +1125,14 @@ module Hwaro
             # the worker's own env — no cross-worker env mutation, and no mutex
             # needed since a single fiber owns the cache. Only the shared
             # fallback cache (sequential path) needs the reentrant mutex.
-            cache_key = template.hash ^ 0x5C0DE_CAFE_u64
             # User shortcodes live at templates/shortcodes/<name>.html; resolving
             # that key through compile_template attaches the filename so errors
-            # point at the file. Builtins aren't on disk and stay anonymous.
+            # point at the file. Identical source under another name still
+            # needs its own compiled template, or Crinja reports the first
+            # file's path for errors in both shortcodes. Builtins aren't on
+            # disk and stay anonymous.
             template_key = shortcode_name.try { |n| "shortcodes/#{n}" }
+            cache_key = {template_key, template}.hash ^ 0x5C0DE_CAFE_u64
             crinja_template = if wcache = template_cache_override
                                 wcache[cache_key]? || begin
                                   compiled = compile_template(env, template, template_key)
@@ -907,6 +1149,12 @@ module Hwaro
                                 end
                               end
             crinja_template.render(context)
+            # Only syntax errors are downgraded to a warning and a marker.
+            # Runtime errors (undefined attribute access, a missing include —
+            # see src/ext/crinja_error_location_fix.cr) propagate and fail
+            # the build as HWARO_E_TEMPLATE, like a page-template error; the
+            # compiled template's filename already locates them in the
+            # shortcode file.
           rescue ex : Crinja::TemplateError
             label = shortcode_name ? "shortcode '#{shortcode_name}'" : "shortcode"
             Logger.warn "Template error in #{label}: #{ex.message}"
@@ -932,6 +1180,16 @@ module Hwaro
         # inwards. Loop until the result stops changing (or until we hit
         # the same depth limit the recursive renderer uses) so every
         # nested level resolves.
+        #
+        # Markd also mangles the comment wherever raw HTML can't go: it is
+        # HTML-escaped in text and attribute values (`\{{ … }}`, a link or
+        # image title, an admonition title) and loses its angle brackets as
+        # a `<…>` link or reference destination. Those forms restore to the
+        # HTML-escaped output, so the token never ships. Inside `<code>` an
+        # escaped token is one the author is displaying (shortcodes never
+        # expand in code), so it stays literal.
+        SHORTCODE_PLACEHOLDER_RESTORE_RE = /<!--(HWARO-SHORTCODE-PLACEHOLDER-\d+)-->|&lt;!--(HWARO-SHORTCODE-PLACEHOLDER-\d+)--&gt;|!--(HWARO-SHORTCODE-PLACEHOLDER-\d+)--|<(\/?)code\b/
+
         private def replace_shortcode_placeholders(html : String, shortcode_results : Hash(String, String)) : String
           return html if shortcode_results.empty?
           result = html
@@ -939,9 +1197,19 @@ module Hwaro
             # Substring probe before the regex pass: the typical page pays
             # one confirming scan per nesting level otherwise, over the
             # whole rendered HTML.
-            return result unless result.includes?(SHORTCODE_PLACEHOLDER_PREFIX)
-            replaced = result.gsub(SHORTCODE_PLACEHOLDER_RE) do |match|
-              shortcode_results[match]? || match
+            return result unless Utils::ByteScan.includes?(result, "HWARO-SHORTCODE-PLACEHOLDER-")
+            code_depth = 0
+            replaced = result.gsub(SHORTCODE_PLACEHOLDER_RESTORE_RE) do |match, m|
+              if m[1]?
+                shortcode_results[match]? || match
+              elsif closing = m[4]?
+                code_depth = closing.empty? ? code_depth + 1 : Math.max(code_depth - 1, 0)
+                match
+              elsif code_depth == 0 && (output = shortcode_results["<!--#{m[2]? || m[3]}-->"]?)
+                HTML.escape(output)
+              else
+                match
+              end
             end
             return replaced if replaced == result
             result = replaced
@@ -977,6 +1245,45 @@ module Hwaro
           end
           return unless should_warn
           Logger.warn "Shortcode template '#{template_key}' not found."
+        end
+
+        # A built-in shortcode call that leaves out a required parameter
+        # renders successfully into markup nobody can use — an iframe at
+        # `https://codepen.io//embed/abc`, a gist script at
+        # `https://gist.github.com//abc.js`, an `<img src="">`. Crinja
+        # resolves the missing name to the empty string and the build exits 0,
+        # so without this the only symptom is a dead embed on the published
+        # page. Only reported for the built-in templates: a user template in
+        # `templates/shortcodes/` decides its own contract, so the caller
+        # skips this whenever the lookup found one — including a file that
+        # overrides a built-in by name.
+        private def warn_missing_shortcode_args(name : String, template_key : String, args : Hash(String, String), warnings : Array(String)?) : Nil
+          return unless templates_required = BuiltinShortcodes.required_params(template_key)
+          missing = templates_required.reject { |param| args[param]?.try { |v| !v.strip.empty? } }
+          return if missing.empty?
+
+          list = missing.join("`, `")
+          message = "Shortcode `#{name}` is missing required argument#{"s" if missing.size > 1} `#{list}` — it renders a broken embed. Usage: `{{ #{name}(#{templates_required.map { |p| %(#{p}="…") }.join(", ")}) }}`."
+          # Page-scoped so the serve error overlay can show it next to the
+          # page that has the bad call; deduped globally for the build log.
+          warnings.try(&.<<(message))
+          should_warn = @crinja_cache_mutex.synchronize do
+            seen = (@shortcode_warnings_seen ||= Set(String).new)
+            seen.add?("args:#{template_key}:#{missing.join(",")}")
+          end
+          Logger.warn message if should_warn
+        end
+
+        # Same once-per-build dedupe for a block opener that never finds its
+        # closer. Keyed separately from the missing-template set so a name
+        # that is both unclosed and unknown still gets both messages.
+        private def warn_unclosed_shortcode(name : String) : Nil
+          should_warn = @crinja_cache_mutex.synchronize do
+            seen = (@shortcode_warnings_seen ||= Set(String).new)
+            seen.add?("unclosed:#{name}")
+          end
+          return unless should_warn
+          Logger.warn "Block shortcode '{% #{name} %}' is never closed — it renders as literal text. Add `{% end#{name} %}` (or `{% end %}`) after its body."
         end
       end
     end

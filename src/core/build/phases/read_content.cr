@@ -15,6 +15,7 @@ module Hwaro::Core::Build::Phases::ReadContent
     result = @lifecycle.run_phase(Lifecycle::Phase::ReadContent, ctx) do
       Logger.status_phase("read")
       collect_content_paths(ctx, ctx.options.drafts)
+      synthesize_generated_pages(ctx)
       # Count surfaces in the closing build receipt's "read" row instead of an
       # inline line, keeping the build quiet until the summary.
       ctx.stats.pages_read = ctx.all_pages.size
@@ -26,11 +27,14 @@ module Hwaro::Core::Build::Phases::ReadContent
   # Collect content file paths without parsing (single directory traversal)
   private def collect_content_paths(ctx : Lifecycle::BuildContext, include_drafts : Bool)
     config = ctx.config
-    content_files_enabled = config.try(&.content_files.enabled?) || false
     seen_raw = Set(String).new
+    @content_index_dirs = Set(String).new
 
-    # Single pass over content directory for both markdown and raw files
-    Dir.glob("content/**/*") do |file_path|
+    # Single pass over content directory for both markdown and raw files.
+    # Sorted: glob yields raw readdir order (hash order on APFS/ext4, name
+    # order on HFS+), which would otherwise leak into `site.pages`,
+    # sitemap.xml and the search index, so one tree built differently per host.
+    Dir.glob("content/**/*").sort!.each do |file_path|
       # lstat, not `File.directory?`: that follows symlinks, and following a
       # symlink cycle (`ln -s loop content/loop`) fails with ELOOP, which
       # `File.info?` raises as `File::Error` — aborting the whole build with a
@@ -58,6 +62,12 @@ module Hwaro::Core::Build::Phases::ReadContent
         # so this stat cannot hit the ELOOP the lstat above avoids.
         target = File.info?(file_path, follow_symlinks: true)
         next if target.nil?
+        # The glob does not descend into a linked directory, so a symlinked
+        # section would vanish from the site without a word.
+        if target.directory?
+          Logger.warn "Skipping content directory symlink (directory symlinks are not followed): #{file_path}"
+          next
+        end
       else
         target = lstat
       end
@@ -65,9 +75,8 @@ module Hwaro::Core::Build::Phases::ReadContent
       # Only regular files are readable content. A FIFO or socket dropped into
       # content/ would otherwise reach the parse phase's `File.read`, and
       # `open(2)` on a writer-less FIFO blocks forever — a build that hangs
-      # with no output and no error. Directories were dropped above; a symlink
-      # to an in-project directory lands here (the glob does not descend into
-      # it either) and is skipped by the same test.
+      # with no output and no error. Directories, linked ones included, were
+      # dropped above.
       next unless target.file?
 
       relative_path = Path[file_path].relative_to("content").to_s
@@ -76,6 +85,13 @@ module Hwaro::Core::Build::Phases::ReadContent
       if PAGE_EXTENSIONS.includes?(ext)
         # Process markdown file
         basename = Path[relative_path].basename
+        # The extension is matched case-insensitively here, but `_index`,
+        # `index` bundles and `.<lang>` suffixes (and dozens of consumers
+        # comparing against `_index.md`) only know the lowercase spelling, so
+        # `_index.MD` quietly became an ordinary page with no section list.
+        if (written_ext = Path[file_path].extension) != ext
+          Logger.warn "content/#{relative_path}: page extension #{written_ext.inspect} is not lowercase — it builds as an ordinary page, never as a section index (_index), bundle (index) or translation (.<lang>). Rename it to #{ext.inspect}."
+        end
         language = extract_language_from_filename(basename, config, ext)
 
         clean_basename = if language
@@ -108,19 +124,47 @@ module Hwaro::Core::Build::Phases::ReadContent
           page.section = path_parts.size > 1 ? path_parts[0..-2].join("/") : ""
         end
         page.is_index = is_index
-        page.language = language
+        # The root directory is never a bundle (Page#collect_assets).
+        if is_index && path_parts.size > 1
+          @content_index_dirs << path_parts[0..-2].join("/")
+        end
+        # Default-language content carries `nil` whether or not the file
+        # spells the suffix out (`about.md` vs `about.en.md`): section
+        # listings, per-language feeds and lookups compare `language`
+        # exactly, so an explicit default suffix silently dropped the page
+        # from its section's `pages` (and a suffixed `_index.en.md` lost all
+        # of its unsuffixed pages). PermalinkResolver strips the suffix.
+        page.language = language == config.try(&.default_language) ? nil : language
+        # Version membership is purely positional: whatever `[[versions.list]]`
+        # directory the file sits under. nil (the common case) when the site
+        # declares no versions.
+        page.version = config.try(&.versions.for_path(relative_path))
       else
-        # Collect raw files (JSON, XML) and content files
+        # Collect raw files (JSON, XML) and content files. Raw JSON/XML is
+        # published without an `allow_extensions` opt-in, but the
+        # `[content.files]` deny rules still apply to it — `disallow_paths =
+        # ["drafts/**"]` must not leak `drafts/secrets.json`.
         next if seen_raw.includes?(relative_path)
-        is_raw = ext == ".json" || ext == ".xml"
-        is_content_file = content_files_enabled && config && Content::Processors::ContentFiles.publish?(relative_path, config)
 
-        if is_raw || is_content_file
+        if config && publishes_content_file?(config, relative_path)
           ctx.raw_files << Lifecycle::RawFile.new(file_path, relative_path)
           seen_raw << relative_path
         end
       end
     end
+  end
+
+  # Is the non-page file `content/<relative_path>` published by the Write
+  # phase's raw lane? Raw JSON/XML is published without an
+  # `allow_extensions` opt-in, but the `[content.files]` deny rules still
+  # apply to it — `disallow_paths = ["drafts/**"]` must not leak
+  # `drafts/secrets.json`. Shared with serve's content-file republish, which
+  # used to test `allow_extensions` alone and so never refreshed an edited
+  # `data.json` that every build publishes.
+  def publishes_content_file?(config : Models::Config, relative_path : String) : Bool
+    ext = File.extname(relative_path).downcase
+    return !config.content_files.denied?(relative_path) if ext == ".json" || ext == ".xml"
+    config.content_files.enabled? && config.content_files.publish?(relative_path)
   end
 
   # Extract the language code from a filename (`about.ko.md` -> "ko",
@@ -134,14 +178,56 @@ module Hwaro::Core::Build::Phases::ReadContent
     return unless config.multilingual?
     return unless basename.size > ext.size && basename[-ext.size..].downcase == ext
 
-    stem = basename[0, basename.size - ext.size]
-    idx = stem.rindex('.')
-    # idx > 0: a non-empty base name must remain (".ko.md" is not a translation)
-    return unless idx && idx > 0
-    lang_code = stem[(idx + 1)..]
-    return if lang_code.empty?
-    return lang_code if config.languages.has_key?(lang_code) || lang_code == config.default_language
+    Utils::PathUtils.language_suffix(basename[0, basename.size - ext.size]) do |code|
+      config.languages.has_key?(code) || code == config.default_language
+    end
+  end
 
-    nil
+  # `[[content.generate]]` — materialize planned data pages into the build's
+  # page list, HERE, so they enter the pipeline at the same point authored
+  # files do and every later phase (parse, cascade/draft filtering,
+  # taxonomies, feeds, search, sitemap, render, output formats) treats them
+  # as ordinary content. See Core::Build::ContentGenerate for the plan
+  # contract and Models::Page::Synthesis for why these pages must NOT carry
+  # the `generated` flag.
+  private def synthesize_generated_pages(ctx : Lifecycle::BuildContext)
+    config = ctx.config
+    return unless config
+    return if config.content_generate.empty?
+    site = @site || return
+
+    plans = ContentGenerate.plan(config, site.data, crinja_env)
+    return if plans.empty?
+
+    # Authored content always wins a path. Collected paths cover what this
+    # build read; the shared disk probe additionally covers files the
+    # collect pass excluded (a draft without --drafts, a `.markdown` twin)
+    # and the leaf-bundle twin `<slug>/index.md` that publishes the same
+    # URL — those still OWN their URL, and a generated page silently
+    # replacing an authored one is the one collision outcome this feature
+    # must never produce.
+    collected_paths = Set(String).new
+    ctx.pages.each { |p| collected_paths << p.path }
+    ctx.sections.each { |s| collected_paths << s.path }
+
+    added = Hash(String, Int32).new(0)
+    plans.each do |plan|
+      if collected_paths.includes?(plan.path) || ContentGenerate.authored_twin_exists?(plan.path)
+        Logger.warn "  #{plan.origin}: skipping generated page '#{plan.path}' — an authored content file already claims that path (authored content wins)."
+        next
+      end
+      page = Models::Page.new(plan.path)
+      page.section = plan.section
+      page.version = config.versions.for_path(plan.path)
+      page.synthesis = Models::Page::Synthesis.new(plan.markdown, plan.item, plan.origin)
+      ctx.pages << page
+      collected_paths << plan.path
+      added[plan.origin] += 1
+    end
+    ctx.invalidate_all_pages_cache
+
+    added.each do |origin, count|
+      Logger.info "  Generated #{count} page(s) from #{origin}"
+    end
   end
 end

@@ -4,6 +4,7 @@
 # in both Builder (src/core/build/builder.cr) and TemplateEngine
 # (src/content/processors/template.cr).
 
+require "csv"
 require "yaml"
 require "json"
 require "toml"
@@ -21,7 +22,7 @@ module Hwaro
       #
       # `depth` guards against a self-referencing YAML anchor, whose parsed
       # graph is cyclic and would otherwise recurse until the stack dies
-      # (see `Utils::Nesting`). Both call sites — `Initialize#parse_data_file`
+      # (see `Utils::Nesting`). Both call sites — `DataDisk.parse_file`
       # and the `load_data` template function — already rescue and degrade, so
       # the raise surfaces as "data file skipped" rather than a crash.
       def from_yaml(value : YAML::Any, depth : Int32 = 0) : Crinja::Value
@@ -40,7 +41,7 @@ module Hwaro
           Crinja::Value.new(i)
         elsif f = value.as_f?
           Crinja::Value.new(f)
-        elsif b = value.as_bool?
+        elsif !(b = value.as_bool?).nil?
           Crinja::Value.new(b)
         elsif (t = value.raw).is_a?(Time)
           # Crystal's YAML core-schema resolver turns an unquoted ISO date
@@ -87,7 +88,7 @@ module Hwaro
           Crinja::Value.new(i)
         elsif f = value.as_f?
           Crinja::Value.new(f)
-        elsif b = value.as_bool?
+        elsif !(b = value.as_bool?).nil?
           Crinja::Value.new(b)
         elsif (t = value.raw).is_a?(Time)
           Crinja::Value.new(t.to_s)
@@ -138,6 +139,42 @@ module Hwaro
           NIL_VALUE
         else
           Crinja::Value.new(value.to_s)
+        end
+      end
+
+      # Parse a data payload into the `Crinja::Value` templates see, dispatching
+      # on a bare format name ("json", "toml", "yaml"/"yml", "csv"). This is the
+      # one place that mapping lives: `data/` files (DataDisk.parse_file),
+      # the `load_data()` template function, and `[[data.remote]]` payloads
+      # (RemoteData#parse_body) all route through it, so a key can move between
+      # a disk file, a template call and a remote source and parse identically.
+      # CSV matches the long-standing `load_data()` shape: an array of rows,
+      # each an array of stripped string cells.
+      #
+      # Returns nil for an unrecognized format — every caller owns its own error
+      # policy (warn and drop the key, debug-log and return none, or raise a
+      # classified fetch error), and no two of them agree, so this helper
+      # neither logs nor raises. Parse exceptions propagate to the caller for
+      # the same reason.
+      #
+      # BOM stripping is the caller's call too: the `data/` and remote paths
+      # strip it (JSON and TOML both reject a leading BOM outright), while
+      # `load_data()` deliberately never has — see its call site.
+      def parse_data_string(content : String, format : String) : Crinja::Value?
+        # The JSON and CSV parsers accept invalid UTF-8 inside strings, and the
+        # first regex any consumer then runs on such a value (TOML escaping
+        # for `[[content.generate]]`, a template filter) raised "UTF-8 error:
+        # illegal byte" and aborted the build. Scrub once, for every source.
+        content = content.scrub unless content.valid_encoding?
+        case format
+        when "json"        then from_json(JSON.parse(content))
+        when "toml"        then from_toml(TOML.parse(content))
+        when "yaml", "yml" then from_yaml(YAML.parse(content))
+        when "csv"
+          rows = CSV.parse(content).map do |row|
+            Crinja::Value.new(row.map { |cell| Crinja::Value.new(cell.strip) })
+          end
+          Crinja::Value.new(rows)
         end
       end
 

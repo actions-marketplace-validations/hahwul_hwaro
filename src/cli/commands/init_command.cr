@@ -24,7 +24,7 @@ module Hwaro
         FLAGS = [
           # Project setup
           FlagInfo.new(short: "-f", long: "--force", description: "Allow init even if directory is not empty (keeps existing files, adds missing scaffold files)"),
-          FlagInfo.new(short: nil, long: "--clean", description: "Remove existing files in target before scaffolding (implies --force; refuses if target contains .git/)"),
+          FlagInfo.new(short: nil, long: "--clean", description: "Remove existing files in target before scaffolding (implies --force; refuses if target contains .git or is / or the home directory)"),
           FlagInfo.new(short: nil, long: "--scaffold", description: "Scaffold type or remote source (e.g., blog, github:user/repo)", takes_value: true, value_hint: "TYPE"),
           FlagInfo.new(short: nil, long: "--include-multilingual", description: "Enable multilingual support (e.g., en,ko)", takes_value: true, value_hint: "LANGS"),
           FlagInfo.new(short: nil, long: "--minimal-config", description: "Generate minimal config.toml without comments and optional sections"),
@@ -72,6 +72,18 @@ module Hwaro
         @scaffold_given = false
 
         def run(args : Array(String))
+          # `--json` has to take effect BEFORE parsing. `parse_options` prints
+          # the scaffold list through `Logger.info` on an unknown `--scaffold`
+          # and `Initializer` prints the whole create/exist tree, so leaving
+          # JSON mode until after the parse let human text share stdout with
+          # the machine payload. Detected from the raw argv the same way
+          # `Runner.emit_hwaro_error` does.
+          # Only flags before `--`: `hwaro init -- --json` names a directory.
+          if Runner.json_flag?(args)
+            @json_output = true
+            Runner.enable_json_mode!
+          end
+
           # Parse first: introspection and wizard eligibility are decided from
           # parsed state, so an unknown flag is rejected in every mode.
           options = parse_options(args)
@@ -98,11 +110,31 @@ module Hwaro
               Logger.info "Cancelled."
               return
             end
-            Services::Initializer.new.run(wizard_options)
+            run_initializer(wizard_options)
             return
           end
 
-          Services::Initializer.new.run(options)
+          run_initializer(options)
+        end
+
+        # Run the initializer and, under `--json`, emit the single result
+        # document. Without it `hwaro init --json` printed the human receipt
+        # and no JSON at all, so a scripted caller got an unparseable stream
+        # on success while errors already arrived as JSON — every other
+        # `--json` command (`new`, `build`, `deploy`, `tool *`) emits a
+        # result object.
+        private def run_initializer(options : Config::Options::InitOptions)
+          initializer = Services::Initializer.new
+          initializer.run(options)
+          return unless @json_output
+
+          payload = {
+            "status"        => "ok",
+            "path"          => options.path,
+            "scaffold"      => options.scaffold_remote || options.scaffold.to_s,
+            "files_created" => initializer.created_count,
+          }
+          STDOUT.puts payload.to_json
         end
 
         private def wizard_eligible? : Bool
@@ -165,7 +197,7 @@ module Hwaro
 
             # Project setup
             parser.on("-f", "--force", "Allow init even if directory is not empty (keeps existing files)") { force = true }
-            parser.on("--clean", "Remove existing files in target before scaffolding (implies --force; refuses if target contains .git/)") { clean = true }
+            parser.on("--clean", "Remove existing files in target before scaffolding (implies --force; refuses if target contains .git or is / or the home directory)") { clean = true }
             parser.on("--scaffold TYPE", "Scaffold type or remote source (e.g., blog, github:user/repo)") do |type|
               @scaffold_given = true
               if Services::Scaffolds::Remote.remote?(type)
@@ -215,7 +247,19 @@ module Hwaro
                   hint: "Examples: 'en', 'ko', 'en,ko', 'pt-BR', 'zh-Hant'.",
                 )
               end
-              multilingual_languages = parsed
+              # A repeated code (`en,en`, or a case variant like `EN,en`)
+              # emits two `[languages.<code>]` tables into config.toml. The
+              # exact repeat is invalid TOML ("duplicated key"), so `hwaro
+              # init` exited 0 having written a config that no later command
+              # — build, serve, doctor — can parse. BCP 47 tags are
+              # case-insensitive, so dedupe on the folded code and keep the
+              # first spelling the author typed.
+              deduped = parsed.uniq(&.downcase)
+              if deduped.size != parsed.size
+                dropped = parsed.size - deduped.size
+                Logger.warn "  --include-multilingual: dropped #{dropped} duplicate language code(s); using #{deduped.join(", ")}."
+              end
+              multilingual_languages = deduped
             end
             parser.on("--minimal-config", "Generate minimal config.toml without comments and optional sections") { minimal_config = true }
             parser.on("--full-config", "Generate full config.toml with all comments and optional sections (maximum discoverability)") { full_config = true }
@@ -263,7 +307,10 @@ module Hwaro
               # `My`, so reject instead. Flag-looking leftovers are not
               # positionals — leave them for OptionParser's invalid-option
               # error, which names the actual offending flag.
-              positionals = before_dash.reject(&.starts_with?('-')) + after_dash
+              # A bare `-` is not a flag either: dropping it silently fell
+              # back to `.` (so `hwaro init - --clean` emptied the current
+              # directory). Keep it as a positional; it is rejected below.
+              positionals = before_dash.reject { |arg| arg.starts_with?('-') && arg != "-" } + after_dash
               if positionals.size > 1
                 raise Hwaro::HwaroError.new(
                   code: Hwaro::Errors::HWARO_E_USAGE,
@@ -272,10 +319,25 @@ module Hwaro
                 )
               end
               if first = positionals.first?
+                if first.strip.empty? || (first == "-" && after_dash.empty?)
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: first.strip.empty? ? "project path must not be empty" : "'-' is not a project path",
+                    hint: "Omit the path to initialize the current directory, or use `hwaro init -- -` for a directory literally named '-'.",
+                  )
+                end
                 path = first
                 @path_given = true
               end
             end
+          end
+
+          if minimal_config && full_config
+            raise Hwaro::HwaroError.new(
+              code: Hwaro::Errors::HWARO_E_USAGE,
+              message: "--minimal-config and --full-config cannot be used together",
+              hint: "Pick one; omit both for the balanced default config.",
+            )
           end
 
           Config::Options::InitOptions.new(

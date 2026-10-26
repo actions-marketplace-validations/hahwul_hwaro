@@ -1,0 +1,93 @@
+# `@/` content-link lookup shared by `tool check-links` and `tool validate`.
+
+require "uri"
+require "./content_lister"
+require "./generated_content"
+
+module Hwaro
+  module Services
+    # The `@/` link targets a default `hwaro build` resolves.
+    #
+    # The build rewrites `href="@/posts/hello.md"` by looking `posts/hello.md`
+    # up in its content-path → page map (`InternalLinkResolver.resolve` over
+    # `build_pages_by_path`, through `InternalLinkResolver.page_for`). That
+    # lookup is exact apart from percent-decoding: Markd encodes a
+    # destination, so `@/my%20post.md` is tried as `my post.md` first, then
+    # as written. It is case-sensitive, does no `./` or `../` normalization,
+    # no guessing of an extension or an `_index.md`, and the map only holds
+    # pages and sections that survived draft, future and expired filtering.
+    # The tools used to test file existence instead, so they passed
+    # `@/draft.md`, `@/UPPER.md` (on a case-insensitive filesystem), `@/./x.md`
+    # and `@/../README.md` — every one a link the build leaves unresolved.
+    #
+    # The keys come from `ContentLister`, the publish-state source of truth
+    # for authored files, plus the planned `[[content.generate]]` pages.
+    class InternalLinkIndex
+      # The content path an `@/` destination looks up: the part before `#`,
+      # then before `?`, split exactly as `InternalLinkResolver` does. nil
+      # when `destination` is not an `@/` link.
+      def self.key(destination : String) : String?
+        return unless destination.starts_with?("@/")
+        destination[2..].split('#', 2).first.partition('?')[0]
+      end
+
+      @states : Hash(String, String)?
+
+      def initialize(@content_dir : String)
+      end
+
+      # nil when a default build resolves `key`. Otherwise why it does not:
+      # "empty link", "not found", or the target's publish state ("draft",
+      # "future", "expired").
+      def unresolved_reason(key : String) : String?
+        return "empty link" if key.empty?
+        # Same order as InternalLinkResolver.page_for.
+        decoded = key.includes?('%') ? URI.decode(key) : key
+        state = (states[decoded]? if key.includes?('%')) || states[key]? || folded_state(decoded)
+        return "not found" unless state
+        state == PublishState::Published.label ? nil : state
+      end
+
+      # Human wording for an `unresolved_reason`.
+      def self.describe(reason : String) : String
+        case reason
+        when "draft"   then "target is a draft"
+        when "future"  then "target is future-dated"
+        when "expired" then "target has expired"
+        else                reason
+        end
+      end
+
+      # The build's NFC retry (`InternalLinkResolver.folded_page_for`): a
+      # decomposed (NFD) file name from macOS or a zip is still reached by a
+      # link typed precomposed, so the tools must not call it dead.
+      private def folded_state(path : String) : String?
+        return if path.ascii_only?
+        folded = path.unicode_normalize(:nfc)
+        states.each { |key, state| return state if !key.ascii_only? && key.unicode_normalize(:nfc) == folded }
+        nil
+      end
+
+      # Content path (relative to the content dir) → publish state label.
+      # Built on first use: most runs never meet an `@/` link.
+      private def states : Hash(String, String)
+        @states ||= begin
+          map = {} of String => String
+          lister = ContentLister.new(@content_dir, GeneratedContent.infos(@content_dir))
+          lister.list_all.each do |info|
+            # Generated rows already carry a content-relative path.
+            path = info.generated_from ? info.path : Path[info.path].relative_to(@content_dir).to_s
+            # An authored file owns its path, as in the build.
+            map[path] = info.status if info.generated_from.nil? || !map.has_key?(path)
+          end
+          # `@/about.md` also reaches `about.en.md` on an `en` site; a
+          # literal file of the bare name keeps its key, as in the build.
+          map.to_a.each do |path, status|
+            lister.default_language_bare_path(path).try { |bare| map[bare] ||= status }
+          end
+          map
+        end
+      end
+    end
+  end
+end

@@ -30,8 +30,9 @@ hwaro tool unused-assets --delete --force --json
 
 | 플래그 | 설명 |
 |------|-------------|
-| -c, --content DIR | 콘텐츠 디렉터리 (기본값: content) |
+| -c, --content-dir DIR | 콘텐츠 디렉터리 (기본값: content) |
 | -s, --static-dir DIR | 정적 파일 디렉터리 (기본값: static) |
+| -t, --templates-dir DIR | 참조 스캔 대상 템플릿 디렉터리 (기본값: templates) |
 | --delete | 사용하지 않는 파일 삭제 (확인 프롬프트 표시) |
 | -f, --force | 삭제 시 확인 프롬프트 생략 (`--json`에서 삭제하려면 필수) |
 | -j, --json | 결과를 JSON으로 출력 |
@@ -45,10 +46,27 @@ hwaro tool unused-assets --delete --force --json
 
 **참조 소스:**
 - 모든 콘텐츠 파일 (`.md`, `.markdown`)
-- 모든 템플릿 파일 (`.html`, `.css`, `.js`)
+- 템플릿 파일 (`.html`, `.j2`, `.jinja`, `.jinja2`, `.ecr`, 그리고 `.css`, `.js`, `.xml`, `.json`, `.webmanifest`, `.svg`, `.txt`)
+- 다른 정적 파일을 참조할 수 있는 정적 소스 (`.css`, `.scss`, `.sass`, `.js`, `.json`, `.webmanifest`, `.xml`, `.svg`, `.txt`, `.html`, `.htm`)
+- 데이터·번역 파일 (`data/`, `i18n/`의 `.yml`, `.yaml`, `.json`, `.toml`)
+- 파일을 지정하는 `config.toml`과 환경별 덮어쓰기 파일(`config.production.toml`)의 값
+- 에셋 파이프라인의 `[assets] source_dir`(`static/`이 아닐 때) 아래 스타일시트와 스크립트
+- 빌드가 직접 연결하는 파일: `[highlight] use_cdn = false`일 때 자체 호스팅하는 highlight.js 테마와 스크립트
+
+템플릿이 `templates/` 밖에 있다면 `--templates-dir`로 스캔 위치를 알려주세요.
+그렇지 않으면 해당 템플릿의 에셋 참조가 보이지 않아, 실제로 쓰이는 에셋이
+미사용으로 보고되고 `--delete`로 삭제될 수 있습니다.
+명시적으로 전달한 `--templates-dir`은 반드시 존재해야 하며(경로는 현재
+디렉터리 기준), 없는 경로면 템플릿 0개를 조용히 스캔하는 대신 실행을
+거부합니다. 명시적으로 전달한 `--content-dir`, `--static-dir`도 마찬가지입니다.
+
+마크업에서 참조하지 않아도 브라우저가 고정 URL로 요청하는 파일은 미사용으로
+보고하지 않습니다. 정적 디렉터리 루트에 있는 `favicon.ico`,
+`apple-touch-icon.png`, `apple-touch-icon-precomposed.png`와 그 `-WxH` 크기
+변형이 해당합니다.
 
 **지원 에셋 확장자:**
-이미지(png, jpg, jpeg, gif, svg, webp, avif, ico, bmp, tiff), 스타일시트(css), 스크립트(js), 폰트(woff, woff2, ttf, eot, otf), 미디어(mp4, webm, ogg, mp3, wav), 문서(pdf, zip).
+이미지(png, jpg, jpeg, gif, svg, webp, avif, ico, bmp, tiff, tif), 스타일시트(css), 스크립트(js), 폰트(woff, woff2, ttf, eot, otf), 미디어(mp4, webm, ogg, mp3, wav), 문서(pdf, zip).
 
 ## 출력 예시
 
@@ -58,11 +76,11 @@ total: 24
 referenced: 20
 unused: 4
 unused files:
-    - static/old-logo.png
-    - static/unused-banner.jpg
-    - content/blog/my-post/draft-image.png
-    - static/deprecated.css
-    [info] dynamic references (e.g. template variables) may cause false positives
+  - static/old-logo.png
+  - static/unused-banner.jpg
+  - content/blog/my-post/draft-image.png
+  - static/deprecated.css
+  [info] dynamic references (e.g. template variables) may cause false positives
 found: 4 unused assets
 ```
 
@@ -88,4 +106,4 @@ found: 4 unused assets
 ## 제한 사항
 
 - 템플릿 변수 등으로 동적으로 참조되는 에셋 파일명(예: `{{ page.image }}`)은 감지되지 않아 오탐(false positive)이 생길 수 있습니다.
-- 감지는 파일명 매칭 기반입니다 — 서로 다른 디렉터리의 두 파일이 이름이 같으면, 실제로는 하나만 쓰이더라도 둘 다 참조된 것으로 간주될 수 있습니다.
+- 감지는 파일명 매칭 기반입니다. 서로 다른 디렉터리의 두 파일이 이름이 같으면, 실제로는 하나만 쓰이더라도 둘 다 참조된 것으로 간주될 수 있습니다.

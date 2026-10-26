@@ -17,10 +17,6 @@ module Hwaro
         def run(options : Config::Options::ImportOptions) : ImportResult
           path = options.path
           output_dir = options.output_dir
-          imported = 0
-          skipped = 0
-          errors = 0
-          wrapped = 0
 
           unless Dir.exists?(path)
             return ImportResult.new(
@@ -31,73 +27,66 @@ module Hwaro
 
           @used_slugs.clear
           reset_written_paths
-          files = collect_files(path, options.drafts)
+          files = collect_files(path, options.drafts, output_dir)
 
           if files.empty?
             return ImportResult.new(
               success: true,
               message: "No Jekyll posts found in #{path}",
+              skipped_count: outside_source_skips,
             )
           end
 
-          files.each do |file_info|
-            result = import_file(file_info, output_dir, options.verbose, options.force)
-            case result
-            when :imported
-              imported += 1
-            when :imported_wrapped
-              imported += 1
-              wrapped += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error importing #{file_info[:path]}: #{ex.message}"
+          import_each(files, "Jekyll", wrapped_note: "contained unconverted Liquid constructs. Imports kept the raw syntax — each will render as literal text until you hand-convert them.") do |file_info|
+            import_file(file_info, output_dir, options.verbose, options.force)
           end
-
-          if wrapped > 0
-            Logger.warn "#{wrapped} file(s) contained unconverted Liquid constructs. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
-          end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Jekyll import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors,
-          )
         end
 
-        private def collect_files(path : String, include_drafts : Bool) : Array(NamedTuple(path: String, draft: Bool))
-          files = [] of NamedTuple(path: String, draft: Bool)
+        private def collect_files(path : String, include_drafts : Bool, output_dir : String? = nil) : Array(NamedTuple(path: String, draft: Bool, section: String))
+          files = [] of NamedTuple(path: String, draft: Bool, section: String)
 
           # Recursive: Jekyll supports organizing posts in subfolders
           # (`_posts/tech/2024-01-02-post.md` is a common category layout);
           # a flat glob silently ignored every nested post.
           posts_dir = File.join(path, "_posts")
           if Dir.exists?(posts_dir)
-            walk_files(posts_dir).sort.each do |file|
-              files << {path: file, draft: false}
+            walk_files(posts_dir, source_root: path).sort.each do |file|
+              files << {path: file, draft: false, section: "posts"}
             end
           end
 
           if include_drafts
             drafts_dir = File.join(path, "_drafts")
             if Dir.exists?(drafts_dir)
-              walk_files(drafts_dir).sort.each do |file|
-                files << {path: file, draft: true}
+              walk_files(drafts_dir, source_root: path).sort.each do |file|
+                files << {path: file, draft: true, section: "posts"}
               end
             end
+          end
+
+          out_dir_clean = output_dir ? File.expand_path(output_dir) : nil
+
+          # Standalone pages outside _posts and _drafts (e.g. about.md, contact.md, docs/page.md)
+          page_files = walk_files(path, skip_dir: ->(entry : String) {
+            return true if entry.starts_with?(".") || entry.starts_with?("_")
+            return true if {"node_modules", "vendor", "assets"}.includes?(entry)
+            if out_dir = out_dir_clean
+              entry_full = File.expand_path(File.join(path, entry))
+              return true if Hwaro::Utils::PathUtils.within?(out_dir, entry_full)
+            end
+            false
+          }, source_root: path)
+
+          page_files.sort.each do |file|
+            sec, _ = section_from_path(file, path, "")
+            files << {path: file, draft: false, section: sec}
           end
 
           files
         end
 
         private def import_file(
-          file_info : NamedTuple(path: String, draft: Bool),
+          file_info : NamedTuple(path: String, draft: Bool, section: String),
           output_dir : String,
           verbose : Bool,
           force : Bool,
@@ -120,14 +109,40 @@ module Hwaro
 
           if yaml
             # Title
-            if title = yaml["title"]?
-              fields["title"] = yaml_string(title)
+            if (title = yaml["title"]?) && (title_text = yaml_title(title))
+              fields["title"] = title_text
             end
 
             # Date from frontmatter (filename fallback below also covers an
             # unparseable frontmatter date, which used to suppress it)
             if date_val = yaml["date"]?
               assign_date_field(fields, "date", date_val)
+            end
+
+            # `last_modified_at` (jekyll-seo-tag's dateModified, and the
+            # jekyll-last-modified-at plugin) is hwaro's `updated`.
+            if modified = yaml["last_modified_at"]?
+              assign_date_field(fields, "updated", modified)
+            end
+
+            # A literal per-document `permalink` is the page's published
+            # address; dropping it moved the page (`/about-us.html` →
+            # `/about/`). Pattern permalinks (`/:year/:title/`) describe the
+            # site-wide scheme and are left to hwaro's own URLs.
+            if permalink = yaml["permalink"]?
+              apply_source_url(fields, permalink.as_s?, file_info[:path])
+            end
+
+            # jekyll-redirect-from (allow-listed on GitHub Pages, enabled under
+            # `plugins:`): each
+            # `redirect_from` address is a redirect to this page — hwaro's
+            # `aliases`. Dropping them broke every old link the site kept
+            # alive on purpose.
+            if redirect_from = yaml["redirect_from"]?
+              aliases = (fields["aliases"]?.as?(Array(String)) || [] of String).dup
+              collect_string_list(redirect_from, into: aliases)
+              aliases = aliases.reject(&.includes?("://")).uniq!
+              fields["aliases"] = aliases unless aliases.empty?
             end
 
             # Layout -> template
@@ -168,11 +183,15 @@ module Hwaro
               end
             end
 
-            # Description
-            if excerpt = yaml["excerpt"]?
-              fields["description"] = yaml_string(excerpt)
-            elsif description = yaml["description"]?
-              fields["description"] = yaml_string(description)
+            # jekyll-sitemap's `sitemap: false` is hwaro's `in_sitemap =
+            # false` (the inverse of `tool export jekyll`); left in [extra],
+            # the page was listed in sitemap.xml again.
+            fields["in_sitemap"] = false if yaml["sitemap"]?.try(&.raw) == false
+
+            # Description. `first_present`, not `if/elsif` on `[]?`: a
+            # present-but-null `excerpt:` would discard the description.
+            if desc = first_present(yaml, "excerpt", "description")
+              fields["description"] = yaml_string(desc)
             end
 
             # Image
@@ -181,7 +200,11 @@ module Hwaro
               when String
                 fields["image"] = yaml_string(image)
               when Hash
-                # Handle nested image object (e.g., image.path or similar)
+                # jekyll-seo-tag's object form `image: {path: …, alt: …}`.
+                # Left empty, it silently dropped the page's social image.
+                if (img_path = image["path"]?) && (ps = img_path.as_s?) && !ps.empty?
+                  fields["image"] = ps
+                end
               end
             end
 
@@ -208,6 +231,14 @@ module Hwaro
             fields["draft"] = true
           end
 
+          # Jekyll derives a post's title from its filename slug when front
+          # matter has none; without this every such post built as "Untitled".
+          # Standalone pages get no derived title in Jekyll, so they keep none.
+          if !fields.has_key?("title") && file_info[:section] == "posts"
+            stem = filename_stem(filename)
+            fields["title"] = title_from_stem(stem) unless stem.blank?
+          end
+
           # Track files that contain unconverted Liquid constructs. The
           # per-file warning stays for verbose consumers; the `run`
           # method emits a single summary warning with the total so
@@ -221,7 +252,7 @@ module Hwaro
           # Use slug from filename, or slugify the title
           if slug.empty?
             if title = fields["title"]?.as?(String)
-              slug = slugify(title)
+              slug = file_slug(title)
             else
               slug = "untitled"
             end
@@ -230,11 +261,14 @@ module Hwaro
           # Stripping the unique `YYYY-MM-DD-` prefix can collide two posts
           # (`2023-01-01-recap.md` + `2024-01-01-recap.md` → `recap.md`);
           # re-attach the date to the later one instead of losing it.
-          unless @used_slugs.add?(slug)
+          scoped_slug = file_info[:section].empty? ? slug : "#{file_info[:section]}/#{slug}"
+          unless @used_slugs.add?(scoped_slug)
             candidate = filename_date ? "#{slug}-#{filename_date.to_s("%Y-%m-%d")}" : slug
+            scoped_candidate = file_info[:section].empty? ? candidate : "#{file_info[:section]}/#{candidate}"
             n = 1
-            until @used_slugs.add?(candidate)
+            until @used_slugs.add?(scoped_candidate)
               candidate = "#{slug}-#{n}"
+              scoped_candidate = file_info[:section].empty? ? candidate : "#{file_info[:section]}/#{candidate}"
               n += 1
             end
             Logger.warn "Slug collision after date-prefix strip: writing #{candidate} for #{file_info[:path]}"
@@ -242,26 +276,60 @@ module Hwaro
           end
 
           frontmatter = generate_frontmatter(fields)
+          frontmatter = append_frontmatter(frontmatter, extra_fields(yaml, fields)) if yaml
           body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
-          written = write_content_file(output_dir, "posts", slug, frontmatter, body, verbose, force)
+          written = write_content_file(output_dir, file_info[:section], slug, frontmatter, body, verbose, force)
 
           return :skipped unless written
           has_liquid ? :imported_wrapped : :imported
         end
 
-        private def extract_slug(filename : String) : String
+        # Keys `import_file` maps (or consumes) itself.
+        MAPPED_KEYS = Set{
+          "title", "date", "last_modified_at", "permalink", "redirect_from",
+          "layout", "categories", "category", "tags", "published", "excerpt",
+          "description", "image",
+        }
+
+        # Jekyll exposes every other front matter key to templates as
+        # `page.<key>`; hwaro's home for such fields is `[extra]`, as the Hugo
+        # importer does for page params (hwaro's own keys, CARRIED_KEYS, stay
+        # top-level). They were silently dropped.
+        private def extra_fields(yaml : YAML::Any, mapped : Hash(String, FieldValue)) : Hash(String, YAML::Any)
+          carried = {} of String => YAML::Any
+          extra = {} of YAML::Any => YAML::Any
+          yaml.as_h.each do |key, value|
+            name = key.as_s? || ""
+            next if value.raw.nil? || MAPPED_KEYS.includes?(name)
+            if CARRIED_KEYS.includes?(name) && !mapped.has_key?(name)
+              carried[name] = value
+            else
+              extra[key] = value
+            end
+          end
+          carried["extra"] = YAML::Any.new(extra) unless extra.empty?
+          carried
+        end
+
+        # The filename without its extension and `YYYY-MM-DD-` prefix.
+        private def filename_stem(filename : String) : String
           if match = FILENAME_PATTERN.match(filename)
             match[2]
           else
-            # Strip extension and use as slug
-            name = File.basename(filename, File.extname(filename))
-            slugify(name)
+            File.basename(filename, File.extname(filename))
           end
+        end
+
+        # URL-safe slug of the filename. The date-prefixed branch used to return
+        # the raw name, so `2024-01-04-100%.md` published at `/posts/100%/`
+        # (malformed percent-encoding) while undated names were slugified.
+        private def extract_slug(filename : String) : String
+          Utils::TextUtils.slugify(filename_stem(filename))
         end
 
         private def extract_date_from_filename(filename : String) : Time?
           if match = FILENAME_PATTERN.match(filename)
-            parse_date(match[1])
+            Utils::DateUtils.parse_import(match[1])
           end
         end
       end

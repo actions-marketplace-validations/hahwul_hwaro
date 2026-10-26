@@ -1,0 +1,16 @@
+# Exclude non-source trees from GitHub's language stats so the main repo
+# language reflects actual noir code. Everything else is detected by file
+# extension as usual.
+* linguist-vendored
+*.cr linguist-vendored=false
+*.c linguist-vendored=false
+*.h linguist-vendored=false
+justfile linguist-vendored=false
+
+# Git for Windows defaults to core.autocrlf=true. A CRLF checkout would bake
+# CRLF scaffold templates and assets into a Windows-built binary, and break
+# the sh script that builds src/ext/stb_impl.o.
+* text=auto eol=lf
+
+# Committed with CRLF; keep its bytes.
+src/ext/fonts/LICENSE-SpaceGrotesk -text

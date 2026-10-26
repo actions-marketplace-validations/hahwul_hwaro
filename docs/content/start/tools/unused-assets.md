@@ -30,8 +30,9 @@ hwaro tool unused-assets --delete --force --json
 
 | Flag | Description |
 |------|-------------|
-| -c, --content DIR | Content directory (default: content) |
+| -c, --content-dir DIR | Content directory (default: content) |
 | -s, --static-dir DIR | Static files directory (default: static) |
+| -t, --templates-dir DIR | Templates directory scanned for references (default: templates) |
 | --delete | Delete unused files (prompts for confirmation) |
 | -f, --force | Skip the confirmation prompt when deleting (required for deletion under `--json`) |
 | -j, --json | Output result as JSON |
@@ -45,10 +46,28 @@ hwaro tool unused-assets --delete --force --json
 
 **Reference sources:**
 - All content files (`.md`, `.markdown`)
-- All template files (`.html`, `.css`, `.js`)
+- Template files (`.html`, `.j2`, `.jinja`, `.jinja2`, `.ecr`, plus `.css`, `.js`, `.xml`, `.json`, `.webmanifest`, `.svg`, `.txt`)
+- Static sources that can reference other static files (`.css`, `.scss`, `.sass`, `.js`, `.json`, `.webmanifest`, `.xml`, `.svg`, `.txt`, `.html`, `.htm`)
+- Data and translation files (`.yml`, `.yaml`, `.json`, `.toml` under `data/` and `i18n/`)
+- `config.toml` and environment overrides (`config.production.toml`) values that name files
+- Stylesheets and scripts under the asset pipeline's `[assets] source_dir`, when it is not `static/`
+- Files the build links on its own: the self-hosted highlight.js theme and script when `[highlight] use_cdn = false`
+
+If your templates live outside `templates/`, point the scan at them with
+`--templates-dir` — otherwise their asset references are invisible and the
+assets they use are reported (and can be deleted) as unused. An explicitly
+passed `--templates-dir` must exist (the path is resolved relative to the
+current directory); the command refuses to run against a missing one rather
+than silently scanning zero templates. The same applies to an explicit
+`--content-dir` and `--static-dir`.
+
+Files that browsers request by a well-known URL without any markup reference
+are never reported: `favicon.ico`, `apple-touch-icon.png`,
+`apple-touch-icon-precomposed.png` and their `-WxH` size variants, when they sit
+at the root of the static directory.
 
 **Supported asset extensions:**
-Images (png, jpg, jpeg, gif, svg, webp, avif, ico, bmp, tiff), stylesheets (css), scripts (js), fonts (woff, woff2, ttf, eot, otf), media (mp4, webm, ogg, mp3, wav), documents (pdf, zip).
+Images (png, jpg, jpeg, gif, svg, webp, avif, ico, bmp, tiff, tif), stylesheets (css), scripts (js), fonts (woff, woff2, ttf, eot, otf), media (mp4, webm, ogg, mp3, wav), documents (pdf, zip).
 
 ## Example Output
 
@@ -58,11 +77,11 @@ total: 24
 referenced: 20
 unused: 4
 unused files:
-    - static/old-logo.png
-    - static/unused-banner.jpg
-    - content/blog/my-post/draft-image.png
-    - static/deprecated.css
-    [info] dynamic references (e.g. template variables) may cause false positives
+  - static/old-logo.png
+  - static/unused-banner.jpg
+  - content/blog/my-post/draft-image.png
+  - static/deprecated.css
+  [info] dynamic references (e.g. template variables) may cause false positives
 found: 4 unused assets
 ```
 
@@ -88,4 +107,4 @@ confirmation, or `cancelled: no files deleted`.
 ## Limitations
 
 - Asset filenames referenced dynamically via template variables (e.g., `{{ page.image }}`) may not be detected, resulting in false positives.
-- The detection is based on filename matching — if two files in different directories share the same name, both may be considered referenced even if only one is actually used.
+- The detection is based on filename matching. If two files in different directories share the same name, both may be considered referenced even if only one is actually used.

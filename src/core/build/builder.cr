@@ -23,6 +23,11 @@ require "crinja"
 require "./cache"
 require "./cache_manager"
 require "./parallel"
+require "./data_disk"
+require "./remote_data"
+require "./privacy"
+require "./csp"
+require "./content_generate"
 require "./template_deps"
 require "./template_loader"
 require "./shortcode_processor"
@@ -46,9 +51,14 @@ require "../../content/seo/jsonld"
 require "../../content/seo/pwa"
 require "../../content/seo/og_image"
 require "../../content/search"
+require "../../content/search_ui"
+require "../../content/front_matter_schema"
+require "../../content/processors/wikilinks"
+require "../../content/processors/includes"
 require "../../content/pagination/paginator"
 require "../../content/pagination/renderer"
 require "../../utils/digest_utils"
+require "../../utils/html_stats"
 require "../../utils/errors"
 require "../../utils/file_safe"
 require "../../utils/logger"
@@ -56,9 +66,9 @@ require "../../utils/profiler"
 require "../../utils/text_utils"
 require "../../config/options/build_options"
 require "../../content/processors/markdown"
-require "../../content/processors/content_files"
 require "../../content/processors/template"
 require "../../content/multilingual"
+require "../../content/versions"
 require "../../content/i18n"
 require "../../models/config"
 require "../../models/page"
@@ -72,6 +82,10 @@ require "../../utils/crinja_utils"
 require "../../utils/html_minifier"
 require "../../utils/output_guard"
 require "../../utils/redirect_html"
+
+require "./builder/incremental"
+require "./builder/serve_sync"
+require "./builder/seo_surfaces"
 
 module Hwaro
   module Core
@@ -120,6 +134,44 @@ module Hwaro
         @cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue))?
         @cache : Cache?
         @config : Models::Config?
+        # Digest of the fetched [[data.remote]] payloads for this build,
+        # folded into compute_data_hash so a changed payload invalidates
+        # cached pages like an edited data/ file. "" when no remote sources
+        # are configured (keeps cache keys byte-identical to pre-feature).
+        @remote_data_digest : String = ""
+        # `[git]` commit metadata keyed by content-relative path, collected
+        # ONCE per full build in the Initialize phase (see GitInfo.collect)
+        # and read by parse_single_page — including the serve incremental
+        # re-parse, which deliberately reuses the last full build's map
+        # rather than shelling out to git on every keystroke. Nil when the
+        # feature is off or history is unavailable.
+        @git_info : Hash(String, Models::GitInfo)? = nil
+        # Per-SERVE-SESSION memo of fetched [[data.remote]] payloads. The
+        # dev server holds one Builder for the whole session, so this lives
+        # exactly as long as `hwaro serve` does; `hwaro build` is one process
+        # per build and never populates it, which is why build semantics are
+        # untouched.
+        #
+        # Without it every full rebuild refetched every source synchronously:
+        # editing a paragraph offline failed the rebuild, and the default
+        # (no `cache`) entry re-hit the network on every unrelated save.
+        # Keyed by {entry key, url digest} — not the url itself, which can
+        # carry a credential in its query string — so editing either in
+        # config.toml misses the memo and refetches, exactly like the disk
+        # cache.
+        @remote_data_memo : Hash({String, String}, {RemoteData::Result, Time}) = {} of {String, String} => {RemoteData::Result, Time}
+        # `[privacy]` localizer for this build (nil when the feature is off).
+        # Rebuilt by every Initialize phase; serve's incremental passes reuse
+        # the last one, and its disk cache keeps them off the network.
+        @privacy : Privacy? = nil
+        # Pages whose `[privacy]` rewrite left a reference external because a
+        # download failed: their cache entry is dropped, so the next `--cache`
+        # build renders them again instead of keeping the external URL.
+        # Guarded by @page_derived_mutex.
+        @privacy_incomplete : Set(String) = Set(String).new
+        # `[csp]`: each HTML file's policy as the Finalize pass emitted it,
+        # checked again after `[build] hooks.post` (nil when CSP is off).
+        @csp_result : Csp::Result? = nil
         @lifecycle : Lifecycle::Manager
         @context : Lifecycle::BuildContext?
         @profiler : Profiler?
@@ -143,11 +195,14 @@ module Hwaro
         # closure can actually reach. build_template_variables skips building
         # the ones it provably can't (SEO/OG strings, JSON-LD strings, the
         # per-page section-pages array copy — O(section size) per page).
-        # Detection is substring-based over the closure's source union, so it
-        # only ever over-approximates: any occurrence of the identifier keeps
-        # the variable. A template is only gated when its whole closure is
-        # statically resolvable AND it cannot contain shortcodes (template
-        # shortcodes render with the same vars hash and could read anything).
+        # Detection only ever over-approximates: any read keeps the variable,
+        # and a template is only gated when its whole closure is statically
+        # resolvable. `needs_seo`/`needs_jsonld` are substring checks and are
+        # forced on when the closure can hold shortcodes (template shortcodes
+        # render with the same vars hash and could read anything).
+        # `needs_section_pages` lexes the closure for a `section` identifier,
+        # except in shortcode templates, whose output is compiled as template
+        # text — a plain substring check covers what they print.
         #
         # `listing_fanout_*` are the exception: they gate no output at all,
         # only the render phase's auto worker count (see
@@ -197,7 +252,9 @@ module Hwaro
         # Per-page Crinja::Value cache — avoids repeated Page→Crinja::Value conversion
         # across build_global_vars, section page lists, and page_to_crinja_list_value
         @page_crinja_value_cache : Hash(String, Crinja::Value) = {} of String => Crinja::Value
-        @series_crinja_cache : Hash(String, Crinja::Value) = {} of String => Crinja::Value
+        # Keyed by the series group ({name, language, version}, see
+        # Transform#series_group_key), not the bare name.
+        @series_crinja_cache : Hash({String, String, String}, Crinja::Value) = {} of {String, String, String} => Crinja::Value
         # Per-section ancestors Crinja::Value cache, keyed by
         # {section_name, language} (pages in the same section+language share ancestors)
         @ancestors_crinja_cache : Hash({String, String?}, Array(Crinja::Value)) = {} of {String, String?} => Array(Crinja::Value)
@@ -232,9 +289,56 @@ module Hwaro
         # receipt cannot claim a page that never reached disk. Atomic because
         # the render fan-out increments it from worker fibers.
         # Memo for the listing-template source union (see Phases::Render).
-        # Keyed by the templates Hash identity so a template reload recomputes.
+        # Keyed by the templates Hash ITSELF (compared with `same?`) so a
+        # template reload recomputes — an `object_id` would let a recycled
+        # address serve the previous snapshot's union.
         @listing_source_union_memo : String? = nil
-        @listing_source_union_memo_key : UInt64 = 0_u64
+        @listing_source_union_memo_key : Hash(String, String)? = nil
+        # Memo for `page_template_scan` (see Phases::Render): what a page's
+        # template closure — entry template, the shortcodes its content calls,
+        # its output-format templates — reads from other pages. Keyed by the
+        # closure roots; reset when the templates Hash itself is replaced
+        # (same `same?` rule as the listing-union memo). Read from render
+        # worker fibers via record_page_cache_entry, hence the mutex.
+        @page_template_scan_memo : Hash(String, Phases::Render::PageTemplateScan) = {} of String => Phases::Render::PageTemplateScan
+        @page_template_scan_memo_key : Hash(String, String)? = nil
+        @page_template_scan_mutex : Mutex = Mutex.new
+        # Shortcode templates a page's content calls, keyed by page path and
+        # validated against the raw_content String it was scanned from (a
+        # re-parse replaces that String, and a template reload the graph, so
+        # the entry self-invalidates).
+        @page_shortcodes_memo : Hash(String, {String, TemplateDeps, Set(String)}) = {} of String => {String, TemplateDeps, Set(String)}
+        # Relations hashes `filter_changed_pages` compared, by page path, for
+        # `record_page_cache_entry` to store. The BeforeRender hooks run in
+        # between and fill in page fields (the auto OG image path), so a
+        # hash recomputed at record time never matched the next build's
+        # filter-time one. Cleared after the render fan-out; guarded by
+        # @page_template_hash_mutex.
+        @filter_relations_hashes : Hash(String, String) = {} of String => String
+        # `get_page` lookup index of one render pass, keyed by that pass's
+        # `link_targets` map (fresh per pass; holding it keeps its address
+        # from being reused). Guarded by @page_template_hash_mutex.
+        @get_page_index : {Hash(String, Models::Page), {Hash(String, Models::Page), Hash(String, Models::Page)}}? = nil
+        # `[markdown] wikilinks` lookup over the current published page set;
+        # rebuilt whenever that set may have changed (refresh_wikilink_index).
+        @wikilink_index : Content::Processors::Wikilinks::Index? = nil
+        # Ambiguous-wikilink warnings already printed; kept across the index
+        # rebuilds of one serve session, cleared by each full build.
+        @wikilink_warnings : Content::Processors::Wikilinks::WarnLog = Content::Processors::Wikilinks::WarnLog.new
+        # Project-relative path => MD5 of the bytes read (nil: missing, or a
+        # transcluded page) for every file an `include_code` / `include_md`
+        # call or a `![[note]]` transclusion read. Serve escalates a save
+        # of any of them to a full rebuild (Server#effective_strategy). Rebuilt by every full build, so a file
+        # nothing includes any more stops escalating.
+        @include_sources : Hash(String, String?) = {} of String => String?
+        @include_sources_mutex : Mutex = Mutex.new
+        # page path => {raw content, wikilink index, include-expanded raw}:
+        # `expanded_raw_content`, shared by the render and the per-page scans
+        # (fingerprints, serve's template-change selection). Valid while the
+        # page's raw string and the index are the same objects; cleared with
+        # @include_sources by every full build, the only strategy serve runs
+        # after an include source changed. Guarded by @include_sources_mutex.
+        @expanded_raw_memo : Hash(String, {String, Content::Processors::Wikilinks::Index?, String}) = {} of String => {String, Content::Processors::Wikilinks::Index?, String}
         @unpublished_pages : Atomic(Int32) = Atomic(Int32).new(0)
         # Pages that actually wrote a file. `process_files_*` returns a delta of
         # this, so every caller (render phase, incremental rebuild, serve
@@ -254,6 +358,11 @@ module Hwaro
         # every auto-include asset — O(site) work for one page — and silently
         # used cache_busting defaults instead of the build's options.
         @render_global_vars : Hash(String, Crinja::Value)? = nil
+        # `[build] write_stats`: tags/classes/ids of every HTML page this
+        # Builder wrote, flushed to `hwaro_stats.json`. Nil when the feature
+        # is off. Replaced per full build; serve's incremental passes keep
+        # adding to it.
+        @html_stats : Utils::HtmlStats? = nil
         # Pages stashed by `--fast-start` during the initial build so the
         # dev server can render them in a background fiber after the
         # "ready" signal has been emitted. Nil outside of fast-start mode.
@@ -265,6 +374,11 @@ module Hwaro
         # full build and per incremental/rerender pass (see
         # compute_output_url_winners). Nil until the first render pass.
         @output_url_winners : Hash(String, String)? = nil
+        # Output file key (`PathUtils.output_file_key`) → path of the page
+        # that publishes its own HTML there, from the same pass. Generated
+        # writers (paginator, taxonomy pages) consult it so they never
+        # overwrite an authored page — see `page_output_owner`.
+        @page_output_files : Hash(String, String) = {} of String => String
         # Unresolved `@/` internal links collected during the render fan-out
         # when `[links] broken_internal = "error"` (each entry is a formatted
         # "source.md → @/target (reason)" line). Guarded by
@@ -273,10 +387,310 @@ module Hwaro
         # into one classified error by raise_on_broken_internal_links!.
         @broken_internal_links : Array(String) = [] of String
         @broken_links_mutex : Mutex = Mutex.new
+        # Fragment links (`@/x.md#id`, same-page `#id`) found in rendered page
+        # content, collected only when `[links] broken_anchors` is not
+        # "ignore": {source path, link as written, target page, fragment}.
+        # Same mutex and lifetime as @broken_internal_links; checked against
+        # the target's output file by check_broken_anchors.
+        @anchor_links : Array({String, String, Models::Page, String}) = [] of {String, String, Models::Page, String}
+        # Output files this build claims that no content source backs — the
+        # taxonomy index/term pages, their pagination pages and their feeds.
+        # A page's own output is recorded in its cache entry; these have no
+        # entry to record them, so the Finalize phase persists this set and
+        # deletes what the PREVIOUS build claimed and this one no longer does
+        # (a term whose last post was deleted). Only a claim recorded here can
+        # ever be deleted, so a generator that reports nothing simply keeps
+        # today's behaviour instead of losing files. Reset by the Initialize
+        # phase; guarded because taxonomy rendering fans out.
+        @generated_output_claims : Set(String) = Set(String).new
+        # What the builder had claimed when the current build reset the set:
+        # the previous build's claims plus everything a serve session's
+        # incremental passes claimed since. Without `--cache` there is no
+        # persisted list to diff against, and this in-memory one is what lets
+        # a `hwaro serve` full rebuild drop the outputs it no longer
+        # publishes (a superseded `main.<hash>.css`, the `amp/` tree after
+        # `[amp]` is switched off). Empty on a process's first build.
+        @previous_generated_claims : Set(String) = Set(String).new
+        # The claims above that a GENERATOR made — every claimer but the
+        # static copy (404.html, feeds, sitemap, robots, llms, the search
+        # index, taxonomy pages, raw content files, bundles). On a cold build
+        # each of them is written after `static/` is copied, so a static file
+        # at one of these paths loses; the serve static lane needs to know
+        # when an edit lands on one (see `copy_changed_static`). Reset with
+        # the claims; guarded by @generated_claims_mutex.
+        @generator_output_claims : Set(String) = Set(String).new
+        # The generator claims above that are the Write phase's own content
+        # copies (`[content.files]`/raw files, bundle assets): those lose to a
+        # page or a real generator at the same path, so they must not count as
+        # one (see `content_copy_shadowed_outputs`). Reset with the claims;
+        # guarded by @generated_claims_mutex.
+        @content_copy_claims : Set(String) = Set(String).new
+        # True while @generated_output_claims is the running full build's own
+        # set (reset by the Initialize phase); false once an incremental serve
+        # pass starts, which re-claims nothing — so the set then still names
+        # outputs that pass is pruning. See `prune_unclaimed_outputs`.
+        @generated_claims_current : Bool = false
+        # Every page output the site of the PREVIOUS build (as the serve
+        # session's incremental passes left it) claimed, captured by `run`
+        # before it drops that site. A full serve rebuild — any config or
+        # data edit, or a file added alongside a content edit — renders only
+        # the new site and never looked back, so a page it moved (`slug`,
+        # `path`, a permalink rule), drafted or turned `render = false` kept
+        # its old file. Empty on a process's first build.
+        @previous_page_outputs : Set(String) = Set(String).new
+        # Output files the pages an incremental serve pass re-parsed occupied
+        # BEFORE the re-parse, until that pass has pruned what they left. The
+        # re-parse moves the page model in place, so a pass that raises in
+        # between (a date-token permalink error) used to leave the old file
+        # behind for good: the recovering full build computes
+        # `@previous_page_outputs` from the MOVED model. Drained by the next
+        # pass that gets as far as pruning, or by the Finalize phase.
+        @unsettled_page_outputs : Set(String) = Set(String).new
+        # True from the moment a build starts replacing the site until its
+        # Finalize prune has consumed the two baselines above. A build that
+        # fails in between (a broken template) leaves them describing its
+        # half-built state, so the next one carries them forward instead of
+        # recomputing them — otherwise a source deleted during the broken
+        # stretch is forgotten and its output is served for the rest of the
+        # session.
+        @prune_baselines_pending : Bool = false
+        @carry_prune_baselines : Bool = false
+        @generated_claims_mutex : Mutex = Mutex.new
+        # Output files the static copy actually (re)wrote this build, in the
+        # canonical absolute form `get_output_path` produces. `static/` is
+        # copied in the Initialize phase and the render phase runs after it,
+        # so on a cold build a page always wins a shared path
+        # (`static/about/index.html` vs `content/about.md`). On a warm
+        # `--cache` build the page is a cache hit and never re-renders, so the
+        # static copy's bytes REPLACED the page — `public/about/index.html`
+        # served the static file until an unrelated edit. Pages whose output
+        # this set names are forced back through the render (see
+        # filter_changed_pages), which restores the cold build's outcome.
+        @static_copied_outputs : Set(String) = Set(String).new
+        @static_copied_mutex : Mutex = Mutex.new
+        # Wall clock at the moment this build started writing into the output
+        # directory. The Finalize prune refuses to delete anything modified
+        # at or after it: whatever this build WROTE is live by definition,
+        # whether or not any bookkeeping claims it. That is what keeps a
+        # shadowed generator output safe — `static/robots.txt` and the
+        # generated `robots.txt` are the same file, so dropping the static
+        # claim when the source is deleted would otherwise take the generated
+        # one with it.
+        #
+        # nil until `mark_build_output_epoch` stamps it, which the Initialize
+        # phase does before the first write. Unstamped means "no build has
+        # written here", and the guard then protects nothing — a caller that
+        # drives the Finalize phase without a build (unit specs) gets exactly
+        # the pruning contract it asks for.
+        @build_output_epoch : Time? = nil
+        # The output directory when this build kept the previous build's tree
+        # (`--cache`, serve), nil when it started from an empty one. Only a
+        # kept tree can hold a leftover of the other kind where this build
+        # writes (see `mkdir_output`).
+        @kept_output_dir : String? = nil
+        # Files a page wrote BESIDES its own output: its `aliases` redirect
+        # stubs and, for a section, its `/page/N/` pagination pages. Both are
+        # produced by the render pass, so a warm `--cache` build that skips a
+        # page never re-derives them — they go into the page's cache entry
+        # (`derived_paths`) instead, which is what lets a removed page take its
+        # stubs with it and a section that lost a page drop the pagination page
+        # it no longer fills. Keyed by page.path, filled during render_page and
+        # drained by record_page_cache_entry a few lines later in the same
+        # worker fiber.
+        @page_derived_outputs : Hash(String, Array(String)) = {} of String => Array(String)
+        @page_derived_mutex : Mutex = Mutex.new
+        # The derived files (see above) each page's LAST render wrote, and
+        # those the running pass has recorded so far. The cache entry is the
+        # only other record, and it is pruned only by a `--cache` build's
+        # Finalize — so a `hwaro serve` session kept serving an alias stub
+        # after the alias was removed (or its page deleted or drafted) and a
+        # `/page/N/` a shrinking section no longer fills. Diffed by
+        # `sweep_stale_derived_outputs` once a render pass has finished.
+        # Guarded by @page_derived_mutex.
+        @rendered_derived_outputs : Hash(String, Array(String)) = {} of String => Array(String)
+        @derived_outputs_this_pass : Hash(String, Array(String)) = {} of String => Array(String)
+        # Taxonomy index/term/pagination/feed files the PREVIOUS taxonomy
+        # generation wrote, and the set the running one is collecting (nil
+        # outside a pass). The Finalize prune covers these only on a `--cache`
+        # build, and only on the full-build path — a `hwaro serve` session
+        # without `--cache`, and every incremental rebuild with it, left a
+        # term whose last post was deleted (or re-tagged) served until
+        # restart. The serve builder lives for the whole session, so the
+        # previous pass is right here in memory. Guarded by
+        # @generated_claims_mutex (taxonomy rendering fans out).
+        @last_taxonomy_outputs : Set(String)? = nil
+        # Feed files the last feed generation published (full build or serve
+        # pass). A section's `generate_feeds` lives in front matter, so an
+        # incremental serve edit can stop a section feed — and incremental
+        # passes run no claims diff. See `track_feed_outputs`. Guarded by
+        # @generated_claims_mutex.
+        @last_feed_outputs : Set(String)? = nil
+        @taxonomy_pass_outputs : Set(String)? = nil
+        # Content-relative directories that host a bundle index (`index.md` /
+        # `_index.md`, any language) as READ — before draft/future/expiry
+        # filtering. A directory here whose index pages all failed the filter
+        # is a withheld bundle: its files must not publish through the raw
+        # lane either (see Phases::Write#withheld_content_file?).
+        @content_index_dirs : Set(String) = Set(String).new
 
         def initialize
           @lifecycle = Lifecycle::Manager.new
           setup_cache_manager
+        end
+
+        # Record an output file this build produced that no cache entry
+        # covers. Public: the taxonomy generator is a module that reaches the
+        # builder through its `builder:` argument.
+        #
+        # `static_copy` marks the Initialize phase's copy of `static/`: it is
+        # a claim like any other, but not a generator's (see
+        # `@generator_output_claims`); `content_copy` marks the Write phase's
+        # content copies (see `@content_copy_claims`).
+        def claim_generated_output(path : String, static_copy : Bool = false, content_copy : Bool = false) : Nil
+          @generated_claims_mutex.synchronize do
+            @generated_output_claims << path
+            @generator_output_claims << path unless static_copy
+            @content_copy_claims << path if content_copy
+            @taxonomy_pass_outputs.try(&.<<(path))
+          end
+        end
+
+        # Everything claimed since the last reset.
+        def generated_output_claims : Set(String)
+          @generated_claims_mutex.synchronize { @generated_output_claims.dup }
+        end
+
+        def reset_generated_output_claims : Nil
+          @generated_claims_mutex.synchronize do
+            @previous_generated_claims = @carry_prune_baselines ? @previous_generated_claims | @generated_output_claims : @generated_output_claims
+            @generated_output_claims = Set(String).new
+            @generator_output_claims = Set(String).new
+            @content_copy_claims = Set(String).new
+          end
+          @generated_claims_current = true
+        end
+
+        # Record an output file the static copy just wrote over (see
+        # `@static_copied_outputs`). Public because the serve watcher's
+        # static-only lane (`copy_changed_static`) copies through the builder
+        # too and must record what it wrote for the same reason. `path` must
+        # already be canonical — see `static_copied_output?`.
+        def note_static_copy(path : String) : Nil
+          @static_copied_mutex.synchronize { @static_copied_outputs << path }
+        end
+
+        # Did the static copy write anything at all this build? The gate in
+        # filter_changed_pages resolves paths against the working directory,
+        # and this lets it skip that work entirely on the common warm build
+        # where no static file changed.
+        def static_copies_recorded? : Bool
+          @static_copied_mutex.synchronize { !@static_copied_outputs.empty? }
+        end
+
+        # `path` may arrive in any spelling — `get_output_path` hands back the
+        # canonical absolute form while alias/pagination paths are built by
+        # joining the output directory — so it is resolved against `cwd` (the
+        # caller's, resolved once) before the lookup.
+        def static_copied_output?(path : String, cwd : String) : Bool
+          @static_copied_mutex.synchronize do
+            return false if @static_copied_outputs.empty?
+            @static_copied_outputs.includes?(File.expand_path(path, cwd))
+          end
+        end
+
+        def reset_static_copied_outputs : Nil
+          @static_copied_mutex.synchronize { @static_copied_outputs.clear }
+        end
+
+        # Stamp the start of this build's output writing (see
+        # `@build_output_epoch`).
+        def mark_build_output_epoch : Nil
+          @build_output_epoch = Time.utc
+        end
+
+        # True when `path` was (re)written by this build.
+        #
+        # Exact on every filesystem with sub-second mtimes (APFS, ext4, btrfs,
+        # NTFS, xfs): a previous build's file is stamped strictly before this
+        # build's epoch, and everything this build writes strictly after. The
+        # comparison carries NO slack on purpose — a slack wide enough to
+        # cover a coarse filesystem is also wide enough to protect the
+        # previous build's output, which would disable pruning outright for
+        # any two builds run seconds apart.
+        #
+        # On a filesystem that truncates mtimes to whole seconds a shadowed
+        # generator file written in the epoch's own second can read as older
+        # and be pruned. That is self-healing: the path leaves the claim list
+        # with it, and the next build's generator finds the file missing and
+        # writes it again.
+        #
+        # Widening the comparison (a slack, or truncating the epoch to its own
+        # second) trades that for a PERMANENT failure instead. A path the
+        # prune skips is not re-claimed by the build that skipped it, so it
+        # never appears in a later build's stale list either — the leftover
+        # stays published forever. Two builds run seconds apart are ordinary,
+        # so the widened form also protects the PREVIOUS build's output as a
+        # matter of course: both widenings were measured against
+        # cache_stale_outputs_spec and disable pruning outright (12+ of its 22
+        # examples). Erring toward pruning is the recoverable direction.
+        #
+        # The stamped copies (static files, bundle assets — `File.utime` with
+        # the SOURCE mtime) deliberately read as old, and they are exactly the
+        # ones a live claim already protects.
+        def written_this_build?(path : String) : Bool
+          epoch = @build_output_epoch
+          return false unless epoch
+          info = File.info?(path)
+          return false unless info
+          info.modification_time >= epoch
+        end
+
+        # Record an alias stub / pagination page / localized `[privacy]`
+        # file `page` just wrote.
+        def record_page_derived_output(page_path : String, output_path : String) : Nil
+          @page_derived_mutex.synchronize do
+            list = @page_derived_outputs[page_path] ||= [] of String
+            list << output_path unless list.includes?(output_path)
+          end
+        end
+
+        # `[privacy]`: the local URL for one external URL (the PWA precache
+        # list), or nil to keep it external.
+        def privacy_url(url : String) : String?
+          return unless localized = @privacy.try(&.localize(url))
+          localized.files.each { |path| claim_generated_output(path) }
+          localized.url
+        end
+
+        # `[privacy]`: point `html`'s external assets at local copies. The
+        # files they now load are claimed, and recorded against `owner` (a
+        # page path) so a `--cache` hit, which skips the render, keeps them.
+        # Public: the taxonomy generator writes through it too.
+        def privacy_rewrite(html : String, owner : String? = nil) : String
+          return html unless privacy = @privacy
+          html, files, incomplete = privacy.rewrite_html(html)
+          files.each do |path|
+            claim_generated_output(path)
+            record_page_derived_output(owner, path) if owner
+          end
+          @page_derived_mutex.synchronize { @privacy_incomplete << owner } if incomplete && owner
+          html
+        end
+
+        # Start this page's list over — called at the top of every render so a
+        # `serve` session's repeated rebuilds don't accumulate.
+        def clear_page_derived_outputs(page_path : String) : Nil
+          @page_derived_mutex.synchronize { @page_derived_outputs.delete(page_path) }
+        end
+
+        # Take (and forget) what this page derived, remembering it as what the
+        # page's render in this pass wrote (see `@derived_outputs_this_pass`).
+        def take_page_derived_outputs(page_path : String) : Array(String)
+          @page_derived_mutex.synchronize do
+            derived = @page_derived_outputs.delete(page_path) || [] of String
+            @derived_outputs_this_pass[page_path] = derived
+            derived
+          end
         end
 
         # Access cache manager for external inspection
@@ -345,1257 +759,16 @@ module Hwaro
           end
         end
 
-        # Access lifecycle for external hook registration
-        def lifecycle : Lifecycle::Manager
-          @lifecycle
-        end
-
         # Register a Hookable module
         def register(hookable : Lifecycle::Hookable)
           @lifecycle.register(hookable)
           self
         end
 
-        # Keyword-argument convenience form of `run`: packs the arguments
-        # into a BuildOptions and delegates to the struct overload, which is
-        # the REAL implementation. Callers holding a BuildOptions (the build
-        # command, the serve watcher) must call that overload directly so
-        # fields this form doesn't expose — `full`, `serve_mode`, `workers`
-        # — reach the build context verbatim instead of being silently
-        # dropped in a re-pack.
-        def run(
-          output_dir : String = "public",
-          base_url : String? = nil,
-          drafts : Bool = false,
-          include_expired : Bool = false,
-          include_future : Bool = false,
-          minify : Bool = false,
-          parallel : Bool = true,
-          cache : Bool = false,
-          full : Bool = false,
-          highlight : Bool = true,
-          verbose : Bool = false,
-          profile : Bool = false,
-          debug : Bool = false,
-          error_overlay : Bool = false,
-          stream : Bool = false,
-          memory_limit : String? = nil,
-          env : String? = nil,
-          fast_start : Bool = false,
-          fast_start_count : Int32 = 20,
-          skip_og_image : Bool = false,
-          skip_image_processing : Bool = false,
-          preserve_output : Bool = false,
-          cache_busting : Bool = true,
-        ) : Bool
-          run(Config::Options::BuildOptions.new(
-            output_dir: output_dir,
-            base_url: base_url,
-            drafts: drafts,
-            include_expired: include_expired,
-            include_future: include_future,
-            minify: minify,
-            parallel: parallel,
-            cache: cache,
-            full: full,
-            highlight: highlight,
-            verbose: verbose,
-            profile: profile,
-            debug: debug,
-            error_overlay: error_overlay,
-            stream: stream,
-            memory_limit: memory_limit,
-            env: env,
-            fast_start: fast_start,
-            fast_start_count: fast_start_count,
-            skip_og_image: skip_og_image,
-            skip_image_processing: skip_image_processing,
-            preserve_output: preserve_output,
-            cache_busting: cache_busting,
-          ))
-        end
-
-        # Drop unresolved-link records from the previous pass so a fixed
-        # link doesn't keep failing (and a new one is attributed to the
-        # right build). Called at every build entry point.
-        private def clear_broken_internal_links
-          @broken_links_mutex.synchronize { @broken_internal_links.clear }
-        end
-
-        # Fail the build with ONE aggregated error listing every unresolved
-        # `@/` internal link collected during the render fan-out. Only
-        # populated when `[links] broken_internal = "error"` — the default
-        # "warn" mode never appends, making this a no-op there. Raising
-        # HwaroError(HWARO_E_CONTENT) maps to exit code 5 for CI; under
-        # `serve` the watcher rescue surfaces it in the error overlay.
-        private def raise_on_broken_internal_links!
-          # Dedupe: the same broken @/target repeated within one page (or a
-          # page rendered twice in a pass) must produce one line, not N.
-          entries = @broken_links_mutex.synchronize { @broken_internal_links.sort.uniq! }
-          return if entries.empty?
-
-          label = entries.size == 1 ? "1 broken internal link" : "#{entries.size} broken internal links"
-          raise Hwaro::HwaroError.new(
-            code: Hwaro::Errors::HWARO_E_CONTENT,
-            message: "#{label}:\n  #{entries.join("\n  ")}",
-            hint: "Fix the @/ links above, or set [links] broken_internal = \"warn\" to demote them to warnings.",
-          )
-        end
-
-        # Incremental build: only re-parse and re-render pages whose source
-        # files have been modified.  Falls back to a full build when the
-        # necessary state from a previous build is not available.
-        #
-        # Optimizations over a full build:
-        # - Only re-parses changed files (not all pages)
-        # - Diff-based taxonomy update (not full rebuild)
-        # - Re-links navigation only for affected sections
-        # - Recomputes series/related posts only for affected pages
-        # - Selectively invalidates Crinja caches
-        def run_incremental(changed_content_files : Array(String), options : Config::Options::BuildOptions) : Bool
-          @render_workers = options.workers
-          config = @config
-          site = @site
-          templates = @templates
-
-          # First build hasn't happened yet – fall back to full build
-          unless config && site && templates
-            return run(options)
-          end
-
-          Logger.info "Incremental build for #{changed_content_files.size} changed file(s)..." if options.verbose
-          start_time = Time.instant
-          clear_broken_internal_links
-
-          output_dir = options.output_dir
-          minify = options.minify
-          highlight = options.highlight && site.config.highlight.enabled
-          verbose = options.verbose
-          include_drafts = options.drafts
-
-          # --- 1. Identify changed pages and snapshot their state before re-parse ---
-          changed_pages = [] of Models::Page
-          affected_sections = Set(String).new
-          old_taxonomies_snapshot = {} of String => Hash(String, Array(String))
-          old_series_names = {} of String => String?
-          # Output files each changed page occupied BEFORE re-parse — a slug/
-          # custom_path edit relocates the page, and the original file would
-          # otherwise keep serving 200 for the rest of the session (and ship
-          # if `public/` is deployed from it).
-          old_output_paths = {} of String => Array(String)
-
-          # Build O(1) lookup map for changed file matching
-          pages_map = @pages_by_path || build_pages_by_path(site)
-
-          # Snapshot old neighbors before re-linking (for render set)
-          old_neighbors = {} of String => {Models::Page?, Models::Page?}
-
-          # Cascade context for re-applying section defaults to re-parsed pages
-          # (parse_single_page resets fields from front matter only). Prefer
-          # the cold build's pre-filter map: it still contains cascades from
-          # draft/expired _index sections that site.sections no longer holds.
-          cascade_map = @cascade_map || build_cascade_map(site.sections)
-
-          changed_content_files.each do |file|
-            relative_path = path_relative_to(file, "content")
-
-            page = pages_map[relative_path]?
-            unless page
-              # Not in the site model: an excluded page (draft / future /
-              # expired / parse-failed at startup) whose edit may have just
-              # made it publishable, or a filtered section _index whose
-              # [cascade] still reaches descendants. Incremental bookkeeping
-              # can't see either — un-drafting a post used to be silently
-              # skipped here until serve restart. A full rebuild re-admits
-              # whatever this save changed. Files gone from disk are the
-              # watcher's removed-file path; still skip those.
-              if File.exists?(file)
-                Logger.info "  Changed #{relative_path} is not in the site model — running full rebuild."
-                return run(options)
-              end
-              next
-            end
-
-            # Snapshot before re-parse (includes property-backed taxonomies
-            # like authors — see snapshot_page_taxonomies)
-            old_taxonomies_snapshot[page.path] = snapshot_page_taxonomies(page, site)
-            old_series_names[page.path] = page.series
-            old_neighbors[page.path] = {page.lower, page.higher}
-            old_cascade = page.is_a?(Models::Section) ? page.cascade : nil
-            old_output_paths[page.path] = collect_page_output_paths(page, output_dir)
-
-            # Re-read, re-parse front-matter and recalculate URL
-            parse_single_page(page)
-            page.generate_permalink(config.base_url)
-            # Content (shortcode usage) or front-matter template may have changed
-            @page_template_hash_mutex.synchronize { @page_template_hash_memo.delete(page.path) }
-
-            # A changed [cascade] affects descendant pages that are NOT in the
-            # changed set — incremental bookkeeping can't reach them, so
-            # escalate to a full rebuild (rare event, correctness first).
-            if (previous_cascade = old_cascade) && page.is_a?(Models::Section) && page.cascade != previous_cascade
-              Logger.info "  Section cascade changed in #{page.path} — running full rebuild."
-              return run(options)
-            end
-
-            apply_cascade_to(page, cascade_map)
-
-            changed_pages << page
-            affected_sections << page.section
-            # Also include ancestor sections that may list this page
-            page.ancestors.each { |ancestor| affected_sections << ancestor.section }
-          end
-
-          if changed_pages.empty?
-            Logger.info "  No matching pages found – skipping."
-            return true
-          end
-
-          # Re-claim output URLs: the edit may have introduced or resolved a
-          # slug/alias collision, and a stale winner map would keep
-          # suppressing (or racing) writes for the rest of the serve session.
-          @output_url_winners = compute_output_url_winners((site.pages + site.sections).as(Array(Models::Page)))
-
-          # --- 2. Incrementally update relationships ---
-          # Identify pages that should be excluded (draft/expired/future)
-          # BEFORE the taxonomy update, so their re-parsed terms don't get
-          # re-added to site.taxonomies — pages rendered in this same pass
-          # would otherwise still show the drafted page in tag clouds and
-          # term counts until the next full build.
-          excluded_pages = [] of Models::Page
-          now = Time.utc
-          # Re-stamp the publication window on re-parsed pages so pages kept
-          # via --include-future/--include-expired stay out of public
-          # artifacts and listings (same contract as the full parse phase).
-          changed_pages.each(&.refresh_unpublished!(now))
-          unless include_drafts
-            excluded_pages.concat(changed_pages.select(&.draft))
-            changed_pages.reject!(&.draft)
-          end
-          unless options.include_expired
-            excluded_pages.concat(changed_pages.select { |p| p.expires.try { |e| e <= now } || false })
-            changed_pages.reject! { |p| p.expires.try { |e| e <= now } || false }
-          end
-          unless options.include_future
-            excluded_pages.concat(changed_pages.select { |p| p.date.try { |d| d > now } || false })
-            changed_pages.reject! { |p| p.date.try { |d| d > now } || false }
-          end
-          excluded_paths = excluded_pages.map(&.path).to_set
-
-          # Date-token permalink errors deferred by the lenient parse (see
-          # ParseContent#calculate_page_url): now that cascades and the
-          # exclusion pass ran, a surviving renderable page must fail the
-          # rebuild — same contract as the full parse phase. The serve
-          # watcher surfaces this via the overlay and escalates the next
-          # rebuild through @rebuild_failed.
-          raise_on_permalink_errors!(changed_pages)
-
-          # Re-render <!-- more --> summaries for the re-parsed pages with the
-          # body pipeline (parse_single_page reset summary_html to nil); the
-          # listing pages re-rendered below read it. Runs AFTER the exclusion
-          # pass so a page just flipped to draft can't feed its summary's
-          # broken @/ links into the strict-mode accumulator (the full build
-          # renders summaries post-filter too).
-          render_page_summaries(changed_pages, site, templates, highlight,
-            link_targets: (site.pages + site.sections).as(Array(Models::Page)))
-
-          # Run taxonomy update on ALL re-parsed pages (including the excluded
-          # ones — their OLD entries must be removed; excluded_paths keeps
-          # their new terms from being re-added).
-          update_taxonomies_incremental(site, changed_pages + excluded_pages, old_taxonomies_snapshot, excluded_paths)
-
-          # Remove excluded pages from site indices and delete stale output files
-          unless excluded_pages.empty?
-            site.pages.reject! { |p| excluded_paths.includes?(p.path) }
-            site.sections.reject! { |p| excluded_paths.includes?(p.path) }
-            excluded_pages.each do |p|
-              stale = old_output_paths[p.path]? || [get_output_path(p, output_dir)].compact
-              delete_orphaned_outputs(stale, output_dir)
-            end
-          end
-
-          # Delete outputs the edit orphaned — a relocation (slug/custom_path
-          # change) moves EVERY output, but a front-matter edit can also drop
-          # just a sibling format (`outputs = ["json"]` removed) while the
-          # primary path stays put, so diff the full old/new path sets
-          # instead of comparing only the primary path. Excluded pages were
-          # handled above.
-          relocated = [] of String
-          changed_pages.each do |page|
-            next unless olds = old_output_paths[page.path]?
-            relocated.concat(olds - collect_page_output_paths(page, output_dir))
-          end
-          delete_orphaned_outputs(relocated, output_dir) unless relocated.empty?
-
-          all_pages = (site.pages + site.sections).as(Array(Models::Page))
-
-          # Rebuild lookup index (page data may have changed)
-          site.build_lookup_index
-
-          # Re-link the global reading order; `renav_pages` is every page whose
-          # prev/next pointer actually changed (a section weight/sort/reverse edit
-          # reorders a whole block, not just the edited page's neighbors).
-          renav_pages = relink_navigation_for_sections(site, affected_sections)
-
-          # Recompute series for affected series (if enabled), including old memberships
-          affected_series = if site.config.series.enabled
-                              recompute_series_for_pages(site, changed_pages, old_series_names)
-                            else
-                              Set(String).new
-                            end
-
-          # Recompute related posts selectively (if enabled). Pass the excluded
-          # pages' paths so pages that listed a now-removed page as related drop it.
-          related_pages_updated = recompute_related_posts_for_pages(site, changed_pages, excluded_paths)
-
-          # Invalidate Crinja caches for affected pages/sections
-          invalidate_caches_for_pages(changed_pages, affected_sections)
-          @crinja_cache_mutex.synchronize do
-            affected_series.each { |s| @series_crinja_cache.delete(s) }
-            related_pages_updated.each { |path| @related_posts_crinja_cache.delete(path) }
-
-            # A changed SECTION's title/url is embedded in every descendant's
-            # breadcrumb, which is served from @ancestors_crinja_cache keyed
-            # {section, language}. affected_sections only covers the section
-            # itself and its UPWARD ancestors, so drop the whole DESCENDANT
-            # subtree ("sec" and "sec/...") too, or re-rendered descendants
-            # would read a cached ancestors array still carrying the old
-            # title/url.
-            changed_pages.each do |page|
-              next unless page.is_a?(Models::Section)
-              sec = page.section
-              @ancestors_crinja_cache.reject! { |k, _| k[0] == sec || k[0].starts_with?("#{sec}/") }
-            end
-          end
-
-          # --- 3. Determine the full set of pages that need re-rendering ---
-          pages_to_render = Set(Models::Page).new(changed_pages)
-
-          # Section index pages whose content lists include the changed pages.
-          # Include every language variant of the section (multilingual sites
-          # have one `_index.<lang>.md` per language under the same path).
-          affected_sections.each do |section_name|
-            site.sections.each do |section|
-              pages_to_render << section if section.section == section_name
-            end
-          end
-
-          # When a SECTION `_index` itself changed, its own title/url can appear
-          # in every descendant page's breadcrumb (page.ancestors) and its sort
-          # settings reorder the section's listings — so re-render the whole
-          # subtree. Cover BOTH descendant content pages (site.pages) AND nested
-          # section index pages (site.sections — `_index.md` files never live in
-          # site.pages), or a nested subsection's breadcrumb stays stale. Bounded
-          # by the edited section's size, and only triggered by the rarer section
-          # edits.
-          changed_pages.each do |page|
-            next unless page.is_a?(Models::Section)
-            sec = page.section
-            prefix = "#{sec}/"
-            site.pages.each do |p|
-              pages_to_render << p if p.section == sec || p.section.starts_with?(prefix)
-            end
-            site.sections.each do |s|
-              pages_to_render << s if s.section == sec || s.section.starts_with?(prefix)
-            end
-          end
-
-          # Previous / next pages. `renav_pages` is every page whose lower/higher
-          # pointer changed in the global re-link (covers block reorders from a
-          # section weight/sort/reverse edit); the explicit old/new neighbors of
-          # each changed page are a subset but kept for clarity.
-          renav_pages.each { |p| pages_to_render << p }
-          changed_pages.each do |page|
-            # New neighbors (after re-link)
-            page.lower.try { |l| pages_to_render << l }
-            page.higher.try { |h| pages_to_render << h }
-
-            # Old neighbors (before re-link, may have shifted)
-            if old = old_neighbors[page.path]?
-              old[0].try { |l| pages_to_render << l }
-              old[1].try { |h| pages_to_render << h }
-            end
-          end
-
-          # Pages in affected series (their series_index may have changed)
-          unless affected_series.empty?
-            site.pages.each do |p|
-              pages_to_render << p if p.series && affected_series.includes?(p.series)
-            end
-          end
-
-          # Pages whose related_posts were recomputed
-          related_pages_updated.each do |path|
-            if p = pages_map[path]?
-              pages_to_render << p
-            end
-          end
-
-          # KNOWN LIMITATION (serve preview only): a page that renders ANOTHER
-          # section's listing via `get_section(X).pages` or a global `site.pages`
-          # widget (e.g. a sidebar "recent posts") is NOT re-rendered when a page
-          # in X changes, so its on-disk HTML can show a stale list until that
-          # page is itself touched. Bounding this would require tracking which
-          # pages reference which section lists; a full `hwaro build` is always
-          # correct, so this is left as a documented preview-mode gap.
-
-          render_list = pages_to_render.to_a
-
-          # --- 4. Re-render the affected pages ---
-          global_vars = build_global_vars(site, options.cache_busting)
-          # Refresh the stash render_global_vars_or_build serves — taxonomy
-          # pages regenerated below (and any later 404 rebuild) would
-          # otherwise render against the site snapshot of the last FULL
-          # build: old titles, old term sets, old menus.
-          @render_global_vars = global_vars
-          @pages_by_path = build_pages_by_path(site)
-          cache = @cache || Cache.new(enabled: false)
-
-          # Render in parallel like run_rerender/the cold build — a section
-          # `_index` edit re-renders its whole subtree, and doing that one
-          # page at a time made large-section edits the slowest watch path.
-          # process_files_sequential mirrors the old per-page loop exactly
-          # (render_page + record_page_cache_entry).
-          error_overlay = options.error_overlay
-          renderable_list = render_list.select(&.render)
-          if options.parallel && renderable_list.size > 1
-            process_files_parallel(renderable_list, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: error_overlay, profiler: active_profiler)
-          else
-            process_files_sequential(renderable_list, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: error_overlay, profiler: active_profiler)
-          end
-          raise_on_broken_internal_links!
-
-          cache.save if options.cache
-
-          # --- 5. Regenerate taxonomy index/term pages ---
-          # Merge the generated taxonomy pages into the page set the SEO
-          # generators read so taxonomy.sitemap/feed take effect on incremental
-          # rebuilds too (mirrors the lifecycle taxonomy hook). `all_pages` is
-          # left intact for the rebuild summary below.
-          taxonomy_sections = Content::Taxonomies.generate(site, output_dir, templates, verbose, builder: self)
-          seo_pages = taxonomy_sections.empty? ? all_pages : all_pages + taxonomy_sections
-
-          # --- 6. Regenerate lightweight SEO / search files in parallel ---
-          regenerate_seo_surfaces(seo_pages, site, output_dir, verbose, options.parallel, include_robots: true, options: options)
-
-          elapsed = Time.instant - start_time
-          Logger.outcome("rebuilt", "#{render_list.size}/#{all_pages.size} pages", :result, elapsed.total_milliseconds)
-          report_cache_stats(options.verbose)
-          true
-        end
-
-        # Incremental parse of changed content + full re-render with reloaded templates.
-        # Used when both content and templates changed simultaneously.
-        def run_incremental_then_rerender(changed_content_files : Array(String), options : Config::Options::BuildOptions) : Bool
-          @render_workers = options.workers
-          config = @config
-          site = @site
-
-          unless config && site
-            return run(options)
-          end
-
-          Logger.info "Re-parsing #{changed_content_files.size} changed file(s) before full re-render..."
-
-          output_dir = options.output_dir
-          pages_map = @pages_by_path || build_pages_by_path(site)
-          changed_pages = [] of Models::Page
-          affected_sections = Set(String).new
-          old_taxonomies_snapshot = {} of String => Hash(String, Array(String))
-          old_series_names = {} of String => String?
-          old_output_paths = {} of String => Array(String)
-
-          # Same cascade context as run_incremental — re-parsed pages must
-          # get their inherited section defaults back before rendering.
-          cascade_map = @cascade_map || build_cascade_map(site.sections)
-
-          changed_content_files.each do |file|
-            relative_path = path_relative_to(file, "content")
-
-            page = pages_map[relative_path]?
-            unless page
-              # See run_incremental: an excluded page's edit may have just
-              # made it publishable, and an excluded section's _index can
-              # still cascade to descendants — escalate rather than miss it.
-              if File.exists?(file)
-                Logger.info "  Changed #{relative_path} is not in the site model — running full rebuild."
-                return run(options)
-              end
-              next
-            end
-
-            # Snapshot before re-parse (includes property-backed taxonomies
-            # like authors — see snapshot_page_taxonomies)
-            old_taxonomies_snapshot[page.path] = snapshot_page_taxonomies(page, site)
-            old_series_names[page.path] = page.series
-            old_cascade = page.is_a?(Models::Section) ? page.cascade : nil
-            old_output_paths[page.path] = collect_page_output_paths(page, output_dir)
-
-            parse_single_page(page)
-            page.generate_permalink(config.base_url)
-            @page_template_hash_mutex.synchronize { @page_template_hash_memo.delete(page.path) }
-
-            # A changed [cascade] affects descendants outside the changed set
-            # — escalate to a full rebuild, mirroring run_incremental.
-            if (previous_cascade = old_cascade) && page.is_a?(Models::Section) && page.cascade != previous_cascade
-              Logger.info "  Section cascade changed in #{page.path} — running full rebuild."
-              return run(options)
-            end
-
-            apply_cascade_to(page, cascade_map)
-
-            changed_pages << page
-            affected_sections << page.section
-            page.ancestors.each { |ancestor| affected_sections << ancestor.section }
-          end
-
-          # Exclusion pass, mirroring run_incremental: a save that flips a
-          # page to draft (or into the expired/future window) alongside a
-          # template edit used to leave it published — still in listings,
-          # feeds, and on disk — because only the content-only strategy
-          # applied the filters.
-          excluded_pages = [] of Models::Page
-          now = Time.utc
-          changed_pages.each(&.refresh_unpublished!(now))
-          unless options.drafts
-            excluded_pages.concat(changed_pages.select(&.draft))
-            changed_pages.reject!(&.draft)
-          end
-          unless options.include_expired
-            excluded_pages.concat(changed_pages.select { |p| p.expires.try { |e| e <= now } || false })
-            changed_pages.reject! { |p| p.expires.try { |e| e <= now } || false }
-          end
-          unless options.include_future
-            excluded_pages.concat(changed_pages.select { |p| p.date.try { |d| d > now } || false })
-            changed_pages.reject! { |p| p.date.try { |d| d > now } || false }
-          end
-          excluded_paths = excluded_pages.map(&.path).to_set
-
-          # Deferred permalink errors — mirrors run_incremental.
-          raise_on_permalink_errors!(changed_pages)
-
-          # Update all derived relationships before full re-render (removal
-          # runs for every re-parsed page; excluded pages' new terms are not
-          # re-added — see update_taxonomies_incremental).
-          update_taxonomies_incremental(site, changed_pages + excluded_pages, old_taxonomies_snapshot, excluded_paths)
-
-          unless excluded_pages.empty?
-            site.pages.reject! { |p| excluded_paths.includes?(p.path) }
-            site.sections.reject! { |p| excluded_paths.includes?(p.path) }
-            excluded_pages.each do |p|
-              stale = old_output_paths[p.path]? || [get_output_path(p, output_dir)].compact
-              delete_orphaned_outputs(stale, output_dir)
-            end
-          end
-
-          # Delete outputs the edit orphaned (relocation or a dropped sibling
-          # output format) — set diff, mirrors run_incremental.
-          relocated = [] of String
-          changed_pages.each do |page|
-            next unless olds = old_output_paths[page.path]?
-            relocated.concat(olds - collect_page_output_paths(page, output_dir))
-          end
-          delete_orphaned_outputs(relocated, output_dir) unless relocated.empty?
-
-          site.build_lookup_index
-          relink_navigation_for_sections(site, affected_sections)
-          recompute_series_for_pages(site, changed_pages, old_series_names) if site.config.series.enabled
-          recompute_related_posts_for_pages(site, changed_pages, excluded_paths) if site.config.related.enabled
-
-          # Re-render with reloaded templates. The selective path inside
-          # run_rerender only covers template-affected pages, so the content
-          # pages re-parsed above must be forced into the render set.
-          #
-          # membership_changed: a page whose draft/expired/future status just
-          # flipped it OUT of the built set leaves changed_pages (so
-          # force_pages can't carry the signal), yet sitemap/feeds/search and
-          # taxonomy pages still list it — run_rerender must refresh those
-          # surfaces even when the template edit itself was layout-only (or a
-          # bare mtime touch). Flips INTO the set escalate to a full rebuild
-          # via the pages_map miss above, so exclusions are the only
-          # membership change this path can see.
-          run_rerender(options, force_pages: changed_pages, membership_changed: !excluded_pages.empty?)
-        end
-
-        # Re-render pages using reloaded templates without re-parsing content.
-        # Useful when only template files have been modified. With template
-        # dependency tracking active, only the pages whose template closure
-        # includes an edited template are re-rendered; otherwise (tracking
-        # off, a dynamic include in the graph, or templates added/removed)
-        # every page re-renders as before.
-        #
-        # `force_pages` are rendered regardless of template impact — callers
-        # that re-parsed content (run_incremental_then_rerender) pass them so
-        # the selective path can't skip a content-changed page. Their taxonomy
-        # membership may have changed too, so taxonomy pages regenerate
-        # whenever force_pages are present.
-        #
-        # `membership_changed` signals that pages left the built set in this
-        # pass (a draft/expired/future flip): the SEO surfaces and taxonomy
-        # pages must refresh even when no template content changed, and the
-        # identical-templates early return must not skip that work.
-        def run_rerender(options : Config::Options::BuildOptions, force_pages : Array(Models::Page)? = nil, membership_changed : Bool = false) : Bool
-          @render_workers = options.workers
-          config = @config
-          site = @site
-
-          unless config && site
-            return run(options)
-          end
-
-          start_time = Time.instant
-          clear_broken_internal_links
-
-          # Reload templates from disk & reset all runtime caches.
-          # Keep the old sources so the dependency graph can diff them.
-          old_templates = @templates
-          old_shadowed = @shadowed_template_hashes
-          @templates = nil
-          @cache_manager.clear_runtime
-          templates = load_templates
-          @templates = templates
-
-          # Refresh invalidation mode for the reloaded template set. Mirror
-          # phases/initialize.cr: snapshot-escaping refs (./-prefixed,
-          # non-template extensions, shadowed exact-ext variants) are read
-          # from disk at render time, so their contents must be folded into
-          # the global hash here too — otherwise serve rerenders and
-          # `build --cache` disagree on every page's cache entry.
-          deps = @template_deps
-          @global_templates_hash = Cache.compute_templates_hash(templates)
-          if (graph = deps) && !graph.snapshot_escaping_refs.empty?
-            @global_templates_hash = fold_snapshot_escaping_refs(@global_templates_hash, graph.snapshot_escaping_refs)
-          end
-          @per_page_template_hash = config.build.template_deps &&
-                                    (deps.try { |d| !d.dynamic? } || false)
-
-          output_dir = options.output_dir
-          minify = options.minify
-          highlight = options.highlight && site.config.highlight.enabled
-          verbose = options.verbose
-
-          all_pages = (site.pages + site.sections).as(Array(Models::Page))
-          renderable_pages = all_pages.select(&.render)
-
-          # Selective re-render: same template set, fully static graph.
-          # `old_shadowed` guards extension-shadowed variants (foo.j2 next to
-          # foo.html): they aren't in the snapshot hash, but an explicit
-          # `{% include "foo.j2" %}` reads them from disk — an edit there
-          # used to hit the "contents are identical" early return forever.
-          affected_templates : Set(String)? = nil
-          changed_template_names : Set(String)? = nil
-          # True when the change can alter page CONTENT and summaries
-          # (shortcode/hook templates in the affected closure), not just the
-          # layout — drives the summary recompute and SEO-surface refresh.
-          content_semantics_changed = false
-          if @per_page_template_hash && deps && old_templates &&
-             old_templates.keys.sort! == templates.keys.sort! &&
-             old_shadowed == @shadowed_template_hashes
-            changed = Set(String).new
-            templates.each do |name, source|
-              changed << name if old_templates[name]? != source
-            end
-            changed_template_names = changed
-            if changed.empty? && (force_pages.nil? || force_pages.empty?) && !membership_changed
-              Logger.info "Template change detected, but contents are identical — nothing to re-render."
-              return true
-            end
-            affected = deps.dependents_closure(changed)
-            if affected.any? { |n| n.starts_with?("hooks/") || n.starts_with?("shortcodes/") }
-              # Hook templates aren't in the {% include %}/{% extends %}
-              # dependency graph (they're invoked from Markdown rendering,
-              # not template rendering), and shortcode output is embedded in
-              # page content AND summaries that listing pages and feeds
-              # re-print — the per-page graph can't scope either, so fall
-              # back to a full re-render. Checking the CLOSURE (not just the
-              # changed set) also catches a partial included by a
-              # shortcode/hook template.
-              affected_templates = nil
-              content_semantics_changed = true
-            else
-              affected_templates = affected
-            end
-            Logger.info "Template change detected (#{changed.join(", ")}). Re-rendering affected pages..." if options.verbose && !changed.empty?
-          else
-            Logger.info "Template change detected. Re-rendering all pages..." if options.verbose
-          end
-
-          pages_to_render = if affected_templates && deps
-                              selected = renderable_pages.select do |page|
-                                entry = determine_template(page, templates, site)
-                                affected_templates.includes?(entry) ||
-                                  deps.shortcodes_used_in(page.raw_content).any? { |sc| affected_templates.includes?(sc) } ||
-                                  format_templates_affected?(page, templates, site, affected_templates)
-                              end
-                              if forced = force_pages
-                                seen = selected.map(&.path).to_set
-                                forced.each do |page|
-                                  selected << page if page.render && !seen.includes?(page.path)
-                                end
-                              end
-                              selected
-                            else
-                              renderable_pages
-                            end
-
-          if options.verbose && affected_templates && pages_to_render.size < renderable_pages.size
-            Logger.info "  #{pages_to_render.size} of #{renderable_pages.size} pages affected."
-          end
-
-          global_vars = build_global_vars(site, options.cache_busting)
-          # Refresh the stash render_global_vars_or_build serves — the 404
-          # page and taxonomy regeneration below would otherwise render
-          # against the site snapshot of the last FULL build.
-          @render_global_vars = global_vars
-          @pages_by_path = build_pages_by_path(site)
-          cache = @cache || Cache.new(enabled: false)
-
-          # Recompute <!-- more --> summaries with the reloaded templates —
-          # but only when they can actually change: a shortcode/hook template
-          # anywhere in the affected closure (content_semantics_changed), an
-          # unclassifiable template change (changed_template_names nil), or
-          # force_pages arriving from run_incremental_then_rerender with
-          # summary_html reset to nil by parse_single_page. A layout-only
-          # edit skips the recompute entirely (it can't affect summaries and
-          # would re-run per-page Crinja work on every keystroke).
-          forced = force_pages || [] of Models::Page
-          summaries_affected = !forced.empty? ||
-                               changed_template_names.nil? ||
-                               content_semantics_changed
-          if summaries_affected
-            # force_pages with render:true are already in pages_to_render;
-            # render:false ones are excluded from the render set but their
-            # summaries still feed listings and feeds.
-            summary_pages = pages_to_render + forced.reject(&.render)
-            render_page_summaries(summary_pages, site, templates, highlight,
-              link_targets: all_pages, global_vars: global_vars)
-
-            # The Crinja value caches and `global_vars` above were built
-            # BEFORE the recompute, so they still embed the OLD summary_html
-            # — a listing page printing `{{ p.summary }}` would re-render
-            # with the stale output (page body new, its summary everywhere
-            # else old). Drop the page-value caches and rebuild the globals
-            # from the fresh summaries.
-            @crinja_cache_mutex.synchronize do
-              @page_crinja_value_cache.clear
-              @section_pages_crinja_cache.clear
-              @section_pages_url_index_cache.clear
-            end
-            global_vars = build_global_vars(site, options.cache_busting)
-            @render_global_vars = global_vars
-          end
-
-          # Re-claim output URLs (see run_incremental): forced content edits
-          # may have introduced or resolved a slug/alias collision.
-          @output_url_winners = compute_output_url_winners(all_pages)
-
-          # User feed templates (rss.xml/atom.xml overrides) are not entry
-          # templates for any page, so an edit to one — or to a partial they
-          # include (dependents_closure above already folded includes) —
-          # selects ZERO pages to re-render. The feed output still changed:
-          # force the SEO-surface refresh and per-term taxonomy feed
-          # regeneration below. Nil affected_templates means "anything may
-          # have changed", which both conditions already treat as affected.
-          feed_templates_affected = affected_templates.nil? ||
-                                    Content::Seo::Feeds::FEED_TEMPLATE_KEYS.values.any? { |key| affected_templates.includes?(key) }
-
-          error_overlay = options.error_overlay
-          count = if pages_to_render.empty?
-                    0
-                  elsif options.parallel && pages_to_render.size > 1
-                    process_files_parallel(pages_to_render, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: error_overlay, profiler: active_profiler)
-                  else
-                    process_files_sequential(pages_to_render, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: error_overlay, profiler: active_profiler)
-                  end
-          raise_on_broken_internal_links!
-
-          # Re-generate 404 page with new template
-          if affected_templates.nil? || affected_templates.includes?("404")
-            generate_404_page(site, templates, output_dir, minify, verbose, global_vars)
-          end
-
-          # Re-generate taxonomy pages with new templates. Their template
-          # resolution falls back taxonomy_term -> taxonomy -> page, so any
-          # of those being affected triggers the regeneration. Forced content
-          # pages may have changed taxonomy membership — regenerate then too.
-          taxonomy_sections = if affected_templates.nil? ||
-                                 (force_pages && !force_pages.empty?) ||
-                                 membership_changed ||
-                                 feed_templates_affected ||
-                                 ["taxonomy", "taxonomy_term", "page"].any? { |name| affected_templates.includes?(name) }
-                                Content::Taxonomies.generate(site, output_dir, templates, verbose, builder: self)
-                              else
-                                [] of Models::Section
-                              end
-
-          # Content semantics changed in this pass — either re-parsed content
-          # (run_incremental_then_rerender) or shortcode/hook template edits
-          # that rewrote the page.content / summary_html that sitemap, feeds,
-          # search, and llms embed. Refresh those surfaces. A pure layout
-          # edit still skips this — template output doesn't feed them —
-          # UNLESS the edit touched a user feed template, whose output IS a
-          # generated surface (see feed_templates_affected above) — or pages
-          # LEFT the built set this pass (membership_changed): sitemap,
-          # feeds, search and llms would keep listing them otherwise.
-          if summaries_affected || feed_templates_affected || membership_changed
-            seo_pages = (site.pages + site.sections).as(Array(Models::Page))
-            seo_pages += taxonomy_sections unless taxonomy_sections.empty?
-            regenerate_seo_surfaces(seo_pages, site, output_dir, verbose, options.parallel, include_robots: true, options: options)
-          elsif site.config.pwa.enabled
-            # A layout-only template edit rightly skips the SEO surfaces
-            # (their inputs didn't change) — but it DID rewrite page HTML,
-            # and sw.js content-hashes the precached pages' bytes, so the
-            # service worker must still be refreshed. Warn-and-continue,
-            # matching regenerate_seo_surfaces: a transient failure here
-            # must not skip cache.save below.
-            begin
-              Content::Seo::Pwa.generate(site, output_dir, verbose)
-            rescue ex
-              Logger.warn "  PWA regeneration failed: #{ex.message}"
-            end
-          end
-
-          cache.save if options.cache
-
-          elapsed = Time.instant - start_time
-          Logger.outcome("rebuilt", "#{count} pages · re-render", :result, elapsed.total_milliseconds)
-          report_cache_stats(verbose)
-          true
-        end
-
-        # Are there any pages stashed by `--fast-start` waiting to render?
-        # Server checks this to decide whether to spawn the background fiber.
-        def has_deferred_pages? : Bool
-          if pages = @deferred_pages
-            !pages.empty?
-          else
-            false
-          end
-        end
-
-        # Render pages that were skipped on the initial `--fast-start` build.
-        # Runs after the dev server is already serving the priority subset,
-        # so user-visible "ready" time stays bounded on large sites.
-        # Regenerates SEO/search files at the end since feeds and the search
-        # index pull from `page.content`, which was empty for deferred pages
-        # during the initial Generate phase.
-        #
-        # Also runs the BeforeRender hooks for the remaining work the
-        # cold pass deferred — OG image generation for non-priority pages
-        # and image resizing for static/content_file globs + non-priority
-        # page assets. Without this step those images never get produced
-        # in a fast-start serve session until the user saves a file.
-        def render_deferred(options : Config::Options::BuildOptions) : Int32
-          @render_workers = options.workers
-          pages = @deferred_pages
-          return 0 if pages.nil? || pages.empty?
-
-          site = @site
-          templates = @templates
-          unless site && templates
-            Logger.warn "render_deferred called before initial build completed; skipping."
-            return 0
-          end
-
-          Logger.info "Fast-start: background-rendering #{pages.size} deferred page(s)..."
-          start_time = Time.instant
-
-          output_dir = options.output_dir
-          minify = options.minify
-          highlight = options.highlight && site.config.highlight.enabled
-          verbose = options.verbose
-          cache = @cache || Cache.new(enabled: false)
-
-          # Re-run the BeforeRender hooks against the full page set. The
-          # ctx carries no priority_pages this time, so OG image
-          # generation and image resizing process whatever the cold pass
-          # left undone. We construct a fresh context rather than reusing
-          # the original — the original's priority_pages would short-
-          # circuit the very hooks we want to fully execute here.
-          deferred_ctx = Lifecycle::BuildContext.new(options)
-          deferred_ctx.site = site
-          deferred_ctx.config = site.config
-          deferred_ctx.pages = site.pages
-          deferred_ctx.sections = site.sections
-          deferred_ctx.templates = templates
-          deferred_ctx.output_dir = output_dir
-          deferred_ctx.cache = @cache
-          deferred_ctx.priority_pages = nil
-          deferred_ctx.profiler = @profiler if @profiler.try(&.enabled?)
-          # Still a partial pass — the priority pass just wrote OG
-          # manifest entries we must not truncate. Without this flag the
-          # deferred pass would overwrite `.og_manifest.json` with only
-          # its own slugs and the next cold start would re-render every
-          # priority page's OG image from scratch.
-          deferred_ctx.partial_render = true
-
-          # Trigger BeforeRender hooks directly — we're not re-running the
-          # Render phase, just the prep work it would have done.
-          @lifecycle.trigger(Lifecycle::HookPoint::BeforeRender, deferred_ctx)
-
-          global_vars = build_global_vars(site, options.cache_busting)
-          # Keep the 404/taxonomy stash in sync (see run_incremental).
-          @render_global_vars = global_vars
-          @pages_by_path = build_pages_by_path(site)
-          renderable = pages.select(&.render)
-
-          count = if options.parallel && renderable.size > 1
-                    process_files_parallel(renderable, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: options.error_overlay, profiler: active_profiler)
-                  else
-                    process_files_sequential(renderable, site, templates, output_dir, minify, cache, highlight, verbose, global_vars, error_overlay: options.error_overlay, profiler: active_profiler)
-                  end
-          # Strict [links] broken_internal = "error": this pass continues the
-          # initial fast-start build, so don't clear here. If the priority
-          # fan-out already raised, its entries are still in the accumulator
-          # (raising never clears) and get re-reported alongside whatever the
-          # deferred pages collected — acceptable: those links are still
-          # broken, and @rebuild_failed escalates the next watch rebuild to a
-          # full build, which clears at entry. The server's fast-start fiber
-          # rescues this and routes it into the error overlay via
-          # notify_build_error; the server keeps running.
-          raise_on_broken_internal_links!
-
-          # Refresh feeds / sitemap / search now that every page has rendered
-          # content. Without this, feed descriptions and the search index
-          # only cover the priority subset. Per-taxonomy RSS feeds and tag
-          # listing pages pull from `page.content` too, so they have to be
-          # regenerated for the same reason — matches `run_rerender`.
-          # Regenerate taxonomy pages BEFORE the SEO surfaces and merge them
-          # into the page set. Previously taxonomy generation ran after the
-          # sitemap, so its pages never appeared in it (taxonomy.sitemap/feed
-          # had no effect on this deferred pass).
-          taxonomy_sections = Content::Taxonomies.generate(site, output_dir, templates, verbose, builder: self)
-          all_pages = (site.pages + site.sections + taxonomy_sections).as(Array(Models::Page))
-          regenerate_seo_surfaces(all_pages, site, output_dir, verbose, options.parallel, options: options)
-
-          # Persist cache updates from the deferred pass. The initial build
-          # already saved once; without this second save, killing the server
-          # before any watch rebuild loses the deferred pages' cache entries
-          # and the next `--cache` cold start has to re-render them.
-          cache.save if options.cache
-
-          # Clear the stash so a second call is a no-op and subsequent
-          # watch-triggered full rebuilds start clean.
-          @deferred_pages = nil
-
-          elapsed = Time.instant - start_time
-          Logger.outcome("rendered", "#{count} deferred pages", :result, elapsed.total_milliseconds)
-          count
-        end
-
-        # Copy `src_path` onto `dest_path` atomically: copy into a
-        # same-directory temp file first, then rename it into place.
-        #
-        # Both callers below run on the serve watcher while HTTP fibers stream
-        # the very same paths to the browser, and `FileUtils.cp` opens the
-        # destination with O_TRUNC and then streams — so the destination is
-        # observably 0 bytes and then every intermediate size, and a request
-        # landing in that window is answered with a truncated body (a 21 MB
-        # stylesheet was served at 0.5 MB, header and body agreeing on the short
-        # length) that nothing retries. `rename` is atomic within a filesystem,
-        # so a reader sees either the old bytes or the new ones. Same invariant
-        # — and the same pid+fiber temp naming, so parallel copies of sibling
-        # files cannot collide — as `FileSafe.atomic_write`.
-        private def atomic_copy(src_path : String, dest_path : String) : Nil
-          # `FileUtils.cp` copies INTO a directory of that name; there is no
-          # file to replace atomically then, so keep the old behaviour instead
-          # of failing the rename on it.
-          if Dir.exists?(dest_path)
-            FileUtils.cp(src_path, dest_path)
-            return
-          end
-
-          tmp = "#{dest_path}.#{Process.pid}.#{Fiber.current.object_id}.tmp"
-          begin
-            File.copy(src_path, tmp)
-            File.rename(tmp, dest_path)
-          rescue ex
-            # Never leave the temp file behind — a failed copy must look
-            # exactly like the old non-atomic failure (destination unchanged).
-            File.delete(tmp) if File.exists?(tmp)
-            raise ex
-          end
-        end
-
-        # Copy only the specified static files to the output directory.
-        # Used by serve mode when only static files have changed.
-        def copy_changed_static(changed_files : Array(String), output_dir : String, verbose : Bool = false)
-          static_config = static_publish_config
-          config = @config
-          sass_on = config.try(&.sass.enabled) || false
-          copied = 0
-          changed_files.each do |src_path|
-            # lstat first — mirrors the full build's collect_static_files
-            # (phases/initialize.cr): a symlinked file whose target escapes
-            # the project must not be published into the output during
-            # serve (e.g. `static/leak -> ~/.ssh/id_rsa` whose target's
-            # mtime change trips the watcher). Dangling symlinks and
-            # directories are skipped like before.
-            lstat = File.info?(src_path, follow_symlinks: false)
-            next if lstat.nil?
-
-            if lstat.symlink?
-              # `static_target_info` (phases/initialize.cr) turns an
-              # unresolvable link — a symlink cycle raises ELOOP out of a bare
-              # `File.info?` — into a skip. Raising here escaped into the
-              # watcher loop, which then failed every single iteration and
-              # could never rebuild again.
-              info = static_target_info(src_path)
-              next if info.nil? || info.directory?
-
-              unless Hwaro::Utils::PathUtils.resolves_within?(src_path, Dir.current)
-                Logger.warn "Skipping static symlink pointing outside the project: #{src_path}"
-                next
-              end
-            else
-              next if lstat.directory?
-              info = lstat
-            end
-
-            # FIFOs, sockets and device nodes are not publishable and hang the
-            # copy forever (`open(2)` on a writer-less FIFO blocks) — same
-            # guard as the full build's collect_static_files.
-            unless info.type.file?
-              Logger.warn "Skipping non-regular static file: #{src_path}"
-              next
-            end
-
-            relative = path_relative_to(src_path, "static")
-            next if static_config.excluded?(relative)
-            next if config.try(&.sass_source?(relative))
-            # When Sass is on, a hand-written sibling of an SCSS entry must not
-            # overwrite the compiled CSS during serve (full build ends with
-            # SCSS winning). Skip the copy and leave the compiled output.
-            if sass_on && relative.ends_with?(".css")
-              scss_sibling = relative.sub(/\.css\z/i, ".scss")
-              scss_src = File.join("static", scss_sibling)
-              if File.exists?(scss_src) && !File.basename(scss_src).starts_with?("_")
-                Logger.warn "  Sass: skipping static copy of #{relative} — sibling #{scss_sibling} compiles to the same path."
-                next
-              end
-            end
-            dest_path = File.join(output_dir, relative)
-            # Parity with copy_changed_content_files: a watcher path outside
-            # static/ yields a `../`-relative destination that must never be
-            # written outside the output directory.
-            unless Utils::OutputGuard.within_output_dir?(dest_path, output_dir)
-              Logger.warn "Skipping static file outside output directory: #{relative}"
-              next
-            end
-
-            Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest_path))
-            atomic_copy(src_path, dest_path)
-            copied += 1
-          end
-          Logger.outcome("copied", "#{copied} static #{copied == 1 ? "file" : "files"}") if copied > 0
-        end
-
-        # Recompile all SCSS entries into the output directory. Used by
-        # serve mode when a `.scss` source changes — such files publish as
-        # compiled `.css`, never verbatim. No-ops unless [sass] is enabled.
-        #
-        # Returns true when reprocessing the asset bundles changed the
-        # manifest (a fingerprinted filename moved) — see
-        # reprocess_asset_bundles for what callers must do then.
-        def recompile_sass(output_dir : String) : Bool
-          config = @config
-          return false unless config && config.sass.enabled
-
-          compiler = Assets::SassCompiler.new(config.sass, config.static)
-          count = compiler.compile_all(output_dir)
-          Logger.outcome("compiled", "#{count} sass #{count == 1 ? "file" : "files"}") if count > 0
-
-          # Bundle entries with `.scss` sources only recompile inside the asset
-          # pipeline (AfterInitialize on a full build). Static-only serve
-          # reloads would otherwise leave fingerprinted bundles stale.
-          config.assets.enabled ? reprocess_asset_bundles(output_dir) : false
-        end
-
-        # True when a watcher-relative path (e.g. "static/js/app.js") is a
-        # source file of a configured [assets] bundle. The serve watcher uses
-        # this to know a plain (non-Sass) static save must re-run the bundle
-        # pipeline — bundle inputs are `source_dir`-joined `bundle.files`,
-        # exactly how Assets::Pipeline reads them.
-        def asset_bundle_source?(path : String) : Bool
-          config = @config
-          return false unless config && config.assets.enabled
-
-          normalized = Path[path].normalize.to_s
-          config.assets.bundles.any? do |bundle|
-            bundle.files.any? do |file|
-              Path[config.assets.source_dir, file].normalize.to_s == normalized
-            end
-          end
-        end
-
-        # Re-run the asset pipeline so SCSS (or plain CSS/JS) bundle sources
-        # refresh under serve. Updates the AssetHooks class-level manifest so
-        # subsequent renders see new fingerprint paths.
-        #
-        # Returns true when the manifest changed — with fingerprinting on,
-        # every already-rendered page still references the OLD hashed
-        # filename, so callers must follow up with a page re-render.
-        def reprocess_asset_bundles(output_dir : String) : Bool
-          config = @config
-          return false unless config && config.assets.enabled
-
-          old_manifest = Content::Hooks::AssetHooks.manifest
-          pipeline = Assets::Pipeline.new(config.assets, config.base_url, config.sass.enabled)
-          pipeline.process(output_dir)
-          Content::Hooks::AssetHooks.replace_manifest(pipeline.manifest)
-          if pipeline.manifest.size > 0
-            Logger.outcome("bundled", "#{pipeline.manifest.size} asset #{pipeline.manifest.size == 1 ? "bundle" : "bundles"}")
-          end
-          pipeline.manifest != old_manifest
-        end
-
-        # Republish non-Markdown content assets (images, etc.) to the output
-        # directory, preserving their path relative to `content/`. Mirrors what
-        # the full build does via the raw-files path in the Write phase, but
-        # only touches the files the watcher actually flagged as changed.
-        #
-        # Skips files whose extension isn't permitted by `[content.files]`, so
-        # the watcher can't smuggle a `.md` or a disallowed type into output.
-        # No-ops when `[content.files]` isn't enabled — nothing was published
-        # in the first place, so there's nothing to refresh. (`@config` is nil
-        # only before the initial build, which `Server#run_with_options`
-        # already performs before spawning the watcher, so the watcher always
-        # sees a loaded config.)
-        def copy_changed_content_files(changed_files : Array(String), output_dir : String, verbose : Bool = false)
-          config = @config
-          unless config && config.content_files.enabled?
-            Logger.debug "  Content-file republish skipped — content.files not enabled."
-            return
-          end
-
-          copied = 0
-          changed_files.each do |src_path|
-            next unless File.exists?(src_path)
-            next if File.directory?(src_path)
-
-            relative = path_relative_to(src_path, "content")
-
-            next unless config.content_files.publish?(relative)
-
-            dest_path = File.join(output_dir, relative)
-            unless Utils::OutputGuard.within_output_dir?(dest_path, output_dir)
-              Logger.warn "Skipping content file outside output directory: #{relative}"
-              next
-            end
-
-            Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest_path))
-            atomic_copy(src_path, dest_path)
-            Logger.action :copy, dest_path, Logger::Role::Dim if verbose
-            copied += 1
-          end
-          Logger.outcome("copied", "#{copied} content #{copied == 1 ? "file" : "files"}") if copied > 0
-        end
-
-        # Map source paths that were removed from disk to the output files
-        # they produced in the last build. A rebuild rewrites surviving pages
-        # but never deletes what's gone, so the serve watcher captures this
-        # BEFORE rebuilding (while @site still knows the page's URL/slug) and
-        # removes the orphans after — otherwise a deleted page keeps serving
-        # 200 and ships with the next deploy of `public/`.
-        def stale_outputs_for_removed(removed_paths : Array(String), output_dir : String) : Array(String)
-          outputs = [] of String
-          site = @site
-          removed_paths.each do |path|
-            if path.starts_with?("static/")
-              relative = path.lchop("static/")
-              # SCSS sources publish as compiled `.css`, never verbatim — the
-              # stale artifact of a removed entry is the compiled sibling.
-              if @config.try(&.sass_source?(relative))
-                relative = relative.sub(/\.scss\z/, ".css")
-              end
-              dest = File.join(output_dir, relative)
-              outputs << dest if Utils::OutputGuard.within_output_dir?(dest, output_dir)
-            elsif path.starts_with?("content/")
-              if path.downcase.ends_with?(".md") || path.downcase.ends_with?(".markdown")
-                next unless site
-                rel = path.lchop("content/")
-                # Section _index pages live in site.sections, not site.pages —
-                # deleting one used to leave its index.html served forever.
-                if page = site.pages.find { |p| p.path == rel } || site.sections.find { |s| s.path == rel }
-                  if primary = get_output_path(page, output_dir)
-                    outputs << primary
-                  end
-
-                  # Sibling output-format files (see `[outputs]`): prefer what
-                  # the cache actually recorded for this source (the ground
-                  # truth of what was last written); fall back to recomputing
-                  # from the page's effective formats when the cache has
-                  # nothing (cache disabled, or never built with caching on).
-                  cached_fmt_paths = @cache.try(&.output_paths_for(path)) || [] of String
-                  if !cached_fmt_paths.empty?
-                    outputs.concat(cached_fmt_paths)
-                  elsif cfg = @config
-                    outputs.concat(format_output_paths(page, output_dir, effective_output_formats(page, cfg)))
-                  end
-                end
-              else
-                dest = File.join(output_dir, path.lchop("content/"))
-                outputs << dest if Utils::OutputGuard.within_output_dir?(dest, output_dir)
-              end
-            end
-          end
-          outputs
-        end
-
-        # Every output file the CURRENT site claims — primary page outputs
-        # plus output-format siblings, computed exactly like
-        # collect_page_output_paths so the two can never drift. The serve
-        # watcher filters its pre-rebuild stale list through this AFTER the
-        # rebuild: a source deleted and re-created under a different path in
-        # one changeset (foo.md → foo/index.md) maps to the same output file,
-        # which the rebuild just rewrote and must not be deleted.
-        def owned_output_paths(output_dir : String) : Set(String)
-          owned = Set(String).new
-          if site = @site
-            (site.pages + site.sections).each do |page|
-              collect_page_output_paths(page, output_dir).each { |path| owned << path }
-            end
-          end
-          owned
-        end
-
-        # Primary output file plus output-format siblings for a page — used
-        # to prune the old files when an edit relocates the page's URL or
-        # excludes the page from the site.
-        private def collect_page_output_paths(page : Models::Page, output_dir : String) : Array(String)
-          paths = [get_output_path(page, output_dir)].compact
-          if cfg = @config
-            paths.concat(format_output_paths(page, output_dir, effective_output_formats(page, cfg)))
-          end
-          paths
-        end
-
-        # Delete output files an incremental rebuild has orphaned (slug
-        # change, page newly excluded), pruning directories the deletion
-        # leaves empty. Guarded so a corrupt path can never delete outside
-        # the output directory. Mirrors Server#remove_stale_outputs.
-        private def delete_orphaned_outputs(paths : Array(String), output_dir : String)
-          paths.each do |path|
-            next unless File.exists?(path)
-            next unless Utils::OutputGuard.within_output_dir?(path, output_dir)
-            File.delete(path)
-            Logger.info "  Removed stale output: #{path}"
-
-            dir = File.dirname(path)
-            while dir != output_dir && Utils::OutputGuard.within_output_dir?(dir, output_dir) && Dir.exists?(dir) && Dir.empty?(dir)
-              Dir.delete(dir)
-              dir = File.dirname(dir)
-            end
-          rescue ex
-            Logger.debug "  Could not remove stale output #{path}: #{ex.message}"
-          end
-        end
-
-        # Full build — the real implementation behind both `run` forms.
-        # The incoming struct is stored on the BuildContext verbatim, so
-        # fields the keyword form doesn't expose (`full`, `serve_mode`)
-        # survive to the phases and hooks that branch on them (`--full`
-        # cache clearing, `[og.image] lazy_generate` under serve).
+        # Full build. The incoming struct is stored on the BuildContext
+        # verbatim, so every field (`full`, `serve_mode`, …) reaches the
+        # phases and hooks that branch on them (`--full` cache clearing,
+        # `[og.image] lazy_generate` under serve).
         #
         # Returns false when the build failed without raising (pre-hook
         # failure or a phase abort) — the serve watcher branches on this to
@@ -1607,16 +780,34 @@ module Hwaro
           # for missing files and TOML parse failures, so callers (and
           # `--json` consumers) can branch on HWARO_E_CONFIG without the
           # build pipeline rewrapping the exception.
+          previous_config = @config
           config = Models::Config.load(env: options.env)
+          # Before anything is written: a cold build wipes the output first.
+          config.require_resolved_base_url!(options.base_url)
           @config = config
+          # `[build]` supplies output_dir/drafts/parallel/cache for anything the
+          # command line left at its default. Applied before the BuildContext is
+          # built so every phase (and the output guard) sees the same values.
+          options.apply_build_config!(config.build)
+          @html_stats = config.build.write_stats ? Utils::HtmlStats.new : nil
           pre_hooks = config.build.hooks.pre
           post_hooks = config.build.hooks.post
 
           # Run pre-build hooks
           unless pre_hooks.empty?
             unless Utils::CommandRunner.run_pre_hooks(pre_hooks)
-              Logger.error "Build aborted due to pre-build hook failure."
-              return false
+              # Classified, not `return false`. Returning false made the CLI
+              # synthesize HWARO_E_INTERNAL / exit 70 — the code reserved for
+              # hwaro's own bugs — for a user command listed in config.toml
+              # exiting non-zero, so CI that alerts on internal faults fired
+              # on `npm run build` failing. `hwaro serve` treats a raise and a
+              # false the same way (see Server#apply_changeset), so the dev
+              # loop is unaffected.
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_CONFIG,
+                message: "Build aborted: a [build] hooks.pre command failed (see the command output above).",
+                hint: "Fix the failing command, or remove it from hooks.pre in config.toml.",
+              )
             end
           end
 
@@ -1627,7 +818,6 @@ module Hwaro
           # Initialize profiler
           profiler = Profiler.new(enabled: options.profile)
           @profiler = profiler
-          profiler.start
 
           if options.streaming?
             Logger.info "  Streaming mode enabled (batch size: #{options.batch_size})"
@@ -1640,11 +830,35 @@ module Hwaro
           @context = ctx
 
           # Reset internal caches (preserve @config loaded above)
+          @carry_prune_baselines = @prune_baselines_pending
+          @prune_baselines_pending = true
+          # Shaped by the config the previous site was BUILT with: a config
+          # edit that turned an `[outputs]` format or AMP off must still
+          # prune the files those wrote.
+          current_outputs = @site ? owned_output_paths(options.output_dir, previous_config) : Set(String).new
+          @previous_page_outputs = @carry_prune_baselines ? @previous_page_outputs | current_outputs : current_outputs
           @site = nil
           @templates = nil
           @cache_manager.clear_runtime
           @created_dirs.clear
           clear_broken_internal_links
+          # The load_data() memo is keyed by ms-mtime, which a rewrite inside
+          # one filesystem timestamp tick does not move; a build must read
+          # the data files as they are now, not as a previous build saw them.
+          Content::Processors::TemplateEngine.clear_load_data_cache
+          # Same for the SRI digests (keyed on mtime + size, so this is
+          # belt-and-braces) and the record `hooks.post` is checked against.
+          Utils::SriCache.clear
+          # Include sources and the expanded-content memo are re-learned by
+          # this build's render.
+          @include_sources_mutex.synchronize do
+            @include_sources = {} of String => String?
+            @expanded_raw_memo.clear
+          end
+          # Same lifetime for the once-per-BUILD shortcode warnings (missing
+          # template, unclosed block): a `serve` session that never cleared them
+          # reported each name only for the first rebuild it appeared in.
+          @shortcode_warnings_seen = nil
 
           # Execute build phases through lifecycle. The live status region
           # animates the current phase on a TTY; `ensure` guarantees the
@@ -1683,123 +897,60 @@ module Hwaro
             Logger.info "No content found. Add Markdown files under content/ before deploying, or run `hwaro new <path>.md` to scaffold one."
           end
 
+          # Human-readable reports (--profile, --debug) go to stderr under
+          # --json: stdout must carry exactly one JSON document, and these
+          # tables printed ahead of the build envelope made it unparseable.
+          # Through Logger's guarded streams: on a closed stdout (a serve whose
+          # reader went away) a raw STDOUT write failed the rebuild here, after
+          # the pages were written but before the post-build hooks.
+          report_io = CLI::Runner.json_mode? ? Logger.err_io : Logger.io
+
           # Print profiling report if enabled
-          profiler.report
-          profiler.template_report
-          profiler.markdown_report
-          profiler.asset_report
-          profiler.hook_report
+          profiler.report(report_io)
+          profiler.template_report(report_io)
+          profiler.markdown_report(report_io)
+          profiler.asset_report(report_io)
+          profiler.hook_report(report_io)
 
           # Print cache stats
           report_cache_stats(options.verbose)
 
           # Run post-build hooks
           unless post_hooks.empty?
+            # Files already off their printed value were changed by the build
+            # itself (Write's minify, Finalize's prune), not by the hooks.
+            stale_before = Utils::SriCache.stale.to_set
             unless Utils::CommandRunner.run_post_hooks(post_hooks)
               Logger.warn "Post-build hooks failed, but build was successful."
             end
+            warn_integrity_changed_by_post_hooks(stale_before)
+            warn_csp_changed_by_post_hooks(config)
           end
 
           if options.debug
             if debug_site = @site
-              Utils::DebugPrinter.print(debug_site)
+              Utils::DebugPrinter.print(debug_site, report_io)
             end
           end
 
           true
         end
 
-        # Resolve `path` relative to `root`, falling back to a plain prefix
-        # strip when it can't be made relative (e.g. an absolute path).
-        private def path_relative_to(path : String, root : String) : String
-          Path[path].relative_to(root).to_s
-        rescue ArgumentError
-          path.lchop("#{root}/")
-        end
-
-        # Renderer over user feed templates (templates/rss.xml.jinja /
-        # atom.xml.jinja, loaded under the keys "rss.xml"/"atom.xml"). Nil
-        # when no override template exists so the feed generators keep the
-        # zero-cost programmatic path. The proc renders with a FRESH Crinja
-        # environment per call — the shared env is not MT-safe (with_scope
-        # mutates the env) and the SEO tasks that generate feeds run in
-        # parallel fibers. create_fresh_crinja_env carries the snapshot
-        # template loader, so `{% include %}` inside a feed template works.
-        def feed_template_renderer : Content::Seo::Feeds::Renderer?
-          return unless feed_template_present?
-
-          ->(source : String, context : Hash(String, Crinja::Value)) do
-            env = create_fresh_crinja_env
-            env.from_string(source).render(context)
+        # The pages carry `integrity` values hashed during Render; a post hook
+        # that rewrote one of those files (a minifier over public/) makes the
+        # browser block it. Nothing re-renders after the hooks, so say so.
+        private def warn_integrity_changed_by_post_hooks(stale_before : Set(String))
+          Utils::SriCache.stale.each do |path|
+            next if stale_before.includes?(path)
+            Logger.warn "[build] hooks.post changed #{path} after its integrity was printed into pages; browsers will block it. Rewrite it in hooks.pre (into static/) instead."
           end
         end
 
-        # True when a user feed template override is loaded. Also consulted
-        # by the Generate phase's skip-if-unchanged gate: a template-only
-        # edit doesn't touch content, so a warm --cache build would keep the
-        # stale feed on disk if feeds were skipped.
-        def feed_template_present? : Bool
-          templates = @templates
-          return false unless templates
-          Content::Seo::Feeds::FEED_TEMPLATE_KEYS.values.any? { |key| templates.has_key?(key) }
-        end
-
-        # Regenerate the lightweight SEO/search surfaces (sitemap, feeds, llms,
-        # search index, optionally robots) for the given page set. Each
-        # generator writes a distinct output file with no shared in-process
-        # state, so task order doesn't affect output.
-        #
-        # `raise_on_error: false`: these are the serve-time passes (watch
-        # incremental, fast-start deferred). A transient generator failure
-        # must warn-and-continue here — raising would skip cache.save, the
-        # deferred-pages cleanup, and the live-reload signal even though
-        # every page rendered fine. The cold-build Generate phase keeps the
-        # fail-loud default via its own ParallelHelper.execute call.
-        private def regenerate_seo_surfaces(pages : Array(Models::Page), site : Models::Site, output_dir : String, verbose : Bool, parallel : Bool, include_robots : Bool = false, options : Config::Options::BuildOptions? = nil)
-          seo_tasks = [
-            -> { Content::Seo::Sitemap.generate(pages, site, output_dir, verbose); nil },
-            -> { Content::Seo::Feeds.generate(pages, site.config, output_dir, verbose, templates: @templates, renderer: feed_template_renderer); nil },
-          ] of Proc(Nil)
-          # Robots slots in right after Feeds — its original position in the
-          # incremental path — so sequential (--no-parallel) output ordering is
-          # preserved, not just the generated files.
-          seo_tasks << -> { Content::Seo::Robots.generate(site.config, output_dir, verbose); nil } if include_robots
-          seo_tasks << -> { Content::Seo::Llms.generate(site.config, pages, output_dir, verbose); nil }
-          seo_tasks << -> { Content::Search.generate(pages, site.config, output_dir, verbose); nil }
-          # Auto-OG images: the incremental/rerender passes never run the
-          # BeforeRender `og_image:generate` hook, so a re-parsed page's
-          # OG file went stale even though its HTML keeps the auto-assigned
-          # URL (see ParseContent#parse_single_page). The manifest hash makes
-          # this a near no-op when no title/description changed. Lazy serve
-          # mode keeps its on-request contract (OgLazyImageHandler), and
-          # --skip-og-image is honored like the hook does. Runs BEFORE the
-          # surface pool (not inside it): generate assigns page.image, which
-          # the feed/search tasks read.
-          if opts = options
-            ai = site.config.og.auto_image
-            if ai.enabled && !opts.skip_og_image && !(ai.lazy_generate && opts.serve_mode)
-              begin
-                Content::Seo::OgImage.generate(pages, site.config, output_dir, verbose, parallel: false)
-              rescue ex
-                # Same warn-and-continue contract as the surface pool below —
-                # a transient OG failure must not skip cache.save / reload.
-                Logger.warn "  OG image regeneration failed: #{ex.message}"
-              end
-            end
-          end
-          ParallelHelper.execute(seo_tasks, parallel, raise_on_error: false)
-          # PWA sw.js content-hashes the bytes of the files it precaches —
-          # including the search index the tasks above just rewrote — so it
-          # regenerates AFTER they finish, mirroring the full build's
-          # AfterWrite hook. Without this no serve incremental path ever
-          # rewrote sw.js and registered service workers kept serving stale
-          # bytes through live reloads.
-          if site.config.pwa.enabled
-            begin
-              Content::Seo::Pwa.generate(site, output_dir, verbose)
-            rescue ex
-              Logger.warn "  PWA regeneration failed: #{ex.message}"
-            end
+        # Same for `[csp]`: the policies hash the inline bytes Finalize saw.
+        private def warn_csp_changed_by_post_hooks(config : Models::Config)
+          return unless result = @csp_result
+          Csp.changed_pages(config.csp, result).each do |path|
+            Logger.warn "[build] hooks.post changed inline scripts or styles in #{path} after its Content-Security-Policy was computed; browsers will block them. Make the change in hooks.pre or a template instead."
           end
         end
 
@@ -1820,7 +971,7 @@ module Hwaro
               @related_posts_crinja_cache.delete(page.path)
 
               if series_name = page.series
-                @series_crinja_cache.delete(series_name)
+                @series_crinja_cache.reject! { |key, _| key[0] == series_name }
               end
 
               # Neighbors' cached values reference this page
@@ -1906,7 +1057,10 @@ module Hwaro
           result = execute_generate_phase(ctx, profiler)
           return result if result != Lifecycle::HookResult::Continue
 
-          if ctx.options.streaming?
+          # Not under serve: its incremental rebuilds re-render pages the
+          # edit didn't touch from this same page set, and an emptied source
+          # renders as an empty body with no backlinks.
+          if ctx.options.streaming? && !ctx.options.serve_mode
             ctx.all_pages.each(&.raw_content=(""))
             GC.collect
           end

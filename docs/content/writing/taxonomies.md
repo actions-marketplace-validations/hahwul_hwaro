@@ -31,32 +31,33 @@ name = "authors"
 | `feed` | bool | false | Generate RSS feed for each term |
 | `sitemap` | bool | true | Include taxonomy pages in sitemap |
 | `paginate_by` | int | — | Items per page on term pages |
-| `sort_by` | string | "date" | Order of pages within a term: `"date"`, `"title"`, or `"weight"` (see [Sorting](#sorting)) |
+| `sort_by` | string | "date" | Order of pages within a term: `"date"`, `"published"`, `"title"`, or `"weight"` (see [Sorting](#sorting)) |
 | `reverse` | bool | false | Flip whichever order `sort_by` produced |
 | `terms_sort_by` | string | "name" | Order of the terms list: `"name"` or `"count"` (see [Sorting](#sorting)) |
 
 ## Sorting
 
-`sort_by` controls the order of pages within each term — on the written
+`sort_by` controls the order of pages within each term: on the written
 term pages, in `term.pages` from `get_taxonomy()`, and in per-term
 pagination. The semantics match section sorting exactly:
 
-- `"date"` (default) — newest first; `reverse = true` gives oldest first.
-- `"title"` — alphabetical ascending; `reverse = true` descends.
+- `"date"` (default): newest first; `reverse = true` gives oldest first.
+- `"published"` — like `"date"`, but on the publish `date` alone (`updated` is ignored).
+- `"title"` — ascending by title, compared byte by byte (uppercase before lowercase); `reverse = true` descends.
 - `"weight"` — lowest weight first; `reverse = true` descends.
 
 An invalid `sort_by` value logs a warning and keeps the `"date"` default.
 
-`terms_sort_by` controls the order of the terms list — on the taxonomy
+`terms_sort_by` controls the order of the terms list, on the taxonomy
 index page and in `get_taxonomy().items`:
 
-- `"name"` (default) — alphabetical ascending.
+- `"name"` (default): ascending by term name, ignoring case, so `apple` sorts before `Zebra`.
 - `"count"` — page count descending, name-ascending tiebreak. On a
   multilingual site, each language's index uses that language's own page
   counts.
 
 **Term feeds are exempt.** With `feed = true`, each term's RSS feed stays
-reverse-chronological regardless of `sort_by` — RSS consumers assume
+reverse-chronological regardless of `sort_by`, because RSS consumers assume
 newest-first entries.
 
 ```toml
@@ -92,7 +93,7 @@ tech = ["crystal", "security"]
 ```
 
 In templates, a page's own terms are available as `page.taxonomies.<name>`
-(e.g. `{% for t in page.taxonomies.tech %}`) — also on the page objects
+(e.g. `{% for t in page.taxonomies.tech %}`), and also on the page objects
 inside `section.pages`, `site.pages`, and term page lists.
 
 ## Generated URLs
@@ -108,7 +109,7 @@ With `paginate_by` set, term pages paginate at `/tags/crystal/page/2/`, `/tags/c
 
 ## Templates
 
-Both templates receive a ready-made listing as `{{ content }}` — the term list in `taxonomy.html`, the page list in `taxonomy_term.html`. For custom markup, use [`get_taxonomy()`](#get-taxonomy-function) instead of `content`.
+Both templates receive a ready-made listing as `{{ content }}`: the term list in `taxonomy.html`, the page list in `taxonomy_term.html`. For custom markup, use [`get_taxonomy()`](#get-taxonomy-function) instead of `content`.
 
 ### Taxonomy Index
 
@@ -151,7 +152,7 @@ Custom term list:
 {% endblock %}
 ```
 
-Custom page list — look up the current term's pages via `get_taxonomy()`:
+Custom page list, looking up the current term's pages via `get_taxonomy()`:
 
 ```jinja
 {% set tax = get_taxonomy(kind=taxonomy_name) %}
@@ -230,11 +231,13 @@ Generate taxonomy term URL:
 {% if page.tags %}
 <div class="post-tags">
 {% for tag in page.tags %}
-  <a href="/tags/{{ tag | slugify }}/">{{ tag }}</a>
+  <a href="{{ get_taxonomy_url(kind="tags", term=tag) }}">{{ tag }}</a>
 {% endfor %}
 </div>
 {% endif %}
 ```
+
+Use `get_taxonomy_url()` (or `term.slug` from `get_taxonomy()`) rather than `{{ tag | slugify }}`: when two terms collide on a slug (`Crystal` and `crystal`), the generator writes `/tags/crystal/` and `/tags/crystal-2/`, and only the function knows which is which.
 
 ### Category Navigation
 

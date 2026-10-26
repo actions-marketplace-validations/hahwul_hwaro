@@ -9,9 +9,11 @@ require "yaml"
 require "toml"
 require "./content_lister"
 require "./doctor"
+require "./internal_link_index"
 require "../utils/errors"
 require "../utils/frontmatter_scanner"
 require "../utils/logger"
+require "../utils/markdown_code"
 require "../utils/text_utils"
 
 module Hwaro
@@ -22,7 +24,18 @@ module Hwaro
 
       alias FrontmatterValue = String | Bool | Int64 | Float64?
 
+      # Parsed front matter plus the tag list carried OUT-OF-BAND. Tags
+      # used to be smuggled through the field hash under a fake "_tags"
+      # key joined with commas, so a real front matter key named `_tags`
+      # triggered bogus mixed-case tag warnings for non-tag data, and
+      # genuine tags containing commas were split apart before the
+      # convention check ever saw them.
+      private record ParsedFrontmatter,
+        fields : Hash(String, FrontmatterValue),
+        tags : Array(String) = [] of String
+
       @content_dir : String
+      @link_index : InternalLinkIndex?
 
       def initialize(@content_dir : String = "content")
       end
@@ -55,10 +68,7 @@ module Hwaro
       # fine. The skip is announced by `ContentWalk`, so the summary's counts
       # are never quietly short of a file the caller can see on disk.
       private def find_content_files : Array(String)
-        files = [] of String
-        Dir.glob(File.join(@content_dir, "**", "*.md")) { |f| files << f if ContentWalk.readable_file?(f) }
-        Dir.glob(File.join(@content_dir, "**", "*.markdown")) { |f| files << f if ContentWalk.readable_file?(f) }
-        files.sort
+        ContentWalk.find_content_files(@content_dir)
       end
 
       private def validate_file(file_path : String, issues : Array(Issue))
@@ -66,18 +76,23 @@ module Hwaro
         # BOM'd file isn't reported as missing every front matter field.
         content = Utils::TextUtils.strip_bom(File.read(file_path))
 
-        frontmatter = parse_frontmatter(file_path, content, issues) || {} of String => FrontmatterValue
+        parsed = parse_frontmatter(file_path, content, issues)
+        frontmatter = parsed.try(&.fields) || {} of String => FrontmatterValue
+        tags = parsed.try(&.tags) || [] of String
 
         title = frontmatter["title"]?
         description = frontmatter["description"]?
         date = frontmatter["date"]?
         draft = frontmatter["draft"]?
-        tags = frontmatter["_tags"]?
 
         # title check
-        if title.nil? || title == "Untitled"
+        # A blank `title = ""` reads as missing — except on the homepage, where
+        # it is the documented way to drop the page title (the blog scaffold
+        # ships it; every scaffold's <title> falls back to site.title).
+        blank = title.is_a?(String) && title.strip.empty? && !home_page?(file_path)
+        if title.nil? || blank || title == "Untitled"
           issues << Issue.new(id: "content-title-missing", level: :warning, category: "content", file: file_path,
-            message: title.nil? ? "Missing title in frontmatter" : "Title is \"Untitled\"")
+            message: title.nil? ? "Missing title in frontmatter" : (blank ? "Title is empty" : "Title is \"Untitled\""))
         end
 
         # description check
@@ -98,21 +113,26 @@ module Hwaro
         end
 
         # tag convention check (mixed-case warning)
-        if tags.is_a?(String) && !tags.as(String).empty?
-          check_tag_conventions(file_path, tags.as(String), issues)
-        end
+        check_tag_conventions(file_path, tags, issues) unless tags.empty?
 
         # image alt text check
         check_image_alt(file_path, content, issues)
 
         # internal link check
         check_internal_links(file_path, content, issues)
-      rescue ex
+      rescue ex : IO::Error | File::Error
         issues << Issue.new(id: "content-read-error", level: :error, category: "content", file: file_path,
           message: "Failed to read file: #{ex.message}")
+      rescue ex
+        # A readable file can still blow up the scanners — invalid UTF-8
+        # makes the front-matter regex raise ArgumentError. Calling that a
+        # read failure pointed authors at permissions/disk when the
+        # problem is the file's encoding or structure.
+        issues << Issue.new(id: "content-read-error", level: :error, category: "content", file: file_path,
+          message: "Cannot process file (invalid encoding or malformed content): #{ex.message}")
       end
 
-      private def parse_frontmatter(file_path : String, content : String, issues : Array(Issue)) : Hash(String, FrontmatterValue)?
+      private def parse_frontmatter(file_path : String, content : String, issues : Array(Issue)) : ParsedFrontmatter?
         if match = content.match(TOML_FRONTMATTER_RE)
           begin
             toml_data = TOML.parse(match[1])
@@ -126,15 +146,14 @@ module Hwaro
               when Time    then result[key] = raw.to_s
               end
             end
-            # Extract tags as comma-separated string for convention check
-            if tags_val = toml_data["tags"]?
-              raw = tags_val.raw
-              if raw.is_a?(Array)
-                tag_strs = raw.compact_map { |item| item.as(TOML::Any).raw.as?(String) }
-                result["_tags"] = tag_strs.join(",") unless tag_strs.empty?
-              end
-            end
-            return result
+            # Extract tags as comma-separated string for convention check.
+            # The `[taxonomies] tags` table is the scaffold's own (and Zola's)
+            # way of declaring them, and the build falls back to it when no
+            # top-level `tags` exists — without the same fallback here, those
+            # sites were never tag-checked at all.
+            tag_strs = toml_tag_list(toml_data["tags"]?)
+            tag_strs = toml_tag_list(toml_data["taxonomies"]?.try(&.as_h?).try(&.["tags"]?)) if tag_strs.empty?
+            return ParsedFrontmatter.new(result, tag_strs)
           rescue ex
             issues << Issue.new(id: "content-frontmatter-toml-error", level: :error, category: "content", file: file_path,
               message: "TOML frontmatter parse error: #{ex.message}")
@@ -149,7 +168,11 @@ module Hwaro
                 k = key.as_s? || next
                 if s = value.as_s?
                   result[k] = s
-                elsif b = value.as_bool?
+                elsif !(b = value.as_bool?).nil?
+                  # `elsif b = value.as_bool?` DROPPED every `false` value —
+                  # Crystal treats the returned `false` as a failed match — so
+                  # a `draft: false` (or any other false flag) never reached
+                  # the checks below.
                   result[k] = b
                 elsif i = value.as_i64?
                   # 64-bit accessor: `as_i?` only type-checks (`@raw.as(Int).to_i`),
@@ -163,26 +186,31 @@ module Hwaro
                   result[k] = t.to_s
                 end
               end
-              # Extract tags for convention check
-              if tags_node = h[YAML::Any.new("tags")]?
-                if arr = tags_node.as_a?
-                  tag_strs = arr.compact_map(&.as_s?)
-                  result["_tags"] = tag_strs.join(",") unless tag_strs.empty?
-                end
+              # Extract tags for convention check (same `[taxonomies]`
+              # fallback the build applies).
+              tag_strs = yaml_tag_list(h[YAML::Any.new("tags")]?)
+              if tag_strs.empty?
+                tag_strs = yaml_tag_list(h[YAML::Any.new("taxonomies")]?.try(&.as_h?).try(&.[YAML::Any.new("tags")]?))
               end
-              return result
+              return ParsedFrontmatter.new(result, tag_strs)
             end
             # Empty or non-mapping YAML frontmatter (e.g. `---\n---`) is valid
             # YAML but carries no title/description. Return an empty hash (not
             # nil) so the missing-field checks still fire — matching empty TOML,
             # which already reaches them via its `{}` result.
-            return {} of String => FrontmatterValue
+            return ParsedFrontmatter.new({} of String => FrontmatterValue)
           rescue ex
+            # Prose between two thematic breaks (`---`, `*Note*: …`, `---`)
+            # is not front matter to the build, which renders it; only a
+            # block that looks like front matter is reported as broken.
+            return unless Utils::FrontmatterScanner.yaml_front_matter_like?(match[1])
             issues << Issue.new(id: "content-frontmatter-yaml-error", level: :error, category: "content", file: file_path,
               message: "YAML frontmatter parse error: #{ex.message}")
             return
           end
-        elsif content.starts_with?('{')
+        elsif Utils::FrontmatterScanner.json_start?(content)
+          # Same JSON-intent test as the build: a page opening with a
+          # shortcode (`{{ … }}`) or a Jinja tag has no front matter at all.
           end_idx = Utils::FrontmatterScanner.find_json_end(content)
           unless end_idx
             issues << Issue.new(id: "content-frontmatter-json-error", level: :error, category: "content", file: file_path,
@@ -198,7 +226,8 @@ module Hwaro
               h.each do |k, value|
                 if s = value.as_s?
                   result[k] = s
-                elsif b = value.as_bool?
+                elsif !(b = value.as_bool?).nil?
+                  # Same falsy-drop as the YAML branch above.
                   result[k] = b
                 elsif i = value.as_i64?
                   # Same Int32 overflow hazard as the YAML branch above.
@@ -207,13 +236,9 @@ module Hwaro
                   result[k] = f
                 end
               end
-              if tags_node = h["tags"]?
-                if arr = tags_node.as_a?
-                  tag_strs = arr.compact_map(&.as_s?)
-                  result["_tags"] = tag_strs.join(",") unless tag_strs.empty?
-                end
-              end
-              return result
+              tag_strs = json_tag_list(h["tags"]?)
+              tag_strs = json_tag_list(h["taxonomies"]?.try(&.as_h?).try(&.["tags"]?)) if tag_strs.empty?
+              return ParsedFrontmatter.new(result, tag_strs)
             end
             return
           rescue ex
@@ -226,8 +251,26 @@ module Hwaro
         nil
       end
 
+      private def toml_tag_list(value : TOML::Any?) : Array(String)
+        raw = value.try(&.raw)
+        return [] of String unless raw.is_a?(Array)
+        raw.compact_map { |item| item.as(TOML::Any).raw.as?(String) }
+      end
+
+      private def yaml_tag_list(value : YAML::Any?) : Array(String)
+        value.try(&.as_a?).try(&.compact_map(&.as_s?)) || [] of String
+      end
+
+      private def json_tag_list(value : JSON::Any?) : Array(String)
+        value.try(&.as_a?).try(&.compact_map(&.as_s?)) || [] of String
+      end
+
       private def check_date_format(file_path : String, date_str : String, issues : Array(Issue))
-        unless date_str.matches?(/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:?\d{2}| [A-Z][A-Za-z]*| [+-]\d{2}:?\d{2})?)?$/)
+        # Fractional seconds (`10:00:00.123Z`, what JavaScript's
+        # `toISOString` and most exporters write) are RFC 3339 and the build
+        # parses them; without `(\.\d+)?` every such date was flagged, which
+        # failed `--strict` / `--max-warnings` on content that builds.
+        unless date_str.matches?(/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2}| [A-Z][A-Za-z]*| [+-]\d{2}:?\d{2})?)?$/)
           issues << Issue.new(id: "content-date-invalid", level: :warning, category: "content", file: file_path,
             message: "Date format may be invalid: \"#{date_str}\"")
           return
@@ -246,7 +289,7 @@ module Hwaro
           Time.parse(date_str, fmt, Time::Location::UTC)
           parsed = true
           break
-        rescue Time::Format::Error | ArgumentError
+        rescue Time::Format::Error | Time::Error | ArgumentError
           next
         end
 
@@ -255,7 +298,7 @@ module Hwaro
           begin
             Time.parse_rfc3339(date_str)
             parsed = true
-          rescue Time::Format::Error | ArgumentError
+          rescue Time::Format::Error | Time::Error | ArgumentError
           end
         end
 
@@ -265,8 +308,7 @@ module Hwaro
         end
       end
 
-      private def check_tag_conventions(file_path : String, tags_csv : String, issues : Array(Issue))
-        tags = tags_csv.split(",")
+      private def check_tag_conventions(file_path : String, tags : Array(String), issues : Array(Issue))
         mixed = tags.select { |tag| tag != tag.downcase && tag != tag.upcase }
         mixed.each do |tag|
           issues << Issue.new(id: "content-tag-mixed-case", level: :info, category: "content", file: file_path,
@@ -274,53 +316,83 @@ module Hwaro
         end
       end
 
-      # Check for images with empty alt text: ![](url)
+      # Markdown images with empty alt text (`![](url)`), and raw HTML
+      # `<img>` elements with no `alt` attribute at all. An explicit
+      # `alt=""` (or a bare `alt`) is the HTML/WCAG way to mark an image
+      # decorative, so only a MISSING attribute is reported for raw HTML.
       private def check_image_alt(file_path : String, content : String, issues : Array(Issue))
-        body = strip_code_blocks(extract_body(content))
+        body = Utils::MarkdownCode.strip(extract_body(content))
         body.scan(/!\[\s*\]\([^\)]+\)/) do |match|
+          issues << Issue.new(id: "content-alt-text-missing", level: :warning, category: "content", file: file_path,
+            message: "Image missing alt text: #{match[0]}")
+        end
+
+        body.scan(HTML_IMG_RE) do |match|
+          next if html_attribute_names(match[1]? || "").includes?("alt")
+
           issues << Issue.new(id: "content-alt-text-missing", level: :warning, category: "content", file: file_path,
             message: "Image missing alt text: #{match[0]}")
         end
       end
 
-      # Check for broken internal links (@/ prefixed) in markdown body
+      HTML_IMG_RE = /<img(\s[^>]*)?\/?>/i
+
+      # One HTML attribute: its name, then an optional `=value` (quoted or
+      # not). Consuming each value whole is what keeps `title="x alt=y"`
+      # from reading as an alt attribute.
+      HTML_ATTRIBUTE_RE = /([^\s"'>\/=]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/
+
+      private def html_attribute_names(attributes : String) : Array(String)
+        names = [] of String
+        attributes.scan(HTML_ATTRIBUTE_RE) { |m| names << m[1].downcase }
+        names
+      end
+
+      # Check for broken internal links (@/ prefixed) in markdown body.
+      # Resolved through the build's own exact content-path lookup (see
+      # InternalLinkIndex), so this agrees with both `hwaro build` and
+      # `tool check-links`.
       private def check_internal_links(file_path : String, content : String, issues : Array(Issue))
-        body = strip_code_blocks(extract_body(content))
+        body = Utils::MarkdownCode.strip(extract_body(content))
         body.scan(/(?<!!)\[([^\]]*)\]\(([^\)]+)\)/) do |match|
           raw_url = match[2].strip
-          next unless raw_url.starts_with?("@/")
+          key = InternalLinkIndex.key(link_destination(match[2])) || next
+          reason = link_index.unresolved_reason(key) || next
 
-          path = raw_url.lchop("@/").split("#").first.split("?").first.strip
-          next if path.empty?
+          message = "Possible broken internal link: #{raw_url}"
+          message += " (#{InternalLinkIndex.describe(reason)})" unless reason == "not found"
+          issues << Issue.new(id: "content-internal-link-broken", level: :warning, category: "content", file: file_path,
+            message: message)
+        end
+      end
 
-          target = File.join(@content_dir, path)
+      private def link_index : InternalLinkIndex
+        @link_index ||= InternalLinkIndex.new(@content_dir)
+      end
 
-          exists = File.exists?(target) ||
-                   File.exists?(target + ".md") ||
-                   File.exists?(File.join(target, "_index.md")) ||
-                   File.exists?(File.join(target, "index.md"))
+      # `index.md` / `_index.md` (or a language variant) at the content root.
+      private def home_page?(file_path : String) : Bool
+        File.dirname(file_path) == File.dirname(File.join(@content_dir, "_")) &&
+          File.basename(file_path).matches?(/\A_?index(?:\.[\w-]+)?\.(?:md|markdown)\z/i)
+      end
 
-          unless exists
-            issues << Issue.new(id: "content-internal-link-broken", level: :warning, category: "content", file: file_path,
-              message: "Possible broken internal link: #{raw_url}")
-          end
+      # CommonMark destinations may be followed by a title, or be wrapped in
+      # angle brackets when they contain spaces. Strip that syntax before
+      # checking the Hwaro @/ content-root prefix; otherwise valid titled
+      # links were looked up with the title appended and angle-wrapped broken
+      # links were silently skipped.
+      private def link_destination(raw_url : String) : String
+        destination = raw_url.strip
+        if destination.starts_with?('<')
+          closing = destination.index('>') || return destination
+          destination[1...closing]
+        else
+          destination.split(/\s/, 2).first
         end
       end
 
       private def extract_body(content : String) : String
         Utils::FrontmatterScanner.strip_frontmatter(content)
-      end
-
-      private def strip_code_blocks(text : String) : String
-        # Strip fenced blocks then inline spans. NOTE: indented (4-space/tab)
-        # code blocks are intentionally NOT stripped — a regex can't tell an
-        # indented code block from a list-item continuation (which is also
-        # indented), so stripping them silently dropped genuine broken-link /
-        # alt-text warnings inside list items, and a long contiguous indented
-        # run blew PCRE2's JIT stack. The minor false positive on example
-        # markdown shown via an indented block is the lesser evil.
-        text.gsub(/(?ms)^(`{3,}|~{3,})[^\n]*\n.*?^\1\s*$/, "")
-          .gsub(/`[^`]+`/, "")
       end
     end
   end

@@ -1,16 +1,275 @@
-# Phase: Finalize — cache save
+# Phase: Finalize — stale-output pruning, cache save
 #
 # Handles the final phase of the build lifecycle:
-# persisting the build cache to disk for future incremental builds.
+# removing output a page no longer claims, then persisting the build cache
+# to disk for future incremental builds.
 
 module Hwaro::Core::Build::Phases::Finalize
   private def execute_finalize_phase(ctx : Lifecycle::BuildContext, profiler : Profiler) : Lifecycle::HookResult
     profiler.start_phase("Finalize")
     result = @lifecycle.run_phase(Lifecycle::Phase::Finalize, ctx) do
       build_cache = @cache || raise "Cache not initialized"
-      build_cache.save if ctx.options.cache
+      # Claimed before the prune so a `--cache` build keeps the headers file.
+      claim_csp_headers_file(ctx)
+      # Serve rebuilds keep their output directory; see
+      # `sweep_stale_derived_outputs` (a no-op on the first build).
+      sweep_stale_derived_outputs(ctx.options.output_dir)
+      if ctx.options.cache
+        prune_orphaned_cached_outputs(ctx, build_cache)
+        build_cache.save
+      else
+        prune_unclaimed_generated_outputs(ctx)
+      end
+      @prune_baselines_pending = false
+      # Files a failed serve pass relocated away from (a no-op otherwise).
+      settle_page_outputs(ctx.options.output_dir)
+      # After the prune, so only live pages are hashed; after every writer,
+      # so the hashes cover the final bytes.
+      apply_csp(ctx)
+      # Cache hits and fast-start's deferred pages were not rendered here.
+      write_html_stats(complete: ctx.stats.cache_hits == 0 && @deferred_pages.try(&.empty?) != false)
     end
     profiler.end_phase
     result
+  end
+
+  # Delete the output of pages that vanished since the last `--cache` build.
+  #
+  # A cold build starts from an empty output directory, so a removed page's
+  # HTML goes with it. `--cache` keeps the directory (that is the point), and
+  # the render phase only ever walks pages that still exist — so the file of a
+  # page that was deleted, renamed, flipped to `draft`, passed its `expires`
+  # date, or turned `render = false` stayed in `public/`, kept answering 200
+  # and shipped with the next `hwaro deploy`. `hwaro serve` already prunes
+  # exactly this (see `stale_outputs_for_removed`); the cold `--cache` path
+  # never did.
+  #
+  # The cache is the only record of the previous build, and it holds one entry
+  # per source file with the primary output it wrote plus its `[outputs]`
+  # siblings — so the entries no live page claims name the files to remove.
+  # Two guards before anything is deleted:
+  #
+  #   * outputs the CURRENT site claims are filtered out, so a source moved
+  #     onto the same URL (`foo.md` -> `foo/index.md`) can't delete the file
+  #     this build just rewrote;
+  #   * `delete_orphaned_outputs` refuses any path outside the output dir, so
+  #     an entry left over from a build with a different `-o` is skipped
+  #     rather than followed.
+  #
+  # Beyond the entries themselves, the files this build claimed
+  # (`Builder#claim_generated_output`) are diffed against what the previous
+  # build claimed. Those are every output no cache ENTRY covers: the taxonomy
+  # index/term pages, their pagination pages and their feeds, every AMP
+  # mirror, the `static/` copies, the `[content.files]`/raw copies, page
+  # bundle assets, and the fingerprinted asset bundles — none of which any
+  # page's entry records, so before this a deleted `static/` file and every
+  # historical `main.<hash>.css` stayed published forever on a `--cache`
+  # build. Auto-generated OG images prune a removed page's image against their
+  # own manifest, in the generator that writes them; they and the responsive
+  # image variants are also claimed, so switching either feature off (or
+  # skipping it by flag) removes what it published.
+  private def prune_orphaned_cached_outputs(ctx : Lifecycle::BuildContext, build_cache : Cache) : Nil
+    return unless build_cache.enabled?
+    output_dir = ctx.options.output_dir
+
+    # One pass, two sets built from the SAME predicate so they cannot drift:
+    # a page still writing output this build keeps its entry (`live`) and
+    # protects the file it wrote (`owned`).
+    # One `getcwd` for every canonicalization below (see
+    # `protected_output_key`), rather than one per page.
+    cwd = Dir.current
+    live = Set(String).new
+    owned = Set(String).new
+    ctx.all_pages.each do |page|
+      # A synthesized page has no source file and therefore no cache entry —
+      # claim its outputs like any other source-less output instead, so the
+      # page of a record that later disappears from the data is pruned by the
+      # claims diff below rather than published forever.
+      # `render = false` and a URL that escapes the output dir write nothing,
+      # so the file they wrote on an earlier build is stale now.
+      if page.synthesized?
+        # Claims are diffed relative to the output directory (see
+        # `stale_generated_outputs`), while page output paths are absolute.
+        root = File.expand_path(output_dir, cwd)
+        collect_page_output_paths(page, output_dir).each do |path|
+          relative = Path[File.expand_path(path, cwd)].relative_to(root).to_s
+          claim_generated_output(File.join(output_dir, relative)) unless Utils::PathUtils.escapes_parent?(relative)
+        end
+        next
+      end
+      next unless page.render
+      # A collision loser writes nothing either (the winner owns its URL), so
+      # the file its entry recorded before it moved onto that URL is stale.
+      next if page.output_suppressed
+      source, output = cache_paths_for(page, output_dir)
+      next unless output
+      live << source
+      collect_page_output_paths(page, output_dir).each { |path| owned << protected_output_key(path, cwd) }
+    end
+
+    respell_folded_output_dirs(owned, output_dir)
+
+    # Entries that survived but moved (a `slug`/`path`/permalink edit) leave
+    # their previous file behind too; #update collected those as it went.
+    stale = build_cache.prune_entries_not_in(live)
+    stale.concat(build_cache.take_orphaned_outputs)
+    # Everything this build still claims survives: the pages' own outputs, and
+    # every file the surviving cache entries record. That second set is what
+    # keeps a whole-cache invalidation — a config edit, `--full` — from
+    # deleting files it only discarded the bookkeeping for.
+    still_written = build_cache.current_output_files.map { |path| protected_output_key(path, cwd) }.to_set
+    stale.concat(stale_generated_outputs(build_cache, output_dir))
+    # Filtered AFTER the source-less list is added, not before. A claimed path
+    # and a page output can name the same file — `static/posts/x/index.html`
+    # publishes exactly where the page `posts/x.md` renders — and a file this
+    # build WROTE must never be deleted because some other bookkeeping stopped
+    # claiming it.
+    stale.reject! do |path|
+      key = protected_output_key(path, cwd)
+      next true if owned.includes?(key) || still_written.includes?(key)
+      # Last line of defence: a file THIS build wrote is live, whatever the
+      # bookkeeping says. `static/robots.txt` and the generated `robots.txt`
+      # are one file, and only the static side is claimed — so deleting the
+      # source would have taken the generated output with it. Same for
+      # `static/404.html`, `static/manifest.json` and every other shadowed
+      # generator surface.
+      #
+      # A generator that SKIPPED writing on this warm build (sitemap, llms and
+      # the search index skip when the file is already there) leaves the
+      # shadowing copy looking unwritten, so it is pruned — and the same
+      # generator, now finding the file missing, writes it again on the next
+      # build. One build without it, never a permanent loss.
+      written_this_build?(path)
+    end
+    stale.uniq!
+    return if stale.empty?
+
+    delete_orphaned_outputs(stale, output_dir)
+  end
+
+  # On a case-insensitive filesystem (macOS, Windows) a `--cache` build that
+  # writes a case-renamed page (`Foo.md` -> `foo.md`) lands in the EXISTING
+  # `public/posts/Foo/` directory, which keeps its old spelling: the tree no
+  # longer matches the page URL (`/posts/foo/`) and 404s once it is deployed
+  # to a case-sensitive host, while a cold build spells it correctly. Rename
+  # each directory on the way to a file this build owns to the spelling the
+  # page URL asks for. Runs after the render, so no worker is writing into the
+  # directory; only directories are touched, since a file replaced by rename
+  # already takes the new name. A no-op everywhere the probe says the
+  # filesystem is case-sensitive.
+  private def respell_folded_output_dirs(owned : Set(String), output_dir : String) : Nil
+    root = File.expand_path(output_dir)
+    return unless Dir.exists?(root) && Utils::PathUtils.case_folding_fs?(root)
+
+    dirs = Set(String).new
+    owned.each do |file|
+      dir = File.dirname(file)
+      while dir.starts_with?("#{root}/")
+        break unless dirs.add?(dir)
+        dir = File.dirname(dir)
+      end
+    end
+
+    listing = {} of String => Array(String)
+    dirs.to_a.sort_by!(&.size).each do |dir|
+      parent = File.dirname(dir)
+      name = File.basename(dir)
+      children = listing[parent] ||= Dir.children(parent)
+      next if children.includes?(name)
+      key = Utils::PathUtils.output_fold_key(name)
+      next unless index = children.index { |child| Utils::PathUtils.output_fold_key(child) == key }
+      actual = children[index]
+      tmp = File.join(parent, "hwaro-respell-#{Process.pid}.tmp")
+      File.rename(File.join(parent, actual), tmp)
+      File.rename(tmp, dir)
+      children[index] = name
+    end
+  rescue ex : File::Error
+    Logger.debug "Could not respell output directories: #{ex.message}"
+  end
+
+  # The cacheless counterpart of the `stale_generated_outputs` half of the
+  # prune above, for a builder that runs more than one build into the same
+  # output directory — the `hwaro serve` session, whose rebuilds keep the
+  # directory. Diffs this build's claims against the ones the builder held
+  # when this build started (`@previous_generated_claims`), through the keep
+  # set of `prune_unclaimed_outputs`. A one-shot cold build has no previous
+  # claims and prunes nothing.
+  #
+  # The previous site's page outputs (`@previous_page_outputs`) go through the
+  # same filter: a page this build moved, drafted or stopped rendering left
+  # its old file behind otherwise.
+  private def prune_unclaimed_generated_outputs(ctx : Lifecycle::BuildContext) : Nil
+    previous = @generated_claims_mutex.synchronize { @previous_generated_claims } | @previous_page_outputs
+    return if previous.empty?
+    # Page outputs, stubs, this build's claims, this build's writes and live
+    # source copies are all kept by the shared choke point.
+    prune_unclaimed_outputs(previous.to_a.sort!, ctx.options.output_dir)
+  end
+
+  # Comparison key for "is this file still written by this build?".
+  #
+  # The two sides reach this filter in different spellings: cache entries and
+  # `get_output_path` store the ABSOLUTE path `OutputGuard.safe_output_path`
+  # canonicalizes to, while the generated-output claims are rebuilt from paths
+  # stored relative to the output directory. Comparing them verbatim silently
+  # matched nothing, so a static copy and the page that publishes the same URL
+  # could not protect each other. A path with no canonical form (an embedded
+  # NUL — `expand_path` raises) falls back to itself: it matches nothing,
+  # which leaves it in the stale list where `delete_orphaned_outputs`'s own
+  # containment guard is the decider.
+  private def protected_output_key(path : String, cwd : String) : String
+    File.expand_path(path, cwd)
+  rescue ArgumentError
+    path
+  end
+
+  # The source-less generated outputs the previous build produced and this one
+  # no longer claims — a taxonomy term whose last post was deleted, and its
+  # feed and pagination pages. Records this build's claims on the way out, so
+  # the next build can do the same.
+  #
+  # Only a path a previous build actually claimed can appear here: a generator
+  # that reports nothing keeps today's behaviour (its output lingers) instead
+  # of having files deleted out from under it. Paths are stored relative to
+  # the output directory, so a workspace that moved — or an `-o` spelled
+  # absolutely one day and relatively the next — still matches.
+  private def stale_generated_outputs(build_cache : Cache, output_dir : String) : Array(String)
+    claimed = generated_output_claims.compact_map do |path|
+      Path[path].relative_to(output_dir).to_s rescue nil
+    end.sort!
+    previous = build_cache.previous_generated_outputs
+    build_cache.record_generated_outputs(claimed)
+
+    return [] of String if previous.empty?
+    current = claimed.to_set
+    previous.reject(&.in?(current)).map { |relative| File.join(output_dir, relative) }
+  end
+
+  # `[csp]` is on for this build: enabled, and never under `hwaro serve`,
+  # whose live-reload client and error overlay are inline.
+  private def csp_config(ctx : Lifecycle::BuildContext) : Models::CspConfig?
+    return if ctx.options.serve_mode
+    @config.try(&.csp).try { |csp| csp if csp.enabled }
+  end
+
+  private def claim_csp_headers_file(ctx : Lifecycle::BuildContext) : Nil
+    csp = csp_config(ctx)
+    return if csp.nil? || csp.meta?
+    claim_generated_output(File.join(ctx.options.output_dir, csp.headers_file))
+  end
+
+  private def apply_csp(ctx : Lifecycle::BuildContext) : Nil
+    @csp_result = nil
+    return unless csp_config(ctx) && (config = @config)
+    output_dir = ctx.options.output_dir
+    # `[content.files]` HTML is published verbatim, like `static/`.
+    raw = ctx.raw_files.map { |file| File.expand_path(File.join(output_dir, file.relative_path)) }.to_set
+    # So are a page bundle's assets, copied from `content/<bundle>/`.
+    ctx.all_pages.each do |page|
+      next if page.assets.empty?
+      bundle_asset_destinations(page, output_dir).try &.each { |_, dest| raw << File.expand_path(dest) }
+    end
+    @csp_result = Csp.apply(config, output_dir, raw, ctx.options.parallel)
   end
 end

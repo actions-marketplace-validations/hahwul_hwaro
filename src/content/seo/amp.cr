@@ -4,6 +4,8 @@ require "../../models/config"
 require "../../models/page"
 require "../../utils/logger"
 require "../../utils/path_utils"
+require "../../utils/text_utils"
+require "../processors/internal_link_resolver"
 
 module Hwaro
   module Content
@@ -29,49 +31,36 @@ module Hwaro
           config : Models::Config,
           output_dir : String,
           verbose : Bool = false,
+          builder : Core::Build::Builder? = nil,
         )
           return unless config.amp.enabled
 
           amp_config = config.amp
-          prefix = amp_config.path_prefix.strip('/')
-          # A "."/".." prefix is not empty, so the emptiness guard below never
-          # fires for it, yet File.join resolves it straight back to the
-          # canonical path: the AMP variant would overwrite the very page it was
-          # converted from, with a rel="amphtml" pointing at itself. Refuse
-          # outright — the way every other emitter refuses a traversing output
-          # path — rather than reinterpreting the author's intent. The prefix
-          # itself is left verbatim (it is also a URL segment, so a literal
-          # percent-encoded directory name must survive unchanged); only the
-          # decision to proceed is taken on the traversal-safe reading of it.
-          _prefix_segments, prefix_refused = Utils::PathUtils.split_safe_segments(prefix)
-          if prefix_refused
-            Logger.warn "AMP path_prefix '#{amp_config.path_prefix}' resolves onto the canonical output path; skipping AMP generation to avoid overwriting canonical pages."
-            return
-          end
-          # A blank/slash-only prefix would make amp_output_path collapse to the
-          # canonical path (File.join drops empty components), overwriting every
-          # canonical page with its AMP variant. Refuse rather than destroy output.
-          if prefix.empty?
-            Logger.warn "AMP path_prefix resolves to empty; skipping AMP generation to avoid overwriting canonical pages."
-            return
-          end
+          prefix = effective_prefix(config, warn: true)
+          return unless prefix
           generated = 0
 
           pages.each do |page|
             next if page.draft
             next if page.generated
             next unless page.render
+            # A `redirect_to` stub is a meta-refresh bounce, not content.
+            next if page.has_redirect?
             next unless amp_config.section_enabled?(page.section)
 
             # Read the canonical rendered HTML
             canonical_path = output_path_for(page, output_dir)
-            next unless File.exists?(canonical_path)
+            next unless canonical_path && File.exists?(canonical_path)
 
             html = File.read(canonical_path)
+            # A `--cache` hit still carries the policy `<meta>` the last
+            # build injected (meta mode, or headers mode for a page no rule
+            # can match); AMP pages get none (see Core::Build::Csp).
+            html = Core::Build::Csp.strip_meta(html) if config.csp.enabled
             amp_html = convert_to_amp(html, page, config)
 
             # Write AMP version
-            amp_output = amp_output_path(page, output_dir, prefix)
+            amp_output = mirror_path(canonical_path, output_dir, prefix)
             unless Utils::OutputGuard.within_output_dir?(amp_output, output_dir)
               Logger.warn "Skipping AMP output outside output directory: #{amp_output}"
               next
@@ -88,6 +77,13 @@ module Hwaro
             dir = File.dirname(amp_output)
             Hwaro::Utils::FileSafe.mkdir_p(dir) unless Dir.exists?(dir)
             Hwaro::Utils::FileSafe.atomic_write(amp_output, amp_html)
+            # A mirror has no content file of its own, so nothing else records
+            # that this build still wants it. Claiming it lets the Finalize
+            # phase drop the mirrors of pages that are gone — and, because this
+            # generator walks every page on every build and claims nothing at
+            # all when `[amp]` is off or its prefix is refused, the whole tree
+            # when AMP stops publishing.
+            builder.try(&.claim_generated_output(amp_output))
 
             # Inject <link rel="amphtml"> into the canonical page
             inject_amphtml_link(canonical_path, page, config, prefix)
@@ -150,7 +146,7 @@ module Hwaro
           end
 
           scheme == base.scheme.try(&.downcase) && default_port(uri) == default_port(base)
-        rescue URI::Error
+        rescue URI::Error | OverflowError
           # An unparseable src can't be shown to be cross-origin; assume
           # same-origin, which only ever drops a privilege.
           true
@@ -166,9 +162,108 @@ module Hwaro
           end
         end
 
+        # Attributes that are legal on the HTML element but not on the AMP
+        # element it becomes, so they have to be dropped during conversion
+        # rather than carried through with the rest of the attribute string.
+        #
+        # `loading` is the one hwaro emits itself: the built-in youtube /
+        # vimeo / codepen / figure shortcodes hard-code `loading="lazy"`, the
+        # image pipeline adds it, and `[markdown] lazy_loading` adds it to
+        # every content image. None of `amp-img`, `amp-iframe` or `amp-video`
+        # accepts it — AMP does its own lazy loading — so every AMP page
+        # carrying an image or an embed failed validation on a DISALLOWED_ATTR
+        # the author never wrote. Scoped to the converted tag's attribute
+        # string (not a document-wide gsub) so a `loading=` appearing inside
+        # `<style amp-custom>` or JSON-LD text is untouched. `decoding` and
+        # `fetchpriority` are the image hints themes write on hero/card
+        # images; amp-img rejects both the same way.
+        AMP_DISALLOWED_ATTR_RE = /\s+(?:loading|decoding|fetchpriority)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+)/i
+
+        private def self.strip_non_amp_attributes(attrs : String) : String
+          attrs.gsub(AMP_DISALLOWED_ATTR_RE, "")
+        end
+
+        # amp-iframe accepts `allowfullscreen`/`allowtransparency` only as bare
+        # boolean attributes and `frameborder` only as 0/1; the values embed
+        # snippets carry (`allowfullscreen="true"`, `frameborder="no"`) fail
+        # validation.
+        private def self.normalize_iframe_attributes(attrs : String) : String
+          attrs
+            .gsub(/(\s)(allowfullscreen|allowtransparency)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+)/i) { "#{$1}#{$2}" }
+            .gsub(/(\s)frameborder\s*=\s*(["']?)(no|yes)\2(?=[\s>]|\z)/i) { %(#{$1}frameborder="#{$3.downcase == "no" ? 0 : 1}") }
+        end
+
+        # At-rules AMP accepts inside `<style amp-custom>`. Anything else
+        # (`@view-transition`, `@starting-style`, `@layer`, `@import`, …) is a
+        # CSS syntax error that fails the whole page.
+        AMP_CSS_AT_RULES = {"font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes",
+                            "-o-keyframes", "-ms-keyframes", "media", "supports", "page"}
+
+        # Drop every at-rule (statement or block, at any nesting depth) whose
+        # name AMP disallows. Comments and quoted strings are copied verbatim
+        # so an `@name` inside them is never mistaken for a rule.
+        private def self.strip_disallowed_at_rules(css : String) : String
+          return css unless css.includes?('@')
+          String.build(css.bytesize) do |io|
+            reader = Char::Reader.new(css)
+            while reader.has_next?
+              c = reader.current_char
+              if c == '/' && reader.peek_next_char == '*'
+                start = reader.pos
+                close = css.byte_index("*/", start + 2)
+                stop = close ? close + 2 : css.bytesize
+                io << css.byte_slice(start, stop - start)
+                reader.pos = stop
+              elsif c == '"' || c == '\''
+                start = reader.pos
+                reader.next_char
+                while reader.has_next? && reader.current_char != c
+                  reader.next_char if reader.current_char == '\\'
+                  reader.next_char if reader.has_next?
+                end
+                reader.next_char if reader.has_next?
+                io << css.byte_slice(start, reader.pos - start)
+              elsif c == '@' && (name = css.byte_slice(reader.pos + 1).match(/\A[-\w]+/).try(&.[0])) &&
+                    !AMP_CSS_AT_RULES.includes?(name.downcase)
+                reader = skip_at_rule(reader)
+              else
+                io << c
+                reader.next_char
+              end
+            end
+          end
+        end
+
+        # `reader` advanced past the at-rule it sits on: up to the `;` ending
+        # a statement, or past the `}` closing its block. (Char::Reader is a
+        # struct, so the advanced copy is returned.)
+        private def self.skip_at_rule(reader : Char::Reader) : Char::Reader
+          depth = 0
+          while reader.has_next?
+            c = reader.current_char
+            reader.next_char
+            case c
+            when '{' then depth += 1
+            when '}'
+              depth -= 1
+              break if depth <= 0
+            when ';' then break if depth == 0
+            end
+          end
+          reader
+        end
+
         # Convert standard HTML to AMP-compliant HTML
         def self.convert_to_amp(html : String, page : Models::Page, config : Models::Config) : String
-          result = html
+          # The mirror lives one prefix deeper than the page it was rendered
+          # for, so a document-relative `cover.png` / `../b2/` (page-bundle
+          # images and links) would resolve under `/amp/…` and 404. Resolve
+          # those against the canonical URL first; everything else is
+          # untouched.
+          base_url = config.base_url.rstrip('/')
+          page_path = page.url.starts_with?('/') ? page.url : "/#{page.url}"
+          result = Processors::InternalLinkResolver.absolutize_links(
+            html, Utils::TextUtils.encode_url_path(base_url + page_path), document_relative_only: true)
 
           # Strip any self-referencing <link rel="amphtml"> left over from a
           # prior build (the on-disk canonical HTML may already carry one). An
@@ -179,14 +274,13 @@ module Hwaro
           # Add AMP boilerplate to <html> tag
           result = result.sub(/<html([^>]*)>/i, %(<html amp\\1>))
 
-          # Remove disallowed tags: <script> (except application/ld+json and amp scripts)
-          # Use [\s\S]*? instead of .*? to match across newlines
-          # The `async`/`custom-element` exceptions must be anchored to real
-          # attribute boundaries (preceded by whitespace, followed by a value /
-          # tag terminator); otherwise a substring match like `id="async"` would
-          # cause an author `<script>` to survive into the AMP page. The
-          # cdn.ampproject.org src allowlist stays in its own lookahead.
-          result = result.gsub(/<script(?![^>]*type=["']application\/ld\+json["'])(?![^>]*\s(?:async|custom-element)(?:\s|=|>|\/))(?![^>]*src=["']https:\/\/cdn\.ampproject\.org)[^>]*>[\s\S]*?<\/script>/mi, "")
+          # Remove disallowed tags: <script> (except application/ld+json and
+          # the AMP runtime/extension scripts, which all load from
+          # cdn.ampproject.org). Use [\s\S]*? instead of .*? to match across
+          # newlines. An `async` attribute is NOT an exemption: it let every
+          # third-party async script (analytics, the tweet shortcode's
+          # widgets.js) through, and AMP forbids all of them.
+          result = result.gsub(/<script(?![^>]*type=["']application\/ld\+json["'])(?![^>]*src=["']https:\/\/cdn\.ampproject\.org)[^>]*>[\s\S]*?<\/script>/mi, "")
 
           # Remove disallowed external stylesheets. AMP forbids
           # `<link rel="stylesheet">` except from allowlisted font providers;
@@ -203,9 +297,12 @@ module Hwaro
           end
 
           # Remove style attributes and JS event handlers BEFORE element conversion
-          # (so that container divs added by amp-img conversion aren't affected)
-          result = result.gsub(/\s+style=["'][^"']*["']/i, "")
-          result = result.gsub(/\s+on\w+=["'][^"']*["']/i, "")
+          # (so that container divs added by amp-img conversion aren't affected).
+          # Each value runs to its OWN closing quote: `[^"']*` stopped at the
+          # first quote of either kind, so `onclick="f('x')"` lost only
+          # `onclick="f('` and left `x')"` behind as a garbage attribute.
+          result = result.gsub(/\s+style=(?:"[^"]*"|'[^']*')/i, "")
+          result = result.gsub(/\s+on\w+=(?:"[^"]*"|'[^']*')/i, "")
 
           # Convert <img> to <amp-img>. Quote-aware attribute scan (same
           # pattern as IMG_LAZY_REGEX in markdown.cr): a `>` inside a quoted
@@ -216,7 +313,7 @@ module Hwaro
             # `[^>]*` greedily swallows the self-closing slash from `<img … />`,
             # which would otherwise be appended mid-tag as
             # `<amp-img … / layout="…">` — invalid AMP. Strip a trailing slash.
-            attrs = $1.sub(/\s*\/\s*$/, "")
+            attrs = strip_non_amp_attributes($1.sub(/\s*\/\s*$/, ""))
             has_width = attrs.includes?("width=")
             has_height = attrs.includes?("height=")
 
@@ -242,7 +339,7 @@ module Hwaro
           needs_amp_video = false
           result = result.gsub(/<video([^>]*)>(.*?)<\/video>/mi) do
             needs_amp_video = true
-            %(<amp-video#{$1} layout="responsive">#{$2}</amp-video>)
+            %(<amp-video#{strip_non_amp_attributes($1)} layout="responsive">#{$2}</amp-video>)
           end
 
           # Convert <iframe> to <amp-iframe>
@@ -251,10 +348,14 @@ module Hwaro
             needs_amp_iframe = true
             # Capture both groups before any inner match: `$~` is per-scope,
             # so the src lookup below would otherwise clobber `$2`.
-            attrs = $1
+            attrs = normalize_iframe_attributes(strip_non_amp_attributes($1))
             inner = $2
             unless attrs.includes?("layout=")
-              attrs += %( layout="responsive")
+              # `responsive` needs both dimensions. A height-only embed (the
+              # codepen shortcode, CodePen's own embed snippet) is full-width
+              # by design, which is what `fixed-height` means.
+              height_only = !attrs.matches?(/\swidth\s*=/i) && attrs.matches?(/\sheight\s*=/i)
+              attrs += height_only ? %( layout="fixed-height") : %( layout="responsive")
             end
             # amp-iframe requires a sandbox attribute; add a sane default when
             # the source <iframe> didn't carry one.
@@ -313,10 +414,10 @@ module Hwaro
               ""
             end
             # `!important` is disallowed inside amp-custom.
-            extracted_css = theme_css.join("\n").gsub(/\s*!important/i, "")
+            extracted_css = strip_disallowed_at_rules(theme_css.join("\n").gsub(/\s*!important/i, ""))
 
             amp_boilerplate = <<-HTML
-              <style amp-boilerplate>body{-webkit-animation:-amp-start 8s steps(1,end) 0s 1 normal both;-moz-animation:-amp-start 8s steps(1,end) 0s 1 normal both;animation:-amp-start 8s steps(1,end) 0s 1 normal both}@-webkit-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-moz-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-ms-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-o-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}</style><noscript><style amp-boilerplate>body{-webkit-animation:none;-moz-animation:none;-ms-animation:none;animation:none}</style></noscript>
+              <style amp-boilerplate>body{-webkit-animation:-amp-start 8s steps(1,end) 0s 1 normal both;-moz-animation:-amp-start 8s steps(1,end) 0s 1 normal both;-ms-animation:-amp-start 8s steps(1,end) 0s 1 normal both;animation:-amp-start 8s steps(1,end) 0s 1 normal both}@-webkit-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-moz-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-ms-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@-o-keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}@keyframes -amp-start{from{visibility:hidden}to{visibility:visible}}</style><noscript><style amp-boilerplate>body{-webkit-animation:none;-moz-animation:none;-ms-animation:none;animation:none}</style></noscript>
               <style amp-custom>.amp-img-container{position:relative;width:100%;min-height:200px}#{extracted_css}</style>
               <script async src="https://cdn.ampproject.org/v0.js"></script>#{extension_scripts}
               HTML
@@ -334,9 +435,10 @@ module Hwaro
             end
           end
 
-          # Add canonical link to the original page
+          # Add canonical link to the original page — percent-encoded like
+          # the `canonical_tag` the page itself carries.
           base_url = config.base_url.rstrip('/')
-          canonical_url = Utils::TextUtils.escape_xml("#{base_url}#{page.url}")
+          canonical_url = Utils::TextUtils.escape_xml(Utils::TextUtils.encode_url_path("#{base_url}#{page.url}"))
           if !result.includes?("rel=\"canonical\"") && result.matches?(/<\/head>/i)
             result = result.sub(/<\/head>/i, %(<link rel="canonical" href="#{canonical_url}">\n</head>))
           end
@@ -355,7 +457,9 @@ module Hwaro
           return if html.includes?("rel=\"amphtml\"")
 
           base_url = config.base_url.rstrip('/')
-          amp_url = Utils::TextUtils.escape_xml("#{base_url}/#{prefix}#{page.url}")
+          # Percent-encoded like every other page URL hwaro emits: a raw
+          # space or non-ASCII slug is not a valid href.
+          amp_url = Utils::TextUtils.escape_xml(Utils::TextUtils.encode_url_path("#{base_url}/#{prefix}#{page.url}"))
           link_tag = %(<link rel="amphtml" href="#{amp_url}">)
 
           if html.matches?(/<\/head>/i)
@@ -366,14 +470,83 @@ module Hwaro
           end
         end
 
-        private def self.output_path_for(page : Models::Page, output_dir : String) : String
-          url_path = page.url.lchop("/")
-          File.join(output_dir, url_path, "index.html")
+        # The `path_prefix` AMP will actually publish under, or nil when it
+        # must not publish at all. Both refusals below would otherwise let an
+        # AMP variant overwrite the very page it was converted from:
+        #
+        #   * a "."/".." prefix is not empty, so the emptiness guard never
+        #     fires for it, yet File.join resolves it straight back to the
+        #     canonical path — with a rel="amphtml" pointing at itself. Refuse
+        #     outright, the way every other emitter refuses a traversing
+        #     output path, rather than reinterpreting the author's intent. The
+        #     prefix itself is left verbatim (it is also a URL segment, so a
+        #     literal percent-encoded directory name must survive unchanged);
+        #     only the decision to proceed is taken on the traversal-safe
+        #     reading of it;
+        #   * a blank/slash-only prefix makes mirror_path collapse onto the
+        #     canonical path (File.join drops empty components).
+        #
+        # Public because the stale-output prune has to resolve the same prefix
+        # to find the mirror of a page that no longer exists; `warn:` keeps the
+        # log lines on the generating call only.
+        def self.effective_prefix(config : Models::Config, warn : Bool = false) : String?
+          return unless config.amp.enabled
+          prefix = config.amp.path_prefix.strip('/')
+          _prefix_segments, refused = Utils::PathUtils.split_safe_segments(prefix)
+          if refused
+            Logger.warn "AMP path_prefix '#{config.amp.path_prefix}' resolves onto the canonical output path; skipping AMP generation to avoid overwriting canonical pages." if warn
+            return
+          end
+          if prefix.empty?
+            Logger.warn "AMP path_prefix resolves to empty; skipping AMP generation to avoid overwriting canonical pages." if warn
+            return
+          end
+          prefix
         end
 
-        private def self.amp_output_path(page : Models::Page, output_dir : String, prefix : String) : String
-          url_path = page.url.lchop("/")
-          File.join(output_dir, prefix, url_path, "index.html")
+        # The AMP mirror of a canonical output file: the same path with
+        # `prefix` inserted directly after the output directory. The one
+        # spelling of the AMP layout — `generate` mirrors each page through it,
+        # and the Finalize phase's stale-output prune mirrors the recorded
+        # output path of a page that is gone, so the two cannot disagree about
+        # where a mirror lives.
+        # Both sides are expanded first: a page's recorded output path is
+        # absolute (OutputGuard resolves it) while `output_dir` is whatever the
+        # caller passed, usually the relative "public" — and `relative_to`
+        # across those two spellings raises instead of matching, which silently
+        # left every AMP mirror behind. The result is rejoined onto the
+        # caller's own spelling so it stays comparable with the paths around it.
+        def self.mirror_path(canonical_output : String, output_dir : String, prefix : String) : String
+          root = File.expand_path(output_dir)
+          relative = Path[File.expand_path(canonical_output)].relative_to(root).to_s
+          File.join(output_dir, prefix, relative)
+        rescue ArgumentError
+          canonical_output
+        end
+
+        # The mirror `generate` writes for `page`, or nil when it writes none
+        # (AMP off, section not enabled, draft/generated/unrendered/redirect page, or
+        # a refused prefix). Same gates as `generate`, so the builder can
+        # count the mirror among the files a page owns — and delete it with
+        # the page.
+        def self.mirror_output_for(page : Models::Page, config : Models::Config, output_dir : String) : String?
+          return unless config.amp.enabled
+          return if page.draft || page.generated || !page.render || page.has_redirect?
+          return unless config.amp.section_enabled?(page.section)
+          prefix = effective_prefix(config)
+          return unless prefix
+          output_path_for(page, output_dir).try { |path| mirror_path(path, output_dir, prefix) }
+        end
+
+        # The file the render phase wrote for `page`, or nil when it wrote
+        # none. Same decoding as the render phase's `url_output_path`: a page
+        # URL carries `#`/`?` as `%23`/`%3F` (Page#url=), while the file sits
+        # in the decoded `a#b/` directory — joining the raw URL looked for
+        # `a%23b/` and silently skipped the page.
+        private def self.output_path_for(page : Models::Page, output_dir : String) : String?
+          segments, refused = Utils::PathUtils.split_safe_segments(page.url.lchop("/"))
+          return if refused
+          File.join(output_dir, segments.join("/"), "index.html")
         end
       end
     end

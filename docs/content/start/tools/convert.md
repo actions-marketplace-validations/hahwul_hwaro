@@ -17,19 +17,41 @@ hwaro tool convert to-toml
 hwaro tool convert to-json
 
 # Convert only in a specific directory
-hwaro tool convert to-yaml -c posts
+hwaro tool convert to-yaml -c content/posts
+
+# Preview which files would change without touching anything
+hwaro tool convert to-yaml --dry-run
 
 # Output result as JSON
 hwaro tool convert to-yaml --json
 ```
 
+The command accepts one format argument (`to-yaml`, `to-toml`, or `to-json`).
+Extra positional arguments are rejected; use flags such as `--content-dir` for
+additional options.
+
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| -c, --content DIR | Limit conversion to a specific content directory |
+| -c, --content-dir DIR | Limit conversion to a specific content directory |
+| --dry-run | Preview what would be converted without changing any file |
 | -j, --json | Output result as JSON |
 | -h, --help | Show help |
+
+Conversion rewrites files in place and cannot preserve front-matter comments,
+so run `--dry-run` first on a tree you care about: it runs the full
+detection/conversion pipeline, including the per-file "dropping N comment
+line(s)" warnings, without writing anything back.
+
+TOML has no null, so `to-toml` writes a null YAML/JSON value in whichever
+form the build reads the same way. For built-in keys such as `title`,
+`description`, `slug`, `image` and `date` (`description:` with nothing after
+it, `slug: ~`, `"image": null`) the key is omitted, since an empty string
+would set an empty title or slug. Keys a section's `[cascade]` can set
+(`draft`, `tags`, `template`, ...), `extra` values and custom keys become `""`:
+a null there still declares the key, so it keeps blocking the cascade, and the
+build already reads a null custom value as an empty string.
 
 ## JSON Output
 
@@ -39,9 +61,24 @@ hwaro tool convert to-yaml --json
   "message": "Converted 5 files to YAML",
   "converted_count": 5,
   "skipped_count": 2,
-  "error_count": 0
+  "error_count": 0,
+  "dry_run": false
 }
 ```
+
+## Skipped Files
+
+The human summary breaks the skip count down by reason: `already TOML`,
+`without front matter`, and `not front matter`:
+
+```
+converted: 5 files · 2 skipped (1 already TOML, 1 not front matter)
+```
+
+`not front matter` is the one worth reading. It means the file opens with a
+`---`/`+++` pair whose contents are prose, not a key/value mapping (a thematic
+rule, say). Rewriting it would delete the author's text, so the file is left
+untouched and named on stderr.
 
 ## Example
 
@@ -61,11 +98,11 @@ After `hwaro tool convert to-yaml`:
 
 ```markdown
 ---
-title: "My Post"
+title: My Post
 date: "2024-01-15"
 tags:
-  - crystal
-  - tutorial
+- crystal
+- tutorial
 ---
 
 Content here.

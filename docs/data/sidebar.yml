@@ -33,6 +33,10 @@
       url: /writing/shortcodes/
     - title: Archetypes
       url: /writing/archetypes/
+    - title: Front Matter Schema
+      url: /writing/schema/
+    - title: Wikilinks & Backlinks
+      url: /writing/obsidian/
 - title: Templates
   section: templates
   items:
@@ -81,6 +85,8 @@
           url: /features/menus/
         - title: Output Formats
           url: /features/output-formats/
+        - title: Git Metadata
+          url: /features/git-info/
     - title: Build & Performance
       items:
         - title: Incremental Build
@@ -103,10 +109,18 @@
           url: /features/auto-includes/
         - title: Content Files
           url: /features/content-files/
+        - title: Remote Data Sources
+          url: /features/remote-data/
+        - title: Content Generation
+          url: /features/content-generation/
+        - title: Dated Report Pages
+          url: /features/dated-report-pages/
     - title: Platform
       items:
         - title: Multilingual
           url: /features/multilingual/
+        - title: Versioned Docs
+          url: /features/versioned-docs/
         - title: Image Processing
           url: /features/image-processing/
         - title: PWA
@@ -115,6 +129,10 @@
           url: /features/amp/
         - title: Deployment
           url: /features/deployment/
+        - title: Privacy Mode
+          url: /features/privacy/
+        - title: Content Security Policy
+          url: /features/csp/
 - title: Deploy
   section: deploy
   items:

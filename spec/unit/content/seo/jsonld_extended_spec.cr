@@ -1,0 +1,463 @@
+require "../../../spec_helper"
+require "json"
+
+describe Hwaro::Content::Seo::JsonLd do
+  describe ".faq_page" do
+    it "generates FAQPage JSON-LD from faq_questions/faq_answers" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/faq/"
+      page.extra["faq_questions"] = ["What is Hwaro?", "How to install?"].as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["faq_answers"] = ["A static site generator.", "Run crystal build."].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.faq_page(page, config)
+
+      result.should contain("application/ld+json")
+      result.should contain("FAQPage")
+      result.should contain("What is Hwaro?")
+      result.should contain("A static site generator.")
+      result.should contain("How to install?")
+    end
+
+    it "generates FAQPage JSON-LD from faq pairs array" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/faq/"
+      page.extra["faq"] = ["Q1", "A1", "Q2", "A2"].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.faq_page(page, config)
+
+      result.should contain("FAQPage")
+      result.should contain("Q1")
+      result.should contain("A1")
+      result.should contain("Q2")
+      result.should contain("A2")
+    end
+
+    it "returns empty when no FAQ data" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      Hwaro::Content::Seo::JsonLd.faq_page(page, config).should eq("")
+    end
+
+    # The documented primary form `[[extra.faq]]` parses to an Array of
+    # Hash(String, ExtraValue). Malformed entries (missing answer, or a
+    # non-hash element) must be silently dropped, not crash.
+    it "builds FAQPage from a table-array hash form, dropping malformed entries" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/faq/"
+
+      arr = [
+        {"question" => "A?".as(Hwaro::Models::ExtraValue), "answer" => "B".as(Hwaro::Models::ExtraValue)}.as(Hwaro::Models::ExtraValue),
+        {"question" => "C?".as(Hwaro::Models::ExtraValue)}.as(Hwaro::Models::ExtraValue), # missing answer
+        "bare-string".as(Hwaro::Models::ExtraValue),                                      # non-hash element
+      ] of Hwaro::Models::ExtraValue
+      page.extra["faq"] = arr.as(Hwaro::Models::ExtraValue)
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.faq_page(page, config)
+
+      json_str = result.gsub(/<\/?script[^>]*>/, "")
+      json = JSON.parse(json_str)
+      json["@type"].as_s.should eq("FAQPage")
+      entities = json["mainEntity"].as_a
+      entities.size.should eq(1)
+      entities[0]["@type"].as_s.should eq("Question")
+      entities[0]["name"].as_s.should eq("A?")
+      entities[0]["acceptedAnswer"]["text"].as_s.should eq("B")
+    end
+  end
+
+  describe ".how_to" do
+    it "generates HowTo JSON-LD from howto_names/howto_texts" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/tutorial/"
+      page.title = "Getting Started"
+      page.description = "A tutorial"
+      page.extra["howto_names"] = ["Install", "Configure", "Run"].as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["howto_texts"] = ["Run install command.", "Edit config.", "Run build."].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      result = Hwaro::Content::Seo::JsonLd.how_to(page, config)
+
+      result.should contain("HowTo")
+      result.should contain("Getting Started")
+      result.should contain("HowToStep")
+      result.should contain("Install")
+      result.should contain("Run install command.")
+
+      # Parse JSON to verify structure
+      json_str = result.gsub(/<\/?script[^>]*>/, "")
+      json = JSON.parse(json_str)
+      json["@type"].as_s.should eq("HowTo")
+      json["step"].as_a.size.should eq(3)
+      json["step"].as_a[0]["position"].as_i.should eq(1)
+    end
+
+    it "returns empty when no steps data" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      Hwaro::Content::Seo::JsonLd.how_to(page, config).should eq("")
+    end
+
+    # The documented primary form `[[extra.howto_steps]]` parses to an Array
+    # of Hash(String, ExtraValue). Malformed entries (missing text, or a
+    # non-hash element) must be silently dropped, not crash.
+    it "builds HowTo from a table-array hash form, dropping malformed entries" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/tutorial/"
+      page.title = "Getting Started"
+
+      arr = [
+        {"name" => "Install".as(Hwaro::Models::ExtraValue), "text" => "Run install command.".as(Hwaro::Models::ExtraValue)}.as(Hwaro::Models::ExtraValue),
+        {"name" => "Configure".as(Hwaro::Models::ExtraValue)}.as(Hwaro::Models::ExtraValue), # missing text
+        "bare-string".as(Hwaro::Models::ExtraValue),                                         # non-hash element
+      ] of Hwaro::Models::ExtraValue
+      page.extra["howto_steps"] = arr.as(Hwaro::Models::ExtraValue)
+
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      result = Hwaro::Content::Seo::JsonLd.how_to(page, config)
+
+      json_str = result.gsub(/<\/?script[^>]*>/, "")
+      json = JSON.parse(json_str)
+      json["@type"].as_s.should eq("HowTo")
+      steps = json["step"].as_a
+      steps.size.should eq(1)
+      steps[0]["@type"].as_s.should eq("HowToStep")
+      steps[0]["name"].as_s.should eq("Install")
+      steps[0]["text"].as_s.should eq("Run install command.")
+    end
+  end
+
+  describe ".website" do
+    it "generates WebSite JSON-LD" do
+      config = Hwaro::Models::Config.new
+      config.title = "My Site"
+      config.base_url = "https://example.com"
+      config.description = "A great site"
+
+      result = Hwaro::Content::Seo::JsonLd.website(config)
+
+      result.should contain("WebSite")
+      result.should contain("My Site")
+      result.should contain("https://example.com/")
+      result.should contain("A great site")
+    end
+
+    it "includes SearchAction when search is enabled" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.search.enabled = true
+
+      result = Hwaro::Content::Seo::JsonLd.website(config)
+
+      result.should contain("SearchAction")
+      result.should contain("search_term_string")
+    end
+
+    it "omits SearchAction when search is disabled" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.search.enabled = false
+
+      result = Hwaro::Content::Seo::JsonLd.website(config)
+
+      result.should_not contain("SearchAction")
+    end
+
+    it "returns empty when base_url is empty" do
+      config = Hwaro::Models::Config.new
+      Hwaro::Content::Seo::JsonLd.website(config).should eq("")
+    end
+  end
+
+  describe ".organization" do
+    it "generates Organization JSON-LD" do
+      config = Hwaro::Models::Config.new
+      config.title = "My Org"
+      config.base_url = "https://example.com"
+      config.description = "An organization"
+
+      result = Hwaro::Content::Seo::JsonLd.organization(config)
+
+      result.should contain("Organization")
+      result.should contain("My Org")
+      result.should contain("https://example.com/")
+    end
+
+    it "includes logo when provided" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      result = Hwaro::Content::Seo::JsonLd.organization(config, "/images/logo.png")
+
+      result.should contain("logo")
+      result.should contain("https://example.com/images/logo.png")
+    end
+
+    it "returns empty when base_url is empty" do
+      config = Hwaro::Models::Config.new
+      Hwaro::Content::Seo::JsonLd.organization(config).should eq("")
+    end
+
+    # Regression: the logo (og.default_image) kept a raw space while og:image
+    # percent-encoded the same value.
+    it "percent-encodes a site-path logo like og:image" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      logo = "/images/my logo.png?v=2"
+
+      data = JSON.parse(Hwaro::Content::Seo::JsonLd.organization(config, logo)[/\{.*\}/m])
+      data["logo"].as_s.should eq(config.og.resolve_image_url(logo, config.base_url))
+      data["logo"].as_s.should eq("https://example.com/images/my%20logo.png?v=2")
+    end
+  end
+
+  describe ".person" do
+    it "generates Person JSON-LD" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      result = Hwaro::Content::Seo::JsonLd.person("John Doe", config, url: "/about/", image: "/images/john.jpg")
+
+      result.should contain("Person")
+      result.should contain("John Doe")
+      result.should contain("https://example.com/about/")
+      result.should contain("https://example.com/images/john.jpg")
+    end
+  end
+
+  describe ".article" do
+    it "resolves the author display name from site.authors" do
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Hello"
+      page.url = "/blog/hello/"
+      page.authors = ["jdoe"] # raw frontmatter id
+
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      site = Hwaro::Models::Site.new(config)
+      site.authors["jdoe"] = Crinja::Value.new({
+        "key"  => Crinja::Value.new("jdoe"),
+        "name" => Crinja::Value.new("Jane Doe"),
+      })
+
+      result = Hwaro::Content::Seo::JsonLd.article(page, config, site)
+      result.should contain("Jane Doe")
+      result.should_not contain("\"name\":\"jdoe\"")
+    end
+
+    it "falls back to the raw id when no site/author data is available" do
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Hello"
+      page.url = "/blog/hello/"
+      page.authors = ["jdoe"]
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+
+      result = Hwaro::Content::Seo::JsonLd.article(page, config)
+      result.should contain("jdoe")
+    end
+
+    # Regression: a bare `date = 2026-03-05` (local midnight) was emitted with
+    # the build machine's UTC offset, so the instant changed with the host.
+    it "writes a date-only value as a date, independent of the host zone" do
+      config = Hwaro::Models::Config.new
+      page = Hwaro::Models::Page.new("post.md")
+      page.title = "Hello"
+      page.url = "/hello/"
+      page.date = Time.local(2026, 3, 5)
+      page.updated = Time.local(2026, 3, 6, 0, 0, 0, location: Time::Location.fixed(9 * 3600))
+
+      data = JSON.parse(Hwaro::Content::Seo::JsonLd.article(page, config)[/\{.*\}/m])
+      data["datePublished"].as_s.should eq("2026-03-05")
+      # An authored offset is a real instant and keeps its timestamp.
+      data["dateModified"].as_s.should eq("2026-03-06T00:00:00+09:00")
+    end
+
+    # Regression: the JSON-LD url carried a raw space / non-ASCII path while
+    # canonical and og:url were percent-encoded — an invalid URL.
+    it "percent-encodes page and breadcrumb URLs like the canonical URL" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      section = Hwaro::Models::Section.new("한국/_index.md")
+      section.title = "Korea"
+      section.url = "/한국/"
+      page = Hwaro::Models::Page.new("한국/글 하나.md")
+      page.title = "Post"
+      page.url = "/한국/글 하나/"
+      page.generate_permalink(config.base_url)
+      page.ancestors = [section] of Hwaro::Models::Page
+
+      encoded = "https://example.com/%ED%95%9C%EA%B5%AD/%EA%B8%80%20%ED%95%98%EB%82%98/"
+      Hwaro::Content::Seo::Tags.canonical_url(page, config).should eq(encoded)
+      [
+        Hwaro::Content::Seo::JsonLd.article(page, config),
+        Hwaro::Content::Seo::JsonLd.collection_page(page, config),
+      ].each do |tag|
+        JSON.parse(tag[/\{.*\}/m])["url"].as_s.should eq(encoded)
+      end
+      crumbs = JSON.parse(Hwaro::Content::Seo::JsonLd.breadcrumb(page, config)[/\{.*\}/m])["itemListElement"]
+      crumbs[1]["item"].as_s.should eq("https://example.com/%ED%95%9C%EA%B5%AD/")
+    end
+  end
+
+  describe ".breadcrumb" do
+    # Regression: a headless (`render = false`) ancestor section publishes no
+    # page, yet its crumb pointed `item` at that unwritten URL (a 404).
+    it "leaves out a headless ancestor and keeps positions contiguous" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.title = "Site"
+      docs = Hwaro::Models::Section.new("docs/_index.md")
+      docs.title = "Docs"
+      docs.url = "/docs/"
+      group = Hwaro::Models::Section.new("docs/api/_index.md")
+      group.title = "API"
+      group.url = "/docs/api/"
+      group.render = false
+      page = Hwaro::Models::Page.new("docs/api/endpoints.md")
+      page.title = "Endpoints"
+      page.url = "/docs/api/endpoints/"
+      page.ancestors = [docs, group] of Hwaro::Models::Page
+
+      crumbs = JSON.parse(Hwaro::Content::Seo::JsonLd.breadcrumb(page, config)[/\{.*\}/m])["itemListElement"].as_a
+      crumbs.map(&.["name"].as_s).should eq(["Site", "Docs", "Endpoints"])
+      crumbs.map(&.["position"].as_i).should eq([1, 2, 3])
+      crumbs.compact_map(&.["item"]?.try(&.as_s)).should_not contain("https://example.com/docs/api/")
+    end
+
+    # Regression: a partially translated site (no `index.ko.md`) pointed
+    # every Korean page's Home crumb at the unwritten `/ko/`.
+    it "points Home at the site root when the page's language has no homepage" do
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      config.default_language = "en"
+      config.languages["ko"] = Hwaro::Models::LanguageConfig.new("ko")
+      page = Hwaro::Models::Page.new("about.ko.md")
+      page.title = "소개"
+      page.url = "/ko/about/"
+      page.language = "ko"
+      site = Hwaro::Models::Site.new(config)
+      site.pages = [page]
+
+      home_item = ->(s : Hwaro::Models::Site) {
+        s.build_lookup_index
+        JSON.parse(Hwaro::Content::Seo::JsonLd.breadcrumb(page, config, s)[/\{.*\}/m])["itemListElement"][0]["item"].as_s
+      }
+      home_item.call(site).should eq("https://example.com/")
+
+      home = Hwaro::Models::Page.new("index.ko.md")
+      home.is_index = true
+      home.url = "/ko/"
+      home.language = "ko"
+      site.pages = [page, home]
+      home_item.call(site).should eq("https://example.com/ko/")
+    end
+  end
+
+  describe ".for_page" do
+    it "auto-detects FAQ schema type" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.extra["schema_type"] = "FAQ".as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["faq"] = ["Q", "A"].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.for_page(page, config)
+
+      result.should contain("FAQPage")
+    end
+
+    it "auto-detects HowTo schema type" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.extra["schema_type"] = "HowTo".as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["howto_steps"] = ["Step 1", "Do this"].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.for_page(page, config)
+
+      result.should contain("HowTo")
+    end
+
+    it "returns empty for unknown schema type" do
+      page = Hwaro::Models::Page.new("test.md")
+      config = Hwaro::Models::Config.new
+
+      Hwaro::Content::Seo::JsonLd.for_page(page, config).should eq("")
+    end
+  end
+
+  describe ".all_tags" do
+    it "includes extended schema when schema_type is set" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/faq/"
+      page.title = "FAQ"
+      page.is_index = true
+      page.extra["schema_type"] = "FAQ".as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["faq_questions"] = ["Q1"].as(String | Bool | Int64 | Float64 | Array(String))
+      page.extra["faq_answers"] = ["A1"].as(String | Bool | Int64 | Float64 | Array(String))
+
+      config = Hwaro::Models::Config.new
+      result = Hwaro::Content::Seo::JsonLd.all_tags(page, config)
+
+      result.should contain("Article")
+      result.should contain("FAQPage")
+    end
+  end
+
+  describe "script-context escaping" do
+    it "escapes <, >, & as \\uXXXX so JSON-LD can't break out of <script> (dogfooding find)" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/post/"
+      # The `<!--<script>` prefix triggers the HTML "script data double
+      # escape" trap; a later real </script> would not close the element.
+      page.title = "Break <!--<script>out</script> attempt & more"
+
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      result = Hwaro::Content::Seo::JsonLd.article(page, config)
+
+      # No raw HTML-significant characters survive inside the <script> body.
+      body = result.sub(%(<script type="application/ld+json">), "").sub("</script>", "")
+      body.should_not contain("<")
+      body.should_not contain(">")
+      body.should contain("\\u003c")
+      body.should contain("\\u003e")
+      body.should contain("\\u0026")
+
+      # …and it still decodes back to the original title.
+      json = JSON.parse(body)
+      json["headline"].as_s.should eq("Break <!--<script>out</script> attempt & more")
+    end
+  end
+end
+describe "JsonLd image absolutization" do
+  it "leaves a protocol-relative article image untouched" do
+    config = Hwaro::Models::Config.new
+    config.base_url = "https://site.com"
+    page = Hwaro::Models::Page.new("post.md")
+    page.title = "T"
+    page.url = "/post/"
+    page.image = "//cdn.example.com/hero.png"
+
+    Hwaro::Content::Seo::JsonLd.article(page, config)
+      .should contain(%("image":"//cdn.example.com/hero.png"))
+  end
+
+  it "absolutizes a relative image path that starts with 'http'" do
+    config = Hwaro::Models::Config.new
+    config.base_url = "https://site.com"
+    page = Hwaro::Models::Page.new("post.md")
+    page.title = "T"
+    page.url = "/post/"
+    page.image = "http-guide/hero.png"
+
+    Hwaro::Content::Seo::JsonLd.article(page, config)
+      .should contain(%("image":"https://site.com/http-guide/hero.png"))
+  end
+end

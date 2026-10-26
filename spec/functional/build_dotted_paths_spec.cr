@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 
 # =============================================================================
 # Content whose path contains dots.
@@ -153,6 +153,29 @@ describe "build: content paths that really would traverse" do
         File.exists?("public/ok-alias/index.html").should be_true
         Dir.exists?("public/evil").should be_false
         File.exists?("public/aliased/index.html").should be_true
+      end
+    end
+  end
+
+  # An alias names an incoming path ON THIS SITE. An absolute URL used to be
+  # treated as plain path text: `aliases = ["http://evil.com/x"]` created the
+  # directory `public/http:/evil.com/x/` — nonsense on POSIX, and a hard build
+  # failure on Windows, where `:` is not a legal path character. A
+  # protocol-relative `//evil.com/` lost one slash and became `public/evil.com/`.
+  it "refuses an absolute or protocol-relative alias" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        dots_project
+        File.write("content/ext.md",
+          "+++\ntitle = \"Ext\"\naliases = [\"http://evil.com/x\", \"//evil.com/\", \"/kept/\"]\n+++\n\next body\n")
+
+        log = with_captured_log { dots_build }
+
+        log.should contain("an alias is a path on this site")
+        Dir.exists?("public/http:").should be_false
+        Dir.exists?("public/evil.com").should be_false
+        File.exists?("public/kept/index.html").should be_true
+        File.exists?("public/ext/index.html").should be_true
       end
     end
   end

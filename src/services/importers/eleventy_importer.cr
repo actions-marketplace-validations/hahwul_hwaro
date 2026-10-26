@@ -16,12 +16,12 @@ module Hwaro
         @used_paths = Set(String).new
 
         def run(options : Config::Options::ImportOptions) : ImportResult
-          path = options.path
+          # Strip trailing separators once: "site/" otherwise broke the
+          # File.dirname-based prefix strip in `import_file` (dirname never
+          # carries the slash), misclassifying the site-root index.md.
+          path = options.path.rstrip('/')
+          path = "/" if path.empty? && !options.path.empty?
           output_dir = options.output_dir
-          imported = 0
-          skipped = 0
-          errors = 0
-          wrapped = 0
 
           @used_paths.clear
           reset_written_paths
@@ -41,48 +41,23 @@ module Hwaro
             return ImportResult.new(
               success: true,
               message: "No content files found in #{path}",
+              skipped_count: outside_source_skips,
             )
           end
 
           # Load directory data files (11ty convention)
           dir_data = load_directory_data(path)
 
-          files.each do |file_path|
-            result = import_file(file_path, path, output_dir, dir_data, options.drafts, options.verbose, options.force)
-            case result
-            when :imported
-              imported += 1
-            when :imported_wrapped
-              imported += 1
-              wrapped += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error importing #{file_path}: #{ex.message}"
+          import_each(files, "Eleventy", wrapped_note: "contained Nunjucks/Liquid template tags. Imports kept the raw syntax — each will render as literal text until you hand-convert them.") do |file_path|
+            import_file(file_path, path, output_dir, dir_data, options.drafts, options.verbose, options.force)
           end
-
-          if wrapped > 0
-            Logger.warn "#{wrapped} file(s) contained Nunjucks/Liquid template tags. Imports kept the raw syntax — each will render as literal text until you hand-convert them."
-          end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Eleventy import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors,
-          )
         end
 
         private def collect_content_files(path : String) : Array(String)
           # Skip common non-content directories
           walk_files(path, skip_dir: ->(entry : String) {
             entry.starts_with?(".") || {"node_modules", "_site", "_includes", "_layouts", "_data"}.includes?(entry)
-          })
+          }, source_root: path)
         end
 
         # Load 11ty directory data files (dirname.json or dirname.11tydata.json)
@@ -117,8 +92,11 @@ module Hwaro
                 end
                 data[relative_dir] = parsed
               end
-            rescue JSON::ParseException | File::Error
-              # Skip invalid or unreadable data files
+            rescue JSON::ParseException | IO::Error
+              # Skip invalid or unreadable data files. IO::Error, not just
+              # File::Error: a data-file path that turns out to be a
+              # directory raises a bare IO::Error ("Is a directory") from
+              # File.read, which used to abort the whole import.
             end
           end
 
@@ -200,8 +178,8 @@ module Hwaro
           if merged_yaml
             if yaml_hash = YAML.parse(merged_yaml).as_h?
               # Title
-              if title = yaml_hash["title"]?
-                fields["title"] = yaml_string(title)
+              if (title = yaml_hash["title"]?) && (title_text = yaml_title(title))
+                fields["title"] = title_text
               end
 
               # Date
@@ -213,7 +191,7 @@ module Hwaro
                   date_str = date_val.as_s
                   # 11ty special date values
                   unless date_str == "Last Modified" || date_str == "Created" || date_str == "git Last Modified" || date_str == "git Created"
-                    parsed = parse_date(date_str)
+                    parsed = Utils::DateUtils.parse_import(date_str)
                     fields["date"] = format_date(parsed) if parsed
                   end
                 end
@@ -252,18 +230,31 @@ module Hwaro
               end
 
               # Description
-              if desc = yaml_hash["description"]? || yaml_hash["excerpt"]? || yaml_hash["summary"]?
+              if desc = first_present(yaml_hash, "description", "excerpt", "summary")
                 fields["description"] = yaml_string(desc)
               end
 
               # Image
-              if image = yaml_hash["image"]? || yaml_hash["featuredImage"]? || yaml_hash["cover"]?
+              if image = first_present(yaml_hash, "image", "featuredImage", "cover")
                 fields["image"] = yaml_string(image)
               end
 
               # Template / layout
               if layout = yaml_hash["layout"]?
                 fields["template"] = yaml_string(layout)
+              end
+
+              # `permalink: false` writes no file in 11ty (hwaro's
+              # `render = false`), and a literal permalink is the page's
+              # published address. Both were dropped, publishing the page
+              # or moving it. A templated one (`{{ page.fileSlug }}/`) is
+              # left alone.
+              if permalink = yaml_hash["permalink"]?
+                if permalink.raw == false
+                  fields["render"] = false
+                elsif (url = permalink.as_s?) && !url.includes?('{')
+                  apply_source_url(fields, url, file_path)
+                end
               end
             end
           end
@@ -281,7 +272,7 @@ module Hwaro
             # Try to extract date from filename (YYYY-MM-DD-slug.md)
             filename = File.basename(file_path)
             if match = /^(\d{4}-\d{2}-\d{2})/.match(filename)
-              parsed = parse_date(match[1])
+              parsed = Utils::DateUtils.parse_import(match[1])
               fields["date"] = format_date(parsed) if parsed
             elsif info = File.info?(file_path)
               fields["date"] = format_date(info.modification_time)
@@ -306,9 +297,9 @@ module Hwaro
                    # structural filename, not a title.
                    "_index"
                  elsif basename == "index" && !is_site_root_index
-                   slugify(File.basename(File.dirname(file_path)))
+                   file_slug(File.basename(File.dirname(file_path)))
                  else
-                   slugify(basename)
+                   file_slug(basename)
                  end
 
           # Avoid collision on section/slug path

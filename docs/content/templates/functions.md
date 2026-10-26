@@ -26,7 +26,7 @@ Retrieve any page by path or URL:
 |------|------|-------------|
 | path | String | Relative source path (e.g. `about.md`) or URL path (e.g. `/about/`) |
 
-**Returns:** Page? (nil if not found) — exposes the standard [Page properties](/templates/data-model/#page), minus per-render computed fields (`permalink`, `lower`/`higher`, `ancestors`, `series_index`, `series_pages`, `related_posts`).
+**Returns:** Page? (nil if not found). Exposes the standard [Page properties](/templates/data-model/#page), minus per-render computed fields (`permalink`, `lower`/`higher`, `ancestors`, `series_index`, `series_pages`, `related_posts`, `backlinks`).
 
 **Examples:**
 
@@ -67,6 +67,10 @@ Retrieve a section by section name, source path, or URL:
 
 **Returns:** Section? (nil if not found)
 
+When translated sections share a name, `get_section()` prefers the current
+page's language, then the default language. Use a source path or URL to select
+a specific language variant.
+
 **Returned Properties:**
 
 | Property | Type |
@@ -79,6 +83,7 @@ Retrieve a section by section name, source path, or URL:
 | pages | Array<Page> |
 | pages_count | Int |
 | assets | Array<String> |
+| subsections | Array<Section> |
 
 **Examples:**
 
@@ -133,10 +138,11 @@ Access taxonomy terms and their pages:
 | items | Array<Term> |
 
 `items` is ordered by the taxonomy's
-[`terms_sort_by`](/writing/taxonomies/#sorting): `"name"` (the default —
-alphabetical) or `"count"` (page count descending, name-ascending
-tiebreak). Counts are site-wide across every language, matching the root
-taxonomy index page.
+[`terms_sort_by`](/writing/taxonomies/#sorting): `"name"` (the default,
+alphabetical, ignoring case) or `"count"` (page count descending, name-ascending
+tiebreak). Counts are site-wide across every language. On a multilingual
+site the root taxonomy index page counts only default-language pages, so
+its `"count"` order can differ.
 
 **Term Properties:**
 
@@ -168,6 +174,12 @@ Generate URL for a taxonomy term:
 
 **Returns:** String (absolute URL)
 
+On a non-default-language page the URL is that language's term page
+(`/ko/tags/crystal/`) when it has one, else the root term page. The URL is
+built for any term, so it only names a written page when the term has a
+published page there: a taxonomy left out of the default language's
+`[languages.<code>] taxonomies` has no root term pages.
+
 ---
 
 ### get_menu()
@@ -186,7 +198,7 @@ Access a named menu's resolved entry tree ([Menus](/features/menus/)):
 |------|------|-------------|
 | name | String | Menu name (e.g., "main", "footer") |
 
-**Returns:** Array\<Entry\> — resolved against the **current page's** language, falling back to the default language when that language has no entries for `name`. An unknown/unregistered menu name returns an empty array (never nil), so a `{% for %}` loop never errors.
+**Returns:** Array\<Entry\>. Resolved against the **current page's** language, falling back to the default language when that language has no entries for `name`. An unknown/unregistered menu name returns an empty array (never nil), so a `{% for %}` loop never errors.
 
 **Entry Properties:**
 
@@ -201,7 +213,7 @@ Access a named menu's resolved entry tree ([Menus](/features/menus/)):
 | children | Array\<Entry\> | Nested entries |
 | page | Page? | The registering page's data (front-matter-registered entries only) |
 
-Prefer `site.menus.<name>` only when you specifically need the **default language's** menu regardless of the current page — `get_menu()` is almost always the right choice inside a shared nav partial.
+Prefer `site.menus.<name>` only when you specifically need the **default language's** menu regardless of the current page. `get_menu()` is almost always the right choice inside a shared nav partial.
 
 ---
 
@@ -225,6 +237,8 @@ Load external data files (JSON, TOML, YAML, CSV):
 | path | String | Path to data file |
 
 **Returns:** Parsed data or nil
+
+`load_data()` reads from the local filesystem only, and paths are resolved inside the project directory. It cannot read a file outside the project, and it cannot fetch a URL. For a single HTTP(S) GET payload, use [`[[data.remote]]`](/features/remote-data/) to expose it as `site.data`; use a [pre-build hook](/features/build-hooks/) when the fetch needs multiple requests or transformation. Everything under `data/` is also exposed as `site.data` without a `load_data()` call.
 
 **Supported Formats:**
 
@@ -286,7 +300,7 @@ Read environment variables in templates:
 | Name | Type | Description |
 |------|------|-------------|
 | name | String | Environment variable name |
-| default | String? | Fallback value if variable is unset (optional) |
+| default | String? | Fallback value if the variable is unset or empty (optional) |
 
 **Returns:** String (env var value, default, or empty string)
 
@@ -327,6 +341,8 @@ Generate URL with base_url:
 
 **Returns:** String (absolute URL)
 
+A `page.assets`/`section.assets` entry (`blog/my-trip/photo.jpg`) resolves to the copy published next to its page, including when a `slug`, `path` or language prefix moves the page.
+
 ---
 
 ### get_url()
@@ -354,13 +370,33 @@ Resolve a bundled or fingerprinted asset to its final URL. When the [asset pipel
 |------|------|-------------|
 | name | String | Bundle or asset name (e.g. `main.css`, `app.js`) |
 
-**Returns:** String — absolute URL under `base_url`. When no manifest entry is found, the name is returned as a path under `base_url` unchanged, so templates keep working before you turn the pipeline on.
+**Returns:** String. Absolute URL under `base_url`. When no manifest entry is found, the name is returned as a path under `base_url` unchanged, so templates keep working before you turn the pipeline on.
 
 ---
 
 ### asset_url()
 
 Alias for `asset()`. Use whichever reads better in your templates.
+
+---
+
+### asset_integrity()
+
+Return the [Subresource Integrity](/features/asset-pipeline/#subresource-integrity) value of the file `asset()` points to, computed over the bytes written to the output (after minify and fingerprint).
+
+```jinja
+<script src="{{ asset(name='app.js') }}" integrity="{{ asset_integrity(name='app.js') }}" crossorigin="anonymous"></script>
+```
+
+Page-bundle and `[content.files]` assets are copied after rendering, so their source file is hashed. Add `crossorigin="anonymous"` so the check also passes when the page is viewed from another host than `base_url`.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| name | String | Bundle name or output path (e.g. `main.css`, `css/site.css`) |
+
+**Returns:** String, such as `sha384-…`. A name that this build does not publish raises a template error, as does a raw `.json`/`.xml`/`.html` file under `--minify` (it is rewritten after rendering).
 
 ---
 
@@ -381,7 +417,7 @@ Get current datetime:
 
 | Name | Type | Description |
 |------|------|-------------|
-| format | String? | Date format string (optional) |
+| format | String? | Date format string (optional; default `%Y-%m-%d %H:%M:%S`) |
 
 **Returns:** String
 
@@ -415,21 +451,35 @@ Returns a resized image variant. When [image processing](/features/image-process
 
 | Name | Type | Description |
 |------|------|-------------|
-| path | String | Image path (e.g., `/images/photo.jpg`) |
+| path | String | Image path (e.g., `/images/photo.jpg`), or a `page.assets` entry |
 | width | Int | Requested width in pixels (0 = original) |
 | height | Int | Requested height in pixels (0 = original) |
+| op | String | `fit` (default), `fill` or `crop` — see [Crop and Fill](/features/image-processing/#crop-and-fill) |
+| anchor | String | Where `fill`/`crop` keep the image: `center` (default), `top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right` |
 
 **Returns:** Object with properties:
 
 | Property | Type | Description |
 |----------|------|-------------|
 | url | String | URL to the resized variant (or original if unavailable) |
-| width | Int | Requested width |
-| height | Int | Requested height |
+| width | Int | The variant's actual width — falls back to the requested width when no variant exists |
+| height | Int | Requested height (0 when not passed) |
 | lqip | String | Base64 data URI of a tiny JPEG placeholder (empty if LQIP disabled) |
 | dominant_color | String | Hex color string of the image's dominant color, e.g. `#a3b2c1` (empty if LQIP disabled) |
 
 The function selects the closest available width from the configured `widths`. If you request `width=500` and the configured widths are `[320, 640, 1024]`, it returns the 640px variant (smallest width >= requested). If nothing is large enough, it falls back to the largest available.
+
+Variants are never upscaled, so a 900px source asked for `width=1024` resolves
+to a 900px file — and `img.width` reports `900`, so
+`<img width="{{ img.width }}">` matches the file the browser loads. `height`
+is only ever the value you passed (`0` when you passed none): the variant map
+is rebuilt from filenames on incremental builds, so a real height is not
+available without decoding every image.
+
+With `op="fill"` or `op="crop"`, both `width` and `height` are required, the
+variant is written at render time (named like `hero_400x300_fill_center.jpg`),
+and `width`/`height` report the written file's size. An unknown `op` or
+`anchor` is a template error.
 
 The `lqip` and `dominant_color` properties require `[image_processing.lqip]` to be enabled. When disabled, they return empty strings.
 

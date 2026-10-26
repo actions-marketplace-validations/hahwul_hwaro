@@ -50,8 +50,9 @@ module Hwaro
       # between siblings collapses to a single rendered space and must
       # therefore be kept as one literal space. Replaced elements that
       # default to display:inline (iframe, video, audio, canvas, embed,
-      # object) are deliberately NOT listed: whitespace adjacent to them
-      # renders as a visible space and must be preserved.
+      # object — and `picture`, an inline wrapper around its `<img>`) are
+      # deliberately NOT listed: whitespace adjacent to them renders as a
+      # visible space and must be preserved.
       BLOCK_TAGS = Set{
         "address", "article", "aside", "base", "blockquote", "body",
         "caption", "col", "colgroup", "dd", "details", "dialog",
@@ -59,7 +60,7 @@ module Hwaro
         "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
         "head", "header", "hgroup", "hr", "html",
         "li", "link", "main", "menu", "meta", "nav", "noscript",
-        "ol", "p", "picture", "pre", "script", "section",
+        "ol", "p", "pre", "script", "section",
         "source", "style", "summary", "table", "tbody", "td",
         "tfoot", "th", "thead", "title", "tr", "track", "ul",
       }
@@ -80,6 +81,13 @@ module Hwaro
       # they were their original tag.
       PROTECTED_INLINE = Set{"code", "svg", "math", "textarea"}
 
+      # Protected tags that render nothing (display:none; `noscript` while
+      # scripting is on). They take no part in whitespace collapsing, so
+      # the space beside one still separates the inline content around
+      # it: `<b>a</b> <script>…</script> <b>c</b>` renders "a c", and
+      # treating the script as block deleted that gap ("ac").
+      PROTECTED_HIDDEN = Set{"script", "style", "noscript"}
+
       # Per-tag extraction patterns, compiled once at load time. minify()
       # runs once per rendered page, so building these eight Regex objects
       # inside protect_sensitive_blocks paid a PCRE2 compile per tag per
@@ -90,30 +98,35 @@ module Hwaro
         # Cheap presence probe: most pages carry no <textarea>, <math>,
         # <noscript>, …, and the heavy `.*?` extraction pattern below has
         # no fast no-match path (every '<' in the document is a candidate
-        # start). The lowercase literal decides via memchr for the
-        # markdown-rendered common case; the case-insensitive probe covers
-        # author-written uppercase tags.
+        # start). The lowercase literal decides via `ByteScan`'s memchr scan
+        # for the markdown-rendered common case; the case-insensitive probe
+        # covers author-written uppercase tags.
          "<#{tag}",
          Regex.new("<#{tag}", Regex::Options::IGNORE_CASE),
+         # `(?![\w-])`, not `\b`: a custom element such as `<pre-view>`
+         # or `<math-field>` is not the protected tag, and `\b` matched it
+         # and sealed everything up to the next real `</pre>` as one block.
          Regex.new(
-           "<#{tag}\\b[^>]*>.*?</#{tag}\\s*>",
+           "<#{tag}(?![\\w-])[^>]*>.*?</#{tag}\\s*>",
            Regex::Options::IGNORE_CASE | Regex::Options::MULTILINE
          )}
       end
 
       # Sentinel format for protected blocks. `\x00` is illegal in HTML,
       # so the placeholder cannot collide with author content. The
-      # `B`/`I` suffix lets the whitespace collapser look up the
+      # `B`/`I`/`H` suffix lets the whitespace collapser look up the
       # original element's display class without re-parsing the body.
       private PRESERVE_PREFIX_BLOCK  = "\x00HW_HTML_PB_"
       private PRESERVE_PREFIX_INLINE = "\x00HW_HTML_PI_"
+      private PRESERVE_PREFIX_HIDDEN = "\x00HW_HTML_PH_"
       private PRESERVE_SUFFIX        = "\x00"
-      # Common prefix of both placeholder forms, for cheap presence probes.
+      # Common prefix of every placeholder form, for cheap presence probes.
       private PRESERVE_TOKEN_PROBE = "\x00HW_HTML_P"
 
       # Regex constants
-      private REGEX_COMMENTS       = /<!--(?!\[if|#|\s*more\s*-->).*?-->/m
-      private REGEX_TRAILING_SPACE = /[ \t]+$/m
+      # The `<!-- more -->` summary marker, which the minifier keeps. Matched
+      # against a comment's whole body (between `<!--` and `-->`).
+      private REGEX_MORE_MARKER = /\A\s*more\s*\z/
       # Match a structural token immediately followed by whitespace and
       # lookahead at the next structural token. A "token" here is
       # either a regular tag or one of our protected-block
@@ -137,10 +150,10 @@ module Hwaro
       # the rendered HTML, and collapsing it either downgraded it to a
       # breakable space (inline neighbours) or deleted it outright
       # (block neighbours), silently changing the rendered page.
-      private REGEX_INTERTOKEN_WS  = /(<\/?[A-Za-z][\w-]*[^>]*>|\x00HW_HTML_P[BI]_\d+\x00)([ \t\r\n\f]+)(?=(<\/?[A-Za-z][\w-]*[^>]*>|\x00HW_HTML_P[BI]_\d+\x00))/
+      private REGEX_INTERTOKEN_WS  = /(<\/?[A-Za-z][\w-]*[^>]*>|\x00HW_HTML_P[BIH]_\d+\x00)([ \t\r\n\f]+)(?=(<\/?[A-Za-z][\w-]*[^>]*>|\x00HW_HTML_P[BIH]_\d+\x00))/
       private REGEX_TAG_NAME       = /^<\/?([A-Za-z][\w-]*)/
       private REGEX_BLANK_LINES    = /\n{2,}/
-      private REGEX_PRESERVE_TOKEN = /\x00HW_HTML_P[BI]_(\d+)\x00/
+      private REGEX_PRESERVE_TOKEN = /\x00HW_HTML_P[BIH]_(\d{1,9})\x00/
 
       # Minify the given HTML.
       #
@@ -174,7 +187,10 @@ module Hwaro
       # to U+FFFD; NUL never appears inside a multi-byte sequence, so this is
       # safe.
       def scrub_nul(html : String) : String
-        return html unless html.byte_index(0)
+        # memchr (via Slice#index), not `String#byte_index`, whose
+        # byte-at-a-time loop is ~15x slower — this probe runs over every
+        # rendered page.
+        return html unless html.to_slice.index(0_u8)
         String.build(html.bytesize) do |io|
           html.each_byte { |b| io.write_byte(b) unless b == 0 }
         end
@@ -187,8 +203,7 @@ module Hwaro
         html = scrub_nul(html)
         preserves = [] of String
         result = protect_sensitive_blocks(html, preserves)
-        result = result.gsub(REGEX_COMMENTS, "")
-        result = result.gsub(REGEX_TRAILING_SPACE, "")
+        result = strip_comments_and_trailing_space(result)
         result = collapse_intra_tag_whitespace(result)
         result = collapse_inter_token_whitespace(result)
         result = result.gsub(REGEX_BLANK_LINES, "\n")
@@ -205,8 +220,14 @@ module Hwaro
       private def protect_sensitive_blocks(html : String, preserves : Array(String)) : String
         result = html
         PROTECTED_PATTERNS.each do |(tag, open_literal, probe, pattern)|
-          next unless result.includes?(open_literal) || result.matches?(probe)
-          prefix = PROTECTED_INLINE.includes?(tag) ? PRESERVE_PREFIX_INLINE : PRESERVE_PREFIX_BLOCK
+          next unless ByteScan.includes?(result, open_literal) || result.matches?(probe)
+          prefix = if PROTECTED_INLINE.includes?(tag)
+                     PRESERVE_PREFIX_INLINE
+                   elsif PROTECTED_HIDDEN.includes?(tag)
+                     PRESERVE_PREFIX_HIDDEN
+                   else
+                     PRESERVE_PREFIX_BLOCK
+                   end
           result = result.gsub(pattern) do |match|
             idx = preserves.size
             preserves << match
@@ -262,6 +283,109 @@ module Hwaro
         html
       end
 
+      # Drop comments and the spaces/tabs that end a line — in TEXT only.
+      # Tags are copied through verbatim (quote-aware, see find_tag_end): a
+      # `<!-- … -->` or a line-final space inside an attribute value is part
+      # of that value (`data-x="<!-- keep -->"`, a multi-line `content="…"`),
+      # and the regex passes this replaces rewrote both.
+      private def strip_comments_and_trailing_space(html : String) : String
+        bytes = html.to_slice
+        n = bytes.size
+        String.build(n) do |io|
+          # Spaces/tabs seen but not yet written. Kept as bytes, not as an
+          # offset: a dropped comment can sit between two runs.
+          pending = IO::Memory.new
+          # Once a comment body starting at some offset has no `-->`, no later
+          # one does either; remembering that keeps a run of unterminated
+          # `<!--` linear instead of rescanning to the end for each.
+          unterminated_from = n
+          i = 0
+          while i < n
+            b = bytes[i]
+            if b == ' '.ord || b == '\t'.ord
+              pending.write_byte(b)
+              i += 1
+              next
+            end
+            if b == '\n'.ord
+              pending.clear # line-final whitespace is dropped
+              io.write_byte(b)
+              i += 1
+              next
+            end
+            if b == '<'.ord && i + 3 < n && bytes[i + 1] == '!'.ord && bytes[i + 2] == '-'.ord && bytes[i + 3] == '-'.ord
+              close = i + 4 >= unterminated_from ? -1 : comment_end(bytes, i + 4, n)
+              unterminated_from = i + 4 if close < 0 && i + 4 < unterminated_from
+              if close >= 0
+                unless kept_comment?(bytes, i + 4, close - 3)
+                  i = close # dropped; pending whitespace stays pending
+                  next
+                end
+                # A kept comment is copied whole. Re-scanning its body read
+                # the `<!-->` that ends `<!--[if !IE]><!-->` as a new comment
+                # and dropped everything up to the next `-->` — the content
+                # every non-IE browser shows.
+                unless pending.empty?
+                  io.write(pending.to_slice)
+                  pending.clear
+                end
+                io.write(bytes[i, close - i])
+                i = close
+                next
+              end
+            end
+            unless pending.empty?
+              io.write(pending.to_slice)
+              pending.clear
+            end
+            if b == '<'.ord && i + 1 < n && tag_start_byte?(bytes[i + 1])
+              tag_end = find_tag_end(bytes, i, n)
+              if tag_end >= 0
+                io.write(bytes[i, tag_end - i + 1])
+                i = tag_end + 1
+                next
+              end
+            end
+            io.write_byte(b)
+            i += 1
+          end
+          # Whitespace at the very end of the document is line-final too.
+        end
+      end
+
+      # Index just past the `-->` closing a comment whose body starts at
+      # `from`, or -1 when unterminated (left verbatim, like the old regex).
+      private def comment_end(bytes : Bytes, from : Int32, n : Int32) : Int32
+        # `<!-->` and `<!--->` are complete (empty) comments to an HTML parser.
+        return from + 1 if from < n && bytes[from] == '>'.ord
+        return from + 2 if from + 1 < n && bytes[from] == '-'.ord && bytes[from + 1] == '>'.ord
+        i = from
+        while i + 2 < n
+          return i + 3 if bytes[i] == '-'.ord && bytes[i + 1] == '-'.ord && bytes[i + 2] == '>'.ord
+          i += 1
+        end
+        -1
+      end
+
+      # True for a comment the minifier keeps: a conditional comment (`[if`),
+      # an SSI directive (`#`) or the `<!-- more -->` summary marker. The
+      # body is `bytes[from...body_end]`. The regex only ever sees that whole
+      # body: both ends sit next to ASCII delimiters, so it is never a slice
+      # cut through a multi-byte character (a fixed-size window was, and
+      # PCRE2 raised "UTF-8 error", failing the whole `--minify` build).
+      private def kept_comment?(bytes : Bytes, from : Int32, body_end : Int32) : Bool
+        size = body_end - from
+        return false if size <= 0
+        first = bytes[from]
+        return true if first == '#'.ord
+        return true if first == '['.ord && size >= 3 && bytes[from + 1] == 'i'.ord && bytes[from + 2] == 'f'.ord
+        # The `<!--<![endif]-->` closing a downlevel-revealed `<!--[if …]><!-->`.
+        return true if size >= 7 && bytes[body_end - 7, 7] == "[endif]".to_slice
+        # `more` plus any whitespace; skip the regex for anything shorter.
+        return false if size < 4
+        REGEX_MORE_MARKER.matches?(String.new(bytes[from, size]).scrub)
+      end
+
       # Collapse whitespace between two structural tokens. The token
       # classification distinguishes block from inline so we can:
       #   * strip whitespace entirely when either neighbour is block
@@ -270,12 +394,17 @@ module Hwaro
       #   * keep a single space only when both neighbours are inline,
       #     preserving the visible gap between adjacent inline elements
       #     like `<a>x</a> <a>y</a>`.
+      # A hidden placeholder (script/style/noscript) is neither: next to
+      # an inline neighbour its space is kept, between two hidden ones
+      # (the usual run of tags in `<head>`) it is stripped.
+      # ponytail: decided per pair, so `<b>a</b><script/> <script/><b>c</b>`
+      # still loses its one space; look past hidden runs if that shows up.
       private def collapse_inter_token_whitespace(html : String) : String
         html.gsub(REGEX_INTERTOKEN_WS) do
           prior = $1
           # $2 = whitespace run (discarded except when we re-emit one space)
           nxt = $3
-          if block_token?(prior) || block_token?(nxt)
+          if block_token?(prior) || block_token?(nxt) || (hidden_token?(prior) && hidden_token?(nxt))
             prior
           else
             "#{prior} "
@@ -288,12 +417,15 @@ module Hwaro
       # block).
       private def block_token?(token : String) : Bool
         return true if token.starts_with?(PRESERVE_PREFIX_BLOCK)
-        return false if token.starts_with?(PRESERVE_PREFIX_INLINE)
         if m = REGEX_TAG_NAME.match(token)
           BLOCK_TAGS.includes?(m[1].downcase)
         else
           false
         end
+      end
+
+      private def hidden_token?(token : String) : Bool
+        token.starts_with?(PRESERVE_PREFIX_HIDDEN)
       end
 
       # Collapse whitespace runs *inside* tag openings to a single
@@ -356,6 +488,21 @@ module Hwaro
         -1
       end
 
+      # True when the attribute right before a trailing ` /` has an
+      # UNQUOTED value (`<link href=/favicon.ico />`). There the space is what
+      # ends the value: `href=/favicon.ico/` makes the slash part of the URL
+      # (`/favicon.ico/`, a 404). A quoted value, a bare attribute name or the
+      # tag name itself is ended by its own syntax, so `<br />` → `<br/>` and
+      # `alt="x" />` → `alt="x"/>` stay safe.
+      private def unquoted_value_before_slash?(body : String) : Bool
+        rest = body.rchop(" /")
+        last = rest.split(' ').last? || ""
+        eq = last.index('=')
+        return false unless eq
+        value = last[(eq + 1)..]
+        !value.empty? && !value.ends_with?('"') && !value.ends_with?('\'')
+      end
+
       # Write the tag at `bytes[start..tag_end]` to `io` with internal
       # whitespace collapsed. The tag-name run is copied verbatim;
       # then we collapse whitespace between attributes, preserve
@@ -416,7 +563,9 @@ module Hwaro
         # the byte preceding the `" /"` is part of a multi-byte
         # UTF-8 sequence inside a quoted attribute value.
         body = body.rstrip
-        body = body.rchop(" /") + "/" if body.ends_with?(" /")
+        if body.ends_with?(" /") && !unquoted_value_before_slash?(body)
+          body = body.rchop(" /") + "/"
+        end
         io << body
         io.write_byte('>'.ord.to_u8)
       end

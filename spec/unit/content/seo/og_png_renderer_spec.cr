@@ -1,0 +1,686 @@
+require "../../../spec_helper"
+
+class Hwaro::Content::Seo::OgPngRenderer
+  def self.test_word_wrap_chain(chain, px_size, text, max_width)
+    word_wrap_chain(chain, px_size, text, max_width)
+  end
+
+  def self.test_balanced_wrap_chain(chain, px_size, text, max_width)
+    balanced_wrap_chain(chain, px_size, text, max_width)
+  end
+end
+
+describe Hwaro::Content::Seo::OgPngRenderer do
+  describe ".parse_hex_color" do
+    it "parses hex color strings" do
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#ff0000").should eq(0xff0000_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#00ff00").should eq(0x00ff00_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#1a1a2e").should eq(0x1a1a2e_u32)
+    end
+
+    it "handles color without hash" do
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("ffffff").should eq(0xffffff_u32)
+    end
+
+    it "expands 3-digit shorthand" do
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#fff").should eq(0xffffff_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#f00").should eq(0xff0000_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#1a2").should eq(0x11aa22_u32)
+    end
+
+    it "drops the alpha byte from 8-digit hex" do
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#ff0000aa").should eq(0xff0000_u32)
+    end
+
+    it "returns 0 for invalid input" do
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("not-a-color").should eq(0_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#12345").should eq(0_u32)
+      Hwaro::Content::Seo::OgPngRenderer.parse_hex_color("#gggggg").should eq(0_u32)
+    end
+  end
+
+  # The logo occupies a LOGO_SIZE square BOX, but the image inside it must
+  # keep its aspect ratio (SVG's `<image>` already does — its default
+  # preserveAspectRatio is "xMidYMid meet"). Stretching to the full square
+  # squashed every non-square logo: a 400x300 mark rendered 48x48.
+  describe ".fit_dimensions" do
+    it "scales a landscape image to the box width" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(400, 300, 48, 48).should eq({48, 36})
+    end
+
+    it "scales a portrait image to the box height" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(300, 400, 48, 48).should eq({36, 48})
+    end
+
+    it "leaves a square image square" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(512, 512, 48, 48).should eq({48, 48})
+    end
+
+    it "upscales a small image into the box without distorting it" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(20, 10, 48, 48).should eq({48, 24})
+    end
+
+    it "never collapses an extreme aspect ratio to zero" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(4000, 10, 48, 48).should eq({48, 1})
+    end
+
+    it "falls back to the box for degenerate dimensions" do
+      Hwaro::Content::Seo::OgPngRenderer.fit_dimensions(0, 0, 48, 48).should eq({48, 48})
+    end
+  end
+
+  describe ".find_system_font" do
+    it "returns a string or nil" do
+      result = Hwaro::Content::Seo::OgPngRenderer.find_system_font
+      if result
+        File.exists?(result).should be_true
+      end
+    end
+  end
+
+  describe ".load_fonts" do
+    it "returns FontContext without arguments (bundled fallback)" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      ctx.should_not be_nil
+    end
+
+    it "returns FontContext with nil custom path" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts(nil)
+      ctx.should_not be_nil
+    end
+
+    # Regression: the memo was keyed on the path string only, so a `serve`
+    # session kept the old font after the file was replaced in place.
+    it "reloads a custom font whose file was replaced at the same path" do
+      Dir.mktmpdir do |dir|
+        font = File.join(dir, "custom.ttf")
+        fonts_dir = File.expand_path("../../../../src/ext/fonts", __DIR__)
+        File.copy(File.join(fonts_dir, "SpaceGrotesk-Bold.ttf"), font)
+        first = Hwaro::Content::Seo::OgPngRenderer.load_fonts(font).not_nil!
+        Hwaro::Content::Seo::OgPngRenderer.load_fonts(font).should be(first)
+
+        File.delete(font)
+        File.copy(File.join(fonts_dir, "DejaVuSans-Bold.ttf"), font)
+        Hwaro::Content::Seo::OgPngRenderer.load_fonts(font).should_not be(first)
+      end
+    end
+
+    it "falls back when custom font path does not exist" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts("/nonexistent/font.ttf")
+      ctx.should_not be_nil
+    end
+
+    it "returns a FontContext when prefer_cjk is set" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts(nil, prefer_cjk: true)
+      ctx.should_not be_nil
+    end
+
+    # Regression (#8): CJK titles rendered as blank "tofu" boxes because the
+    # font search list was Latin-only. When a CJK-capable system font exists,
+    # prefer_cjk must load it so Hangul/Han/kana glyphs are available.
+    it "loads a CJK-capable font that covers Hangul when one is installed" do
+      cjk_path = Hwaro::Content::Seo::OgPngRenderer.find_cjk_font
+      next if cjk_path.nil? # no CJK font on this machine (e.g. minimal CI) — skip
+
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts(nil, prefer_cjk: true)
+      ctx.should_not be_nil
+      # U+D55C '한' (Hangul) must resolve to a real glyph somewhere in the
+      # font chains (the CJK fallback is appended to every role chain).
+      ctx.not_nil!.covers?(0xD55C).should be_true
+    end
+
+    it "builds fallback chains with the brand font first and DejaVu last" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      ctx.should_not be_nil
+      ctx = ctx.not_nil!
+      # Each role chain carries at least the brand font plus the DejaVu tail.
+      ctx.display.size.should be >= 2
+      ctx.text.size.should be >= 2
+      ctx.mono.size.should be >= 2
+      # Basic Latin must be drawable by every chain.
+      ctx.covers?('A'.ord).should be_true
+    end
+
+    it "measures mixed-script text as a positive width" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      ctx.should_not be_nil
+      w = Hwaro::Content::Seo::OgPngRenderer.chain_measure(ctx.not_nil!.display, 48_f32, "Hello 123")
+      w.should be > 0
+      # Tracking adds per-character advance.
+      wt = Hwaro::Content::Seo::OgPngRenderer.chain_measure(ctx.not_nil!.display, 48_f32, "Hello 123", 2.0_f32)
+      wt.should be > w
+    end
+  end
+
+  describe ".find_cjk_font" do
+    it "returns an existing font path or nil" do
+      result = Hwaro::Content::Seo::OgPngRenderer.find_cjk_font
+      if result
+        File.exists?(result).should be_true
+      else
+        result.should be_nil
+      end
+    end
+  end
+
+  describe ".render_png" do
+    it "renders a PNG file when fonts are available" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Hello PNG World"
+        page.description = "Testing PNG rendering"
+
+        config = Hwaro::Models::Config.new
+        config.title = "Test Site"
+        config.og.auto_image.enabled = true
+
+        png_path = File.join(dir, "test.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+
+        result.should be_true
+        File.exists?(png_path).should be_true
+        # PNG files start with the magic bytes
+        data = File.open(png_path, "rb", &.getb_to_end)
+        data.size.should be > 1000 # Reasonable PNG size
+        data[0].should eq(0x89_u8) # PNG magic byte
+        data[1].should eq(0x50_u8) # 'P'
+        data[2].should eq(0x4E_u8) # 'N'
+        data[3].should eq(0x47_u8) # 'G'
+      end
+    end
+
+    # Regression: the base-layer memo was keyed on the background image PATH
+    # only, so replacing the file in a long-lived `serve` process re-rendered
+    # the cards (the config hash flagged them) over the stale baked background.
+    it "rebuilds the base layer when the background image is replaced at the same path" do
+      Dir.mktmpdir do |dir|
+        bg = File.join(dir, "bg.png")
+        write_solid = ->(r : UInt8, b : UInt8) {
+          pixel = Pointer(UInt8).malloc(4)
+          pixel[0] = r; pixel[1] = 0_u8; pixel[2] = b; pixel[3] = 255_u8
+          LibStb.stbi_write_png(bg, 1, 1, 4, pixel.as(Void*), 4)
+          GC.free(pixel.as(Void*))
+        }
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.background_image = bg
+        config.og.auto_image.overlay_opacity = 0.0
+
+        write_solid.call(255_u8, 0_u8)
+        red = Hwaro::Content::Seo::OgPngRenderer.build_base_layer(
+          config, bg, Hwaro::Content::Seo::OgPngRenderer.load_image(bg, 1200, 630)).dup
+
+        write_solid.call(0_u8, 255_u8)
+        blue = Hwaro::Content::Seo::OgPngRenderer.build_base_layer(
+          config, bg, Hwaro::Content::Seo::OgPngRenderer.load_image(bg, 1200, 630))
+
+        blue.should_not eq(red)
+      end
+    end
+
+    # Regression: an empty page title left the headline block blank; it now
+    # renders exactly like a page titled with the site title.
+    it "falls back to the site title for an empty page title" do
+      Dir.mktmpdir do |dir|
+        config = Hwaro::Models::Config.new
+        config.title = "Fallback Site"
+        config.og.auto_image.enabled = true
+
+        untitled = Hwaro::Models::Page.new("a.md")
+        untitled.title = ""
+        untitled.description = "same description"
+        titled = Hwaro::Models::Page.new("b.md")
+        titled.title = "Fallback Site"
+        titled.description = "same description"
+
+        ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+        a = File.join(dir, "a.png")
+        b = File.join(dir, "b.png")
+        Hwaro::Content::Seo::OgPngRenderer.render_png(untitled, config, a, font_ctx: ctx).should be_true
+        Hwaro::Content::Seo::OgPngRenderer.render_png(titled, config, b, font_ctx: ctx).should be_true
+        File.read(a).should eq(File.read(b))
+      end
+    end
+
+    it "renders with custom colors" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Colored"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.background = "#ff0000"
+        config.og.auto_image.text_color = "#00ff00"
+        config.og.auto_image.accent_color = "#0000ff"
+
+        png_path = File.join(dir, "colored.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+        result.should be_true
+        File.exists?(png_path).should be_true
+      end
+    end
+
+    it "renders with dots style" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Dots Style"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.style = "dots"
+
+        png_path = File.join(dir, "dots.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+        result.should be_true
+      end
+    end
+
+    it "renders with minimal style (no accent bars)" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Minimal"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.style = "minimal"
+
+        png_path = File.join(dir, "minimal.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+        result.should be_true
+      end
+    end
+
+    it "renders geometric styles (split / band / brutalist)" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      Dir.mktmpdir do |dir|
+        %w[split band brutalist].each do |style|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Geometric #{style}"
+          page.description = "bold layout"
+
+          config = Hwaro::Models::Config.new
+          config.title = "Site"
+          config.og.auto_image.style = style
+
+          png_path = File.join(dir, "#{style}.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, font_ctx: ctx)
+          result.should be_true
+          File.exists?(png_path).should be_true
+        end
+      end
+    end
+
+    it "renders signature styles (terminal / bauhaus / halftone)" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      Dir.mktmpdir do |dir|
+        %w[terminal bauhaus halftone].each do |style|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Signature #{style}"
+          page.description = "self-contained composition"
+
+          config = Hwaro::Models::Config.new
+          config.title = "Site"
+          config.og.auto_image.style = style
+
+          png_path = File.join(dir, "#{style}.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, font_ctx: ctx)
+          result.should be_true
+          File.exists?(png_path).should be_true
+        end
+      end
+    end
+
+    it "renders modern styles with generated backgrounds (gradient / glow / frame)" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      Dir.mktmpdir do |dir|
+        %w[editorial framed artistic hero surreal monument].each do |style|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Modern #{style}"
+          page.description = "distinct background signature"
+
+          config = Hwaro::Models::Config.new
+          config.title = "Site"
+          config.og.auto_image.style = style
+
+          png_path = File.join(dir, "#{style}.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, font_ctx: ctx)
+          result.should be_true
+          File.exists?(png_path).should be_true
+        end
+      end
+    end
+
+    it "renders with an explicit secondary_color" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Two Tone"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.style = "split"
+        config.og.auto_image.accent_color = "#ff3b6b"
+        config.og.auto_image.secondary_color = "#00f3b7"
+
+        png_path = File.join(dir, "split2.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+        result.should be_true
+        File.exists?(png_path).should be_true
+      end
+    end
+
+    it "renders without site name when show_title is false" do
+      Dir.mktmpdir do |dir|
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "No Title"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.show_title = false
+
+        png_path = File.join(dir, "notitle.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+        result.should be_true
+      end
+    end
+
+    it "renders with a logo image" do
+      Dir.mktmpdir do |dir|
+        # Create a small valid PNG (1x1 red pixel)
+        logo_path = File.join(dir, "logo.png")
+        # Write minimal valid 1x1 PNG
+        pixel = Pointer(UInt8).malloc(4)
+        pixel[0] = 255_u8; pixel[1] = 0_u8; pixel[2] = 0_u8; pixel[3] = 255_u8
+        LibStb.stbi_write_png(logo_path, 1, 1, 4, pixel.as(Void*), 4)
+        GC.free(pixel.as(Void*))
+
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "With Logo"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.logo = logo_path
+
+        png_path = File.join(dir, "withlogo.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, logo_path)
+        result.should be_true
+      end
+    end
+
+    it "renders with background image and overlay" do
+      Dir.mktmpdir do |dir|
+        # Create a small valid PNG for background
+        bg_path = File.join(dir, "bg.png")
+        pixel = Pointer(UInt8).malloc(4)
+        pixel[0] = 0_u8; pixel[1] = 0_u8; pixel[2] = 255_u8; pixel[3] = 255_u8
+        LibStb.stbi_write_png(bg_path, 1, 1, 4, pixel.as(Void*), 4)
+        GC.free(pixel.as(Void*))
+
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "With BG"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.background_image = bg_path
+        config.og.auto_image.overlay_opacity = 0.7
+
+        png_path = File.join(dir, "withbg.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, nil, bg_path)
+        result.should be_true
+      end
+    end
+
+    # config.cr only rejects non-finite opacity; a finite but out-of-range
+    # value (e.g. 1.8 or -0.5) passes through from TOML. Every opacity branch
+    # relies on .clamp(0.0,1.0) before .to_u8 (the gradient branch even carries
+    # a comment that a missing clamp raises OverflowError). These render with
+    # out-of-range opacities to pin that no OverflowError aborts the build.
+    {1.8, -0.5}.each do |opacity|
+      it "renders dots style with out-of-range pattern_opacity #{opacity} without OverflowError" do
+        Dir.mktmpdir do |dir|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Dots Opacity"
+
+          config = Hwaro::Models::Config.new
+          config.og.auto_image.style = "dots"
+          config.og.auto_image.pattern_opacity = opacity
+
+          png_path = File.join(dir, "dots-opacity.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+          result.should be_true
+          data = File.open(png_path, "rb", &.getb_to_end)
+          data[0].should eq(0x89_u8) # PNG magic byte
+        end
+      end
+
+      it "renders gradient style with out-of-range pattern_opacity #{opacity} without OverflowError" do
+        Dir.mktmpdir do |dir|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Gradient Opacity"
+
+          config = Hwaro::Models::Config.new
+          config.og.auto_image.style = "gradient"
+          config.og.auto_image.pattern_opacity = opacity
+
+          png_path = File.join(dir, "gradient-opacity.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+          result.should be_true
+          data = File.open(png_path, "rb", &.getb_to_end)
+          data[0].should eq(0x89_u8) # PNG magic byte
+        end
+      end
+    end
+
+    it "renders a background overlay with out-of-range overlay_opacity without OverflowError" do
+      Dir.mktmpdir do |dir|
+        bg_path = File.join(dir, "bg.png")
+        pixel = Pointer(UInt8).malloc(4)
+        pixel[0] = 0_u8; pixel[1] = 0_u8; pixel[2] = 255_u8; pixel[3] = 255_u8
+        LibStb.stbi_write_png(bg_path, 1, 1, 4, pixel.as(Void*), 4)
+        GC.free(pixel.as(Void*))
+
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "Overlay Opacity"
+
+        config = Hwaro::Models::Config.new
+        config.og.auto_image.background_image = bg_path
+        config.og.auto_image.overlay_opacity = 2.0
+
+        png_path = File.join(dir, "overlay-opacity.png")
+        result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, nil, bg_path)
+        result.should be_true
+        data = File.open(png_path, "rb", &.getb_to_end)
+        data[0].should eq(0x89_u8) # PNG magic byte
+      end
+    end
+
+    # render_png's only failure signal is the boolean return from
+    # stbi_write_png. Writing into a read-only directory makes the write fail;
+    # render_png must return false (not raise) and leave no file behind.
+    it "returns false without raising when the png cannot be written" do
+      posix_only!("chmod can't make a directory unwritable on Windows")
+      {% unless flag?(:windows) %}
+        next if LibC.getuid == 0 # root bypasses chmod-based unwritability
+      {% end %}
+
+      Dir.mktmpdir do |dir|
+        ro_dir = File.join(dir, "readonly")
+        Dir.mkdir_p(ro_dir)
+        File.chmod(ro_dir, 0o500)
+        begin
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Write Failure"
+
+          config = Hwaro::Models::Config.new
+
+          png_path = File.join(ro_dir, "out.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+          result.should be_false
+          File.exists?(png_path).should be_false
+        ensure
+          File.chmod(ro_dir, 0o700) # restore so mktmpdir cleanup succeeds
+        end
+      end
+    end
+
+    # An empty / whitespace-only title yields title_lines == [] from
+    # word_wrap_measured. The terminal-cursor branch (!title_lines.empty?) and
+    # the hero ghost branch (page.title.split.first? / unless empty?) are
+    # load-bearing guards; render must no-op those branches without raising.
+    ["", "   "].each do |blank|
+      label = blank.empty? ? "empty" : "whitespace-only"
+
+      it "renders terminal style with an #{label} title without raising" do
+        Dir.mktmpdir do |dir|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = blank
+
+          config = Hwaro::Models::Config.new
+          config.og.auto_image.style = "terminal"
+
+          png_path = File.join(dir, "terminal-blank.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+          result.should be_true
+        end
+      end
+
+      it "renders hero style with an #{label} title without raising" do
+        Dir.mktmpdir do |dir|
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = blank
+
+          config = Hwaro::Models::Config.new
+          config.og.auto_image.style = "hero"
+
+          png_path = File.join(dir, "hero-blank.png")
+          result = Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path)
+          result.should be_true
+        end
+      end
+    end
+  end
+
+  # A title segment wider than the line on its own (a URL, a file path) was
+  # kept whole, so it ran off the canvas — and across the window frame in
+  # `terminal`. The SVG renderer hard-breaks such segments; so must PNG.
+  describe ".word_wrap_chain" do
+    long_title = "Understanding github.com/hahwul/hwaro/src/content/processors/image_processor.cr in depth"
+
+    it "hard-breaks a segment wider than the line" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts.as(Hwaro::Content::Seo::OgPngRenderer::FontContext)
+      lines = Hwaro::Content::Seo::OgPngRenderer.test_word_wrap_chain(ctx.mono, 54_f32, long_title, 900)
+      lines.size.should be > 2
+      lines.each do |line|
+        Hwaro::Content::Seo::OgPngRenderer.chain_measure(ctx.mono, 54_f32, line).should be <= 900
+      end
+      lines.join.delete(' ').should eq(long_title.delete(' '))
+    end
+
+    it "does not split words that fit when balancing" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts.as(Hwaro::Content::Seo::OgPngRenderer::FontContext)
+      title = "Short words wrap only at spaces here"
+      lines = Hwaro::Content::Seo::OgPngRenderer.test_balanced_wrap_chain(ctx.display, 56_f32, title, 700)
+      lines.join(" ").should eq(title)
+    end
+  end
+
+  describe "canvas clipping" do
+    # `fill_rect`/`fill_rect_alpha` write through a raw `UInt8*` with no bounds
+    # checking, and several callers legitimately produce NEGATIVE coordinates:
+    # the monument/brand rows subtract a MEASURED site-title width from a fixed
+    # right edge, and `draw_corner_bracket` subtracts an arm length. Only the
+    # upper bound used to be clipped, so a long enough `config.title` walked the
+    # write cursor off the front of the buffer — silent heap corruption at a few
+    # thousand characters, SIGSEGV in `fill_rect` at a few hundred thousand.
+    it "survives a site title far wider than the canvas in every style" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      Dir.mktmpdir do |dir|
+        %w[monument framed default terminal minimal editorial band split].each do |style|
+          config = Hwaro::Models::Config.new
+          config.title = "A" * 500_000
+          config.og.auto_image.style = style
+          config.og.auto_image.show_title = true
+
+          page = Hwaro::Models::Page.new("test.md")
+          page.title = "Hello"
+          page.description = "World"
+
+          png_path = File.join(dir, "wide-#{style}.png")
+          Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, font_ctx: ctx).should be_true
+        end
+      end
+    end
+
+    # Front matter is not UTF-8 validated, so a title can carry a truncated
+    # multi-byte sequence. The C measure/render decoders used to advance by the
+    # sequence's NOMINAL length, stepping the cursor past the string's NUL
+    # terminator and reading heap memory until it happened to hit a zero byte.
+    it "renders a title whose bytes end mid UTF-8 sequence" do
+      ctx = Hwaro::Content::Seo::OgPngRenderer.load_fonts
+      truncated = String.new(Bytes[0x41_u8, 0x42_u8, 0xF0_u8])
+      Dir.mktmpdir do |dir|
+        config = Hwaro::Models::Config.new
+        config.title = truncated
+
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = truncated
+        page.description = truncated
+
+        png_path = File.join(dir, "truncated.png")
+        Hwaro::Content::Seo::OgPngRenderer.render_png(page, config, png_path, font_ctx: ctx).should be_true
+      end
+    end
+  end
+
+  describe ".load_image" do
+    # load_image decodes/resizes logo & bg images via stb. Its failure guards
+    # must each return nil cleanly (and free the source buffer) rather than
+    # raise or segfault on a user-supplied corrupt or missing image.
+    it "returns nil for a corrupt (non-image) file" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "corrupt.png")
+        File.write(path, "this is not an image")
+        Hwaro::Content::Seo::OgPngRenderer.load_image(path, 48, 48).should be_nil
+      end
+    end
+
+    it "returns nil for a nonexistent path" do
+      Hwaro::Content::Seo::OgPngRenderer.load_image("/nonexistent/logo.png", 48, 48).should be_nil
+    end
+
+    # Regression: a phone photo (EXIF Orientation 6) as background or logo was
+    # drawn from stb's raw sideways rows, while browsers (and the SVG card,
+    # which embeds the original) show it upright.
+    it "draws a JPEG upright by its EXIF orientation" do
+      Dir.mktmpdir do |dir|
+        photo = File.join(dir, "logo.jpg")
+        write_exif_jpeg(photo, 40, 20, 6)
+        fitted = Hwaro::Content::Seo::OgPngRenderer.load_image(photo, 100, 100, fit: true).not_nil!
+        {fitted.width, fitted.height}.should eq({50, 100})
+
+        plain = File.join(dir, "plain.jpg")
+        write_exif_jpeg(plain, 40, 20, nil)
+        fitted = Hwaro::Content::Seo::OgPngRenderer.load_image(plain, 100, 100, fit: true).not_nil!
+        {fitted.width, fitted.height}.should eq({100, 50})
+      end
+    end
+  end
+
+  describe "integration with OgImage.generate" do
+    it "generates PNG files directly when format is png" do
+      Dir.mktmpdir do |dir|
+        config = Hwaro::Models::Config.new
+        config.title = "My Site"
+        config.og.auto_image.enabled = true
+        config.og.auto_image.format = "png"
+
+        page = Hwaro::Models::Page.new("test.md")
+        page.title = "PNG Integration"
+        page.url = "/posts/png-test/"
+        page.render = true
+
+        Hwaro::Content::Seo::OgImage.generate([page], config, dir)
+
+        # Should generate PNG directly
+        png_path = File.join(dir, "og-images", "posts-png-test.png")
+        File.exists?(png_path).should be_true
+        page.image.should eq("/og-images/posts-png-test.png")
+
+        # Should NOT leave an SVG behind
+        svg_path = File.join(dir, "og-images", "posts-png-test.svg")
+        File.exists?(svg_path).should be_false
+      end
+    end
+  end
+end

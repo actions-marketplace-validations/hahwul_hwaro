@@ -1,5 +1,6 @@
 require "yaml"
 require "./base"
+require "../../content/processors/fence_tracker"
 
 module Hwaro
   module Services
@@ -11,10 +12,6 @@ module Hwaro
         def run(options : Config::Options::ImportOptions) : ImportResult
           path = options.path
           output_dir = options.output_dir
-          imported = 0
-          skipped = 0
-          errors = 0
-          wrapped = 0
 
           reset_written_paths
 
@@ -34,48 +31,23 @@ module Hwaro
             )
           end
 
-          files = collect_markdown_files(content_dir)
+          files = collect_markdown_files(content_dir, path)
 
           if files.empty?
             return ImportResult.new(
               success: true,
               message: "No content files found in #{content_dir}",
+              skipped_count: outside_source_skips,
             )
           end
 
-          files.each do |file_path|
-            result = import_file(file_path, content_dir, output_dir, options.drafts, options.verbose, options.force)
-            case result
-            when :imported
-              imported += 1
-            when :imported_wrapped
-              imported += 1
-              wrapped += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error importing #{file_path}: #{ex.message}"
+          import_each(files, "Astro", wrapped_note: "contained MDX components. Imports kept the raw markup — each will render as literal text until you hand-convert them.") do |file_path|
+            import_file(file_path, content_dir, output_dir, options.drafts, options.verbose, options.force)
           end
-
-          if wrapped > 0
-            Logger.warn "#{wrapped} file(s) contained MDX components. Imports kept the raw markup — each will render as literal text until you hand-convert them."
-          end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Astro import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors,
-          )
         end
 
-        private def collect_markdown_files(dir : String) : Array(String)
-          walk_files(dir, [".md", ".mdx"])
+        private def collect_markdown_files(dir : String, source_root : String) : Array(String)
+          walk_files(dir, [".md", ".mdx"], source_root: source_root)
         end
 
         private def import_file(
@@ -97,17 +69,18 @@ module Hwaro
 
           if yaml
             # Title
-            if title = yaml["title"]?
-              fields["title"] = yaml_string(title)
+            if (title = yaml["title"]?) && (title_text = yaml_title(title))
+              fields["title"] = title_text
             end
 
-            # Date (pubDate is Astro's convention)
-            if date_val = yaml["pubDate"]? || yaml["date"]? || yaml["publishDate"]?
+            # Date (pubDate is Astro's convention). `first_present`, not
+            # `||`: a present-but-null key would discard the fallbacks.
+            if date_val = first_present(yaml, "pubDate", "date", "publishDate")
               assign_date_field(fields, "date", date_val)
             end
 
             # Updated date
-            if updated = yaml["updatedDate"]? || yaml["updated"]? || yaml["lastmod"]?
+            if updated = first_present(yaml, "updatedDate", "updated", "lastmod")
               assign_date_field(fields, "updated", updated)
             end
 
@@ -144,7 +117,7 @@ module Hwaro
             fields["tags"] = tags unless tags.empty?
 
             # Image (heroImage is Astro's blog template convention)
-            if image = yaml["heroImage"]? || yaml["image"]? || yaml["cover"]?
+            if image = first_present(yaml, "heroImage", "image", "cover")
               case image.raw
               when String
                 fields["image"] = image.as_s
@@ -182,10 +155,7 @@ module Hwaro
           # can emit a single summary warning.
           has_mdx_components = false
           if file_path.ends_with?(".mdx")
-            # [^\n], not `.+`: Crystal's /m makes `.` match newlines, so `.+$`
-            # swallowed everything from the first import line to EOF —
-            # deleting the entire article body of any real MDX file.
-            body = body.gsub(/^import[ \t]+[^\n]+$\n?/m, "")
+            body = strip_mdx_imports(body)
             if body.matches?(/<[A-Z]/)
               Logger.warn "MDX components detected in #{file_path} — manual conversion needed."
               has_mdx_components = true
@@ -199,17 +169,89 @@ module Hwaro
           # directory — a literal "index" slug collides across every bundle
           # in the section, silently dropping all but the first.
           base = File.basename(file_path, File.extname(file_path))
+          source_dir = File.dirname(file_path)
+          bundle = false
           if base == "index"
-            parent = File.basename(File.dirname(file_path))
-            base = parent unless File.same?(File.dirname(file_path), content_dir)
+            parent = File.basename(source_dir)
+            base = parent unless File.same?(source_dir, content_dir)
+            bundle = !File.same?(source_dir, content_dir) && !File.same?(source_dir, File.join(content_dir, section))
           end
-          slug = slugify(base)
+          slug = file_slug(base)
 
           frontmatter = generate_frontmatter(fields)
           body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
-          written = write_content_file(output_dir, section, slug, frontmatter, body.strip, verbose, force)
+
+          # A bundle with co-located files (`cover.png` beside `index.md`) is
+          # written as a bundle too: flattening it to `<dir>.md` would leave
+          # its relative `./cover.png` references pointing at nothing, and
+          # the images would never be copied. Asset-less bundles stay flat.
+          if bundle && bundle_assets?(source_dir)
+            dir_slug = slug
+            n = 1
+            while (index_path = resolve_content_path(output_dir, "#{section}/#{dir_slug}", "index", quiet: true)) && destination_claimed?(index_path)
+              dir_slug = "#{slug}-#{n}"
+              n += 1
+            end
+            written, dest_path = write_content_file_to(output_dir, "#{section}/#{dir_slug}", "index", frontmatter, body.strip, verbose, force)
+            copy_bundle_assets(source_dir, File.dirname(dest_path), output_dir, verbose, force) if dest_path
+          else
+            written = write_content_file(output_dir, section, slug, frontmatter, body.strip, verbose, force)
+          end
           return :skipped unless written
           has_mdx_components ? :imported_wrapped : :imported
+        end
+
+        # True when `dir` holds files besides its content pages — the
+        # resources `copy_bundle_assets` would carry along.
+        private def bundle_assets?(dir : String) : Bool
+          Dir.children(dir).any? do |entry|
+            path = File.join(dir, entry)
+            File.file?(path) && !File.symlink?(path) && !entry.ends_with?(".md") && !entry.ends_with?(".markdown") && !entry.ends_with?(".mdx")
+          end
+        end
+
+        # Drop MDX's top-level ESM `import` statements. Only lines outside
+        # fenced code are statements: a JavaScript sample in a ``` block
+        # starting with `import …` is article content, and deleting it
+        # mangled every MDX post that shows how to import a module.
+        #
+        # A multi-line `import {` statement is dropped through the line that
+        # starts with its closing `}`, but only while the lines in between
+        # look like a specifier list (identifiers, `as`, commas, `//`
+        # comments). Anything else — a blank line, prose — means it was not
+        # a statement after all, and the held lines are kept, so an
+        # unclosed `import {` can't swallow the rest of the article.
+        private def strip_mdx_imports(body : String) : String
+          tracker = Content::Processors::FenceTracker.new
+          pending : String? = nil
+          String.build do |io|
+            body.each_line(chomp: false) do |line|
+              fenced = tracker.fence_line?(line)
+              if held = pending
+                code = line.sub(%r{//.*}, "").strip
+                if !fenced && code.starts_with?('}')
+                  pending = nil
+                  next
+                elsif !fenced && code.matches?(/\A[\w$\s,]+\z/)
+                  pending = held + line
+                  next
+                end
+                io << held
+                pending = nil
+              end
+
+              if fenced
+                io << line
+              elsif line.matches?(/\Aimport[ \t]/)
+                code = line.sub(%r{//.*}, "")
+                pending = line if code.includes?('{') && !code.includes?('}')
+              else
+                io << line
+              end
+            end
+            # Never closed: not a statement, keep it.
+            pending.try { |held| io << held }
+          end
         end
       end
     end

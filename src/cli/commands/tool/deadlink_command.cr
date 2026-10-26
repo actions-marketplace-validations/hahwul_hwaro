@@ -2,12 +2,28 @@ require "json"
 require "http/client"
 require "socket"
 require "uri"
+require "uri/punycode"
 require "file"
 require "option_parser"
 require "../../metadata"
+require "toml"
+require "yaml"
 require "../../../models/config"
+require "../../../services/content_lister"
+require "../../../services/internal_link_index"
+require "../../../services/page_route_index"
+require "../../../utils/frontmatter_scanner"
+require "../../../utils/text_utils"
 require "../../../utils/errors"
 require "../../../utils/logger"
+require "../../../utils/build_output"
+require "../../../utils/markdown_code"
+require "../../../content/processors/internal_link_resolver"
+require "../../../content/seo/pwa"
+
+require "./deadlink_command/scanner"
+require "./deadlink_command/internal_resolver"
+require "./deadlink_command/external_checker"
 
 module Hwaro
   module CLI
@@ -27,6 +43,9 @@ module Hwaro
             FlagInfo.new(short: nil, long: "--concurrency", description: "Max concurrent requests (default: 8)", takes_value: true, value_hint: "N"),
             FlagInfo.new(short: nil, long: "--external-only", description: "Check external links only"),
             FlagInfo.new(short: nil, long: "--internal-only", description: "Check internal links only"),
+            FlagInfo.new(short: nil, long: "--ignore-url", description: "Skip links whose URL matches PATTERN (substring; * wildcards; repeatable)", takes_value: true, value_hint: "PATTERN"),
+            FlagInfo.new(short: nil, long: "--allow-status", description: "Treat these HTTP status codes as healthy (comma-separated, e.g. 403,429)", takes_value: true, value_hint: "CODES"),
+            FlagInfo.new(short: nil, long: "--skip-anchors", description: "Do not check #fragment links against the built HTML"),
             JSON_FLAG,
             HELP_FLAG,
           ]
@@ -74,6 +93,9 @@ module Hwaro
             concurrency = DEFAULT_CONCURRENCY
             external_only = false
             internal_only = false
+            ignore_patterns = [] of Regex
+            allowed_statuses = Set(Int32).new
+            skip_anchors = false
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool check-links [options]"
@@ -102,8 +124,54 @@ module Hwaro
               end
               parser.on("--external-only", "Check external links only") { external_only = true }
               parser.on("--internal-only", "Check internal links only") { internal_only = true }
+              parser.on("--skip-anchors", "Do not check #fragment links against the built HTML") { skip_anchors = true }
+              parser.on("--ignore-url PATTERN", "Skip links whose URL matches PATTERN (substring; * wildcards; repeatable)") do |v|
+                if v.strip.empty?
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: "--ignore-url expects a non-empty pattern",
+                    hint: "Example: --ignore-url twitter.com or --ignore-url 'https://example.com/*'.",
+                  )
+                end
+                ignore_patterns << ignore_pattern_to_regex(v)
+              end
+              parser.on("--allow-status CODES", "Treat these HTTP status codes as healthy (comma-separated)") do |v|
+                segments = v.split(',')
+                # All-empty input (`--allow-status ","`) would otherwise be a
+                # silent no-op; reject it like any other unusable value.
+                if segments.all?(&.strip.empty?)
+                  raise Hwaro::HwaroError.new(
+                    code: Hwaro::Errors::HWARO_E_USAGE,
+                    message: "Invalid --allow-status value: #{v}",
+                    hint: "Pass comma-separated HTTP status codes between 100 and 599, e.g. --allow-status 403,429.",
+                  )
+                end
+                segments.each do |code|
+                  # A trailing/doubled comma (`--allow-status "403,"`) yields
+                  # empty segments; skip them instead of rejecting with a
+                  # confusing empty-value message.
+                  next if code.strip.empty?
+                  parsed = code.strip.to_i?
+                  unless parsed && (100..599).includes?(parsed)
+                    raise Hwaro::HwaroError.new(
+                      code: Hwaro::Errors::HWARO_E_USAGE,
+                      message: "Invalid --allow-status value: #{code.strip}",
+                      hint: "Pass comma-separated HTTP status codes between 100 and 599, e.g. --allow-status 403,429.",
+                    )
+                  end
+                  allowed_statuses << parsed
+                end
+              end
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
+              parser.unknown_args do |before_dash, after_dash|
+                unknown = before_dash + after_dash
+                raise Hwaro::HwaroError.new(
+                  code: Hwaro::Errors::HWARO_E_USAGE,
+                  message: "unexpected extra argument(s): '#{unknown.join("', '")}'",
+                  hint: "hwaro tool check-links accepts options only.",
+                ) unless unknown.empty?
+              end
             end
 
             Runner.enable_json_mode! if json_output
@@ -119,10 +187,7 @@ module Hwaro
                 code: Hwaro::Errors::HWARO_E_IO,
                 message: "Directory not found: #{target_dir}",
               )
-              if json_output
-                puts err.to_error_payload.to_json
-                exit(err.exit_code)
-              end
+              Runner.exit_with_error_payload(err) if json_output
               Logger.error "Error [#{err.code}]: #{err.message}"
               exit(err.exit_code)
             end
@@ -131,15 +196,39 @@ module Hwaro
 
             external_links = internal_only ? [] of Link : find_external_links(target_dir)
             internal_links = external_only ? [] of Link : find_internal_links(target_dir)
+            anchor_links = skip_anchors ? [] of Link : @anchor_links
 
-            if external_links.empty? && internal_links.empty?
+            # `--ignore-url` drops matching links BEFORE any check runs, so an
+            # ignored external host is never contacted at all — the point is
+            # silencing a known-flaky or paywalled domain in CI, not merely
+            # hiding its failure afterwards.
+            ignored_count = 0
+            unless ignore_patterns.empty?
+              before = external_links.size + internal_links.size
+              external_links = external_links.reject { |l| ignore_patterns.any?(&.matches?(l.url)) }
+              internal_links = internal_links.reject { |l| ignore_patterns.any?(&.matches?(l.url)) }
+              ignored_count = before - external_links.size - internal_links.size
+              anchors_before = anchor_links.size
+              anchor_links = anchor_links.reject { |l| ignore_patterns.any?(&.matches?(l.url)) }
+              ignored_count += anchors_before - anchor_links.size
+            end
+
+            if external_links.empty? && internal_links.empty? && anchor_links.empty?
               if json_output
+                # `ignored_count` distinguishes "all healthy" from "an
+                # over-broad --ignore-url pattern checked nothing".
                 puts({
-                  "dead_internal" => [] of Result,
-                  "dead_external" => [] of Result,
+                  "dead_internal"    => [] of Result,
+                  "dead_external"    => [] of Result,
+                  "dead_anchors"     => [] of Result,
+                  "skipped_external" => [] of Result,
+                  "ignored_count"    => ignored_count,
+                  # Same key on every payload: a consumer reads one schema,
+                  # and "nothing to check" has no build-output caveat.
+                  "output_hint" => nil,
                 }.to_json)
               else
-                Logger.outcome("checked", "no links found", :info)
+                Logger.outcome("checked", ignored_count > 0 ? "no links to check (#{ignored_count} ignored)" : "no links found", :info)
               end
               return
             end
@@ -147,13 +236,17 @@ module Hwaro
             # Check external links
             external_results = check_links_concurrently(external_links, timeout, concurrency)
             skipped_external = external_results.select { |r| r.error == "Skipped: private/internal address" }
-            dead_external = external_results.select { |r| !(200..299).includes?(r.status) && r.error != "Skipped: private/internal address" }
+            dead_external = external_results.select do |r|
+              !(200..299).includes?(r.status) &&
+                !allowed_statuses.includes?(r.status) &&
+                r.error != "Skipped: private/internal address"
+            end
 
             # Check internal links. Load taxonomy names from config.toml so
             # URLs like `/tags/` or `/categories/foo/` that Hwaro generates
             # at build time aren't reported as dead (the source-only check
             # has no way to discover these otherwise).
-            project_root = find_project_root(target_dir)
+            project_root = Utils::PathUtils.find_project_root(target_dir)
             config = load_config(project_root)
             taxonomy_names = config ? config.taxonomies.map(&.name) : [] of String
             base_path = config ? config.base_path : ""
@@ -163,15 +256,46 @@ module Hwaro
             # multilingual site resolves against `content/ko/…` and is
             # reported dead.
             language_codes = translation_language_codes(config)
-            dead_internal = check_internal_links(internal_links, target_dir, taxonomy_names, base_path, language_codes)
+            generated_routes = generated_routes(config)
+            # Follow `[build] output_dir`; "public" only as the fallback. The
+            # tree is consulted through the oracle so a serve-only workflow
+            # (which since #758 never populates it) is told why its
+            # pipeline-emitted assets read as dead, instead of validating
+            # against an absent — or permanently stale — tree (#761).
+            output_dir = config.try(&.build.output_dir) || "public"
+            oracle = Utils::BuildOutput.oracle(
+              output_dir,
+              root: project_root,
+              sources: [target_dir] + %w[config.toml templates static data themes].map { |d| File.join(project_root, d) },
+              tool: "check-links",
+            )
+            dead_internal = check_internal_links(internal_links, target_dir, taxonomy_names, base_path, language_codes, generated_routes, oracle, config)
+            dead_anchors = check_anchor_links(anchor_links, target_dir, base_path, language_codes, oracle, config)
+            # Say it only where it changes how the result should be read: an
+            # unusable tree explains dead internal links, a stale one explains
+            # links it just accepted.
+            output_hint = oracle.hint if !dead_internal.empty? || oracle.usable?
 
             total = external_links.size + internal_links.size
-            dead_total = dead_external.size + dead_internal.size
+            dead_total = dead_external.size + dead_internal.size + dead_anchors.size
 
             if json_output
+              # `skipped_external` names the links the SSRF guard refused to
+              # contact (private/localhost/.internal hosts). They used to be
+              # silently absent from the payload, so a JSON consumer could
+              # not tell "checked and healthy" from "never checked".
               puts({
-                "dead_internal" => dead_internal,
-                "dead_external" => dead_external,
+                "dead_internal"    => dead_internal,
+                "dead_external"    => dead_external,
+                "dead_anchors"     => dead_anchors,
+                "skipped_external" => skipped_external,
+                "ignored_count"    => ignored_count,
+                # Null unless the build tree changed how this result should be
+                # read (absent/serve output that could not validate pipeline
+                # assets, or stale output that accepted some). The human line
+                # is suppressed under --json, and CI is exactly where a run
+                # against no build output is easiest to miss.
+                "output_hint" => output_hint,
               }.to_json)
               # Exit non-zero so CI can gate on broken links (the JSON payload
               # has already been emitted to stdout for tooling to consume).
@@ -179,10 +303,25 @@ module Hwaro
               return
             end
 
-            Logger.section("scan", "#{external_links.size} external · #{internal_links.size} internal")
+            scan_detail = "#{external_links.size} external · #{internal_links.size} internal"
+            scan_detail += " · #{anchor_links.size} #{anchor_links.size == 1 ? "anchor" : "anchors"}" unless anchor_links.empty?
+            scan_detail += " · #{ignored_count} ignored" if ignored_count > 0
+            Logger.section("scan", scan_detail)
             links_noun = total == 1 ? "link" : "links"
 
-            if dead_total == 0 && skipped_external.empty?
+            if Logger.quiet?
+              # `Logger.item` is silenced by --quiet, which left a failing CI
+              # run with exit 1 and no output at all. Errors still reach
+              # stderr under --quiet: one line per dead link.
+              dead_external.each do |result|
+                detail = "#{sanitize_for_terminal(result.link.url)}  #{result.status}"
+                detail += " — #{sanitize_for_terminal(result.error.to_s)}" if result.error
+                Logger.error "#{sanitize_for_terminal(result.link.file)}: #{detail}"
+              end
+              (dead_internal + dead_anchors).each do |result|
+                Logger.error "#{sanitize_for_terminal(result.link.file)}: #{sanitize_for_terminal(result.link.url)}  #{sanitize_for_terminal(result.error.to_s)}"
+              end
+            elsif dead_total == 0 && skipped_external.empty?
               Logger.info "" if Logger.color_enabled?
               Logger.outcome("checked", "#{total} #{links_noun} · all healthy")
             else
@@ -198,7 +337,7 @@ module Hwaro
                 detail += " — #{sanitize_for_terminal(result.error.to_s)}" if result.error
                 Logger.item(detail, glyph: :arrow, indent: 4)
               end
-              dead_internal.each do |result|
+              (dead_internal + dead_anchors).each do |result|
                 Logger.item(sanitize_for_terminal(result.link.file), glyph: :err)
                 Logger.item("#{sanitize_for_terminal(result.link.url)}  #{sanitize_for_terminal(result.error.to_s)}", glyph: :arrow, indent: 4)
               end
@@ -206,8 +345,17 @@ module Hwaro
               if dead_total == 0
                 Logger.outcome("checked", "#{total} #{links_noun} · all healthy")
               else
-                Logger.outcome("checked", "#{total} #{links_noun} · #{dead_total} dead", :err)
+                parts = ["#{total} #{links_noun}"]
+                dead_links = dead_external.size + dead_internal.size
+                parts << "#{dead_links} dead" if dead_links > 0
+                parts << "#{dead_anchors.size} missing #{dead_anchors.size == 1 ? "anchor" : "anchors"}" unless dead_anchors.empty?
+                Logger.outcome("checked", parts.join(" · "), :err)
               end
+            end
+
+            if hint = output_hint
+              Logger.info "" if Logger.color_enabled?
+              Logger.item(sanitize_for_terminal(hint), glyph: :info)
             end
 
             # A dead-links result must fail the process so `check-links` is
@@ -216,118 +364,13 @@ module Hwaro
             exit(Hwaro::Errors::EXIT_GENERIC) if dead_total > 0
           end
 
-          # Markdown links inside fenced code blocks or inline code spans are
-          # documentation examples (e.g. a `![Diagram](/images/diagram.png)`
-          # snippet demonstrating image syntax), not real links. Strip them
-          # before scanning so `check-links` doesn't report false-positive dead
-          # links — mirrors the code-stripping the scaffold link-integrity spec
-          # already performs.
-          #
-          # Fences are tracked line-by-line, CommonMark-style: a fence opens
-          # with 3+ backticks/tildes (up to 3 spaces of indent) and only
-          # closes on a fence of the same character at least as long. The old
-          # non-greedy /```[\s\S]*?```/ mispaired nested fences — a 4-backtick
-          # example wrapping a 3-backtick fence desynchronized every fence
-          # after it, resurrecting example links as false positives.
-          # Also stripped: HTML comments and indented (4-space/tab) code
-          # blocks. Both hold example markup that is not a link — a
-          # `<!-- <img src="/old.png"> -->` note and an indented
-          # `<a href="/example/">` demo were each reported dead.
-          #
-          # Indented code is recognized conservatively, per CommonMark: a run
-          # only counts as code when it follows a blank line AND no list item
-          # is open. Without the list guard a 4-space list-item continuation
-          # would be swallowed, which is exactly the failure that made the
-          # sibling validator give up on indented blocks entirely.
-          private def strip_code(content : String) : String
-            result = String::Builder.new
-            fence_char : Char? = nil
-            fence_len = 0
-            in_comment = false
-            in_indented_code = false
-            in_list = false
-            prev_blank = true
-
-            content.each_line(chomp: false) do |line|
-              blank = line.strip.empty?
-
-              # HTML comments span lines and can open/close mid-line.
-              if in_comment
-                if idx = line.index("-->")
-                  in_comment = false
-                  result << line[(idx + 3)..].gsub(/`[^`\n]*`/, "")
-                else
-                  result << '\n'
-                end
-                prev_blank = blank
-                next
-              end
-
-              if m = line.match(/\A {0,3}(`{3,}|~{3,})/)
-                marker = m[1]
-                if fence_char.nil?
-                  fence_char = marker[0]
-                  fence_len = marker.size
-                  in_indented_code = false
-                  result << '\n'
-                  prev_blank = false
-                  next
-                elsif marker[0] == fence_char && marker.size >= fence_len
-                  fence_char = nil
-                  fence_len = 0
-                  result << '\n'
-                  prev_blank = false
-                  next
-                end
-              end
-
-              if fence_char
-                result << '\n'
-                prev_blank = blank
-                next
-              end
-
-              # Track list context so a 4-space continuation line is treated as
-              # prose, not code.
-              if line.matches?(/\A {0,3}(?:[-*+]|\d+[.)])\s/)
-                in_list = true
-              elsif blank
-                # A blank line alone does not close a list; a subsequent
-                # unindented non-list line does.
-              elsif !line.starts_with?(" ") && !line.starts_with?("\t")
-                in_list = false
-              end
-
-              indented = line.starts_with?("    ") || line.starts_with?("\t")
-              if in_indented_code
-                if blank || indented
-                  result << '\n'
-                  prev_blank = blank
-                  next
-                end
-                in_indented_code = false
-              elsif indented && prev_blank && !in_list && !blank
-                in_indented_code = true
-                result << '\n'
-                prev_blank = false
-                next
-              end
-
-              stripped = line.gsub(/`[^`\n]*`/, "")
-              # A comment opened on this line: keep the text before it.
-              if idx = stripped.index("<!--")
-                if close = stripped.index("-->", idx)
-                  stripped = stripped[0...idx] + stripped[(close + 3)..]
-                else
-                  in_comment = true
-                  stripped = stripped[0...idx] + "\n"
-                end
-              end
-              result << stripped
-              prev_blank = blank
-            end
-
-            result.to_s
+          # Compile an `--ignore-url` pattern: matched as a SUBSTRING of the
+          # link URL as written, with `*` matching any run of characters.
+          # Everything else is literal — dots in domains don't need escaping.
+          # Matching is case-insensitive: URL hosts are case-insensitive, so
+          # `--ignore-url twitter.com` must also silence `https://Twitter.com/…`.
+          private def ignore_pattern_to_regex(pattern : String) : Regex
+            Regex.new(pattern.split('*').map { |part| Regex.escape(part) }.join(".*"), Regex::Options::IGNORE_CASE)
           end
 
           # Link URLs/paths come from semi-trusted content (e.g. a docs/blog
@@ -337,23 +380,6 @@ module Hwaro
           # characters before logging so the report can't inject escapes.
           private def sanitize_for_terminal(s : String) : String
             s.gsub { |c| c.control? ? "" : c }
-          end
-
-          private def find_external_links(dir : String) : Array(Link)
-            links = [] of Link
-            link_regex = /(?:!\[[^\]]*?\]|\[[^\]]*?\])\((https?:\/\/(?:\([^\s()]*\)|[^\s()])+)\)/
-
-            Dir.glob("#{dir}/**/*.md").each do |file|
-              content = readable_markdown(file) || next
-              content.scan(link_regex) do |match|
-                links << Link.new(file: file, url: match[1], kind: :external)
-              end
-              scan_reference_definitions(content) do |url|
-                next unless url.starts_with?("http://") || url.starts_with?("https://")
-                links << Link.new(file: file, url: url, kind: :external)
-              end
-            end
-            links
           end
 
           # Read and code-strip one Markdown file, returning nil when the file
@@ -368,476 +394,26 @@ module Hwaro
           # read and code-stripped twice — and an unreadable one warned twice.
           @scanned = {} of String => String?
 
-          private def readable_markdown(file : String) : String?
-            @scanned.fetch(file) { @scanned[file] = read_and_strip(file) }
-          end
+          # The Markdown sources under each scanned directory, walked once per
+          # invocation for the same reason (an unfollowable symlink warns once).
+          @markdown_files = {} of String => Array(String)
 
-          private def read_and_strip(file : String) : String?
-            strip_code(File.read(file))
-          rescue ex : ArgumentError | IO::Error
-            Logger.warn "Skipping #{file}: #{ex.message}"
-            nil
-          end
+          # Directory → its Markdown sources keyed by stem (`leaf` →
+          # `[dir/leaf.MD]`), so route probes list each directory once per run.
+          @markdown_stems = {} of String => Hash(String, Array(String))
 
-          # Markdown link/image destination, allowing ONE level of balanced
-          # parentheses inside it. Plain `([^\)]+)` stopped at the first `)`,
-          # so `[x](/docs/foo_(bar))` was scanned as `/docs/foo_(bar` and
-          # reported dead — a false positive on a link the build resolves fine.
-          # The alternation branches start with disjoint characters, so there
-          # is no backtracking ambiguity.
-          LINK_DEST = /((?:[^()]|\([^()]*\))*)/
+          # Internal page links that carry a `#fragment`, gathered by
+          # find_internal_links (url keeps the fragment, kind `:anchor`).
+          @anchor_links = [] of Link
 
-          # Normalize a Markdown link/image destination to a bare URL.
-          #
-          # CommonMark allows an optional title after the destination
-          # (`[t](/url "title")` / `![a](/img 'title')`); the capture includes
-          # that title, so without stripping it the resolved target became e.g.
-          # `/posts/b/ "title"` and every titled internal link was falsely
-          # reported dead.
-          #
-          # An angle-bracket destination (`[t](</my page.md> "title")`) is the
-          # one form that MAY contain spaces, so the whitespace split has to
-          # come after unwrapping it — otherwise the target was the literal
-          # `</my`, and even a space-free `</about/>` was reported dead while
-          # the build resolved it correctly.
-          private def clean_link_target(raw : String) : String
-            stripped = raw.strip
-            dest =
-              if stripped.starts_with?('<') && (close = stripped.index('>'))
-                stripped[1...close]
-              else
-                stripped.split(/\s/, 2).first
-              end
-            dest.split("#").first.split("?").first.strip
-          end
-
-          private def find_internal_links(dir : String) : Array(Link)
-            links = [] of Link
-            link_re = /(?<!!)\[([^\]]*)\]\(#{LINK_DEST.source}\)/
-            image_re = /!\[([^\]]*)\]\(#{LINK_DEST.source}\)/
-
-            Dir.glob("#{dir}/**/*.md").each do |file|
-              content = readable_markdown(file) || next
-
-              # Regular links (exclude images by using negative lookbehind)
-              content.scan(link_re) do |match|
-                url = clean_link_target(match[2])
-                next if skip_internal?(url)
-                links << Link.new(file: file, url: url, kind: :internal)
-              end
-
-              # Image links
-              content.scan(image_re) do |match|
-                url = clean_link_target(match[2])
-                next if skip_internal?(url, allow_fragment: false)
-                links << Link.new(file: file, url: url, kind: :image)
-              end
-
-              # Reference-style links (`[text][id]` + `[id]: /target/`) and
-              # raw HTML anchors/images. Both render as real links, so a page
-              # written that way used to get a clean bill of health.
-              scan_reference_definitions(content) do |raw|
-                url = clean_link_target(raw)
-                next if skip_internal?(url)
-                links << Link.new(file: file, url: url, kind: :internal)
-              end
-
-              content.scan(HTML_TAG_RE) do |tag|
-                kind = tag[1].downcase == "a" ? :internal : :image
-                tag[2].scan(HTML_ATTR_RE) do |attr|
-                  raw = attr[2]? || attr[3]? || attr[4]?
-                  next unless raw
-                  html_link_targets(attr[1], raw).each do |candidate|
-                    url = clean_link_target(candidate)
-                    next if skip_internal?(url) || url.includes?("{{") || url.includes?("{%")
-                    links << Link.new(file: file, url: url, kind: kind)
-                  end
-                end
-              end
-            end
-            links
-          end
-
-          # `<a href>` / `<img src|srcset>` / `<source src|srcset>` written
-          # directly in Markdown. `<source>` matters because `<picture>` and
-          # `<video>` blocks are the common hand-written HTML in docs content.
-          # The value may be unquoted (`href=/x/`), which stops at whitespace
-          # or `>`.
-          # Matched in two passes — tag, then each attribute inside it — because
-          # a single regex consumes the whole tag and so only ever reports the
-          # FIRST link attribute: `<img srcset="…" src="…">` lost its `src`.
-          HTML_TAG_RE  = /<(a|img|source)\b([^>]*)>/i
-          HTML_ATTR_RE = /\b(href|src|srcset)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
-
-          # One `srcset` entry is `url [descriptor]`, comma-separated.
-          private def html_link_targets(attribute : String, value : String) : Array(String)
-            return [value] unless attribute.downcase == "srcset"
-            value.split(',').compact_map do |candidate|
-              url = candidate.strip.split(/\s+/).first?
-              url if url && !url.empty?
-            end
-          end
-
-          # A Markdown link reference definition (`[id]: /target/ "title"`).
-          #
-          # Three guards keep this from inventing links: footnote definitions
-          # (`[^1]: …`) are skipped, the destination must look like a URL or
-          # path, and — decisively — the label must actually be USED somewhere
-          # in the document. Shape alone is not enough: the ordinary prose line
-          #
-          #     [Note]: /usr/bin is where the binary lives on most systems
-          #
-          # has a path-shaped first token and was reported as a dead link.
-          # CommonMark only treats such a line as a definition when a matching
-          # reference exists, so requiring one removes the whole false-positive
-          # class rather than blacklisting shapes.
-          REFERENCE_DEFINITION_RE = /^ {0,3}\[([^\]\n]+)\]:[ \t]*(\S+)/m
-
-          # `[text][label]`, `[label][]`, and the shortcut form `[label]` — the
-          # last excluding anything followed by `(`, `[` or `:`, which is an
-          # inline link, a full reference, or another definition.
-          REFERENCE_USE_RES = {
-            /\]\[([^\]\n]+)\]/,
-            /\[([^\]\n]+)\]\[\]/,
-            /\[([^\]\n]+)\](?![\(\[:])/,
-          }
-
-          private def referenced_labels(content : String) : Set(String)
-            labels = Set(String).new
-            REFERENCE_USE_RES.each do |re|
-              content.scan(re) { |m| labels << m[1].strip.downcase }
-            end
-            labels
-          end
-
-          private def scan_reference_definitions(content : String, &)
-            used = referenced_labels(content)
-            content.scan(REFERENCE_DEFINITION_RE) do |match|
-              label = match[1]
-              next if label.starts_with?('^')
-              next unless used.includes?(label.strip.downcase)
-              dest = match[2]
-              dest = dest[1..-2] if dest.starts_with?('<') && dest.ends_with?('>')
-              next unless dest.starts_with?('/') || dest.starts_with?("./") ||
-                          dest.starts_with?("../") || dest.starts_with?("@/") ||
-                          dest =~ /\A[a-z][a-z0-9+.\-]*:/i
-              yield dest
-            end
-          end
-
-          # Destinations the filesystem check cannot say anything about:
-          # empty, protocol-relative, pure fragments, and anything carrying a
-          # URI scheme (`mailto:`, `tel:`, `javascript:`, `https:`, …).
-          private def skip_internal?(url : String, allow_fragment : Bool = true) : Bool
-            return true if url.empty?
-            return true if allow_fragment && url.starts_with?("#")
-            return true if url.starts_with?("//")
-            !!(url =~ /\A[a-z][a-z0-9+.\-]*:/i)
-          end
-
-          private def check_internal_links(links : Array(Link), content_dir : String, taxonomy_names : Array(String) = [] of String, base_path : String = "", language_codes : Array(String) = [] of String) : Array(Result)
-            results = [] of Result
-            project_root = find_project_root(content_dir)
-
-            links.each do |link|
-              decoded_url = URI.decode(link.url)
-              resolved_url = decoded_url
-              if resolved_url.starts_with?("/") && !base_path.empty?
-                if resolved_url == base_path
-                  resolved_url = "/"
-                elsif resolved_url.starts_with?(base_path + "/")
-                  resolved_url = resolved_url[base_path.size..]
-                end
-              end
-
-              base_dir = File.dirname(link.file)
-
-              # Resolve the URL exactly as written FIRST. A leading segment
-              # that happens to match a language code may be a real section
-              # (`content/ko/posts/`), and that section outranks any
-              # translation reading — stripping unconditionally reported such
-              # links dead even though the build publishes them.
-              exists = resolves?(resolved_url, link, content_dir, base_dir, project_root, taxonomy_names)
-
-              # Only when the literal path fails do we read the URL as a
-              # translation route (`/ko/about/` ← `content/about.ko.md`), and
-              # then ONLY language-qualified evidence counts. Accepting the
-              # default-language source here would pass `/ko/x/` for a site
-              # that never translated `x` — a link the build emits nothing for.
-              if !exists && (code = translatable_language_prefix(resolved_url, language_codes))
-                stripped = resolved_url[(code.size + 1)..]
-                stripped = "/" if stripped.empty?
-                exists = translated_source?(stripped, code, link, content_dir, base_dir, taxonomy_names)
-              end
-
-              unless exists
-                kind_label = link.kind == :image ? "Image not found" : "Internal link target not found"
-                results << Result.new(link: link, status: -1, error: kind_label)
-              end
-            rescue ex : ArgumentError
-              # A destination whose percent-encoding decodes to a byte no path
-              # may contain (`/a%00b` → a real NUL) makes every `File.exists?`
-              # probe in `resolves?` raise straight out of libc. Degrade PER
-              # LINK — mirroring the per-file degradation `read_and_strip`
-              # already does for invalid UTF-8 — so one hostile destination
-              # cannot abort the whole run, hide the genuinely dead links in
-              # the other files, or leave `--json` writing nothing at all to
-              # stdout. The link itself is reported dead, which is exactly what
-              # it is: the build cannot resolve it either.
-              results << Result.new(link: link, status: -1, error: "Invalid link target: #{ex.message}")
-            end
-            results
-          end
-
-          # Resolve the project root from the given content directory.
-          # Supports running with -i content, -i ., or from inside a subdirectory.
-          private def find_project_root(content_dir : String) : String
-            # Common case: target_dir is "content" or ends with /content
-            if File.basename(content_dir) == "content"
-              parent = File.dirname(content_dir)
-              return parent.empty? || parent == "." ? "." : parent
-            end
-
-            # If there's a "content" sibling, use the current directory as root
-            if Dir.exists?(File.join(content_dir, "content")) || Dir.exists?(File.join(content_dir, "../content"))
-              # content_dir might already be the project root
-              return content_dir
-            end
-
-            content_dir
-          end
-
-          # Taxonomy listing and term pages (`/tags/`, `/categories/foo/`) are
-          # generated by Hwaro at build time, so they have no source file to
-          # check against. Match the URL's leading segment against the site's
-          # declared taxonomy names and accept it when it lines up.
-          # Language codes that get a `/<code>/` URL prefix: every declared
-          # language except the default one, which is served at the root.
-          private def translation_language_codes(config : Models::Config?) : Array(String)
-            return [] of String unless config
-            config.languages.keys.reject { |code| code.empty? || code == config.default_language }
-          end
-
-          # Returns the leading language segment of an absolute URL when it
-          # names a non-default language the build can actually route, else
-          # nil. The build matches filename suffixes against DECLARED codes
-          # (ReadContent#extract_language_from_filename), so every declared
-          # non-default code — including hyphenated ones like `pt-BR` —
-          # produces `/<code>/…` routes.
-          private def translatable_language_prefix(url : String, codes : Array(String)) : String?
-            return if codes.empty?
-            return unless url.starts_with?("/")
-            segment = url.lstrip("/").split("/").first?
-            return unless segment
-            return unless codes.includes?(segment)
-            segment
-          end
-
-          # Does `url` resolve to a source file, taxonomy route, or shipped
-          # asset, read literally? This is the language-agnostic resolution the
-          # checker has always performed.
-          private def resolves?(url : String, link : Link, content_dir : String, base_dir : String,
-                                project_root : String, taxonomy_names : Array(String)) : Bool
-            target = content_target(url, content_dir, base_dir)
-            # Most internal URLs are written with a trailing slash (`/about/`,
-            # `/posts/hello/`) — strip it before computing the leaf-file
-            # candidate so `target_no_slash + ".md"` resolves to
-            # `content/about.md` instead of the broken `content/about/.md`.
-            # The directory candidates work either way.
-            target_no_slash = target.rstrip("/")
-
-            return true if File.exists?(target) ||
-                           File.exists?(target_no_slash + ".md") ||
-                           File.exists?(target_no_slash + ".markdown") ||
-                           File.exists?(File.join(target_no_slash, "_index.md")) ||
-                           File.exists?(File.join(target_no_slash, "_index.markdown")) ||
-                           File.exists?(File.join(target_no_slash, "index.md")) ||
-                           File.exists?(File.join(target_no_slash, "index.markdown")) ||
-                           (link.kind != :image && taxonomy_url?(url, taxonomy_names))
-
-            # Also accept assets that live in static/ (source) or public/ (after
-            # build): images under static/images/, resized/LQIP variants the
-            # image pipeline emits into public/, and anything published via
-            # [content.files] or the asset pipeline. The public/ probe doubles
-            # as the oracle for generated routes on an already-built site.
-            asset_path = url.lstrip("/")
-            File.exists?(File.join(project_root, "static", asset_path)) ||
-              File.exists?(File.join(project_root, "public", asset_path))
-          end
-
-          # Language-qualified resolution for a `/<code>/…` URL whose literal
-          # path did not resolve. Deliberately narrow: only a `.<code>` source
-          # or a taxonomy route counts, never the default-language file.
-          private def translated_source?(url : String, code : String, link : Link,
-                                         content_dir : String, base_dir : String,
-                                         taxonomy_names : Array(String)) : Bool
-            target_no_slash = content_target(url, content_dir, base_dir).rstrip("/")
-
-            File.exists?("#{target_no_slash}.#{code}.md") ||
-              File.exists?("#{target_no_slash}.#{code}.markdown") ||
-              File.exists?(File.join(target_no_slash, "_index.#{code}.md")) ||
-              File.exists?(File.join(target_no_slash, "_index.#{code}.markdown")) ||
-              File.exists?(File.join(target_no_slash, "index.#{code}.md")) ||
-              File.exists?(File.join(target_no_slash, "index.#{code}.markdown")) ||
-              (link.kind != :image && taxonomy_url?(url, taxonomy_names))
-          end
-
-          # Map a link destination onto a path under the content directory.
-          private def content_target(url : String, content_dir : String, base_dir : String) : String
-            if url.starts_with?("@/")
-              # Zola-style content-root link (`@/posts/hello.md`). The build
-              # resolves these against the content dir, so the checker must too.
-              File.join(content_dir, url[2..])
-            elsif url.starts_with?("/")
-              File.join(content_dir, url.lstrip("/"))
-            else
-              File.join(base_dir, url)
-            end
-          end
-
-          private def taxonomy_url?(url : String, names : Array(String)) : Bool
-            return false if names.empty?
-            return false unless url.starts_with?("/")
-            segments = url.lstrip("/").rstrip("/").split("/")
-            return false if segments.empty? || segments.first.empty?
-            names.includes?(segments.first)
-          end
-
-          private def load_config(project_root : String = ".") : Models::Config?
-            config_path = File.join(project_root, "config.toml")
-            return unless File.exists?(config_path)
-
-            Dir.cd(project_root) do
-              Models::Config.load
-            end
-          rescue Exception
-            nil
-          end
-
-          private def check_links_concurrently(links : Array(Link), timeout_seconds : Int32, max_concurrency : Int32) : Array(Result)
-            results_channel = Channel(Result).new(links.size)
-            work_channel = Channel(Link?).new(max_concurrency)
-
-            # Spawn bounded worker pool
-            max_concurrency.times do
-              spawn do
-                while link = work_channel.receive?
-                  error_message : String? = nil
-                  status = begin
-                    current_uri = URI.parse(link.url)
-                    method = "HEAD"
-                    redirects_left = 5
-                    response_status = -1
-
-                    loop do
-                      host = current_uri.host
-                      if host && private_host?(host)
-                        error_message = "Skipped: private/internal address"
-                        response_status = -1
-                        break
-                      end
-
-                      client = HTTP::Client.new(current_uri)
-                      client.connect_timeout = timeout_seconds.seconds
-                      client.read_timeout = timeout_seconds.seconds
-
-                      begin
-                        headers = HTTP::Headers{"User-Agent" => "hwaro-link-checker/1.0"}
-                        response = if method == "HEAD"
-                                     client.head(current_uri.request_target, headers: headers)
-                                   else
-                                     client.get(current_uri.request_target, headers: headers)
-                                   end
-
-                        status_code = response.status_code
-
-                        if {301, 302, 307, 308}.includes?(status_code)
-                          if redirects_left > 0
-                            location = response.headers["Location"]?
-                            if location
-                              current_uri = current_uri.resolve(location)
-                              redirects_left -= 1
-                              next
-                            else
-                              error_message = "Redirect without Location header"
-                              response_status = status_code
-                              break
-                            end
-                          else
-                            error_message = "Too many redirects"
-                            response_status = status_code
-                            break
-                          end
-                        elsif method == "HEAD" && {405, 403, 501}.includes?(status_code)
-                          method = "GET"
-                          next
-                        else
-                          response_status = status_code
-                          break
-                        end
-                      ensure
-                        client.close
-                      end
-                    end
-
-                    response_status
-                  rescue ex : Socket::ConnectError
-                    error_message = "Connection failed: #{ex.message}"
-                    -1
-                  rescue IO::TimeoutError
-                    error_message = "Request timed out (#{timeout_seconds}s)"
-                    -1
-                  rescue ex : Socket::Addrinfo::Error
-                    error_message = "DNS resolution failed: #{ex.message}"
-                    -1
-                  rescue ex
-                    error_message = ex.message
-                    -1
-                  end
-                  results_channel.send(Result.new(link: link, status: status, error: error_message))
-                end
-              end
-            end
-
-            # Feed links to workers
-            links.each { |link| work_channel.send(link) }
-            max_concurrency.times { work_channel.send(nil) }
-
-            # Collect all results
-            Array.new(links.size) { results_channel.receive }
-          end
-
-          # Check if a hostname resolves to a private/internal IP address (SSRF protection).
-          private def private_host?(host : String) : Bool
-            return true if host == "localhost" || host.ends_with?(".local") || host.ends_with?(".internal")
-
-            begin
-              addrs = Socket::Addrinfo.resolve(host, 80, type: Socket::Type::STREAM)
-              addrs.any? do |addr|
-                ip = addr.ip_address.address
-                ip.starts_with?("127.") ||
-                  ip.starts_with?("10.") ||
-                  ip.starts_with?("192.168.") ||
-                  ip.starts_with?("169.254.") ||
-                  ip == "0.0.0.0" ||
-                  ip == "::1" ||
-                  ip == "::" ||
-                  ip.starts_with?("fc") || ip.starts_with?("fd") || # IPv6 ULA
-                  ip.starts_with?("fe80") ||                        # IPv6 link-local
-                  private_172?(ip)
-              end
-            rescue Socket::Error
-              false
-            end
-          end
-
-          private def private_172?(ip : String) : Bool
-            return false unless ip.starts_with?("172.")
-            parts = ip.split(".")
-            return false if parts.size < 2
-            second = parts[1].to_i? || return false
-            second >= 16 && second <= 31
-          end
+          # Memoized per run: the same host used to be resolved synchronously
+          # on every occurrence and every redirect hop, stalling all workers
+          # on slow DNS. The cache is bounded by the finite host set of one
+          # invocation. Resolution happens OUTSIDE the mutex so a slow lookup
+          # for one host never serializes the others; a rare duplicate
+          # resolution for the same host is benign.
+          @private_host_cache = {} of String => Bool
+          @private_host_cache_mutex = Mutex.new
         end
       end
     end

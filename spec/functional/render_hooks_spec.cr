@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 require "../../src/content/hooks/image_hooks"
 
 # =============================================================================
@@ -13,13 +13,13 @@ require "../../src/content/hooks/image_hooks"
 # isolation (see spec/unit/render_hooks_spec.cr for that).
 # =============================================================================
 
-private def with_resize_map(map, &)
-  prior = Hwaro::Content::Hooks::ImageHooks.resize_map
-  Hwaro::Content::Hooks::ImageHooks.set_resize_map(map)
-  begin
-    yield
-  ensure
-    Hwaro::Content::Hooks::ImageHooks.set_resize_map(prior)
+# Raw bytes of a w×h grey PNG.
+private def png_body(w : Int32, h : Int32) : String
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "x.png")
+    px = Bytes.new(w * h * 3, 90_u8)
+    LibStb.stbi_write_png(path, w, h, 3, px.to_unsafe.as(Void*), w * 3)
+    File.read(path)
   end
 end
 
@@ -134,25 +134,21 @@ describe "Render hooks: responsive images" do
 
       [image_processing]
       enabled = true
+      widths = [400, 800]
       TOML
 
-    resize_map = {
-      "/photo.png" => {400 => "/photo_400w.png", 800 => "/photo_800w.png"},
-    }
-
-    with_resize_map(resize_map) do
-      build_site(
-        config,
-        content_files: {"index.md" => %(+++\ntitle = "Home"\n+++\n![alt](/photo.png))},
-        template_files: {
-          "page.html"               => "<body>{{ content }}</body>",
-          "hooks/render-image.html" => %(<img src="{{ destination }}" alt="{{ alt }}" />),
-        },
-      ) do
-        html = File.read("public/index.html")
-        html.should contain(%(srcset="/photo_400w.png 400w, /photo_800w.png 800w"))
-        html.should contain(%(loading="lazy"))
-      end
+    build_site(
+      config,
+      content_files: {"index.md" => %(+++\ntitle = "Home"\n+++\n![alt](/photo.png))},
+      template_files: {
+        "page.html"               => "<body>{{ content }}</body>",
+        "hooks/render-image.html" => %(<img src="{{ destination }}" alt="{{ alt }}" />),
+      },
+      static_files: {"photo.png" => png_body(1000, 500)},
+    ) do
+      html = File.read("public/index.html")
+      html.should contain(%(srcset="/photo_400w.png 400w, /photo_800w.png 800w"))
+      html.should contain(%(loading="lazy"))
     end
   end
 end
@@ -370,13 +366,13 @@ describe "Render hooks: --cache invalidation on a hook template edit" do
 
         builder = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder.register(h) }
-        builder.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
         File.read("public/index.html").should contain(%(class="v1"))
 
         File.write("templates/hooks/render-link.html", %(<a class="v2" href="{{ destination }}">{{ text }}</a>))
         builder2 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
-        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder2.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
 
         File.read("public/index.html").should contain(%(class="v2"))
       end
@@ -395,13 +391,13 @@ describe "Render hooks: --cache invalidation on a hook template edit" do
 
         builder = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder.register(h) }
-        builder.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
         File.read("public/index.html").should contain(%(class="v1"))
 
         File.write("templates/hooks/render-link.html", %(<a class="v2" href="{{ destination }}">{{ text }}</a>))
         builder2 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
-        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder2.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
 
         File.read("public/index.html").should contain(%(class="v2"))
       end

@@ -62,6 +62,60 @@ module Hwaro
           result
         end
 
+        # Content paths the scaffold's own menus and templates link to.
+        # `--skip-sample-content` still writes these, as front-matter-only
+        # stubs: skipping them left a site with no homepage whose every nav
+        # link 404'd.
+        protected def skeleton_page_paths : Array(String)
+          ["index.md"]
+        end
+
+        # The `--skip-sample-content` content set: the skeleton pages (and
+        # their translations) with the sample body dropped, so no sample
+        # prose or links to skipped sample pages remain.
+        def skeleton_content_files(
+          languages : Array(String) = [] of String,
+          skip_taxonomies : Bool = false,
+        ) : Hash(String, String)
+          keep = skeleton_page_paths
+          return {} of String => String if keep.empty?
+
+          files = languages.size > 1 ? multilingual_content_files(languages, skip_taxonomies) : content_files(skip_taxonomies)
+          suffixes = languages.size > 1 ? languages[1..].map { |lang| ".#{lang}.md" } : [] of String
+          result = {} of String => String
+          files.each do |path, body|
+            base_path = suffixes.find { |suffix| path.ends_with?(suffix) }.try { |suffix| path.rchop(suffix) + ".md" } || path
+            result[path] = extract_front_matter(body) if keep.includes?(base_path)
+          end
+          result
+        end
+
+        # Extract front matter from markdown content, discarding the body.
+        # Keeps the +++ delimited TOML front matter block and adds a placeholder.
+        protected def extract_front_matter(content : String) : String
+          lines = content.lines
+          return content if lines.empty?
+
+          # Detect front matter delimiter (+++ for TOML, --- for YAML)
+          delimiter = lines[0].strip
+          return content unless delimiter == "+++" || delimiter == "---"
+
+          # Find the closing delimiter
+          close_index = nil
+          lines.each_with_index do |line, i|
+            next if i == 0
+            if line.strip == delimiter
+              close_index = i
+              break
+            end
+          end
+
+          return content unless close_index
+
+          front_matter = lines[0..close_index].join("\n")
+          "#{front_matter}\n"
+        end
+
         # Rewrite Markdown links that point at the default-language URL
         # space so they resolve to the translated locale's URL space
         # instead. Without this, `index.ko.md`'s body keeps
@@ -256,6 +310,101 @@ module Hwaro
           DesignTokens.theme_toggle_css
         end
 
+        # The search palette shell (modal, open animation, input row) shared
+        # by the blog and docs stylesheets.
+        protected def search_modal_css : String
+          <<-CSS
+            .search-modal {
+              width: 560px;
+              max-width: 90vw;
+              max-height: 70vh;
+              background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+              backdrop-filter: saturate(180%) blur(24px);
+              -webkit-backdrop-filter: saturate(180%) blur(24px);
+              border: 1px solid var(--border-subtle);
+              border-radius: var(--radius);
+              box-shadow: var(--shadow-lg);
+              display: flex;
+              flex-direction: column;
+              overflow: hidden;
+              align-self: flex-start;
+            }
+            @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .search-modal { background: var(--bg-raised); } }
+
+            /* The palette settles into place when it opens. */
+            @media (prefers-reduced-motion: no-preference) {
+              .search-overlay.active { transition: opacity 0.15s var(--ease-out); }
+              .search-overlay.active .search-modal { transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out); }
+              @starting-style {
+                .search-overlay.active { opacity: 0; }
+                .search-overlay.active .search-modal { opacity: 0; transform: translateY(-8px) scale(0.985); }
+              }
+            }
+
+            .search-input-wrap {
+              display: flex;
+              align-items: center;
+              gap: 0.6rem;
+              padding: 0.75rem 1rem;
+              border-bottom: 1px solid var(--border-subtle);
+            }
+            CSS
+        end
+
+        # Keyboard-hint footer of the search palette (blog and docs).
+        protected def search_hint_css : String
+          <<-CSS
+            .search-hint {
+              padding: 0.5rem 0.75rem;
+              display: flex;
+              gap: 1rem;
+              justify-content: center;
+              border-top: 1px solid var(--border-subtle);
+              color: var(--text-muted);
+              font-size: 0.7rem;
+            }
+
+            .search-hint kbd {
+              font-size: 0.65rem;
+              padding: 0 0.3rem;
+              border: 1px solid var(--border);
+              border-radius: 3px;
+              background: var(--bg-raised);
+              box-shadow: 0 1px 0 var(--border);
+              font-family: inherit;
+              line-height: 1.4;
+            }
+            CSS
+        end
+
+        # Scroll-driven reading-progress bar (blog and book).
+        protected def reading_progress_css : String
+          <<-CSS
+            .reading-progress { display: none; }
+            @supports (animation-timeline: scroll()) {
+              @media (prefers-reduced-motion: no-preference) {
+                .reading-progress {
+                  display: block;
+                  position: fixed;
+                  top: 0;
+                  left: 0;
+                  right: 0;
+                  height: 2px;
+                  z-index: 110;
+                  transform-origin: 0 50%;
+                  background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
+                  animation: reading-progress linear both;
+                  animation-timeline: scroll(root);
+                }
+                @keyframes reading-progress {
+                  from { transform: scaleX(0); }
+                  to { transform: scaleX(1); }
+                }
+              }
+            }
+            CSS
+        end
+
         # Applied before first paint so a visitor's stored theme choice
         # doesn't flash the OS scheme first (`theme_toggle_script` is the
         # writer side). Inlined in every scaffold's <head>.
@@ -335,6 +484,14 @@ module Hwaro
           }
         end
 
+        # Files outside content/templates/static/archetypes, keyed by their
+        # path relative to the project root (e.g. `data/sidebar.yml`).
+        # Built-in scaffolds ship none; a remote scaffold carries its
+        # `data/` and `i18n/` over.
+        def extra_files : Hash(String, String)
+          {} of String => String
+        end
+
         # Built-in default archetype content (TOML front matter).
         # `Services::Creator` substitutes `{{ title }}`, `{{ date }}`,
         # `{{ draft }}`, `{{ tags }}`, and `{{ description }}`. An unset
@@ -362,10 +519,64 @@ module Hwaro
         # `--include-multilingual`) is threaded through so the full config
         # emits a real, enabled `[languages]` block instead of the commented
         # placeholder.
-        abstract def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
+        # The `--full-config` config.toml: every section, in one fixed order,
+        # with a discoverability banner per section. Scaffolds do not restate
+        # this list — they opt sections out through `ships_taxonomies?` and
+        # supply their menu entries through `menus_config` (empty by
+        # default), and `bare` overrides the whole method for its subset.
+        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
+          String.build do |str|
+            # Site basics
+            str << base_config(config_title, config_description)
 
-        # Returns the site title used in config (overridable per scaffold)
-        protected def config_title : String
+            # Content & Processing
+            str << multilingual_config(multilingual_languages, skip_taxonomies)
+            str << ConfigSnippets.plugins
+            str << content_files_config
+            str << ConfigSnippets.highlight
+            str << ConfigSnippets.og
+            str << ConfigSnippets.search
+            str << ConfigSnippets.pagination
+            str << ConfigSnippets.series
+            # `[related]` points at `tags`; without a `[[taxonomies]]` block
+            # for it, ship the commented form so doctor stays quiet.
+            str << (!skip_taxonomies && ships_taxonomies? ? related_config : ConfigSnippets.related(commented: true))
+            str << taxonomies_config if !skip_taxonomies && ships_taxonomies?
+            str << menus_config(multilingual_languages)
+
+            # SEO & Feeds
+            str << ConfigSnippets.sitemap
+            str << ConfigSnippets.robots
+            str << ConfigSnippets.llms
+            str << feeds_config(feed_sections)
+
+            # Optional features (commented out by default)
+            str << ConfigSnippets.permalinks
+            str << ConfigSnippets.auto_includes
+            str << ConfigSnippets.assets
+            str << ConfigSnippets.markdown
+            str << ConfigSnippets.content_new
+            str << ConfigSnippets.image_processing
+            str << ConfigSnippets.build
+            str << ConfigSnippets.pwa
+            str << ConfigSnippets.amp
+            str << ConfigSnippets.og_auto_image
+            str << ConfigSnippets.doctor
+            str << ConfigSnippets.deployment
+          end
+        end
+
+        # `[[menus.*]]` section of the full config; scaffolds whose templates
+        # render a menu override this (see Simple / Blog).
+        protected def menus_config(multilingual_languages : Array(String) = [] of String) : String
+          ""
+        end
+
+        # Returns the site title used in config (overridable per scaffold).
+        # Public so `hwaro doctor` can source its placeholder-title advisory
+        # from the scaffolds themselves instead of a hand-kept literal list
+        # that only ever covered "My Hwaro Site".
+        def config_title : String
           "My Hwaro Site"
         end
 
@@ -387,6 +598,17 @@ module Hwaro
           [] of String
         end
 
+        # Whether this scaffold ships `[[taxonomies]]` at all. Scaffolds
+        # that opt out (bare's "no batteries" promise, book's
+        # chapter-ordered structure) return false so neither the global
+        # `[[taxonomies]]` block nor the per-language `taxonomies = [...]`
+        # lines are emitted — otherwise a multilingual bare/book config
+        # carried dead per-language taxonomy lists pointing at taxonomies
+        # that don't exist.
+        protected def ships_taxonomies? : Bool
+          true
+        end
+
         # Site identity + optional `[languages]` block. Split out of
         # `minimal_config_content` so a scaffold that opts out of individual
         # feature sections (see `Bare`) can recompose the same header instead
@@ -405,7 +627,7 @@ module Hwaro
               str << "[languages]\n"
               lang_blocks = multilingual_languages.map_with_index do |lang, index|
                 lang_name = language_display_name(lang)
-                tax_line = skip_taxonomies ? "" : "\n  taxonomies = [\"tags\", \"categories\", \"authors\"]"
+                tax_line = skip_taxonomies || !ships_taxonomies? ? "" : "\n  taxonomies = [\"tags\", \"categories\", \"authors\"]"
                 "  [languages.#{lang}]\n" \
                 "  language_name = \"#{lang_name}\"\n" \
                 "  weight = #{index + 1}\n" \
@@ -441,7 +663,7 @@ module Hwaro
         end
 
         protected def minimal_taxonomies_toml(skip_taxonomies : Bool) : String
-          return "" if skip_taxonomies
+          return "" if skip_taxonomies || !ships_taxonomies?
 
           String.build do |str|
             str << "\n[[taxonomies]]\n"
@@ -479,6 +701,34 @@ module Hwaro
             str << "\n[search]\n"
             str << "enabled = true\n"
             str << "format = \"fuse_json\"\n"
+          end
+        end
+
+        # Renders `[[menus.main]]` entries from {name, url} pairs — plus,
+        # for a multilingual project, `[[languages.<code>.menus.main]]`
+        # mirrors with locale-prefixed URLs for every non-default language.
+        # Without those, a language with no `menus` key inherits the
+        # top-level entries verbatim (see `Content::Menus.build`), so the
+        # nav on a `/ko/…` page pointed at the default-language URLs.
+        protected def main_menu_toml(items : Array(Tuple(String, String)), multilingual_languages : Array(String) = [] of String) : String
+          String.build do |str|
+            items.each_with_index do |(name, url), index|
+              str << "\n[[menus.main]]\n"
+              str << "name = \"#{name}\"\n"
+              str << "url = \"#{url}\"\n"
+              str << "weight = #{index + 1}\n"
+            end
+            if multilingual_languages.size > 1
+              multilingual_languages[1..].each do |lang|
+                items.each_with_index do |(name, url), index|
+                  str << "\n[[languages.#{lang}.menus.main]]\n"
+                  str << "name = \"#{name}\"\n"
+                  str << "url = \"/#{lang}#{url}\"\n"
+                  str << "weight = #{index + 1}\n"
+                end
+              end
+            end
+            str << "\n"
           end
         end
 
@@ -542,6 +792,7 @@ module Hwaro
               {{ jsonld }}
               {{ hreflang_tags }}
               {{ pagination_seo_links }}
+              {{ pwa_tags }}
               #{styles}
               {# The syntax theme is inlined in the CSS above, so no highlight
                  theme stylesheet link is emitted here (sub-path safe). Highlight.js
@@ -557,6 +808,7 @@ module Hwaro
                   <a href="{{ base_url }}{{ lang_prefix }}/" class="site-logo">{{ site.title | e }}</a>
                   <div class="site-header-right">
                     #{navigation}
+                    #{lang_switcher_html}
                     #{theme_toggle_html}
                   </div>
                 </div>
@@ -699,6 +951,8 @@ module Hwaro
               .site-logo::before { content: ""; width: 9px; height: 9px; flex: none; border-radius: 2px; transform: rotate(45deg); background: var(--spark); }
               .site-logo:hover { color: var(--primary); }
               .site-header-right { display: flex; align-items: center; gap: 1.4rem; }
+              .lang-switcher { display: flex; gap: 0.6rem; }
+              .lang-switcher a[aria-current="true"] { color: var(--text); font-weight: 600; }
               .site-header nav { display: flex; gap: 1.4rem; }
               .site-header nav a { color: var(--text-muted); text-decoration: none; font-size: var(--step--1); letter-spacing: 0.01em; padding-bottom: 2px; border-bottom: 2px solid transparent; transition: color var(--transition), border-color var(--transition); }
               .site-header nav a:hover { color: var(--primary); }
@@ -729,7 +983,7 @@ module Hwaro
                  hwaro scaffold shares — and its first paragraph reads as a
                  serif lede, giving the page a real focal point. */
               .site-main > h1:first-child { position: relative; padding-bottom: 1rem; margin-bottom: 1.1rem; }
-              .site-main > h1:first-child::after { content: ""; position: absolute; left: 0; bottom: 0; width: 3.25rem; height: 3px; border-radius: 999px; background: linear-gradient(90deg, var(--rule-from), var(--rule-to)); }
+              .site-main > h1:first-child::after { content: ""; position: absolute; left: 0; bottom: 0; width: 2.75rem; height: 4px; border-radius: 999px; background: linear-gradient(90deg, var(--rule-from), var(--rule-to)); }
               .site-main > h1:first-child + p { font-family: var(--font-serif); font-size: var(--step-1); line-height: 1.55; color: var(--text-secondary); }
 
               /* Links: ember, with an underline that warms up on hover. */
@@ -813,26 +1067,29 @@ module Hwaro
             CSS
         end
 
-        # Override in subclasses to customize navigation (Jinja2 syntax)
+        # Links to the current page's translations (rendered only on a
+        # multilingual site). Blog and docs carry their own styled copy;
+        # simple, bare and book share this one, so `--include-multilingual`
+        # never builds translated pages a reader has no way to reach.
+        protected def lang_switcher_html : String
+          <<-HTML
+            {% if page.translations | length > 0 %}
+            <nav class="lang-switcher" aria-label="Language">
+              {% for t in page.translations %}<a href="{{ base_url }}{{ t.url }}" hreflang="{{ t.code }}"{% if t.is_current %} aria-current="true"{% endif %}>{{ t.code | upper }}</a>{% endfor %}
+            </nav>
+            {% endif %}
+            HTML
+        end
+
+        # Header nav for `header_template` (Jinja2): renders the "main" menu,
+        # so adding a nav item never requires editing this template.
+        # `item.name` defaults to the page title when a menu is registered
+        # from front matter, so it's escaped like any other author-controlled
+        # value.
         protected def navigation : String
           <<-NAV
             <nav>
-              <!-- Add links for new sections here (e.g. /notes/, /til/).
-                   Dynamic version (copy out and remove the hardcoded links
-                   below). It lists only the current language's sections;
-                   s.url already includes the language prefix, so do NOT add
-                   lang_prefix. For custom ordering, set `weight` in each
-                   section's front matter and use sort(attribute="weight").
-                   (The example below is wrapped in a raw block so it
-                   isn't executed here.)
-                   {% raw %}
-                   {% for s in site.sections | sort(attribute="title") %}
-                     {% if not s.transparent and s.name and s.language == page_language %}<a href="{{ base_url }}{{ s.url }}">{{ s.title }}</a>{% endif %}
-                   {% endfor %}
-                   {% endraw %}
-              -->
-              <a href="{{ base_url }}{{ lang_prefix }}/">Home</a>
-              <a href="{{ base_url }}{{ lang_prefix }}/about/">About</a>
+              {% for item in get_menu(name="main") %}<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name | e }}</a>{% endfor %}
             </nav>
             NAV
         end
@@ -851,19 +1108,24 @@ module Hwaro
             TOML
         end
 
-        protected def multilingual_config(multilingual_languages : Array(String) = [] of String) : String
+        protected def multilingual_config(multilingual_languages : Array(String) = [] of String, skip_taxonomies : Bool = false) : String
           # When `--include-multilingual` requested 2+ languages, emit a real,
           # enabled languages block so the full config honors the flag (gh: the
           # full-config path used to drop multilingual entirely, leaving
           # `.ko.md` variants routed as literal `/about.ko/` pages).
           if multilingual_languages.size > 1
             default_lang = multilingual_languages.first
+            # Per-language taxonomies mirror `minimal_site_toml`: taxonomy
+            # pages for a language only generate when that language lists
+            # the taxonomy, so omitting this line left localized `/ko/tags/`
+            # links dead under `--full-config`.
+            tax_line = skip_taxonomies || !ships_taxonomies? ? "" : "\n  taxonomies = [\"tags\", \"categories\", \"authors\"]"
             lang_blocks = multilingual_languages.map_with_index do |lang, index|
               "  [languages.#{lang}]\n" \
               "  language_name = \"#{language_display_name(lang)}\"\n" \
               "  weight = #{index + 1}\n" \
               "  generate_feed = true\n" \
-              "  build_search_index = true"
+              "  build_search_index = true#{tax_line}"
             end
             return String.build do |str|
               str << "\n"
@@ -904,14 +1166,6 @@ module Hwaro
             TOML
         end
 
-        protected def plugins_config : String
-          ConfigSnippets.plugins
-        end
-
-        protected def pagination_config : String
-          ConfigSnippets.pagination
-        end
-
         protected def content_files_config : String
           <<-TOML
 
@@ -929,49 +1183,21 @@ module Hwaro
             TOML
         end
 
-        protected def highlight_config : String
-          ConfigSnippets.highlight
-        end
-
         # Shared search overlay markup; only the input placeholder varies per
         # scaffold (e.g. "Search posts...", "Search documentation...").
         protected def search_overlay_html(placeholder : String) : String
           <<-HTML
-            <div class="search-overlay" id="searchOverlay" onclick="if(event.target===this)closeSearch()">
+            <div class="search-overlay" id="searchOverlay">
               <div class="search-modal">
                 <div class="search-input-wrap">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                   <input type="search" id="searchInput" aria-label="Search" placeholder="#{placeholder}" autocomplete="off">
-                  <kbd onclick="closeSearch()">ESC</kbd>
+                  <kbd data-search-close>ESC</kbd>
                 </div>
                 <div class="search-results" id="searchResults"></div>
               </div>
             </div>
             HTML
-        end
-
-        protected def og_config : String
-          ConfigSnippets.og
-        end
-
-        protected def search_config : String
-          ConfigSnippets.search
-        end
-
-        protected def sitemap_config : String
-          ConfigSnippets.sitemap
-        end
-
-        protected def robots_config : String
-          ConfigSnippets.robots
-        end
-
-        protected def llms_config : String
-          ConfigSnippets.llms
-        end
-
-        protected def series_config : String
-          ConfigSnippets.series
         end
 
         protected def related_config : String
@@ -1024,62 +1250,17 @@ module Hwaro
             TOML
         end
 
-        protected def permalinks_config : String
-          ConfigSnippets.permalinks
-        end
-
-        protected def auto_includes_config : String
-          ConfigSnippets.auto_includes
-        end
-
-        protected def assets_config : String
-          ConfigSnippets.assets
-        end
-
-        protected def markdown_config : String
-          ConfigSnippets.markdown
-        end
-
-        protected def content_new_config : String
-          ConfigSnippets.content_new
-        end
-
-        protected def doctor_config : String
-          ConfigSnippets.doctor
-        end
-
-        protected def build_hooks_config : String
-          ConfigSnippets.build
-        end
-
-        protected def pwa_config : String
-          ConfigSnippets.pwa
-        end
-
-        protected def amp_config : String
-          ConfigSnippets.amp
-        end
-
-        protected def og_auto_image_config : String
-          ConfigSnippets.og_auto_image
-        end
-
-        protected def image_processing_config : String
-          ConfigSnippets.image_processing
-        end
-
-        protected def deployment_config : String
-          ConfigSnippets.deployment
-        end
-
         # Search overlay JS shared by the blog and docs scaffolds.
         # `extra_init` is inserted inside the IIFE right before it closes —
         # docs passes its heading hover-anchor block. Raw heredocs
         # (`<<-'JS'`) on purpose: the JS must not go through `#{}`
         # interpolation.
-        protected def search_js_content(extra_init : String = "") : String
-          head = <<-'JS'
-            (function () {
+        # The search overlay script (data loading, matching, result list,
+        # keyboard handling) WITHOUT its IIFE wrapper, so a scaffold that
+        # ships one combined script (book.js) can splice it between its own
+        # sections. `search_js_content` wraps it for the standalone search.js.
+        protected def search_js_body : String
+          <<-'JS'
               var searchData = null;
               var activeIndex = -1;
               var overlay = document.getElementById('searchOverlay');
@@ -1111,6 +1292,16 @@ module Hwaro
                 activeIndex = -1;
               };
 
+              overlay.addEventListener('click', function (e) {
+                if (e.target === overlay) closeSearch();
+              });
+              document.querySelectorAll('[data-search-open]').forEach(function (el) {
+                el.addEventListener('click', function () { openSearch(); });
+              });
+              document.querySelectorAll('[data-search-close]').forEach(function (el) {
+                el.addEventListener('click', function () { closeSearch(); });
+              });
+
               document.addEventListener('keydown', function (e) {
                 if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
                   e.preventDefault();
@@ -1131,11 +1322,27 @@ module Hwaro
                 return d.innerHTML;
               }
 
+              // Encode what a raw href must not carry (quotes, spaces) but keep
+              // the escapes the index already holds: a page named `a#b.md` is
+              // indexed as `/a%23b/`, and plain encodeURI linked `/a%2523b/`.
+              function resultHref(url) {
+                return encodeURI(url).replace(/%25([0-9A-Fa-f]{2})/g, '%$1');
+              }
+
+              // Match on the raw text and escape each piece afterwards: running the
+              // query over already-escaped HTML split entities (`&amp;`) with a
+              // <mark> and could never match a query containing & < >.
               function highlightMatch(text, query) {
                 if (!query) return escapeHtml(text);
-                var escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-                var re = new RegExp('(' + escaped + ')', 'gi');
-                return escapeHtml(text).replace(re, '<mark>$1</mark>');
+                var lower = text.toLowerCase(), q = query.toLowerCase();
+                // Lowercasing can change the length (e.g. `İ`), which would shift every offset.
+                if (lower.length !== text.length) return escapeHtml(text);
+                var out = '', pos = 0, i;
+                while ((i = lower.indexOf(q, pos)) !== -1) {
+                  out += escapeHtml(text.slice(pos, i)) + '<mark>' + escapeHtml(text.slice(i, i + q.length)) + '</mark>';
+                  pos = i + q.length;
+                }
+                return out + escapeHtml(text.slice(pos));
               }
 
               function getSnippet(content, query) {
@@ -1143,7 +1350,7 @@ module Hwaro
                 var idx = lower.indexOf(query.toLowerCase());
                 var start = Math.max(0, idx - 60);
                 var end = Math.min(content.length, idx + query.length + 100);
-                var snippet = content.substring(start, end).replace(/\\s+/g, ' ').trim();
+                var snippet = content.substring(start, end).replace(/\s+/g, ' ').trim();
                 if (start > 0) snippet = '...' + snippet;
                 if (end < content.length) snippet = snippet + '...';
                 return snippet;
@@ -1164,7 +1371,11 @@ module Hwaro
                   var titleIdx = item.title.toLowerCase().indexOf(q);
                   var contentIdx = item.content.toLowerCase().indexOf(q);
                   if (titleIdx !== -1 || contentIdx !== -1) {
-                    var score = titleIdx !== -1 ? 100 - titleIdx : contentIdx;
+                    // Earlier matches rank higher; every title match outranks
+                    // every content-only match. The title bonus must stay
+                    // larger than any offset a title can reach, or a match
+                    // late in a long title scores below a content-only hit.
+                    var score = titleIdx !== -1 ? 1e9 - titleIdx : -contentIdx;
                     results.push({ item: item, score: score });
                   }
                 }
@@ -1181,7 +1392,7 @@ module Hwaro
                 for (var j = 0; j < results.length; j++) {
                   var r = results[j].item;
                   var snippet = getSnippet(r.content, query.trim());
-                  html += '<a class="search-result-item" href="' + encodeURI(r.url) + '" data-index="' + j + '">'
+                  html += '<a class="search-result-item" href="' + resultHref(r.url) + '" data-index="' + j + '">'
                     + '<div class="search-result-title">' + highlightMatch(r.title, query.trim()) + '</div>'
                     + '<div class="search-result-snippet">' + highlightMatch(snippet, query.trim()) + '</div>'
                     + '</a>';
@@ -1209,6 +1420,7 @@ module Hwaro
                 input.addEventListener('keydown', function (e) {
                   var items = resultsEl.querySelectorAll('.search-result-item');
                   var count = items.length;
+                  if (count === 0 && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) return;
                   if (e.key === 'ArrowDown') {
                     e.preventDefault();
                     activeIndex = (activeIndex + 1) % count;
@@ -1228,6 +1440,10 @@ module Hwaro
                 });
               }
             JS
+        end
+
+        protected def search_js_content(extra_init : String = "") : String
+          head = "(function () {\n" + search_js_body
           tail = "})();"
           if extra_init.empty?
             head + "\n" + tail

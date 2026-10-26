@@ -19,7 +19,7 @@ module Hwaro
           "Blog-focused structure with posts, archives, and taxonomies"
         end
 
-        protected def config_title : String
+        def config_title : String
           "My Blog"
         end
 
@@ -56,6 +56,11 @@ module Hwaro
           files
         end
 
+        # Pages the menus/nav link to (kept as stubs by --skip-sample-content).
+        protected def skeleton_page_paths : Array(String)
+          ["index.md", "about.md", "archives.md", "posts/_index.md"]
+        end
+
         # Blog templates share the same chrome (header nav + search
         # overlay + container open) across page/section/post/archives/
         # taxonomy/404. We extract those into `partials/` so users editing
@@ -85,78 +90,22 @@ module Hwaro
           files
         end
 
-        def config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
-          config = String.build do |str|
-            # Site basics
-            str << base_config(config_title, config_description)
-
-            # Content & Processing
-            str << multilingual_config(multilingual_languages)
-            str << plugins_config
-            str << content_files_config
-            str << highlight_config
-            str << og_config
-            str << search_config
-            str << pagination_config
-            str << series_config
-            str << related_config
-            str << taxonomies_config unless skip_taxonomies
-            str << menus_config
-
-            # SEO & Feeds
-            str << sitemap_config
-            str << robots_config
-            str << llms_config
-            str << feeds_config(feed_sections)
-
-            # Optional features (commented out by default)
-            str << permalinks_config
-            str << auto_includes_config
-            str << assets_config
-            str << markdown_config
-            str << content_new_config
-            str << image_processing_config
-            str << build_hooks_config
-            str << pwa_config
-            str << amp_config
-            str << og_auto_image_config
-            str << doctor_config
-            str << deployment_config
-          end
-          config
-        end
-
         # `[[menus.main]]` entries backing blog_nav_html's
         # `get_menu(name="main")` loop — matches the three links the
         # scaffold's own content creates (posts/_index.md, archives.md,
         # about.md). Add a fourth entry here (or register a page into
         # "main" from its own front matter with `menus = ["main"]`) to
-        # extend the nav without touching a template.
-        private def menu_entries_toml : String
-          <<-TOML
-
-            [[menus.main]]
-            name = "Posts"
-            url = "/posts/"
-            weight = 1
-
-            [[menus.main]]
-            name = "Archives"
-            url = "/archives/"
-            weight = 2
-
-            [[menus.main]]
-            name = "About"
-            url = "/about/"
-            weight = 3
-
-            TOML
+        # extend the nav without touching a template. Multilingual
+        # projects also get `[[languages.<code>.menus.main]]` mirrors
+        # with locale-prefixed URLs (see `Base#main_menu_toml`).
+        private def menu_entries_toml(multilingual_languages : Array(String) = [] of String) : String
+          main_menu_toml([{"Posts", "/posts/"}, {"Archives", "/archives/"}, {"About", "/about/"}], multilingual_languages)
         end
 
         # `--full-config` path: same entries as `minimal_config_content`
         # below, with a discoverability banner matching the rest of
         # `config_content`'s commented sections.
-        protected def menus_config : String
+        protected def menus_config(multilingual_languages : Array(String) = [] of String) : String
           banner = <<-TOML
 
             # =============================================================================
@@ -168,7 +117,7 @@ module Hwaro
             # front matter with `menus = ["main"]` — no template edit
             # required either way.
             TOML
-          banner + menu_entries_toml
+          banner + menu_entries_toml(multilingual_languages)
         end
 
         # `hwaro init`'s DEFAULT path (no `--full-config`) and
@@ -177,7 +126,7 @@ module Hwaro
         # `get_menu(name="main")` would resolve against a config with no
         # `[[menus.*]]` at all, rendering an empty nav out of the box.
         def minimal_config_content(skip_taxonomies : Bool = false, multilingual_languages : Array(String) = [] of String) : String
-          super + menu_entries_toml
+          super + menu_entries_toml(multilingual_languages)
         end
 
         # Override styles for blog - external CSS file
@@ -207,6 +156,7 @@ module Hwaro
               {{ jsonld }}
               {{ hreflang_tags }}
               {{ pagination_seo_links }}
+              {{ pwa_tags }}
               #{styles}
               {# The syntax theme is inlined in css/style.css, so no highlight theme
                  stylesheet link is emitted here (sub-path safe). Highlight.js itself
@@ -416,7 +366,7 @@ module Hwaro
               left: 0;
               bottom: 0;
               width: 2.75rem;
-              height: 3px;
+              height: 4px;
               border-radius: 999px;
               background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
             }
@@ -582,7 +532,7 @@ module Hwaro
               left: 0;
               bottom: 0;
               width: 2.75rem;
-              height: 3px;
+              height: 4px;
               border-radius: 999px;
               background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
             }
@@ -940,40 +890,7 @@ module Hwaro
 
             .search-overlay.active { display: flex; }
 
-            .search-modal {
-              width: 560px;
-              max-width: 90vw;
-              max-height: 70vh;
-              background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
-              backdrop-filter: saturate(180%) blur(24px);
-              -webkit-backdrop-filter: saturate(180%) blur(24px);
-              border: 1px solid var(--border-subtle);
-              border-radius: var(--radius);
-              box-shadow: var(--shadow-lg);
-              display: flex;
-              flex-direction: column;
-              overflow: hidden;
-              align-self: flex-start;
-            }
-            @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .search-modal { background: var(--bg-raised); } }
-
-            /* The palette settles into place when it opens. */
-            @media (prefers-reduced-motion: no-preference) {
-              .search-overlay.active { transition: opacity 0.15s var(--ease-out); }
-              .search-overlay.active .search-modal { transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out); }
-              @starting-style {
-                .search-overlay.active { opacity: 0; }
-                .search-overlay.active .search-modal { opacity: 0; transform: translateY(-8px) scale(0.985); }
-              }
-            }
-
-            .search-input-wrap {
-              display: flex;
-              align-items: center;
-              gap: 0.6rem;
-              padding: 0.75rem 1rem;
-              border-bottom: 1px solid var(--border-subtle);
-            }
+            #{search_modal_css}
 
             .search-input-wrap svg { flex-shrink: 0; color: var(--text-muted); }
 
@@ -1024,26 +941,7 @@ module Hwaro
             .search-result-item .search-result-snippet mark { background: color-mix(in srgb, var(--primary) 15%, transparent); color: var(--primary-strong); border-radius: 2px; padding: 0 1px; }
             .search-no-results { padding: 2rem 1rem; text-align: center; color: var(--text-muted); font-size: 0.9rem; }
 
-            .search-hint {
-              padding: 0.5rem 0.75rem;
-              display: flex;
-              gap: 1rem;
-              justify-content: center;
-              border-top: 1px solid var(--border-subtle);
-              color: var(--text-muted);
-              font-size: 0.7rem;
-            }
-
-            .search-hint kbd {
-              font-size: 0.65rem;
-              padding: 0 0.3rem;
-              border: 1px solid var(--border);
-              border-radius: 3px;
-              background: var(--bg-raised);
-              box-shadow: 0 1px 0 var(--border);
-              font-family: inherit;
-              line-height: 1.4;
-            }
+            #{search_hint_css}
 
             /* Search trigger press feedback */
             .search-trigger { transition: border-color var(--transition), color var(--transition), transform 0.1s var(--ease-out); }
@@ -1053,28 +951,7 @@ module Hwaro
                pages, driven entirely by CSS scroll-driven animation. Browsers
                without animation-timeline (and reduced-motion readers) simply
                never see it. */
-            .reading-progress { display: none; }
-            @supports (animation-timeline: scroll()) {
-              @media (prefers-reduced-motion: no-preference) {
-                .reading-progress {
-                  display: block;
-                  position: fixed;
-                  top: 0;
-                  left: 0;
-                  right: 0;
-                  height: 2px;
-                  z-index: 110;
-                  transform-origin: 0 50%;
-                  background: linear-gradient(90deg, var(--rule-from), var(--rule-to));
-                  animation: reading-progress linear both;
-                  animation-timeline: scroll(root);
-                }
-                @keyframes reading-progress {
-                  from { transform: scaleX(0); }
-                  to { transform: scaleX(1); }
-                }
-              }
-            }
+            #{reading_progress_css}
 
             /* Responsive — the type scale is fluid, so only the frame
                needs to adapt. The date rails stack above their entries. */
@@ -1105,7 +982,7 @@ module Hwaro
                        register a page/section into "main" from its own front
                        matter with `menus = ["main"]` — no template edit
                        required either way. -->
-                  {% for item in get_menu(name="main") %}<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name }}</a>{% endfor %}
+                  {% for item in get_menu(name="main") %}<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name | e }}</a>{% endfor %}
                 </nav>
                 <div class="header-right">
                   {% if page.translations | length > 0 %}
@@ -1115,7 +992,7 @@ module Hwaro
                     {% endfor %}
                   </nav>
                   {% endif %}
-                  <button class="search-trigger" onclick="openSearch()" title="Search">
+                  <button class="search-trigger" data-search-open title="Search">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                     <span>Search</span>
                     <kbd>&#8984;K</kbd>
@@ -1152,7 +1029,7 @@ module Hwaro
                 <section class="home-latest" aria-labelledby="home-latest-title">
                   <h2 id="home-latest-title" class="home-section-title">Latest posts</h2>
                   <ul class="post-list">
-                    {% for p in site.pages | selectattr("date") | rejectattr("is_index") | rejectattr("draft") | selectattr("language", "equalto", page_language) | sort(attribute="date", reverse=true) %}
+                    {% for p in site.pages | selectattr("date") | rejectattr("draft") | selectattr("language", "equalto", page_language) | sort(attribute="date", reverse=true) %}
                     {% if loop.index <= 5 %}
                       <li class="post-item">
                         <time class="post-date" datetime="{{ p.date }}">{{ p.date }}</time>
@@ -1272,16 +1149,16 @@ module Hwaro
                      flat reading chain, which for a date-sorted feed runs
                      newest to oldest: lower is the newer post, higher the
                      older one. Both links are guarded to stay inside this
-                     post's section and to skip _index. #}
-                  {% if (page.lower and page.lower.section == page.section and not page.lower.is_index) or (page.higher and page.higher.section == page.section and not page.higher.is_index) %}
+                     post's section and to skip section indexes. #}
+                  {% if (page.lower and page.lower.section == page.section and not page.lower.is_section) or (page.higher and page.higher.section == page.section and not page.higher.is_section) %}
                   <nav class="post-nav" aria-label="More posts">
-                    {% if page.lower and page.lower.section == page.section and not page.lower.is_index %}
+                    {% if page.lower and page.lower.section == page.section and not page.lower.is_section %}
                     <a class="post-nav-link post-nav-prev" href="{{ base_url }}{{ page.lower.url }}" rel="prev">
                       <span class="post-nav-label">Newer</span>
                       <span class="post-nav-title">{{ page.lower.title | e }}</span>
                     </a>
                     {% endif %}
-                    {% if page.higher and page.higher.section == page.section and not page.higher.is_index %}
+                    {% if page.higher and page.higher.section == page.section and not page.higher.is_section %}
                     <a class="post-nav-link post-nav-next" href="{{ base_url }}{{ page.higher.url }}" rel="next">
                       <span class="post-nav-label">Older</span>
                       <span class="post-nav-title">{{ page.higher.title | e }}</span>
@@ -1342,17 +1219,6 @@ module Hwaro
                 {{ content }}
             {% include "footer.html" %}
             HTML
-        end
-
-        # Override navigation (not used directly - kept for base class
-        # compatibility). Mirrors blog_nav_html's menu-driven nav so this
-        # stays in sync with the real header if anything ever calls it.
-        protected def navigation : String
-          <<-NAV
-            <nav>
-              {% for item in get_menu(name="main") %}<a href="{{ item.href }}"{% if item.url | active_path %} aria-current="page"{% endif %}>{{ item.name }}</a>{% endfor %}
-            </nav>
-            NAV
         end
 
         # Generates a sample post date relative to today, so a freshly
@@ -1633,7 +1499,7 @@ module Hwaro
                 {{ content }}
 
                 <ul class="archive-list">
-                {% for p in site.pages | selectattr("date") | rejectattr("is_index") | rejectattr("draft") | selectattr("language", "equalto", page_language) | sort(attribute="date", reverse=true) %}
+                {% for p in site.pages | selectattr("date") | rejectattr("draft") | selectattr("language", "equalto", page_language) | sort(attribute="date", reverse=true) %}
                   <li class="archive-entry">
                     <time datetime="{{ p.date }}">{{ p.date }}</time>
                     <a href="{{ base_url }}{{ p.url }}">{{ p.title | e }}</a>

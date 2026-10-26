@@ -5,12 +5,54 @@
 # - escape_xml: Escape XML special characters
 
 require "digest/sha1"
+require "html"
 require "uri"
+require "./byte_scan"
 
 module Hwaro
   module Utils
     module TextUtils
       extend self
+
+      # Character ranges of each candidate URL in a srcset value.
+      def srcset_url_spans(value : String) : Array({Int32, Int32})
+        chars = value.chars
+        n = chars.size
+        spans = [] of {Int32, Int32}
+        i = 0
+        while i < n
+          while i < n && (chars[i].ascii_whitespace? || chars[i] == ',')
+            i += 1
+          end
+          break if i >= n
+          start = i
+          while i < n && !chars[i].ascii_whitespace?
+            i += 1
+          end
+          stop = i
+          if chars[stop - 1] == ','
+            while stop > start && chars[stop - 1] == ','
+              stop -= 1
+            end
+            spans << {start, stop} if stop > start
+            next
+          end
+          spans << {start, stop}
+          depth = 0
+          while i < n
+            c = chars[i]
+            i += 1
+            if c == '('
+              depth += 1
+            elsif c == ')'
+              depth -= 1 if depth > 0
+            elsif c == ',' && depth == 0
+              break
+            end
+          end
+        end
+        spans
+      end
 
       # Longest error message any console emitter prints on one line.
       #
@@ -27,6 +69,11 @@ module Hwaro
       # codepoint in the terminal). Returns the message untouched when it fits,
       # which is every ordinary error.
       def truncate_error(message : String, max : Int32 = MAX_ERROR_CHARS) : String
+        # A negative budget is nonsense, but `String#[0, negative]` answers it
+        # with `ArgumentError: Negative count` — turning a caller's bad cap
+        # into a crash while it was busy REPORTING another error, which is the
+        # worst possible moment to raise. Clamp to "keep nothing" instead.
+        max = 0 if max < 0
         return message if message.size <= max
         "#{message[0, max]}… (truncated, #{message.size} characters)"
       end
@@ -66,6 +113,16 @@ module Hwaro
       # and data files unparseable. Strip it once at the point of read.
       def strip_bom(content : String) : String
         content.lchop('\uFEFF')
+      end
+
+      # A taxonomy term as the build identifies it: stripped and NFC-normalised.
+      # macOS filenames, IMEs and the clipboard produce NFD text, and `slugify`
+      # drops the combining marks of an NFD `\u00E9` (so `/tags/cafe/` next to
+      # `/tags/caf\u00E9/`) while NFD and NFC Hangul share one directory on APFS \u2014
+      # visually identical tags must be one term. NFC is the identity for ASCII.
+      def normalize_term(term : String) : String
+        term = term.strip
+        term.ascii_only? ? term : term.unicode_normalize(:nfc)
       end
 
       # Remove terminal control characters (ANSI escapes, CR, BEL, \u2026) plus the
@@ -227,12 +284,22 @@ module Hwaro
         width
       end
 
+      # Widest padding run `pad_display` will emit. Far past any real terminal,
+      # so alignment is unaffected; it only bounds a nonsense width.
+      MAX_PAD_COLUMNS = 10_000
+
       # Left-align `s` in a field `width` terminal columns across. The
       # display-width counterpart of `String#ljust`; identical to it for
       # ASCII-only input.
       def pad_display(s : String, width : Int32) : String
-        pad = width - display_width(s)
-        pad > 0 ? "#{s}#{" " * pad}" : s
+        # Int64 subtraction: `width - display_width(s)` overflows Int32 for a
+        # width near either extreme (a terminal width read as Int32::MIN, a
+        # column computed from a pathological label), and `String#*` then gets
+        # a negative or absurd count. Both raise out of a pure FORMATTING
+        # helper. Cap the padding at a full screen's worth instead.
+        pad = width.to_i64 - display_width(s).to_i64
+        return s unless pad > 0
+        "#{s}#{" " * pad.clamp(0_i64, MAX_PAD_COLUMNS.to_i64)}"
       end
 
       # Space through `~`: one byte, one codepoint, one column each — the
@@ -262,37 +329,100 @@ module Hwaro
       # behind both `page.word_count` / `page.reading_time` and
       # `hwaro tool stats`, which previously split on whitespace alone and
       # reported ~30% more words than the site itself rendered.
+      #
+      # Chinese and Japanese are written without spaces, so each Han,
+      # Hiragana or Katakana character counts as one word (Hangul keeps
+      # space-based counting: Korean separates words with spaces). Any
+      # Unicode whitespace (NBSP, U+3000 ideographic space) splits words.
       def count_words(text : String) : Int32
+        count_words_and_cjk(text)[0]
+      end
+
+      # `{words, cjk}`: the `count_words` total, and how many of those words
+      # are single Han/Kana characters (reading time weighs them apart).
+      def count_words_and_cjk(text : String) : {Int32, Int32}
         in_tag = false
         in_word = false
         count = 0
+        cjk = 0
+
+        bytes = text.to_slice
+        last_comment_close = nil.as(Int32?)
+        looked_for_comment_close = false
 
         reader = Char::Reader.new(text)
         while reader.has_next?
           char = reader.current_char
           if char == '<'
-            # Only enter tag mode for a real HTML tag start (`<a`, `</p`, `<!--`).
-            # A bare `<` in prose/math ("n < 1000", "if 0 < x") is a literal
-            # less-than, not a tag \u2014 treating it as one set in_tag with no closing
-            # `>` and swallowed the rest of the document, collapsing the count.
+            # Only enter tag mode for a real HTML tag start (`<a`, `</p`, `<!--`)
+            # that is actually closed. A bare `<` in prose/math ("n < 1000",
+            # "if 0 < x", "a<b", "i<n;") is a literal less-than, not a tag \u2014
+            # treating it as one set in_tag with no closing `>` and swallowed
+            # the rest of the document, collapsing the count. The closer must
+            # come before the next `<` (a tag may span lines); a comment needs
+            # a `-->` somewhere after it. Each `<` scans only up to the next
+            # `<`, so the whole pass stays linear.
             nxt = reader.peek_next_char
-            in_tag = true if nxt.ascii_letter? || nxt == '/' || nxt == '!'
+            if nxt.ascii_letter? || nxt == '/' || nxt == '!'
+              start = reader.pos
+              if nxt == '!' && bytes.size >= start + 4 && bytes[start + 2] === '-' && bytes[start + 3] === '-'
+                unless looked_for_comment_close
+                  looked_for_comment_close = true
+                  i = bytes.size - 3
+                  while i >= 0
+                    if bytes[i] === '-' && bytes[i + 1] === '-' && bytes[i + 2] === '>'
+                      last_comment_close = i
+                      break
+                    end
+                    i -= 1
+                  end
+                end
+                in_tag = true if (close = last_comment_close) && close >= start + 4
+              else
+                scan = start + 1
+                while scan < bytes.size && bytes[scan] != '<'.ord && bytes[scan] != '>'.ord
+                  scan += 1
+                end
+                in_tag = true if scan < bytes.size && bytes[scan] == '>'.ord
+              end
+            end
             in_word = false
           elsif char == '>'
             in_tag = false
           elsif !in_tag
-            is_word_char = !char.ascii_whitespace? && !char.in?('#', '*', '_', '`', '[', ']', '(', ')', '~', '>', '<', '|')
-            if is_word_char
+            if cjk_word_char?(char)
+              count += 1
+              cjk += 1
+              in_word = false
+            elsif char.whitespace? || cjk_punctuation?(char) || char.in?('#', '*', '_', '`', '[', ']', '(', ')', '~', '>', '<', '|')
+              in_word = false
+            else
               count += 1 unless in_word
               in_word = true
-            else
-              in_word = false
             end
           end
           reader.next_char
         end
 
-        count
+        {count, cjk}
+      end
+
+      # Han ideographs (with 々〆〇), Hiragana and Katakana (incl. halfwidth).
+      private def cjk_word_char?(c : Char) : Bool
+        ord = c.ord
+        return false if ord < 0x3005
+        (0x3005 <= ord <= 0x3007) || (0x3040 <= ord <= 0x30FF) || (0x31F0 <= ord <= 0x31FF) ||
+          (0x3400 <= ord <= 0x4DBF) || (0x4E00 <= ord <= 0x9FFF) || (0xF900 <= ord <= 0xFAFF) ||
+          (0xFF66 <= ord <= 0xFF9F) || (0x20000 <= ord <= 0x3FFFF)
+      end
+
+      # CJK punctuation (。、「」) and fullwidth punctuation (，！？（）)
+      # separate words like ASCII whitespace; fullwidth letters and digits
+      # stay word characters.
+      private def cjk_punctuation?(c : Char) : Bool
+        ord = c.ord
+        return false if ord < 0x3000
+        (ord <= 0x303F) || (0xFF00 <= ord <= 0xFF65 && !c.alphanumeric?)
       end
 
       # Convert text to a URL-friendly slug
@@ -305,12 +435,18 @@ module Hwaro
       #   slugify("한글 제목")      # => "한글-제목"
       #   slugify("CJK 테스트!")   # => "cjk-테스트"
       #   slugify("日本語　テスト") # => "日本語-テスト"  (U+3000)
+      #   slugify("CI/CD")         # => "ci-cd"
+      #   slugify("보안—우회")      # => "보안-우회"  (em dash)
       #
       def slugify(text : String) : String
         # Single-pass: directly emit hyphens for separators, collapsing runs.
         # Avoids intermediate String allocation + regex gsub.
+        # NFC first: macOS file names and copy-paste often carry NFD text, and
+        # "cafe\u0301" must land on the same slug as "café".
+        text = text.unicode_normalize(:nfc) unless text.ascii_only?
         String.build(text.bytesize) do |io|
           last_was_sep = true # suppress leading hyphen
+          prev = ' '
           # Separator test is `whitespace?`, not `ascii_whitespace?`: the
           # ideographic space U+3000 is the ordinary word separator in CJK
           # titles, and an `&nbsp;` in a title decodes to U+00A0. Neither is
@@ -320,18 +456,35 @@ module Hwaro
             if char.ascii_letter? || char.ascii_number?
               io << char.downcase
               last_was_sep = false
-            elsif char.whitespace? || char == '-' || char == '_'
+            elsif char.whitespace? || char == '-' || char == '_' || slug_separator?(char)
               unless last_was_sep
                 io << '-'
                 last_was_sep = true
               end
-            elsif cjk_char?(char) || unicode_letter?(char)
+            elsif cjk_char?(char) || unicode_letter?(char) || (word_mark?(char) && (prev.alphanumeric? || word_mark?(prev)))
+              # Combining marks (vowel signs, virama, tone marks) are part of
+              # the word they follow. One after a dropped character has
+              # nothing to attach to.
               io << char.downcase
               last_was_sep = false
             end
             # All other characters (punctuation, symbols) are dropped
+            prev = char
           end
         end.rstrip('-')
+      end
+
+      # Punctuation that joins two words WITHOUT surrounding spaces and so
+      # must become a hyphen rather than vanish. Dropping these welded the
+      # words together: "CI/CD" → "cicd", "security/xss" → "securityxss",
+      # "보안—우회" → "보안우회" — while every slug convention (and Hwaro's own
+      # `Creator.slugify` for filenames) separates them ("ci-cd").
+      # Deliberately narrow: slash, backslash, and the Unicode dash block
+      # (hyphen U+2010 … horizontal bar U+2015) plus minus sign U+2212.
+      # Other punctuation ('.', '&', apostrophes, …) keeps the historical
+      # drop behavior so existing heading anchors and term URLs don't move.
+      private def slug_separator?(char : Char) : Bool
+        char == '/' || char == '\\' || char.in?('‐'..'―') || char == '−'
       end
 
       # Longest slug `safe_slugify` returns, in bytes.
@@ -401,11 +554,13 @@ module Hwaro
         s.bytesize > MAX_SLUG_BYTES
       end
 
-      private def bound_slug(slug : String, source : String) : String
-        return slug if slug.bytesize <= MAX_SLUG_BYTES
+      # Other generated file names (OG images) bound theirs with a tighter
+      # *max_bytes* that leaves room for their extension.
+      def bound_slug(slug : String, source : String, max_bytes : Int32 = MAX_SLUG_BYTES) : String
+        return slug if slug.bytesize <= max_bytes
 
         suffix = "-#{Digest::SHA1.hexdigest(source)[0, SLUG_DIGEST_CHARS]}"
-        head = truncate_bytes(slug, MAX_SLUG_BYTES - suffix.bytesize)
+        head = truncate_bytes(slug, max_bytes - suffix.bytesize)
         # The cut can land right after a separator ("...-word-"); dropping it
         # keeps the result shaped like any other slug, which never ends in "-".
         "#{head.rstrip('-')}#{suffix}"
@@ -507,7 +662,10 @@ module Hwaro
       # already present are stepped over so pre-encoded URLs don't get
       # double-encoded.
       def encode_url_path(url : String) : String
-        return url if url.ascii_only? && !url.includes?(' ')
+        if url.ascii_only? && !url.includes?(' ')
+          return url unless illegal_ascii_in_path?(url)
+          return encode_illegal_ascii_path(url)
+        end
 
         if scheme_end = url.index("://")
           host_end = url.index('/', scheme_end + 3)
@@ -518,6 +676,58 @@ module Hwaro
         else
           encode_path_preserving_escapes(url)
         end
+      end
+
+      # Byte index where the path of `url` starts and where it ends (before
+      # the first `?`/`#`). A scheme/host prefix and a query are not path.
+      private def path_bounds(url : String) : {Int32, Int32}
+        start = 0
+        # `://` only opens an authority when nothing path-like precedes it: a
+        # relative URL whose query carries a URL (`/x?u=http://y/z[1]`) has no
+        # host, and its query must not be mistaken for a path.
+        if (scheme_end = url.index("://")) && !url[0, scheme_end].matches?(%r{[/?#]})
+          start = url.index('/', scheme_end + 3) || url.bytesize
+        end
+        stop = url.index(/[?#]/, start) || url.bytesize
+        {start, stop}
+      end
+
+      # RFC 3986 forbids these ASCII characters in a path, and a `%` that does
+      # not start a `%XX` escape. `100%`, `[b]`, `{c}` and `a|b` file names
+      # used to reach a sitemap `<loc>` / RSS `<link>` raw, while the same
+      # characters beside a non-ASCII one were encoded.
+      private def illegal_ascii_in_path?(url : String) : Bool
+        start, stop = path_bounds(url)
+        bytes = url.to_slice
+        i = start
+        while i < stop
+          case bytes[i]
+          when '"'.ord, '<'.ord, '>'.ord, '['.ord, ']'.ord, '{'.ord, '}'.ord, '|'.ord, '^'.ord, '`'.ord, '\\'.ord
+            return true
+          when '%'.ord
+            return true unless i + 2 < stop && bytes[i + 1].unsafe_chr.hex? && bytes[i + 2].unsafe_chr.hex?
+          end
+          i += 1
+        end
+        false
+      end
+
+      # Encode only the path of an all-ASCII URL; the host and any
+      # `?query`/`#fragment` stay as written (`?d[]=1` is a working link).
+      private def encode_illegal_ascii_path(url : String) : String
+        start, stop = path_bounds(url)
+        url[0, start] + encode_path_preserving_escapes(url[start, stop - start]) + url[stop..]
+      end
+
+      # `encode_url_path` for a URL that may carry a `?query` or `#fragment`
+      # (an author-written image path such as `/img/사진.png?v=2`): only the
+      # part before the first `?`/`#` is encoded, the rest is kept as
+      # written. `encode_url_path` alone escaped the delimiters themselves
+      # (`…png%3Fv%3D2`, a 404).
+      def encode_url_path_keep_query(url : String) : String
+        cut = url.index(/[?#]/)
+        return encode_url_path(url) unless cut
+        encode_url_path(url[0, cut]) + url[cut..]
       end
 
       # `URI.encode_path`, except that a `%XX` escape already in the input is
@@ -571,6 +781,11 @@ module Hwaro
         false
       end
 
+      # The attribute run of an opening tag: anything but `>`, except that a
+      # quoted value may contain `>` (`alt="Home > Docs"`). Possessive, so a
+      # long data: URI value is one cheap step, not one per character.
+      HTML_TAG_ATTRS = %q((?:[^>"']++|"[^"]*"|'[^']*')*)
+
       # Raw-text HTML elements whose *content* is code, not display text.
       # `<style>`/`<script>` bodies must be dropped along with their tags;
       # otherwise the CSS/JS source survives tag-stripping and pollutes
@@ -580,7 +795,57 @@ module Hwaro
       # relying on a dotall flag; `\1` ties the close tag to the open tag.
       # A self-closing or unterminated tag won't match and is left to the
       # tag stripper below.
-      RAW_TEXT_ELEMENT = /<(script|style)(?:\s[^>]*)?>[\s\S]*?<\/\1\s*>/i
+      RAW_TEXT_ELEMENT = /<(script|style)(?:\s#{HTML_TAG_ATTRS})?>/i
+
+      # Elements the author marked `aria-hidden="true"` are decoration, not
+      # text: a screen reader skips them and so must every plain-text
+      # projection of the page. Two live in rendered content and both leaked
+      # into the search index and feed summaries — the heading anchor link
+      # (`insert_anchor_links`, a 🔗 after every heading) and the code-block
+      # line-number gutter (`[highlight] line_numbers`, which indexed
+      # `1 2 3 4 …` alongside the code). Same lazy `[\s\S]*?` shape as
+      # RAW_TEXT_ELEMENT: an unterminated or same-tag-nested element just
+      # falls through to the tag stripper, which is harmless here because the
+      # result is text either way.
+      ARIA_HIDDEN_ELEMENT = /<([a-zA-Z][a-zA-Z0-9]*)\s[^>]*aria-hidden=["']true["'][^>]*>/
+
+      # Replace each `opener` match (capture 1 = tag name) and everything up to
+      # the first matching `</tag>` with a space; an opener with no closer is
+      # left to the tag stripper. A lazy `[\s\S]*?</\1>` regex rescans to the
+      # end for every unclosed opener (quadratic on `<script>` x 20k), so the
+      # closer is searched here and a tag with no closer left is not retried.
+      private def drop_elements(text : String, opener : Regex, ignore_case : Bool) : String
+        return text unless opener.matches?(text)
+        # That match validated the UTF-8 (or raised); PCRE2 would redo it over
+        # the whole subject on every later call, quadratic in the match count.
+        opts = Regex::MatchOptions::NO_UTF_CHECK
+        closers = {} of String => Regex
+        dead = Set(String).new
+        pos = 0
+        copied = 0
+        String.build do |io|
+          while m = opener.match_at_byte_index(text, pos, opts)
+            start = m.byte_begin
+            tag = ignore_case ? m[1].downcase : m[1]
+            closer = closers[tag] ||= Regex.new("</#{Regex.escape(m[1])}\\s*>", ignore_case ? Regex::Options::IGNORE_CASE : Regex::Options::None)
+            if !dead.includes?(tag) && (c = closer.match_at_byte_index(text, m.byte_end, opts))
+              io.write(text.to_slice[copied, start - copied])
+              io << ' '
+              copied = pos = c.byte_end
+            else
+              dead << tag
+              pos = start + 1
+            end
+          end
+          io.write(text.to_slice[copied, text.bytesize - copied])
+        end
+      end
+
+      # Rendered HTML as plain text: tags stripped, entities decoded, edges
+      # trimmed. The one spelling for excerpts and feed descriptions.
+      def html_to_plain_text(html : String) : String
+        HTML.unescape(strip_html(html)).strip
+      end
 
       # Strip HTML tags from text (single-pass)
       #
@@ -590,38 +855,291 @@ module Hwaro
       def strip_html(text : String) : String
         # Remove raw-text element bodies (<style>/<script>) before stripping
         # tags so their CSS/JS contents don't leak through as "text".
-        text = text.gsub(RAW_TEXT_ELEMENT, " ")
-        String.build(text.bytesize) do |io|
-          in_tag = false
+        text = drop_elements(text, RAW_TEXT_ELEMENT, true)
+        # Then the decorative ones. Guarded by a substring probe so a page
+        # with no aria-hidden markup never pays for the scan.
+        text = drop_elements(text, ARIA_HIDDEN_ELEMENT, false) if ByteScan.includes?(text, "aria-hidden")
+        size = text.bytesize
+        String.build(size) do |io|
           last_was_space = true # suppress leading space
           pending_space = false # deferred space from tag boundary
-          text.each_char do |char|
-            if char == '<'
-              in_tag = true
-              # Mark that we might need a space (tag boundary)
-              pending_space = true unless last_was_space
+          reader = Char::Reader.new(text)
+          while reader.pos < size
+            char = reader.current_char
+            if char == '<' && html_tag_start?(text.byte_at?(reader.pos + 1))
+              tag_end, inline = scan_html_tag(text, reader.pos)
+              # A block/void/unknown tag or a comment may separate words;
+              # inline markup (`H<sub>2</sub>O`, `**한글**은`) must not.
+              pending_space = true unless inline || last_was_space
+              reader.pos = tag_end
+              next
             elsif char == '>'
-              in_tag = false
-            elsif !in_tag
-              if char.ascii_whitespace?
-                unless last_was_space
-                  io << ' '
-                  last_was_space = true
-                  pending_space = false
-                end
-              else
-                # Emit deferred space only if the next char is alphanumeric
-                # (avoids "World !" from "</b>!")
-                if pending_space && char.alphanumeric?
-                  io << ' '
-                end
+              # A bare `>` outside any tag is dropped (pinned by the specs).
+            elsif char.ascii_whitespace?
+              unless last_was_space
+                io << ' '
+                last_was_space = true
                 pending_space = false
-                io << char
-                last_was_space = false
               end
+            else
+              # Emit the deferred space unless the next char closes the
+              # sentence or a bracket ("Visible.<!-- -->" stays "Visible."):
+              # an opening quote, bracket or emoji after a block boundary
+              # starts a new word (`<li>a</li><li>"b"</li>` was `a"b"`).
+              if pending_space && !closing_punct?(char)
+                io << ' '
+              end
+              pending_space = false
+              last_was_space = false
+              if char.ascii?
+                # The ASCII bytes up to the next `<`, `>`, whitespace or
+                # non-ASCII byte all land here with nothing pending: copy
+                # the run in one write.
+                run_end = reader.pos + 1
+                while run_end < size && (byte = text.to_unsafe[run_end]) < 0x80 &&
+                      byte != '<'.ord && byte != '>'.ord && !byte.unsafe_chr.ascii_whitespace?
+                  run_end += 1
+                end
+                io.write(text.to_slice[reader.pos, run_end - reader.pos])
+                reader.pos = run_end
+                next
+              end
+              io << char
             end
+            reader.next_char
           end
         end.strip
+      end
+
+      # Punctuation that attaches to the word before it.
+      private def closing_punct?(char : Char) : Bool
+        char.in?('.', ',', ';', ':', '!', '?', ')', ']', '}', '、', '。', '）', '，', '！', '？', '：', '；', '」', '』')
+      end
+
+      # A `<` opens a tag/comment only before a letter, `/`, `!` or `?`;
+      # anywhere else ("a < b", "x<3") it is plain text.
+      private def html_tag_start?(byte : UInt8?) : Bool
+        return false unless byte
+        byte.chr.ascii_letter? || byte == '/'.ord || byte == '!'.ord || byte == '?'.ord
+      end
+
+      # Scans the tag or comment starting at the `<` at byte *start* and
+      # returns the byte index just past it plus whether it is inline markup.
+      # Comments run to `-->` (or to the end when unterminated, like a
+      # browser). Inside a tag a `>` does not end it while it sits in a quoted
+      # attribute value (`alt="Home > Docs"`); quotes only count right after
+      # `=`, so a stray apostrophe in an unquoted attribute cannot swallow the
+      # text that follows.
+      private def scan_html_tag(text : String, start : Int32) : {Int32, Bool}
+        size = text.bytesize
+        i = start + 1
+        if text.byte_at?(i) == '!'.ord && text.byte_at?(i + 1) == '-'.ord && text.byte_at?(i + 2) == '-'.ord
+          close = ByteScan.byte_index(text, "-->", i + 1)
+          return {close ? close + 3 : size, false}
+        end
+
+        i += 1 if text.byte_at?(i) == '/'.ord
+        name_start = i
+        while i < size && (b = text.byte_at(i)) && (b.chr.ascii_alphanumeric? || b == '-'.ord)
+          i += 1
+        end
+        inline = html_inline_tag?(text.byte_slice(name_start, i - name_start))
+
+        quote = 0_u8
+        after_eq = false
+        while i < size
+          b = text.byte_at(i)
+          if quote != 0
+            quote = 0_u8 if b == quote
+          else
+            case b
+            when '>'.ord
+              return {i + 1, inline}
+            when '='.ord
+              after_eq = true
+            when '"'.ord, '\''.ord
+              quote = b if after_eq
+              after_eq = false
+            when ' '.ord, '\t'.ord, '\n'.ord, '\r'.ord, '\f'.ord
+              # whitespace between `=` and the value is allowed
+            else
+              after_eq = false
+            end
+          end
+          i += 1
+        end
+        {size, inline}
+      end
+
+      # Phrasing elements that sit inside a word's line without a visual
+      # break. Anything else — block, void (`br`, `img`), custom or unknown
+      # — keeps the word-separating space.
+      private def html_inline_tag?(name : String) : Bool
+        case name.downcase
+        when "a", "abbr", "b", "bdi", "cite", "code", "data", "del", "em", "i",
+             "ins", "kbd", "mark", "q", "s", "small", "span", "strong", "sub",
+             "sup", "time", "u", "var", "wbr"
+          true
+        else
+          false
+        end
+      end
+
+      # Elements whose CONTENT is not prose and must not seed an automatic
+      # summary: code blocks (`<pre>`), raw-text elements, figures/images
+      # (captions and alt text read badly out of context) and headings (a
+      # summary that opens with the page's own title is noise). Inline
+      # `<code>` is part of the sentence and stays. Matched with a lazy
+      # `[\s\S]*?` so multi-line blocks are removed whole; the `<code>`
+      # inside `<pre>` is consumed by the outer match. Unterminated tags
+      # fall through to the generic tag stripper.
+      EXCERPT_SKIP_ELEMENT = /<(pre|script|style|figure|h[1-6])(?:\s#{HTML_TAG_ATTRS})?>/i
+      EXCERPT_SKIP_VOID    = /<img(?:\s#{HTML_TAG_ATTRS})?\/?>/i
+      # Markup the Markdown extensions emit whose text is not prose either:
+      # display math (TeX source until KaTeX/MathJax runs in the browser),
+      # mermaid diagrams (a code fence, like `<pre>`), footnote reference
+      # markers (`[1]`) and the trailing footnotes section. Inline math
+      # (`math-inline`) is part of the sentence and keeps its `\(x\)` source.
+      EXCERPT_SKIP_CLASSED = /<(span|div|sup|section)\s+class="(?:math(?! math-inline)|mermaid|footnote-ref|footnotes)[^"]*"[^>]*>/i
+
+      # Plain prose of a rendered HTML body, for the automatic summary:
+      # code-block/figure/heading/display-math/footnote blocks dropped, tags stripped,
+      # entities decoded
+      # (after stripping, so `&lt;p&gt;` can never be read as markup), and
+      # whitespace collapsed to single spaces. The result is TEXT — a
+      # consumer that embeds it in HTML must escape it again.
+      def excerpt_text(html : String) : String
+        cleaned = drop_elements(drop_elements(html, EXCERPT_SKIP_ELEMENT, true), EXCERPT_SKIP_CLASSED, true).gsub(EXCERPT_SKIP_VOID, " ")
+        text = HTML.unescape(strip_html(cleaned))
+        collapse_whitespace(text)
+      end
+
+      # Trailing characters dropped before the ellipsis so a cut never ends
+      # in `word,…` / `word;…`. Covers ASCII and the full-width CJK forms.
+      EXCERPT_TRAILING_PUNCT = {',', ';', ':', '&', '\uFF0C', '\uFF1B', '\uFF1A', '\u3001', '(', '\uFF08', '[', '-', '\u2013', '\u2014'}
+
+      # Truncate plain text for an automatic summary. Returns the excerpt
+      # and whether anything was cut.
+      #
+      # Units: space-delimited text is measured in WORDS. Text whose
+      # non-space characters are mostly CJK (Chinese/Japanese have no word
+      # boundaries; Korean has them but sentences pack far more meaning
+      # per word) is measured in CHARACTERS with the same numeric setting
+      # scaled ×2, so `length = 70` reads as ~70 words or ~140 CJK
+      # characters. The character cut is never placed inside a Latin word
+      # embedded in CJK text (it backs up to the preceding boundary), and
+      # every index is a Char index, so a multibyte sequence cannot be
+      # split. Entities are not a concern: callers pass decoded text.
+      # `length <= 0` means "no limit" — callers gate the feature on it.
+      def truncate_excerpt(text : String, length : Int32, ellipsis : String) : {String, Bool}
+        text = collapse_whitespace(text)
+        return {text, false} if text.empty? || length <= 0
+
+        cut = if cjk_dominant?(text)
+                truncate_excerpt_chars(text, length * 2)
+              else
+                truncate_excerpt_words(text, length)
+              end
+        return {text, false} unless cut
+
+        cut = cut.rstrip
+        while (last = cut[-1]?) && (last.ascii_whitespace? || EXCERPT_TRAILING_PUNCT.includes?(last))
+          cut = cut.rchop
+        end
+        # Degenerate input (all punctuation before the cut): keep the raw
+        # cut rather than emitting a bare ellipsis.
+        cut = text[0, length].rstrip if cut.empty?
+        {"#{cut}#{ellipsis}", true}
+      end
+
+      # CJK-dominant: more than half of the non-whitespace characters are
+      # CJK (same ranges `tokenize_cjk`/`slugify` use).
+      def cjk_dominant?(text : String) : Bool
+        cjk = 0
+        total = 0
+        text.each_char do |c|
+          next if c.ascii_whitespace?
+          total += 1
+          cjk += 1 if cjk_char?(c)
+        end
+        total > 0 && cjk * 2 > total
+      end
+
+      # The text before the max_words-th space — what
+      # `text.split(' ')[0, max_words].join(' ')` builds — without splitting
+      # the whole body into words to keep the first few.
+      private def truncate_excerpt_words(text : String, max_words : Int32) : String?
+        bytes = text.to_slice
+        cut = -1
+        max_words.times do
+          cut = bytes.index(' '.ord.to_u8, cut + 1) || return
+        end
+        text.byte_slice(0, cut)
+      end
+
+      private def truncate_excerpt_chars(text : String, max_chars : Int32) : String?
+        return if text.size <= max_chars
+        chars = text.chars
+        idx = max_chars
+        # Inside a run of non-CJK, non-space characters (a Latin word or a
+        # number embedded in CJK prose)? Back up to where that run started.
+        if latin_word_char?(chars[idx]) && latin_word_char?(chars[idx - 1])
+          back = idx
+          while back > 0 && latin_word_char?(chars[back - 1])
+            back -= 1
+          end
+          idx = back if back > 0
+        end
+        chars[0, idx].join
+      end
+
+      private def latin_word_char?(c : Char) : Bool
+        !c.ascii_whitespace? && !cjk_char?(c) && (c.alphanumeric? || c == '\'' || c == '_')
+      end
+
+      private def collapse_whitespace(text : String) : String
+        return text if collapsed_whitespace?(text)
+        String.build(text.bytesize) do |io|
+          pending = false
+          started = false
+          text.each_char do |c|
+            if c.whitespace?
+              pending = started
+            else
+              io << ' ' if pending
+              pending = false
+              started = true
+              io << c
+            end
+          end
+        end
+      end
+
+      # Already collapse_whitespace's output: no edge whitespace and every
+      # whitespace run a single ASCII space. Text excerpt_text produced
+      # always is, so truncate_excerpt's second pass allocates nothing. An
+      # invalid byte (read as U+FFFD, which the rebuild writes out) or a
+      # literal U+FFFD takes the rebuild.
+      private def collapsed_whitespace?(text : String) : Bool
+        prev_space = true
+        text.each_char do |c|
+          return false if c == Char::REPLACEMENT
+          if c.whitespace?
+            return false if prev_space || c != ' '
+            prev_space = true
+          else
+            prev_space = false
+          end
+        end
+        !prev_space || text.empty?
+      end
+
+      # A combining mark that is part of a word (vowel signs, virama, tone and
+      # accent marks). Emoji presentation machinery is not: variation
+      # selectors and the keycap enclosure stay out of slugs, so "1️⃣ Step"
+      # and "ℹ️ Info" slugify as "1-step" and "ℹ-info" as before.
+      def word_mark?(char : Char) : Bool
+        char.mark? && !(0xFE00..0xFE0F).includes?(char.ord) && !(0xE0100..0xE01EF).includes?(char.ord) && char.ord != 0x20E3
       end
 
       # Check if a character is in a CJK Unicode range

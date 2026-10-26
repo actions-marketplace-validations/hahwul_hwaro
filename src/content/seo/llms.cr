@@ -8,20 +8,22 @@ module Hwaro
   module Content
     module Seo
       class Llms
-        # Backward-compatible entry point for callers that don't have a
-        # page list handy. The current build pipeline always uses the
-        # 4-arg form below; this stub keeps any external caller working
-        # by emitting the title/description/instructions header without
-        # the page index.
-        def self.generate(config : Models::Config, output_dir : String, verbose : Bool = false)
-          generate(config, [] of Models::Page, output_dir, verbose)
+        # The files the current config publishes — `llms.txt` and, when
+        # enabled, `llms-full.txt` — claimed by the builder whether written or
+        # skipped as unchanged (see Sitemap.published_outputs).
+        def self.published_outputs(config : Models::Config, output_dir : String) : Array(String)
+          outputs = [] of String
+          return outputs unless config.llms.enabled
+          outputs << File.join(output_dir, index_output_filename(config))
+          outputs << File.join(output_dir, full_output_filename(config)) if config.llms.full_enabled
+          outputs
         end
 
         def self.generate(config : Models::Config, pages : Array(Models::Page), output_dir : String, verbose : Bool = false, skip_if_unchanged : Bool = false)
           return unless config.llms.enabled
 
           if skip_if_unchanged
-            filename = File.basename(config.llms.filename.empty? ? "llms.txt" : config.llms.filename)
+            filename = index_output_filename(config)
             # The probe must cover every file this generator writes: when
             # full output is enabled, a present llms.txt with a missing
             # llms-full.txt must NOT skip, or the full document is never
@@ -34,7 +36,7 @@ module Hwaro
             end
           end
 
-          filename = File.basename(config.llms.filename.empty? ? "llms.txt" : config.llms.filename)
+          filename = index_output_filename(config)
           file_path = File.join(output_dir, filename)
           Hwaro::Utils::FileSafe.atomic_write(file_path, build_index(config, pages))
           Logger.action :create, file_path if verbose
@@ -67,6 +69,8 @@ module Hwaro
           # (path-sort-first winner, same rule as sitemap/search/feeds) so
           # the index never lists an unwritten loser.
           eligible = DiscoveryPages.dedupe_by_url(pages.select(&.search_index_eligible?))
+          # llms.txt describes the CURRENT docs: latest version only.
+          eligible.select! { |p| config.versions.in_llms?(p) } if config.versions.enabled?
 
           # Group by section, keyed by display heading. A section's heading
           # comes from its `_index.md`, which is the only page modeled as a
@@ -74,11 +78,16 @@ module Hwaro
           # page-bundle leaf (`foo/bar/index.md`) is also `is_index == true`,
           # so testing `is_index` here let an arbitrary leaf's title clobber
           # the section heading.
+          #
+          # A section's translations share its key; the default language's
+          # title names the group. Last-wins let `_index.zh.md` (which sorts
+          # after `_index.md`) retitle an English section in Chinese.
           headings = {} of String => String
           eligible.each do |p|
             next unless p.is_a?(Models::Section)
-            next if p.section.empty?
-            headings[p.section] = p.title unless p.title.empty? || p.title == "Untitled"
+            next if p.section.empty? || p.untitled?
+            default_lang = (p.language || config.default_language) == config.default_language
+            headings[p.section] = p.title if default_lang || !headings.has_key?(p.section)
           end
 
           # Fold section-level `_index.md` pages (a `Models::Section` with a
@@ -117,24 +126,24 @@ module Hwaro
                         else
                           headings[section_name]? || section_name.split("/").last.capitalize
                         end
-              str << "## " << heading << "\n\n"
+              str << "## " << one_line(heading) << "\n\n"
 
               by_section[section_name].sort_by(&.url).each do |p|
-                link = if base_url.empty?
-                         p.url
-                       else
-                         "#{base_url}#{p.url}"
-                       end
+                # Percent-encode like the sitemap does: a Markdown link
+                # destination cannot contain a raw space (`[t](/a b/)` is not
+                # a link), and a page whose slug or filename has one used to
+                # come out exactly that way.
+                link = Utils::TextUtils.encode_url_path(base_url.empty? ? p.url : "#{base_url}#{p.url}")
                 # The root index commonly has `title = ""` so its heading
                 # falls through to the site title; without this fallback
                 # the homepage rendered as `- [](url)` (no link label).
-                raw_label = p.title.empty? ? config.title : p.title
+                raw_label = one_line(p.title.empty? ? config.title : p.title)
                 # Escape link-label metacharacters so a title with a stray
                 # `[`/`]` doesn't break the `- [label](url)` Markdown link.
                 # (escape backslash first, then the brackets)
                 label = raw_label.gsub('\\', "\\\\").gsub('[', "\\[").gsub(']', "\\]")
                 str << "- [" << label << "](" << link << ")"
-                if d = p.description
+                if d = p.description.try { |text| one_line(text) }
                   str << ": " << d unless d.empty?
                 end
                 str << "\n"
@@ -142,6 +151,19 @@ module Hwaro
               str << "\n"
             end
           end
+        end
+
+        # A heading, link label or description is one Markdown line: a line
+        # break in front matter text (a `"""` description) would otherwise
+        # end the list item, or open a heading/list of its own.
+        private def self.one_line(text : String) : String
+          text.gsub(/\s+/, " ").strip
+        end
+
+        # Resolved output basename for llms.txt — shared by the writer, the
+        # warm-build skip probe and `published_outputs`.
+        private def self.index_output_filename(config : Models::Config) : String
+          File.basename(config.llms.filename.empty? ? "llms.txt" : config.llms.filename)
         end
 
         # Resolved output basename for llms-full.txt — shared by the writer
@@ -177,6 +199,7 @@ module Hwaro
           eligible_pages = DiscoveryPages.dedupe_by_url(pages.select(&.search_index_eligible?))
             .reject!(&.raw_content.empty?)
             .sort_by!(&.url)
+          eligible_pages.select! { |p| config.versions.in_llms?(p) } if config.versions.enabled?
 
           base_url = config.base_url
           base_url = base_url.rstrip('/') unless base_url.empty?
@@ -197,10 +220,12 @@ module Hwaro
 
             eligible_pages.each do |page|
               str << "\n---\n\n"
-              str << "Title: " << page.title << "\n"
+              # Same fallback as the llms.txt index: a root index commonly
+              # has `title = ""`.
+              str << "Title: " << (page.title.empty? ? config.title : page.title) << "\n"
 
               url = page.url
-              absolute_url = base_url.empty? ? url : "#{base_url}#{url}"
+              absolute_url = Utils::TextUtils.encode_url_path(base_url.empty? ? url : "#{base_url}#{url}")
               str << "URL: " << absolute_url << "\n"
               str << "Source: content/" << page.path << "\n"
 

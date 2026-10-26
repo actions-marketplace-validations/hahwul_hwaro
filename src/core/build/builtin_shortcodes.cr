@@ -33,6 +33,29 @@ module Hwaro
           "shortcodes/callout" => ["type", "title"],
         }
 
+        # Parameters a built-in template interpolates straight into a URL or
+        # an `src`, with no `default(...)` behind them. Leaving one out is
+        # never intentional: `{{ codepen(id="abc") }}` (no `user`) rendered a
+        # perfectly well-formed iframe pointing at `https://codepen.io//embed/abc`,
+        # `{{ gist(id="abc") }}` at `https://gist.github.com//abc.js`, and
+        # `{{ youtube() }}` at the bare embed root — a broken embed on the
+        # page, exit code 0, and nothing in the log. `alert`/`callout` are
+        # absent on purpose: every one of their slots has a default.
+        REQUIRED_PARAMS = {
+          "shortcodes/youtube" => ["id"],
+          "shortcodes/vimeo"   => ["id"],
+          "shortcodes/gist"    => ["user", "id"],
+          "shortcodes/tweet"   => ["user", "id"],
+          "shortcodes/codepen" => ["user", "id"],
+          "shortcodes/figure"  => ["src"],
+        }
+
+        # The required parameters for a built-in shortcode, or nil when the
+        # template has none (or is not a built-in).
+        def self.required_params(template_key : String) : Array(String)?
+          REQUIRED_PARAMS[template_key]?
+        end
+
         # Returns the full set of built-in shortcode templates keyed by
         # their template path (e.g. "shortcodes/youtube").
         def self.templates : Hash(String, String)
@@ -51,10 +74,11 @@ module Hwaro
           # ── YouTube ──────────────────────────────────────────────
           # Usage: {{ youtube(id="dQw4w9WgXcQ") }}
           #        {{ youtube(id="dQw4w9WgXcQ", width="560", height="315") }}
+          #        {{ youtube(id="dQw4w9WgXcQ", start="30") }}
           t["shortcodes/youtube"] = <<-HTML
             <div class="sc-video sc-video--youtube">
               <iframe
-                src="https://www.youtube.com/embed/{{ id | e }}"
+                src="https://www.youtube.com/embed/{{ id | e }}{% if start %}?start={{ start | e }}{% endif %}"
                 width="{{ width | default(value='560') | e }}"
                 height="{{ height | default(value='315') | e }}"
                 frameborder="0"

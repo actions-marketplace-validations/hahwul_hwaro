@@ -14,7 +14,7 @@ Vercel에 Hwaro 사이트를 배포합니다. 별도 설정 없이도 바로 배
 hwaro tool platform vercel
 ```
 
-빌드 설정, 별칭(alias) 기반 리다이렉트, 캐시 헤더가 담긴 `vercel.json`이 생성됩니다.
+빌드 설정, 별칭(alias) 기반 리다이렉트, 캐시 헤더(핑거프린트된 에셋 번들을 켠 경우)가 담긴 `vercel.json`이 생성됩니다.
 
 ### Git으로 배포
 
@@ -79,5 +79,5 @@ Vercel은 프로덕션이 아닌 브랜치에 푸시할 때마다 프리뷰 배�
 ## 함께 보기
 
 - [platform](/ko/start/tools/platform/) — 플랫폼 설정 생성기 상세 옵션
-- [CLI](/ko/start/cli/) — tool 명령 전체
+- [CLI](/ko/start/cli/#tool) — tool 명령 전체
 - 다른 플랫폼: [Netlify](/ko/deploy/netlify/) | [Cloudflare Pages](/ko/deploy/cloudflare-pages/) | [GitHub Pages](/ko/deploy/github-pages/)

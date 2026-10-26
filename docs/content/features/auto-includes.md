@@ -38,7 +38,7 @@ static/
 │       └── 02-app.js
 ```
 
-Files are scanned recursively from `static/{dir}/**/*.css` and `static/{dir}/**/*.js`.
+Files are scanned recursively from `static/{dir}/**/*.css` and `static/{dir}/**/*.js`. Files matched by `[static] exclude` are skipped, since they are never published.
 
 ## File Ordering
 
@@ -108,6 +108,10 @@ Given the example directory structure above, the template variables produce:
 <script src="/assets/js/02-app.js"></script>
 ```
 
+The example assumes an empty `base_url` and cache busting turned off. In a real build each URL starts with your `base_url` and carries the `?v=<hash>` query from [cache busting](/features/cache-busting/), and `[assets] sri = true` adds an `integrity` attribute (see [Subresource Integrity](/features/asset-pipeline/#subresource-integrity)).
+
+With `[sass]` enabled, each non-partial `.scss` file in the scanned directories is listed as the `.css` file it compiles to.
+
 ## Full Template Example
 
 ```jinja
@@ -132,7 +136,7 @@ Given the example directory structure above, the template variables produce:
 
 - **Separate concerns**: Use `auto_includes_css` in `<head>` and `auto_includes_js` before `</body>` for optimal page loading.
 - **Multiple directories**: You can list multiple directories to scan. Each directory is scanned independently.
-- **Avoid overlapping directories**: results are not deduplicated — a file reachable from two configured dirs (e.g. `assets` and `assets/css`) is included once per dir, so list non-overlapping directories.
+- **Avoid overlapping directories**: results are not deduplicated. A file reachable from two configured dirs (e.g. `assets` and `assets/css`) is included once per dir, so list non-overlapping directories.
 - **Static files only**: Auto includes scan the `static/` directory. Files in `content/` are not included.
 
 ## See Also

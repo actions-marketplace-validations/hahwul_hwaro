@@ -26,6 +26,17 @@ module Hwaro
             end
           end
 
+          # `inspect` text of a list/mapping element. Nested containers
+          # recurse: `Crinja::Value#to_s` of one printed Crystal internals
+          # (`[Crinja::Value<1>]`). Scalars keep their plain text.
+          def self.inspect_element(value : Crinja::Value) : String
+            case raw = value.raw
+            when Array then "[#{raw.join(", ") { |v| inspect_element(v) }}]"
+            when Hash  then "{#{raw.join(", ") { |k, v| "#{k}: #{inspect_element(v)}" }}}"
+            else            value.to_s
+            end
+          end
+
           def self.register(env : Crinja)
             # JSON encode filter (escapes </ to prevent script-tag breakout in inline JS).
             # Serialize the actual value tree — `target.to_s.to_json` would stringify
@@ -54,13 +65,26 @@ module Hwaro
               JSON.build(indent_str) { |b| MiscFilters.build_json(b, target) }.gsub("</", "<\\/")
             end
 
-            # Default filter — returns fallback when target is nil/undefined or empty string
-            env.filters["default"] = Crinja.filter({value: ""}) do
-              if target.raw.nil? || target.undefined?
-                arguments["value"].to_s
+            # Default filter — returns the fallback when the target is
+            # undefined, none, or renders as an empty string. The fallback
+            # keeps its type (`default(value=0) + 1` is arithmetic), except
+            # that a none fallback renders as "". A non-empty array, hash or
+            # object passes through unchanged; any other non-empty target is
+            # stringified, as it always was, so string filters chained after
+            # it (`| length`, `| replace`) keep working on numbers and bools.
+            # `boolean=true` (Jinja's second argument, which the Crinja
+            # built-in this replaces honored) also replaces any falsy value:
+            # `false`, `0`, an empty list or mapping.
+            env.filters["default"] = Crinja.filter({value: "", boolean: false}) do
+              fallback = arguments["value"]
+              fallback = Crinja::Value.new("") if fallback.none?
+              if target.raw.nil? || target.undefined? || (arguments["boolean"].truthy? && !target.truthy?)
+                fallback
+              elsif target.indexable? || target.mapping?
+                target
               else
                 val = target.to_s
-                val.empty? ? arguments["value"].to_s : val
+                val.empty? ? fallback : Crinja::Value.new(val)
               end
             end
 
@@ -74,21 +98,8 @@ module Hwaro
                 raw.inspect
               when Bool, Int32, Int64, Float64
                 raw.to_s
-              when Array
-                String.build do |io|
-                  io << "["
-                  target.as_a.each_with_index do |v, i|
-                    io << ", " if i > 0
-                    io << v.to_s
-                  end
-                  io << "]"
-                end
-              when Hash
-                pairs = [] of String
-                target.as_h.each do |k, v|
-                  pairs << "#{k}: #{v}"
-                end
-                "{#{pairs.join(", ")}}"
+              when Array, Hash
+                MiscFilters.inspect_element(target)
               else
                 target.to_s.inspect
               end

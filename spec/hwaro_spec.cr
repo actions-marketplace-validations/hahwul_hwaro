@@ -4,7 +4,7 @@ describe Hwaro do
   describe "VERSION" do
     it "has a version number" do
       Hwaro::VERSION.should_not be_nil
-      Hwaro::VERSION.should eq("0.18.1")
+      Hwaro::VERSION.should eq("0.21.0")
     end
   end
 
@@ -48,7 +48,9 @@ describe Hwaro do
       options = Hwaro::Config::Options::ServeOptions.new(drafts: true)
       build_options = options.to_build_options
       build_options.drafts.should be_true
-      build_options.output_dir.should eq("public")
+      # Serve builds into its own dev directory, never the deployable
+      # output_dir (issue #756).
+      build_options.output_dir.should eq(Hwaro::Config::Options::ServeOptions::DEV_OUTPUT_DIR)
     end
   end
 
@@ -271,40 +273,24 @@ describe Hwaro do
     end
   end
 
-  describe Hwaro::Content::Processors::Registry do
-    it "has markdown processor registered by default" do
-      Hwaro::Content::Processors::Registry.has?("markdown").should be_true
-    end
-
-    it "has html processor registered" do
-      Hwaro::Content::Processors::Registry.has?("html").should be_true
-    end
-
-    it "can list all processor names" do
-      names = Hwaro::Content::Processors::Registry.names
-      names.should contain("markdown")
-      names.should contain("html")
-    end
-  end
-
   describe Hwaro::CLI::CommandRegistry do
     # Initialize runner to register commands
     Hwaro::CLI::Runner.new
 
     it "has init command registered" do
-      Hwaro::CLI::CommandRegistry.has?("init").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("init").should be_true
     end
 
     it "has build command registered" do
-      Hwaro::CLI::CommandRegistry.has?("build").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("build").should be_true
     end
 
     it "has serve command registered" do
-      Hwaro::CLI::CommandRegistry.has?("serve").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("serve").should be_true
     end
 
     it "has deploy command registered" do
-      Hwaro::CLI::CommandRegistry.has?("deploy").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("deploy").should be_true
     end
   end
 

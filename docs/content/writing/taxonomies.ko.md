@@ -31,26 +31,27 @@ name = "authors"
 | `feed` | bool | false | 항목별 RSS 피드 생성 |
 | `sitemap` | bool | true | 택소노미 페이지를 사이트맵에 포함 |
 | `paginate_by` | int | — | 항목 페이지의 페이지당 항목 수 |
-| `sort_by` | string | "date" | 항목 안 페이지의 정렬 기준: `"date"`, `"title"`, `"weight"` ([정렬](#정렬) 참고) |
+| `sort_by` | string | "date" | 항목 안 페이지의 정렬 기준: `"date"`, `"published"`, `"title"`, `"weight"` ([정렬](#정렬) 참고) |
 | `reverse` | bool | false | `sort_by`가 만든 순서 뒤집기 |
 | `terms_sort_by` | string | "name" | 항목 목록의 정렬 기준: `"name"` 또는 `"count"` ([정렬](#정렬) 참고) |
 
 ## 정렬
 
-`sort_by`는 각 택소노미 항목에 속한 페이지의 순서를 결정합니다 — 생성되는 항목 페이지, `get_taxonomy()`의 `term.pages`, 항목별 페이지네이션 모두에 적용됩니다. 의미는 섹션 정렬과 정확히 같습니다:
+`sort_by`는 각 택소노미 항목에 속한 페이지의 순서를 결정하며, 생성되는 항목 페이지, `get_taxonomy()`의 `term.pages`, 항목별 페이지네이션 모두에 적용됩니다. 의미는 섹션 정렬과 정확히 같습니다:
 
-- `"date"`(기본값) — 최신순. `reverse = true`면 오래된 순.
-- `"title"` — 알파벳 오름차순. `reverse = true`면 내림차순.
+- `"date"`(기본값): 최신순. `reverse = true`면 오래된 순.
+- `"published"` — `"date"`와 같지만 발행일 `date`만 사용합니다(`updated`는 무시).
+- `"title"` — 제목 오름차순(바이트 단위 비교라 대문자가 소문자보다 앞). `reverse = true`면 내림차순.
 - `"weight"` — 낮은 weight 우선. `reverse = true`면 내림차순.
 
 `sort_by` 값이 잘못되면 경고를 남기고 기본값 `"date"`를 유지합니다.
 
-`terms_sort_by`는 항목 목록의 순서를 결정합니다 — 택소노미 인덱스 페이지와 `get_taxonomy().items`에 적용됩니다:
+`terms_sort_by`는 항목 목록의 순서를 결정하며, 택소노미 인덱스 페이지와 `get_taxonomy().items`에 적용됩니다:
 
-- `"name"`(기본값) — 알파벳 오름차순.
+- `"name"`(기본값): 항목 이름 오름차순. 대소문자를 구분하지 않으므로 `apple`이 `Zebra`보다 앞에 옵니다.
 - `"count"` — 페이지 수 내림차순, 동률이면 이름 오름차순. 다국어 사이트에서는 각 언어의 인덱스가 해당 언어 자체의 페이지 수를 사용합니다.
 
-**항목 피드는 예외입니다.** `feed = true`일 때 각 항목의 RSS 피드는 `sort_by`와 무관하게 항상 역시간순(최신 우선)을 유지합니다 — RSS 소비자는 최신 항목이 먼저 온다고 가정하기 때문입니다.
+**항목 피드는 예외입니다.** `feed = true`일 때 각 항목의 RSS 피드는 `sort_by`와 무관하게 항상 역시간순(최신 우선)을 유지합니다. RSS 소비자는 최신 항목이 먼저 온다고 가정하기 때문입니다.
 
 ```toml
 [[taxonomies]]
@@ -94,11 +95,11 @@ tech = ["crystal", "security"]
 | `/tags/` | 전체 태그 목록 |
 | `/tags/crystal/` | "crystal" 태그가 붙은 페이지 |
 
-`paginate_by`를 설정하면 항목 페이지가 `/tags/crystal/page/2/`, `/tags/crystal/page/3/`, … 로 페이지네이션됩니다(1페이지는 `/tags/crystal/`에 그대로 있습니다). 페이저 객체는 [데이터 모델 › Paginator](/ko/templates/data-model/)에 설명되어 있습니다.
+`paginate_by`를 설정하면 항목 페이지가 `/tags/crystal/page/2/`, `/tags/crystal/page/3/`, … 로 페이지네이션됩니다(1페이지는 `/tags/crystal/`에 그대로 있습니다). 페이저 객체는 [데이터 모델 › Paginator](/ko/templates/data-model/#paginator)에 설명되어 있습니다.
 
 ## 템플릿
 
-두 템플릿 모두 완성된 목록을 `{{ content }}`로 받습니다 — `taxonomy.html`에는 항목 목록이, `taxonomy_term.html`에는 페이지 목록이 들어갑니다. 커스텀 마크업이 필요하면 `content` 대신 [`get_taxonomy()`](#get-taxonomy-함수)를 사용합니다.
+두 템플릿 모두 완성된 목록을 `{{ content }}`로 받습니다. `taxonomy.html`에는 항목 목록이, `taxonomy_term.html`에는 페이지 목록이 들어갑니다. 커스텀 마크업이 필요하면 `content` 대신 [`get_taxonomy()`](#get-taxonomy-함수)를 사용합니다.
 
 ### 택소노미 인덱스
 
@@ -141,7 +142,7 @@ tech = ["crystal", "security"]
 {% endblock %}
 ```
 
-커스텀 페이지 목록 — 현재 항목의 페이지를 `get_taxonomy()`로 조회합니다:
+커스텀 페이지 목록으로, 현재 항목의 페이지를 `get_taxonomy()`로 조회합니다:
 
 ```jinja
 {% set tax = get_taxonomy(kind=taxonomy_name) %}
@@ -220,11 +221,13 @@ tech = ["crystal", "security"]
 {% if page.tags %}
 <div class="post-tags">
 {% for tag in page.tags %}
-  <a href="/tags/{{ tag | slugify }}/">{{ tag }}</a>
+  <a href="{{ get_taxonomy_url(kind="tags", term=tag) }}">{{ tag }}</a>
 {% endfor %}
 </div>
 {% endif %}
 ```
+
+`{{ tag | slugify }}` 대신 `get_taxonomy_url()`(또는 `get_taxonomy()`의 `term.slug`)을 사용합니다. 두 항목이 같은 슬러그로 충돌하면(`Crystal`과 `crystal`) 생성기는 `/tags/crystal/`과 `/tags/crystal-2/`를 만드는데, 어느 쪽이 어느 항목인지는 함수만 알고 있습니다.
 
 ### 카테고리 내비게이션
 

@@ -5,20 +5,20 @@ weight = 4
 toc = true
 +++
 
-숏코드는 마크다운 콘텐츠 안에서 쓸 수 있는 재사용 가능한 템플릿 조각입니다. 커스텀 숏코드는 `templates/shortcodes/`에 두는 Jinja2 템플릿입니다 — 템플릿 언어 레퍼런스는 [문법](/ko/templates/syntax/)을 참고합니다.
+숏코드는 마크다운 콘텐츠 안에서 쓸 수 있는 재사용 가능한 템플릿 조각입니다. 커스텀 숏코드는 `templates/shortcodes/`에 두는 Jinja2 템플릿입니다. 템플릿 언어 레퍼런스는 [문법](/ko/templates/syntax/)을 참고합니다.
 
 ## 숏코드 사용
 
 콘텐츠 파일에서는 두 가지 문법이 동작합니다:
 
 ```markdown
-{%raw%}{{ shortcode_name(arg1="value", arg2="value") }}{%endraw%}
+{{ shortcode_name(arg1="value", arg2="value") }}
 ```
 
 또는 명시적으로:
 
 ```markdown
-{%raw%}{{ shortcode("shortcode_name", arg1="value") }}{%endraw%}
+{{ shortcode("shortcode_name", arg1="value") }}
 ```
 
 ### 블록 숏코드 닫기
@@ -38,17 +38,26 @@ toc = true
 
 단순하지 않은 콘텐츠에는 **이름 있는 닫기**(`{% endNAME %}`)를 강력히 권장합니다. 여러 숏코드를 섞어 쓰거나 깊게 중첩할 때 마크다운을 읽고 유지보수하기가 훨씬 쉬워집니다.
 
+코드 펜스 밖의 Markdown 페이지에서 숏코드 문법을 그대로 보이려면 raw 블록으로
+감쌉니다. `{% raw %}`와 `{% endraw %}` 표식은 Markdown 출력에도 표시되며, 블록
+안에 코드 펜스가 있어도 raw 영역이 분리되지 않습니다.
+
 ## 내장 숏코드
 
 Hwaro에는 템플릿 파일 없이 바로 동작하는 내장 숏코드가 들어 있습니다.
+
+파라미터는 이름을 지정하거나 각 숏코드에 표시된 순서대로 전달할 수 있습니다.
+예를 들어 `{{ youtube("VIDEO_ID") }}`와 `{{ gist("username", "gist_id") }}`는
+위치 인자를 사용하며, 따옴표로 감싼 빈 값도 해당 위치를 차지합니다.
 
 ### youtube
 
 YouTube 동영상을 삽입합니다.
 
 ```markdown
-{%raw%}{{ youtube(id="dQw4w9WgXcQ") }}
-{{ youtube(id="dQw4w9WgXcQ", width="800", height="450") }}{%endraw%}
+{{ youtube(id="dQw4w9WgXcQ") }}
+{{ youtube(id="dQw4w9WgXcQ", width="800", height="450") }}
+{{ youtube(id="dQw4w9WgXcQ", start="30") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -57,13 +66,14 @@ YouTube 동영상을 삽입합니다.
 | `width` | `560` | 플레이어 너비 |
 | `height` | `315` | 플레이어 높이 |
 | `title` | `YouTube Video` | 접근성용 제목 |
+| `start` | | 특정 타임스탬프(초 단위)부터 재생 |
 
 ### vimeo
 
 Vimeo 동영상을 삽입합니다.
 
 ```markdown
-{%raw%}{{ vimeo(id="123456789") }}{%endraw%}
+{{ vimeo(id="123456789") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -78,8 +88,8 @@ Vimeo 동영상을 삽입합니다.
 GitHub Gist를 삽입합니다.
 
 ```markdown
-{%raw%}{{ gist(user="octocat", id="abc123") }}
-{{ gist(user="octocat", id="abc123", file="hello.rb") }}{%endraw%}
+{{ gist(user="octocat", id="abc123") }}
+{{ gist(user="octocat", id="abc123", file="hello.rb") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -95,8 +105,8 @@ GitHub Gist를 삽입합니다.
 단순 닫기와 이름 있는 닫기를 모두 지원합니다(복잡한 페이지에는 이름 있는 닫기를 권장합니다):
 
 ```markdown
-{%raw%}{% alert(type="warning", title="Caution") %}Be careful with this!{% end %}
-{% alert(type="tip") %}Using named closer also works{% endalert %}{%endraw%}
+{% alert(type="warning", title="Caution") %}Be careful with this!{% end %}
+{% alert(type="tip") %}Using named closer also works{% endalert %}
 ```
 
 (명확성을 위해 이름 있는 닫기 스타일을 권장합니다.)
@@ -111,7 +121,7 @@ GitHub Gist를 삽입합니다.
 캡션을 붙일 수 있는 이미지입니다.
 
 ```markdown
-{%raw%}{{ figure(src="/img/photo.jpg", alt="A photo", caption="My caption") }}{%endraw%}
+{{ figure(src="/img/photo.jpg", alt="A photo", caption="My caption") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -127,7 +137,7 @@ GitHub Gist를 삽입합니다.
 트윗을 삽입합니다.
 
 ```markdown
-{%raw%}{{ tweet(user="jack", id="20") }}{%endraw%}
+{{ tweet(user="jack", id="20") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -140,8 +150,8 @@ GitHub Gist를 삽입합니다.
 CodePen을 삽입합니다.
 
 ```markdown
-{%raw%}{{ codepen(user="chriscoyier", id="gfdDu") }}
-{{ codepen(user="chriscoyier", id="gfdDu", tab="css,result", height="400") }}{%endraw%}
+{{ codepen(user="chriscoyier", id="gfdDu") }}
+{{ codepen(user="chriscoyier", id="gfdDu", tab="css,result", height="400") }}
 ```
 
 | 파라미터 | 기본값 | 설명 |
@@ -152,11 +162,88 @@ CodePen을 삽입합니다.
 | `height` | `300` | 삽입 높이 |
 | `title` | `CodePen Embed` | 접근성용 제목 |
 
-> 내장 숏코드를 덮어쓰려면 `templates/shortcodes/`에 같은 이름의 파일을 만들면 됩니다(예: `templates/shortcodes/youtube.html`). 사용자 템플릿이 항상 우선합니다.
+위에서 **(필수)** 로 표시된 매개변수는 모두 URL이나 `src`에 그대로 들어갑니다.
+빠뜨려도 렌더링은 성공하지만 아무 데도 가리키지 않는 임베드
+(`https://codepen.io//embed/gfdDu`)가 나오므로, 배포된 페이지에서 깨진 임베드를
+직접 찾는 대신 빌드가 경고합니다.
+
+```
+[WARN] Shortcode `codepen` is missing required argument `user` — it renders a broken embed. Usage: `{{ codepen(user="…", id="…") }}`.
+```
+
+### include_code
+
+소스 파일 전체나 일부를 펜스 코드 블록으로 넣습니다. 블록은 일반 코드 파이프라인을 그대로 거칩니다: 하이라이팅, [펜스 옵션](/ko/features/syntax-highlighting/), 복사 버튼, render-codeblock 훅.
+
+```markdown
+{{ include_code(path="examples/site/config.toml") }}
+{{ include_code(path="examples/site/config.toml", region="feeds", lines="2-8", title="config.toml", hl_lines="3") }}
+```
+
+| 매개변수 | 기본값 | 설명 |
+|-------|---------|-------------|
+| `path` | (필수) | 프로젝트 루트 기준 파일 경로 |
+| `region` | (없음) | `#region <name>`과 `#endregion <name>` 사이의 줄만 |
+| `lines` | (없음) | 줄 범위 `a-b` 또는 한 줄 `a` (1부터, 양 끝 포함; `region`과 함께 쓰면 영역 안에서 셉니다) |
+| `lang` | 파일 이름이나 확장자에서 추론(`Makefile`, `Dockerfile`, `.rs`). 클라이언트 하이라이트 모드에서는 highlight.js 이름 | 코드 블록 언어 |
+| `title`, `hl_lines`, `hide_lines`, `linenos`, `linenostart`, `copy` | | 펜스 옵션으로 전달 |
+
+영역 표시는 어떤 주석 기호 뒤에도 쓸 수 있어서 원본 파일에서도 올바른 코드로 남습니다:
+
+```crystal
+module App
+  # #region server
+  def run
+    serve
+  end
+  # #endregion server
+end
+```
+
+`//`, `#`, `--`, `<!--`, `/*`, `;` 모두 쓸 수 있고, 이름 없는 `#endregion`은 가장 안쪽의 열린 영역을 닫습니다. 표시 줄과 선택한 영역 안의 중첩된 표시는 출력에서 빠집니다. `region` 없이 쓰면 파일을 그대로 넣습니다. 모든 줄에 공통인 앞쪽 들여쓰기는 제거됩니다.
+
+### include_md
+
+마크다운 파일을 그 자리에 쓴 것처럼 렌더링합니다.
+
+```markdown
+{{ include_md(path="shared/install.md") }}
+{{ include_md(path="shared/install.md", region="brew") }}
+```
+
+| 매개변수 | 기본값 | 설명 |
+|-------|---------|-------------|
+| `path` | (필수) | 프로젝트 루트 기준 파일 경로 |
+| `region` | (없음) | `<!-- #region <name> -->`과 `<!-- #endregion <name> -->` 사이의 줄만 |
+
+포함된 파일 안의 숏코드도 펼쳐지고, 그 제목은 페이지의 목차와 제목 id에 함께 들어갑니다. 프론트 매터는 버립니다. 포함된 파일이 다른 파일을 다시 포함할 수 있으며 깊이는 8단계까지입니다. 순환 포함은 그 경로를 보여 주는 오류가 됩니다.
+
+#### 경로와 오류
+
+두 숏코드 모두 프로젝트 루트 안의 파일만 읽습니다. 절대 경로, `..`, 프로젝트 밖으로 이어지는 심볼릭 링크, 빌드 출력 디렉터리, `.hwaro/`는 거부합니다. 파일이나 영역이 없거나, 줄 범위가 파일을 벗어나거나, 경로가 거부되면 페이지와 파일 이름을 담은 오류로 빌드가 실패합니다:
+
+```
+Error [HWARO_E_TEMPLATE]: {{ include_code(path="examples/app.cr", region="srv") }} in content/guide.md: region 'srv' not found
+```
+
+포함된 파일은 그것을 포함하는 페이지의 의존성입니다. `--cache` 웜 빌드와 `hwaro serve` 모두 파일이 바뀌면 페이지를 다시 렌더링하며, `content/` 밖의 파일도 마찬가지입니다.
+
+코드 스팬, 펜스 코드 블록, `{% raw %}` 영역 안의 호출은 글자 그대로 남습니다.
+
+> 내장 숏코드를 덮어쓰려면 `templates/shortcodes/`에 같은 이름의 파일을 만들면 됩니다(예: `templates/shortcodes/youtube.html`). 사용자 템플릿이 항상 우선하며, 자기 계약을 스스로 정의하므로 위 경고는 적용되지 않습니다.
 
 ## 커스텀 숏코드 작성
 
 숏코드 템플릿은 `templates/shortcodes/`에 둡니다.
+
+숏코드 템플릿이 렌더링 중에 실패하면(예: 정의되지 않은 속성 접근, 존재하지
+않는 템플릿을 `{% include %}`) 페이지 템플릿과 마찬가지로 빌드가
+`HWARO_E_TEMPLATE`(종료 코드 4)로 실패합니다. 오류 메시지에는
+`templates/shortcodes/alert.html:3:5`처럼 숏코드 파일과 줄 번호가 표시됩니다.
+`hwaro serve`에서는 대신 오류 오버레이에 표시됩니다.
+
+숏코드 템플릿의 구문 오류는 같은 파일과 위치를 담은 경고로 알립니다.
+Hwaro는 호출 위치에 HTML 주석을 표시하고 페이지 렌더링을 계속합니다.
 
 ### 예시: 알림 상자
 
@@ -173,7 +260,7 @@ CodePen을 삽입합니다.
 콘텐츠에서 사용:
 
 ```markdown
-{%raw%}{{ alert(type="warning", message="This is important!") }}{%endraw%}
+{{ alert(type="warning", message="This is important!") }}
 ```
 
 출력:
@@ -203,7 +290,7 @@ CodePen을 삽입합니다.
 콘텐츠에서 사용:
 
 ```markdown
-{%raw%}{{ youtube(id="dQw4w9WgXcQ") }}{%endraw%}
+{{ youtube(id="dQw4w9WgXcQ") }}
 ```
 
 ### 예시: 캡션 있는 figure
@@ -222,7 +309,7 @@ CodePen을 삽입합니다.
 콘텐츠에서 사용:
 
 ```markdown
-{%raw%}{{ figure(src="/images/photo.jpg", alt="A photo", caption="My caption") }}{%endraw%}
+{{ figure(src="/images/photo.jpg", alt="A photo", caption="My caption") }}
 ```
 
 ### 예시: 이미지 갤러리(에셋 코로케이션)
@@ -247,7 +334,7 @@ CodePen을 삽입합니다.
 콘텐츠에서 사용(페이지 번들 디렉터리 안에서):
 
 ```markdown
-{%raw%}{{ gallery() }}{%endraw%}
+{{ gallery() }}
 ```
 
 마크다운 파일 옆에 있는 모든 JPG/PNG 이미지가 그리드로 렌더링됩니다.
@@ -257,9 +344,9 @@ CodePen을 삽입합니다.
 블록 숏코드는 여는 태그와 닫는 태그 사이의 콘텐츠를 감쌉니다:
 
 ```markdown
-{%raw%}{% note() %}
+{% note() %}
 This is the **body** content of the shortcode.
-{% end %}{%endraw%}
+{% end %}
 ```
 
 본문은 `body` 변수로 숏코드 템플릿에 전달됩니다. 마크다운 변환은 자동으로 적용되지 **않으므로**, 필요하면 템플릿에서 `markdownify` 필터를 사용합니다:
@@ -281,9 +368,9 @@ This is the **body** content of the shortcode.
 블록 숏코드는 최대 5단계까지 중첩할 수 있습니다:
 
 ```markdown
-{%raw%}{% outer() %}
+{% outer() %}
   Some text with {{ inner(type="info") }} inside.
-{% end %}{%endraw%}
+{% end %}
 ```
 
 ## 인자 문법
@@ -293,17 +380,19 @@ This is the **body** content of the shortcode.
 인자는 여러 따옴표 스타일을 지원합니다:
 
 ```markdown
-{%raw%}{{ alert(type="warning", message="Double quotes") }}
+{{ alert(type="warning", message="Double quotes") }}
 {{ alert(type='info', message='Single quotes') }}
-{{ alert(type=danger, message=No quotes for simple values) }}{%endraw%}
+{{ alert(type=danger, message=Unquoted) }}
 ```
+
+따옴표 없는 값은 첫 공백에서 끝나므로(`message=No quotes here`는 `No`만 전달) 한 단어보다 긴 값은 따옴표로 감싸세요.
 
 ### 위치 인자
 
 `key=value` 문법을 쓰지 않으면 인자가 `_0`, `_1`, … 로 할당됩니다:
 
 ```markdown
-{%raw%}{{ youtube("dQw4w9WgXcQ") }}{%endraw%}
+{{ youtube("dQw4w9WgXcQ") }}
 ```
 
 숏코드 템플릿에서는 `{{ _0 }}`으로 접근합니다:
@@ -364,6 +453,10 @@ templates/shortcodes/
     ├── twitter.html
     └── github.html
 ```
+
+하위 디렉터리의 숏코드는 명시적 형식으로 `templates/shortcodes/` 아래 경로를
+적어 호출합니다: `{{ shortcode("code/tabs", lang="crystal") }}`. 짧은 형식은
+이름만 받으므로 `{{ code/tabs() }}`는 글자 그대로 남습니다.
 
 ## 함께 보기
 

@@ -31,6 +31,10 @@
       url: /ko/writing/shortcodes/
     - title: 아키타입
       url: /ko/writing/archetypes/
+    - title: 프론트 매터 스키마
+      url: /ko/writing/schema/
+    - title: 위키링크와 백링크
+      url: /ko/writing/obsidian/
 - title: 템플릿
   section: templates
   items:
@@ -79,6 +83,8 @@
           url: /ko/features/menus/
         - title: 출력 포맷
           url: /ko/features/output-formats/
+        - title: Git 메타데이터
+          url: /ko/features/git-info/
     - title: 빌드와 성능
       items:
         - title: 증분 빌드
@@ -101,10 +107,18 @@
           url: /ko/features/auto-includes/
         - title: 콘텐츠 파일
           url: /ko/features/content-files/
+        - title: 원격 데이터 소스
+          url: /ko/features/remote-data/
+        - title: 콘텐츠 생성
+          url: /ko/features/content-generation/
+        - title: 날짜별 리포트 페이지
+          url: /ko/features/dated-report-pages/
     - title: 플랫폼
       items:
         - title: 다국어
           url: /ko/features/multilingual/
+        - title: 버전별 문서
+          url: /ko/features/versioned-docs/
         - title: 이미지 처리
           url: /ko/features/image-processing/
         - title: PWA
@@ -113,6 +127,10 @@
           url: /ko/features/amp/
         - title: 배포 명령
           url: /ko/features/deployment/
+        - title: 프라이버시 모드
+          url: /ko/features/privacy/
+        - title: 콘텐츠 보안 정책(CSP)
+          url: /ko/features/csp/
 - title: 배포
   section: deploy
   items:

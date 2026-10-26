@@ -1,12 +1,24 @@
 require "yaml"
 require "./base"
+require "../../content/processors/fence_tracker"
 
 module Hwaro
   module Services
     module Importers
       class ObsidianImporter < Base
-        # Obsidian wiki-link pattern: [[Page Name]] or [[Page Name|Display Text]]
-        WIKILINK_PATTERN = /\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]/
+        # Obsidian wiki-link pattern: [[Page Name]] or [[Page Name|Display Text]].
+        # Inside a table Obsidian requires the alias pipe escaped
+        # (`[[Page\|Text]]`); the backslash belongs to the pipe, not the name.
+        WIKILINK_PATTERN = /\[\[([^\]|]+?)\\?(?:\|([^\]]+?))?\]\]/
+
+        # Spans where `#word`, `[[links]]` and `![[embeds]]` are literal text:
+        # HTML tags (an attribute value like `color: #fff` is not a tag) and
+        # comments, and inline/display math (`$a #b$`). Math follows the pandoc
+        # rules so prose like "$5 and #tag later $6" is not swallowed: the
+        # opening `$` is followed by a non-space, the closing one preceded by
+        # a non-space and not followed by a digit.
+        HTML_SPAN_PATTERN = /<!--.*?-->|<\/?[A-Za-z][^<>\n]*>/
+        MATH_SPAN_PATTERN = /\$\$.+?\$\$|(?<![\\$])\$[^\s$](?:[^$\n]*?[^\s$\\])?\$(?![\d$])/
 
         # Obsidian embed pattern: ![[filename]]
         EMBED_PATTERN = /!\[\[([^\]]+?)\]\]/
@@ -20,9 +32,6 @@ module Hwaro
         def run(options : Config::Options::ImportOptions) : ImportResult
           path = options.path
           output_dir = options.output_dir
-          imported = 0
-          skipped = 0
-          errors = 0
 
           reset_written_paths
 
@@ -39,6 +48,7 @@ module Hwaro
             return ImportResult.new(
               success: true,
               message: "No Markdown files found in #{path}",
+              skipped_count: outside_source_skips,
             )
           end
 
@@ -49,34 +59,15 @@ module Hwaro
           # The pass also caches each file's raw bytes so the second pass below
           # reuses them instead of re-reading every note from disk (2N → N reads).
           content_cache = {} of String => String
-          link_map = build_link_map(files, path, options.drafts, content_cache)
+          link_map = build_link_map(files, path, output_dir, options.drafts, content_cache)
 
-          files.each do |file_path|
-            result = import_file(file_path, path, output_dir, options.drafts, options.verbose, options.force, link_map, content_cache)
-            case result
-            when :imported
-              imported += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error importing #{file_path}: #{ex.message}"
+          import_each(files, "Obsidian") do |file_path|
+            import_file(file_path, path, output_dir, options.drafts, options.verbose, options.force, link_map, content_cache)
           end
-
-          report_collisions
-
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Obsidian import complete: #{imported} imported, #{skipped} skipped, #{errors} errors",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors,
-          )
         end
 
         private def collect_markdown_files(path : String) : Array(String)
-          walk_files(path, skip_dir: ->(entry : String) { entry.starts_with?(".") })
+          walk_files(path, skip_dir: ->(entry : String) { entry.starts_with?(".") }, source_root: path)
         end
 
         # Build a name → URL map covering every note in the vault. Keys are
@@ -91,10 +82,16 @@ module Hwaro
         private def build_link_map(
           files : Array(String),
           base_path : String,
+          output_dir : String,
           include_drafts : Bool,
           content_cache : Hash(String, String) = {} of String => String,
         ) : Hash(String, String)
           map = Hash(String, String).new
+          # Replays the run's destination claims (`import_file` claims them in
+          # this same order), so notes sharing a title map to the `-1`, `-2`…
+          # file each one will actually be written to.
+          claimed = Set(String).new
+          suffixes = Hash(String, Int32).new
           files.each do |file_path|
             raw = read_text(file_path)
             content_cache[file_path] = raw
@@ -103,7 +100,7 @@ module Hwaro
             # Section mirrors `import_file`'s computation so the URL we
             # emit lands at the same path the file will be written to.
             section, _ = section_from_path(file_path, base_path, "posts")
-            section = section.split('/').reject(&.empty?).map { |s| slugify(s) }.join('/')
+            section = section.split('/').reject(&.empty?).map { |s| Utils::TextUtils.slugify(s) }.join('/')
 
             basename = File.basename(file_path, File.extname(file_path))
             title = basename
@@ -118,8 +115,8 @@ module Hwaro
                 end
               end
 
-              if t = yaml["title"]?
-                title = yaml_string(t)
+              if (t = yaml["title"]?) && (title_text = yaml_title(t))
+                title = title_text
               end
               if a = yaml["aliases"]?
                 case a.raw
@@ -132,9 +129,15 @@ module Hwaro
             end
 
             relative_path = file_path.sub(base_path, "").lstrip('/')
-            relative_path_no_ext = relative_path.sub(File.extname(relative_path), "")
+            # `rchop`, not `sub`: sub strips the FIRST occurrence of the
+            # extension substring, registering the wrong link-map key for a
+            # stem that itself contains ".md" (`a.md.old.md` → `a.old.md`).
+            relative_path_no_ext = relative_path.rchop(File.extname(relative_path))
 
-            slug = slugify(title)
+            slug = file_slug(title)
+            if resolved = resolve_content_path(output_dir, section, slug, quiet: true)
+              slug = File.basename(claim_path_in(claimed, suffixes, resolved), ".md")
+            end
             url = "/#{section}/#{slug}/"
 
             # Register every name a wiki-link could plausibly use.
@@ -154,7 +157,7 @@ module Hwaro
         # Map a `[[Wiki-Link]]` target to either an absolute site URL (when
         # the target was found in the vault) or the slugified fallback (so
         # external references still produce *some* link rather than nothing).
-        private def resolve_wikilink(page : String, link_map : Hash(String, String)) : String
+        private def resolve_wikilink(page : String, link_map : Hash(String, String), note_dir : String = "") : String
           # Obsidian links can include a `#heading` anchor (`[[Note#Section]]`)
           # and `^block-ref` ids (`[[Note#^abc]]`). Strip those before lookup
           # and re-append the anchor in slugified form afterwards.
@@ -165,14 +168,26 @@ module Hwaro
           end
 
           key = name.strip.downcase
-          if url = link_map[key]?
-            return anchor.empty? ? url : "#{url}##{slugify(anchor.lchop('#').lchop('^'))}"
+          url = link_map[key]?
+          # A link with a folder (`[[Sub/Note]]`, `[[../Other/Note]]`) is
+          # relative to the linking note's folder, or a partial path Obsidian
+          # matches against the end of a note's vault path. Only the
+          # whole-vault path was looked up, so these fell back to a broken
+          # relative slug.
+          # ponytail: the suffix match scans every key; index vault paths by
+          # basename if vaults with thousands of such links get slow.
+          if url.nil? && key.includes?('/')
+            url = link_map[Path.posix(note_dir.downcase, key).normalize.to_s]? ||
+                  link_map.find { |k, _| k.ends_with?("/#{key}") }.try(&.[1])
+          end
+          if url
+            return anchor.empty? ? url : "#{url}##{Utils::TextUtils.slugify(anchor.lchop('#').lchop('^'))}"
           end
           # Unknown target: fall back to a relative slug. This keeps behavior
           # backwards-compatible for vaults that link to pages outside the
           # import scope, and the user can fix up by hand.
-          slug = slugify(name)
-          anchor.empty? ? slug : "#{slug}##{slugify(anchor.lchop('#').lchop('^'))}"
+          slug = Utils::TextUtils.slugify(name)
+          anchor.empty? ? slug : "#{slug}##{Utils::TextUtils.slugify(anchor.lchop('#').lchop('^'))}"
         end
 
         private def import_file(
@@ -187,14 +202,15 @@ module Hwaro
         ) : Symbol
           raw = content_cache[file_path]? || read_text(file_path)
           frontmatter_yaml, body = split_yaml_frontmatter(raw)
+          body = strip_comments(body)
 
           fields = Hash(String, FieldValue).new
           tags = [] of String
 
           if frontmatter_yaml
             if yaml = YAML.parse(frontmatter_yaml).as_h?
-              if title = yaml["title"]?
-                fields["title"] = yaml_string(title)
+              if (title = yaml["title"]?) && (title_text = yaml_title(title))
+                fields["title"] = title_text
               end
 
               if date_val = yaml["date"]?
@@ -264,13 +280,14 @@ module Hwaro
           end
 
           # Convert Obsidian-specific syntax
-          body = convert_obsidian_syntax(body, link_map)
+          note_dir = File.dirname(file_path.sub(base_path, "").lstrip('/'))
+          body = convert_obsidian_syntax(body, link_map, note_dir)
 
           # Determine section from vault folder structure
           section, _ = section_from_path(file_path, base_path, "posts")
-          section = section.split('/').reject(&.empty?).map { |s| slugify(s) }.join('/')
+          section = section.split('/').reject(&.empty?).map { |s| Utils::TextUtils.slugify(s) }.join('/')
 
-          slug = slugify(fields["title"].as?(String) || File.basename(file_path, File.extname(file_path)))
+          slug = file_slug(fields["title"].as?(String) || File.basename(file_path, File.extname(file_path)))
 
           frontmatter = generate_frontmatter(fields)
           body = strip_redundant_title_h1(body, fields["title"]?.as?(String))
@@ -303,6 +320,52 @@ module Hwaro
           result
         end
 
+        # Remove Obsidian comments (`%%hidden%%`, inline or spanning lines).
+        # Obsidian never renders them — they hold private notes and TODOs —
+        # so importing them verbatim published them on the site. `%%` inside
+        # fenced or inline code is literal. A note whose comments don't
+        # balance is left untouched rather than guessing where one ends.
+        private def strip_comments(body : String) : String
+          return body unless body.includes?("%%")
+          tracker = Content::Processors::FenceTracker.new
+          in_comment = false
+          result = String.build do |io|
+            body.each_line(chomp: false) do |line|
+              # Only text outside comments reaches the fence tracker: a
+              # ``` inside a comment would otherwise leave it "in a fence"
+              # and publish every comment after it.
+              started_in_comment = in_comment
+              if !in_comment && tracker.fence_line?(line)
+                io << line
+                next
+              end
+              text = line.chomp
+              ranges = in_comment ? [] of Range(Int32, Int32) : inline_code_ranges(text)
+              chars = text.chars
+              had_comment = in_comment
+              kept = String.build do |buf|
+                i = 0
+                while i < chars.size
+                  if chars[i] == '%' && chars[i + 1]? == '%' && (in_comment || ranges.none?(&.includes?(i)))
+                    in_comment = !in_comment
+                    had_comment = true
+                    i += 2
+                  else
+                    buf << chars[i] unless in_comment
+                    i += 1
+                  end
+                end
+              end
+              # A line that held nothing but comment disappears entirely.
+              next if had_comment && kept.blank?
+              # The visible tail of a line that closed a comment is fed now.
+              tracker.fence_line?(kept) if started_in_comment
+              io << (had_comment ? kept.rstrip : kept) << line[text.size..]
+            end
+          end
+          in_comment ? body : result
+        end
+
         private def inline_code_ranges(line : String) : Array(Range(Int32, Int32))
           ranges = [] of Range(Int32, Int32)
           i = 0
@@ -330,12 +393,32 @@ module Hwaro
           ranges
         end
 
+        # `inline_code_ranges` plus HTML tag/comment and math spans.
+        private def protected_ranges(line : String) : Array(Range(Int32, Int32))
+          ranges = inline_code_ranges(line)
+          if line.includes?('<')
+            line.scan(HTML_SPAN_PATTERN) { |m| ranges << (m.begin(0)..(m.end(0) - 1)) }
+          end
+          if line.includes?('$')
+            line.scan(MATH_SPAN_PATTERN) { |m| ranges << (m.begin(0)..(m.end(0) - 1)) }
+          end
+          ranges
+        end
+
         private def extract_inline_tags(body : String) : Array(String)
           tags = [] of String
-          # Skip code blocks when extracting tags
+          # Skip code blocks (and `$$` display math) when extracting tags
           in_code_block = false
+          in_math_block = false
           fence_close_re : Regex? = nil
           body.each_line do |line|
+            if in_math_block
+              in_math_block = false if line.strip == "$$"
+              next
+            elsif !in_code_block && line.strip == "$$"
+              in_math_block = true
+              next
+            end
             if in_code_block
               if fence_close_re.try(&.match(line))
                 in_code_block = false
@@ -353,7 +436,7 @@ module Hwaro
 
             next if line.starts_with?('\t') || line.match(/^ {4,}/)
 
-            ranges = inline_code_ranges(line)
+            ranges = protected_ranges(line)
 
             line.scan(OBSIDIAN_TAG_PATTERN) do |tag_match|
               next if ranges.any?(&.includes?(tag_match.begin(0)))
@@ -365,11 +448,18 @@ module Hwaro
           tags.uniq
         end
 
-        private def convert_obsidian_syntax(body : String, link_map : Hash(String, String) = {} of String => String) : String
+        private def convert_obsidian_syntax(body : String, link_map : Hash(String, String) = {} of String => String, note_dir : String = "") : String
           in_code_block = false
+          in_math_block = false
           fence_close_re : Regex? = nil
           lines = body.split("\n").map do |line|
-            if in_code_block
+            if in_math_block
+              in_math_block = false if line.strip == "$$"
+              line
+            elsif !in_code_block && line.strip == "$$"
+              in_math_block = true
+              line
+            elsif in_code_block
               if fence_close_re.try(&.match(line))
                 in_code_block = false
                 fence_close_re = nil
@@ -386,7 +476,7 @@ module Hwaro
               if line.starts_with?('\t') || line.match(/^ {4,}/)
                 line
               else
-                ranges = inline_code_ranges(line)
+                ranges = protected_ranges(line)
 
                 line = line.gsub(EMBED_PATTERN) do |match|
                   if ranges.any?(&.includes?($~.begin(0)))
@@ -394,7 +484,7 @@ module Hwaro
                   else
                     full_match = $1
                     parts = full_match.split('|', 2)
-                    target = parts[0].strip
+                    target = parts[0].rstrip('\\').strip
                     alt_or_width = parts.size > 1 ? parts[1].strip : ""
 
                     if target.matches?(/\.(png|jpg|jpeg|gif|svg|webp|avif)$/i)
@@ -407,13 +497,13 @@ module Hwaro
                       "![#{alt}](#{target})"
                     else
                       display = alt_or_width.empty? ? target : alt_or_width
-                      resolved_url = resolve_wikilink(target, link_map)
+                      resolved_url = resolve_wikilink(target, link_map, note_dir)
                       "[#{display}](#{resolved_url})"
                     end
                   end
                 end
 
-                ranges = inline_code_ranges(line)
+                ranges = protected_ranges(line)
 
                 line = line.gsub(WIKILINK_PATTERN) do |match|
                   if ranges.any?(&.includes?($~.begin(0)))
@@ -421,20 +511,24 @@ module Hwaro
                   else
                     page = $1
                     display = $~[2]? || page
-                    target = resolve_wikilink(page, link_map)
+                    target = resolve_wikilink(page, link_map, note_dir)
                     "[#{display}](#{target})"
                   end
                 end
 
-                ranges = inline_code_ranges(line)
+                ranges = protected_ranges(line)
 
-                line.gsub(/(?:^|(?<=\s))#([a-zA-Z][\w\-\/]*)/) do |match|
+                stripped = line.gsub(OBSIDIAN_TAG_PATTERN) do |match|
                   if ranges.any?(&.includes?($~.begin(0)))
                     match
                   else
                     ""
                   end
-                end.rstrip
+                end
+                # Trim only what removing a tag left behind: an unconditional
+                # rstrip also ate the two trailing spaces of every Markdown
+                # hard line break.
+                stripped == line ? line : stripped.rstrip
               end
             end
           end

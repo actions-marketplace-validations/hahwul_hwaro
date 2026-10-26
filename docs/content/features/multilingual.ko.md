@@ -33,11 +33,11 @@ weight = 3
 | 키 | 타입 | 기본값 | 설명 |
 |-----|------|---------|-------------|
 | default_language | string | "en" | 기본 언어 코드 |
-| language_name | string | — | 사람이 읽는 언어 이름 |
-| weight | int | 0 | 정렬 순서(낮을수록 앞) |
-| generate_feed | bool | true | 해당 언어의 RSS/Atom 피드 생성 여부 |
+| language_name | string | 언어 코드 | 사람이 읽는 언어 이름 |
+| weight | int | 1 | 정렬 순서(낮을수록 앞) |
+| generate_feed | bool | true | 해당 언어의 RSS/Atom/JSON 피드 생성 여부 |
 | build_search_index | bool | true | 검색 인덱스 포함 여부 |
-| taxonomies | array | [] | 해당 언어의 택소노미 |
+| taxonomies | array | 모든 `[[taxonomies]]` 이름 | 해당 언어의 택소노미. 생략하면 전역 설정을 상속하고, `[]`이면 사용하지 않음 |
 
 ## 콘텐츠 구조
 
@@ -66,6 +66,8 @@ content/
 
 기본 언어 페이지는 루트 경로로 서비스되고, 비기본 언어 페이지에는 언어 코드 접두사가 붙습니다.
 
+기본 언어 접미사는 붙여도 되고 생략해도 됩니다. `default_language = "en"`일 때 `about.en.md`는 `about.md`와 같게 취급되어 `/about/`에 게시되고, 섹션의 다른 기본 언어 페이지와 함께 목록에 나옵니다.
+
 ### 섹션 번역
 
 섹션 인덱스 파일에도 언어 접미사를 쓸 수 있습니다:
@@ -83,6 +85,8 @@ content/
 Hwaro는 파일 이름을 기준으로 번역된 페이지를 자동으로 연결합니다. 언어 접미사를 뺀 기본 이름이 같은 페이지들은 서로의 번역으로 간주됩니다.
 
 예를 들어 `hello.md`, `hello.ko.md`, `hello.ja.md`는 모두 번역 관계로 연결됩니다.
+
+아직 번역되지 않은 페이지는 `hwaro doctor`로 찾을 수 있습니다. 언어가 둘 이상인 사이트에서는 같은 짝짓기 규칙으로, 번역이 없는 페이지·섹션과 기본 언어 원본이 없는 번역을 언어별로 보여 줍니다. [doctor](/ko/start/tools/doctor/#검사-항목)를 참고하세요.
 
 ### 템플릿 변수
 
@@ -335,7 +339,7 @@ back = "뒤로"
 | 비기본 언어 (예: `ko`) | `/ko/rss.xml` | 한국어 페이지만 |
 | 비기본 언어 (예: `ja`) | `/ja/rss.xml` | 일본어 페이지만 |
 
-기본적으로 메인 사이트 피드(`/rss.xml` 또는 `/atom.xml`)에는 **기본 언어 페이지만** 포함됩니다. 이 동작은 `default_language_only` 옵션으로 바꿀 수 있습니다. `generate_feed = true`인 비기본 언어는 이 설정과 무관하게 각자의 언어 접두사 아래에 자체 피드를 갖습니다.
+기본적으로 메인 사이트 피드(`/rss.xml`, `/atom.xml` 또는 `/feed.json`)에는 **기본 언어 페이지만** 포함됩니다. 이 동작은 `default_language_only` 옵션으로 바꿀 수 있습니다. `generate_feed = true`인 비기본 언어는 이 설정과 무관하게 각자의 언어 접두사 아래에 자체 피드를 갖습니다.
 
 ### 설정
 
@@ -365,7 +369,7 @@ generate_feed = false   # No /ja/rss.xml will be generated
 ```toml
 [feeds]
 enabled = true
-type = "rss"           # 또는 "atom"
+type = "rss"           # 또는 "atom", "json"
 limit = 20
 truncate = 0
 full_content = true    # false = 설명/요약만 포함
@@ -377,10 +381,13 @@ default_language_only = true
 
 - **RSS 피드**에는 `<language>` 태그가 포함됩니다 (예: `<language>ko</language>`)
 - **Atom 피드**에는 `xml:lang` 속성이 포함됩니다 (예: `<feed xmlns="..." xml:lang="ko">`)
+- **JSON 피드**에는 최상위 `"language"` 필드가 포함됩니다 (예: `"language": "ko"`)
+- 기본 언어가 아닌 언어의 섹션 피드(`/ko/blog/rss.xml`)와 택소노미 용어 피드(`/ko/tags/crystal/rss.xml`)도 같은 방식으로 언어를 선언합니다. 기본 언어 피드는 언어를 선언하지 않습니다
 - 피드 제목에 언어 이름이 붙습니다: `"My Site (한국어)"`
 - 자기 참조 링크는 해당 언어 경로를 가리킵니다 (예: `https://example.com/ko/rss.xml`)
 - 초안 페이지와 섹션 인덱스 페이지는 제외됩니다
-- 언어 피드는 메인 피드의 `enabled` 설정과 무관하게 생성됩니다
+- 언어 피드도 `[feeds] enabled = true`여야 생성됩니다. `generate_feed = false`는 해당 언어만 제외합니다
+- 게시된 페이지가 없는 언어에는 피드가 생성되지 않습니다
 
 ### 템플릿 링크
 

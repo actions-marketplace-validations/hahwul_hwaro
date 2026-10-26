@@ -7,6 +7,7 @@
 require "digest/md5"
 require "json"
 require "../../utils/digest_utils"
+require "../../utils/file_safe"
 require "../../utils/logger"
 require "../../models/config"
 require "../../config/options/build_options"
@@ -20,6 +21,12 @@ module Hwaro
 
         property path : String
         property mtime : Int64
+        # Source size alongside the mtime: a tool that restores mtimes
+        # (`rsync -t`, tar) can bring back the old mtime with new bytes, and
+        # a size change then still re-hashes the file. -1 (unknown) for
+        # entries written before this field: only their mtime is compared.
+        @[JSON::Field(key: "size", emit_null: false)]
+        property size : Int64
         property hash : String
         property output_path : String
         @[JSON::Field(key: "template_hash", emit_null: false)]
@@ -45,6 +52,32 @@ module Hwaro
         @[JSON::Field(key: "assets_hash", emit_null: false)]
         property assets_hash : String
 
+        # Fingerprint of the page's git metadata (latest commit hash, lastmod,
+        # first_commit — see Render#page_git_hash) as of the build that wrote
+        # this entry. With `[git] enabled` a new commit to an unedited file
+        # changes `page.updated`/`page.git` and therefore the rendered output
+        # even though the source bytes are unchanged, so it must be part of
+        # the cache key. "" when the feature is off or the file has no
+        # history, AND for legacy entries — so a disabled site never rebuilds
+        # because of this field.
+        @[JSON::Field(key: "git_hash", emit_null: false)]
+        property git_hash : String
+
+        # Fingerprint of what this page renders from OTHER pages, one by one:
+        # its prev/next neighbours, series, related posts, translations and
+        # ancestors (when its templates read them), the pages it fetches with
+        # a literal `get_page(path=...)`, and the URLs its `@/` links resolve
+        # to. None of those move this page's own source, and none of them are
+        # a listing the global page-set fingerprint gates, so retitling a post
+        # left its neighbours' "next: …" link — and every `@/` link to a
+        # renamed page — stale on warm builds. "" when the page reads none of
+        # them, and for legacy entries: a page that reads none never rebuilds
+        # because of this field, while every page that does re-renders once
+        # on the first warm build after upgrading (its legacy "" no longer
+        # matches).
+        @[JSON::Field(key: "relations_hash", emit_null: false)]
+        property relations_hash : String
+
         # Secondary sibling output files this page emitted beyond
         # `output_path` (e.g. `index.json`, `index.xml` — see `[outputs]`).
         # Empty for pages with no extra formats and for every entry written
@@ -52,16 +85,31 @@ module Hwaro
         @[JSON::Field(key: "output_paths", emit_null: false)]
         property output_paths : Array(String)
 
+        # Files this page produced that are NOT its own output: its `aliases`
+        # redirect stubs and, for a section, its `/page/N/` pagination pages.
+        # Kept apart from `output_paths` on purpose — that list also feeds
+        # `changed?` ("a manually deleted sibling forces a rebuild"), and the
+        # page count a section paginates into is only known AFTER rendering,
+        # so it cannot take part in the decision to render. These paths exist
+        # solely so a page that goes away, or stops producing one of them,
+        # takes the file with it. Empty for entries written before this field.
+        @[JSON::Field(key: "derived_paths", emit_null: false)]
+        property derived_paths : Array(String)
+
         def initialize(
           @path : String,
           @mtime : Int64,
           @hash : String,
           @output_path : String,
+          @size : Int64 = -1_i64,
           @template_hash : String = "",
           @config_hash : String = "",
           @cascade_hash : String = "",
           @output_paths : Array(String) = [] of String,
           @assets_hash : String = "",
+          @git_hash : String = "",
+          @derived_paths : Array(String) = [] of String,
+          @relations_hash : String = "",
         )
         end
 
@@ -69,34 +117,45 @@ module Hwaro
         def self.new(pull : JSON::PullParser)
           path = ""
           mtime = 0_i64
+          size = -1_i64
           hash = ""
           output_path = ""
           template_hash = ""
           config_hash = ""
           cascade_hash = ""
           assets_hash = ""
+          git_hash = ""
+          relations_hash = ""
           output_paths = [] of String
+          derived_paths = [] of String
 
           pull.read_object do |key|
             case key
-            when "path"          then path = pull.read_string
-            when "mtime"         then mtime = pull.read_int.to_i64
-            when "hash"          then hash = pull.read_string
-            when "output_path"   then output_path = pull.read_string
-            when "template_hash" then template_hash = pull.read_string
-            when "config_hash"   then config_hash = pull.read_string
-            when "cascade_hash"  then cascade_hash = pull.read_string
-            when "assets_hash"   then assets_hash = pull.read_string
+            when "path"           then path = pull.read_string
+            when "mtime"          then mtime = pull.read_int.to_i64
+            when "size"           then size = pull.read_int.to_i64
+            when "hash"           then hash = pull.read_string
+            when "output_path"    then output_path = pull.read_string
+            when "template_hash"  then template_hash = pull.read_string
+            when "config_hash"    then config_hash = pull.read_string
+            when "cascade_hash"   then cascade_hash = pull.read_string
+            when "assets_hash"    then assets_hash = pull.read_string
+            when "git_hash"       then git_hash = pull.read_string
+            when "relations_hash" then relations_hash = pull.read_string
             when "output_paths"
               output_paths = [] of String
               pull.read_array { output_paths << pull.read_string }
+            when "derived_paths"
+              derived_paths = [] of String
+              pull.read_array { derived_paths << pull.read_string }
             else pull.skip
             end
           end
 
-          new(path: path, mtime: mtime, hash: hash, output_path: output_path,
+          new(path: path, mtime: mtime, hash: hash, output_path: output_path, size: size,
             template_hash: template_hash, config_hash: config_hash, cascade_hash: cascade_hash,
-            output_paths: output_paths, assets_hash: assets_hash)
+            output_paths: output_paths, assets_hash: assets_hash, git_hash: git_hash,
+            derived_paths: derived_paths, relations_hash: relations_hash)
         end
       end
 
@@ -140,6 +199,38 @@ module Hwaro
         @[JSON::Field(key: "output_dir", emit_null: false)]
         property output_dir : String = ""
 
+        # Output files the last build produced that no cache ENTRY covers: the
+        # taxonomy index/term pages, their pagination pages and their feeds.
+        # Those have no content file, so nothing else remembers them, and a
+        # `--cache` build (which keeps the output directory) left the term page
+        # of a tag whose last post was deleted published forever. Stored
+        # relative to the output directory so moving the workspace, or
+        # switching between an absolute and a relative `-o`, does not strand
+        # them. Empty for caches written before this field existed: the first
+        # build after an upgrade records the set and prunes from the next one.
+        @[JSON::Field(key: "generated_outputs", emit_null: false)]
+        property generated_outputs : Array(String) = [] of String
+
+        # Digest of what templates read OUTSIDE the tracked files: the
+        # build-derived globals (asset-bundle manifest, auto-include tags and
+        # their `?v=`) plus the current value of every recorded render read
+        # (`env()` names, `load_data()` files, `resize_image()` sources —
+        # see `TemplateEngine.record_render_read`). Only the digest and the
+        # read KEYS are stored: an env value may be a secret. "" (a cache
+        # written before this existed) compares as unknown, not as a change.
+        @[JSON::Field(key: "render_inputs_hash", emit_null: false)]
+        property render_inputs_hash : String = ""
+        @[JSON::Field(key: "render_input_keys", emit_null: false)]
+        property render_input_keys : Array(String) = [] of String
+
+        # Static and bundle copies made while their source mtime was still
+        # inside its timestamp tick (#859). The copy is stamped with the
+        # source mtime, so a same-size rewrite in that tick matches it
+        # exactly; the next build byte-compares these instead of trusting
+        # the match.
+        @[JSON::Field(key: "racy_copies", emit_null: false)]
+        property racy_copies : Array(String) = [] of String
+
         def initialize(@template_hash : String = "", @config_hash : String = "",
                        @page_set_hash : String = "", @section_set_hash : String = "")
         end
@@ -162,6 +253,38 @@ module Hwaro
         # and 'hwaro_' prefix to identify it as project-specific cache
         CACHE_FILE = ".hwaro_cache.json"
 
+        # `hwaro serve --cache` keeps its own cache, inside the `.hwaro/`
+        # workspace next to the `.hwaro/serve` tree it describes. A cache
+        # remembers ONE output directory, and a `--cache` build whose cache
+        # names another one takes the cold path — so a shared file made every
+        # `hwaro build --cache` after a serve session wipe `public/` and
+        # regenerate every OG image and resized image variant.
+        SERVE_CACHE_FILE = ".hwaro/serve_cache.json"
+
+        # Racy-git: an mtime only stands in for a file's bytes once it is
+        # safely older than the moment the stamp was taken. Filesystems stamp
+        # with a coarse clock (ext4 uses the kernel tick, 1-10ms; HFS+ 1s,
+        # FAT 2s), so a same-size rewrite inside the tick a stamp was taken
+        # in keeps the stamped mtime, and the next warm build served the old
+        # output (#857: two builds in one tick, as specs, `serve` and scripts
+        # run them). A stamp that is not `stable_mtime?` is not kept; the
+        # next build re-hashes the file instead.
+        RACY_WINDOW_MS = 2_000_i64
+
+        # Stored in place of an mtime that was not stable when recorded.
+        # Never a real mtime, so the next check re-hashes the file.
+        UNSTABLE_MTIME = Int64::MIN
+
+        # `now_ms` must be read BEFORE the file is stat'ed and hashed.
+        def self.stable_mtime?(mtime_ms : Int64, now_ms : Int64) : Bool
+          now_ms - mtime_ms >= RACY_WINDOW_MS
+        end
+
+        # The cache file a build with these settings reads and writes.
+        def self.path_for(serve_mode : Bool) : String
+          serve_mode ? SERVE_CACHE_FILE : CACHE_FILE
+        end
+
         @entries : Hash(String, CacheEntry)
         @enabled : Bool
         @cache_path : String
@@ -176,6 +299,24 @@ module Hwaro
         # can skip rewriting the whole JSON on no-op warm builds. Set under
         # @mutex wherever entries or metadata actually change.
         @dirty : Bool = false
+
+        # True once #load read a metadata-format cache file (see
+        # #tracks_output_dir?). A missing, empty, corrupt or legacy-array file
+        # leaves it false.
+        @loaded : Bool = false
+
+        # Output files an entry recorded on the LAST build and no longer
+        # records after this one — a page whose `slug`/`path`/permalink moved
+        # keeps its source file (so it keeps its entry) but writes somewhere
+        # else, leaving the old file behind on a `--cache` build that never
+        # wipes the output directory. Collected under @mutex by #update and
+        # drained once by the Finalize phase.
+        @orphaned_outputs = [] of String
+
+        # Racy copies not yet checked against a settled source (see
+        # CacheMetadata#racy_copies): loaded with the cache, kept across serve
+        # rebuilds that reuse it.
+        @racy_copies = Set(String).new
 
         def initialize(@enabled : Bool = true, @cache_path : String = CACHE_FILE)
           @entries = {} of String => CacheEntry
@@ -199,9 +340,11 @@ module Hwaro
           invalidated = false
           output_key = Cache.output_dir_key(output_dir)
 
+          output_dir_changed = false
           if !@metadata.output_dir.empty? && !output_key.empty? && @metadata.output_dir != output_key
             Logger.info "  Cache: output directory changed — invalidating all entries."
             invalidated = true
+            output_dir_changed = true
           end
 
           if invalidate_on_template_change && !@metadata.template_hash.empty? && @metadata.template_hash != template_hash
@@ -215,18 +358,113 @@ module Hwaro
           end
 
           if invalidated
-            @mutex.synchronize { @entries.clear }
+            @mutex.synchronize { discard_entries_recording_outputs }
+          end
+
+          # The generated-output claims are paths RELATIVE to the output
+          # directory, so they are meaningless once that directory changes:
+          # rejoined against the new one they name files a different tree
+          # holds. Alternating `-o dist` and `-o preview` would otherwise let
+          # the first build in each tree delete whatever the other tree
+          # happened to have at the same relative path.
+          if output_dir_changed
+            @mutex.synchronize { @metadata.generated_outputs = [] of String }
           end
 
           if invalidated || @metadata.template_hash != template_hash || @metadata.config_hash != config_hash
             @dirty = true
           end
-          # Preserve the page/section-set fingerprints loaded from the prior
-          # build so the render phase can compare against them before recording
-          # the current ones.
-          @metadata = CacheMetadata.new(template_hash: template_hash, config_hash: config_hash,
-            page_set_hash: @metadata.page_set_hash, section_set_hash: @metadata.section_set_hash)
+          # Update the two hashes IN PLACE rather than rebuilding the struct.
+          # A rebuild resets every field the constructor doesn't take, so each
+          # new piece of metadata had to be hand-carried across this line (the
+          # page/section-set fingerprints the render phase compares against,
+          # the output dir, and now the generated-output list the Finalize
+          # phase prunes from) — and the next one added would silently be
+          # dropped instead.
+          @metadata.template_hash = template_hash
+          @metadata.config_hash = config_hash
           @metadata.output_dir = output_key unless output_key.empty?
+        end
+
+        # The render reads the last build recorded (see
+        # `CacheMetadata#render_input_keys`).
+        def render_input_keys : Array(String)
+          @mutex.synchronize { @metadata.render_input_keys.dup }
+        end
+
+        # Compare the current render-inputs digest (computed over
+        # `render_input_keys`) with the last build's. A change invalidates
+        # every entry, like a config edit: the reads are global, and a cached
+        # page cannot say which of them it made. Returns true when it did.
+        def check_render_inputs(digest : String) : Bool
+          return false unless @enabled
+          @mutex.synchronize do
+            stored = @metadata.render_inputs_hash
+            next false if stored.empty? || stored == digest
+            Logger.info "  Cache: template inputs (env, load_data, images, assets) changed — invalidating all entries."
+            discard_entries_recording_outputs
+            @dirty = true
+            true
+          end
+        end
+
+        # Persist this build's render-inputs digest and the read keys it
+        # covers; marks the cache dirty only when either moved.
+        def record_render_inputs(digest : String, keys : Array(String)) : Nil
+          return unless @enabled
+          @mutex.synchronize do
+            next if @metadata.render_inputs_hash == digest && @metadata.render_input_keys == keys
+            @metadata.render_inputs_hash = digest
+            @metadata.render_input_keys = keys
+            @dirty = true
+          end
+        end
+
+        # Does this cache describe what is sitting in `output_dir` right now?
+        #
+        # A `--cache` build keeps the output directory and prunes only what
+        # the cache remembers writing there, so it is only as good as that
+        # memory. With no usable record — no cache file, a corrupt one (whose
+        # warning promises a rebuild from scratch), a legacy one, or one last
+        # written for a DIFFERENT output directory — a page deleted since the
+        # tree was written stayed published, with its alias stubs and tag
+        # pages, on every later warm build. The Initialize phase takes the
+        # cold path instead when this is false. Asked before
+        # `set_global_checksums`, which re-stamps `output_dir`.
+        def tracks_output_dir?(output_dir : String) : Bool
+          return false unless @enabled && @loaded
+          key = Cache.output_dir_key(output_dir)
+          !key.empty? && @metadata.output_dir == key
+        end
+
+        # Write-ahead invalidation: the file on disk stops describing the
+        # output directory the moment a build starts rewriting it, and only a
+        # successful Finalize `save` (forced by the dirty flag) vouches for it
+        # again. A build that dies mid-render otherwise leaves the previous
+        # build's hashes next to half-rewritten pages, and reverting the edit
+        # that broke it makes every hash match again — a warm build then
+        # trusts output it never produced.
+        def invalidate_on_disk : Nil
+          return unless @enabled
+          File.delete?(@cache_path)
+          @dirty = true
+        rescue File::Error
+          @dirty = true
+        end
+
+        # A build WITHOUT `--cache` rewrites `output_dir` and never touches the
+        # cache file, which keeps describing the tree as it was: the next
+        # `--cache` build then keeps the new output (drafts, minified or
+        # other-base-url pages) and skips every page whose hashes still match.
+        # Drop the file when it describes this output directory; a cache for
+        # another one is none of this build's business.
+        def self.discard_if_tracking(output_dir : String, cache_path : String = CACHE_FILE) : Nil
+          return unless File.file?(cache_path)
+          key = output_dir_key(output_dir)
+          return if key.empty?
+          File.delete(cache_path) if CacheData.from_json(File.read(cache_path)).metadata.output_dir == key
+        rescue JSON::ParseException | JSON::SerializableError | File::Error | IO::Error
+          # Unreadable or legacy: tracks_output_dir? is already false for it.
         end
 
         # Has the global page set (content page metadata that listings render —
@@ -247,10 +485,8 @@ module Hwaro
           if @metadata.page_set_hash != page_set || @metadata.section_set_hash != section_set
             @dirty = true
           end
-          previous_output_dir = @metadata.output_dir
-          @metadata = CacheMetadata.new(template_hash: @metadata.template_hash, config_hash: @metadata.config_hash,
-            page_set_hash: page_set, section_set_hash: section_set)
-          @metadata.output_dir = previous_output_dir
+          @metadata.page_set_hash = page_set
+          @metadata.section_set_hash = section_set
         end
 
         # Check if a file has changed since last build.
@@ -259,7 +495,7 @@ module Hwaro
         # `extra_outputs` are secondary sibling output files (see `[outputs]`)
         # that must also still exist on disk — a manually deleted `index.json`
         # forces a rebuild just like a deleted `index.html` does.
-        def changed?(file_path : String, output_path : String = "", cascade_hash : String = "", template_hash : String? = nil, extra_outputs : Array(String) = [] of String, assets_hash : String = "") : Bool
+        def changed?(file_path : String, output_path : String = "", cascade_hash : String = "", template_hash : String? = nil, extra_outputs : Array(String) = [] of String, assets_hash : String = "", git_hash : String = "", relations_hash : String = "") : Bool
           return true unless @enabled
           return true unless File.exists?(file_path)
 
@@ -280,6 +516,14 @@ module Hwaro
 
           return true if extra_outputs.any? { |p| !File.exists?(p) }
 
+          # Alias redirect stubs and `/page/N/` pagination pages are written
+          # only by this page's render, so a deleted one (`rm -rf
+          # public/posts/page/2`, a deploy step that cleaned `old/`) never came
+          # back: every warm build saw the page itself as up to date. Only
+          # files the render actually wrote are recorded, so a path missing
+          # here was removed by someone else.
+          return true if entry.derived_paths.any? { |p| !File.exists?(p) }
+
           # A parent section's [cascade] changed what this page inherits —
           # the source file is unchanged but the rendered output isn't.
           return true if entry.cascade_hash != cascade_hash
@@ -290,6 +534,16 @@ module Hwaro
           # once after upgrading (same handling as cascade_hash).
           return true if entry.assets_hash != assets_hash
 
+          # The file's git history moved (a new commit touched it) — with
+          # `[git]` enabled the page's lastmod/commit fields render differently
+          # though the source bytes are byte-for-byte the same.
+          return true if entry.git_hash != git_hash
+
+          # A page this one renders something of (a neighbour's title, a
+          # translation, an `@/` link target's URL) changed — see
+          # CacheEntry#relations_hash.
+          return true if entry.relations_hash != relations_hash
+
           # A template in this page's dependency closure changed.
           if template_hash && entry.template_hash != template_hash
             return true
@@ -297,8 +551,10 @@ module Hwaro
 
           # Fast path: check modification time first
           begin
-            current_mtime = File.info(file_path).modification_time.to_unix_ms
-            if current_mtime != entry.mtime
+            now = Time.utc.to_unix_ms
+            info = File.info(file_path)
+            current_mtime = info.modification_time.to_unix_ms
+            if current_mtime != entry.mtime || (entry.size >= 0 && info.size != entry.size)
               # mtime changed — verify with content hash to catch false positives
               # (e.g. file touched but content identical)
               current_hash = compute_file_hash(file_path)
@@ -311,7 +567,8 @@ module Hwaro
               # back keeps every other field intact without a hand-maintained
               # field-by-field reconstruction.
               refreshed = entry
-              refreshed.mtime = current_mtime
+              refreshed.mtime = Cache.stable_mtime?(current_mtime, now) ? current_mtime : UNSTABLE_MTIME
+              refreshed.size = info.size.to_i64
               @mutex.synchronize do
                 @entries[file_path] = refreshed
                 @dirty = true
@@ -326,12 +583,6 @@ module Hwaro
           false
         end
 
-        # Check multiple files for changes (returns changed files)
-        def filter_changed(files : Array(String)) : Array(String)
-          return files unless @enabled
-          files.select { |f| changed?(f) }
-        end
-
         # Secondary output files (beyond the primary HTML output) recorded for
         # `file_path` on the last build, or `[]` when the entry has none (or
         # doesn't exist). Used to detect a manually deleted sibling format
@@ -341,37 +592,123 @@ module Hwaro
           @mutex.synchronize { @entries[file_path]?.try(&.output_paths) || [] of String }
         end
 
+        # Files this page wrote BESIDES its own output on the last build — its
+        # `aliases` redirect stubs and a section's `/page/N/` pagination pages
+        # (see `CacheEntry#derived_paths`). They are produced only by a render,
+        # so a caller that needs to know whether something else has since
+        # overwritten one has to ask for them by name.
+        def derived_paths_for(file_path : String) : Array(String)
+          @mutex.synchronize { @entries[file_path]?.try(&.derived_paths) || [] of String }
+        end
+
+        # The source-less generated outputs the LAST build recorded, and the
+        # setter the current build's Finalize phase persists through. Paths are
+        # stored relative to the output directory; callers rejoin them.
+        def previous_generated_outputs : Array(String)
+          @mutex.synchronize { @metadata.generated_outputs.dup }
+        end
+
+        def record_generated_outputs(paths : Array(String)) : Nil
+          return unless @enabled
+          @mutex.synchronize do
+            next if @metadata.generated_outputs == paths
+            @metadata.generated_outputs = paths
+            @dirty = true
+          end
+        end
+
+        # Output files recorded by an entry this build then replaced — see
+        # `@orphaned_outputs`. Drained: a second call returns nothing.
+        def take_orphaned_outputs : Array(String)
+          @mutex.synchronize do
+            taken = @orphaned_outputs
+            @orphaned_outputs = [] of String
+            taken
+          end
+        end
+
+        # Drop every entry whose source path is NOT in `live_paths` and return
+        # the output files those entries recorded.
+        #
+        # A `--cache` build keeps the output directory between runs (a cold
+        # build wipes it), and nothing else notices that a page went away: the
+        # render phase only walks pages that still exist. So `rm
+        # content/posts/old.md && hwaro build --cache` left /posts/old/ in
+        # `public/` — still served, still deployed — and the same held for a
+        # renamed source, a post flipped to `draft`, one that passed its
+        # `expires` date, and `render = false`. Each entry knows the primary
+        # file it wrote plus its `[outputs]` siblings, so the entries no live
+        # page claims name exactly the files to remove.
+        #
+        # Callers filter the result against the outputs the CURRENT site
+        # claims before deleting: a source renamed onto the same output URL
+        # (foo.md -> foo/index.md) leaves an orphan entry pointing at a file
+        # this very build rewrote.
+        def prune_entries_not_in(live_paths : Set(String)) : Array(String)
+          stale = [] of String
+          return stale unless @enabled
+          @mutex.synchronize do
+            @entries.reject! do |path, entry|
+              next false if live_paths.includes?(path)
+              stale << entry.output_path unless entry.output_path.empty?
+              stale.concat(entry.output_paths)
+              stale.concat(entry.derived_paths)
+              @dirty = true
+              true
+            end
+          end
+          stale
+        end
+
         # Update cache entry for a file.
         # `template_hash` is the page's template closure fingerprint; nil
         # stores the global templates checksum (non-page entries).
         # `output_paths` are the secondary sibling output files this page
         # emitted (see `[outputs]`); empty when the feature isn't in use.
+        # `source_read` is the page's Page#source_read: the entry then
+        # describes the bytes the render read, not whatever the file holds by
+        # now (#859). A racy read stores its own digest; a file whose stamp
+        # moved since the read stores a hash that never matches, so the next
+        # build re-renders it.
         # Thread-safe: protected by mutex for concurrent parallel builds.
-        def update(file_path : String, output_path : String = "", cascade_hash : String = "", template_hash : String? = nil, output_paths : Array(String) = [] of String, assets_hash : String = "")
+        def update(file_path : String, output_path : String = "", cascade_hash : String = "", template_hash : String? = nil, output_paths : Array(String) = [] of String, assets_hash : String = "", git_hash : String = "", derived_paths : Array(String) = [] of String, relations_hash : String = "", source_read : {Int64, Int64, String?}? = nil)
           return unless @enabled
           return unless File.exists?(file_path)
 
           effective_template_hash = template_hash || @current_template_hash
 
           begin
-            mtime = File.info(file_path).modification_time.to_unix_ms
+            now = Time.utc.to_unix_ms
+            info = File.info(file_path)
+            mtime = info.modification_time.to_unix_ms
+            size = info.size.to_i64
+            read_digest = source_read.try(&.[2])
+            edited_since_read = source_read && read_digest.nil? && {source_read[0], source_read[1]} != {mtime, size}
 
             # Fast path: skip update if entry is unchanged (protected by mutex)
             @mutex.synchronize do
               existing = @entries[file_path]?
-              if existing && existing.mtime == mtime && existing.output_path == output_path &&
+              if existing && !edited_since_read && existing.mtime == mtime && existing.size == size && existing.output_path == output_path &&
                  existing.cascade_hash == cascade_hash && existing.template_hash == effective_template_hash &&
-                 existing.output_paths == output_paths && existing.assets_hash == assets_hash
+                 existing.output_paths == output_paths && existing.assets_hash == assets_hash &&
+                 existing.git_hash == git_hash && existing.derived_paths == derived_paths &&
+                 existing.relations_hash == relations_hash
                 return
               end
             end
 
             # Compute hash outside the lock to minimize contention
-            content_hash = compute_file_hash(file_path)
+            content_hash = if edited_since_read
+                             ""
+                           else
+                             read_digest || compute_file_hash(file_path)
+                           end
+            stable = Cache.stable_mtime?(mtime, now) && read_digest.nil? && !edited_since_read
 
             entry = CacheEntry.new(
               path: file_path,
-              mtime: mtime,
+              mtime: stable ? mtime : UNSTABLE_MTIME,
+              size: size,
               hash: content_hash,
               output_path: output_path,
               template_hash: effective_template_hash,
@@ -379,12 +716,24 @@ module Hwaro
               cascade_hash: cascade_hash,
               output_paths: output_paths,
               assets_hash: assets_hash,
+              git_hash: git_hash,
+              derived_paths: derived_paths,
+              relations_hash: relations_hash,
             )
 
             @mutex.synchronize do
               # Re-check under lock: another fiber may have written a newer entry
               current = @entries[file_path]?
               if current.nil? || current.mtime <= mtime
+                if previous = current
+                  fresh = output_paths.dup.concat(derived_paths) << output_path
+                  (previous.output_paths + previous.derived_paths).each do |old_path|
+                    @orphaned_outputs << old_path unless old_path.empty? || fresh.includes?(old_path)
+                  end
+                  unless previous.output_path.empty? || fresh.includes?(previous.output_path)
+                    @orphaned_outputs << previous.output_path
+                  end
+                end
                 @entries[file_path] = entry
                 @dirty = true
               end
@@ -404,11 +753,51 @@ module Hwaro
         # Clear all cache entries
         def clear
           @mutex.synchronize do
-            @entries.clear
+            produced = @metadata.generated_outputs
+            discard_entries_recording_outputs
             @metadata = CacheMetadata.new
+            # Not part of the cache's VALIDITY — a record of what is sitting in
+            # the output directory, which `--full` does not empty when
+            # `--cache` keeps it. Dropping it here would let a `--full --cache`
+            # build lose track of the taxonomy pages the last build wrote.
+            @metadata.generated_outputs = produced
             @dirty = true
           end
           File.delete(@cache_path) if File.exists?(@cache_path)
+        end
+
+        # Drop every entry, remembering the files they recorded so the Finalize
+        # phase can still tell what the last build produced.
+        #
+        # A config/template/output-dir change (and `--full`) invalidates the
+        # whole cache, and with the entries went the only record of what was
+        # written last time: after `per_page = 2` became `3`, the `/page/N/`
+        # file the section no longer fills stayed published. The build re-adds
+        # an entry for everything it still produces, and Finalize filters this
+        # list against those, so only the genuinely-gone files are deleted.
+        # Caller holds @mutex.
+        private def discard_entries_recording_outputs : Nil
+          @entries.each_value do |entry|
+            @orphaned_outputs << entry.output_path unless entry.output_path.empty?
+            @orphaned_outputs.concat(entry.output_paths)
+            @orphaned_outputs.concat(entry.derived_paths)
+          end
+          @entries.clear
+        end
+
+        # Every output file the entries that SURVIVED this build record. The
+        # Finalize phase subtracts it from the stale list: a path harvested
+        # from a discarded entry and then written again is not stale at all.
+        def current_output_files : Set(String)
+          files = Set(String).new
+          @mutex.synchronize do
+            @entries.each_value do |entry|
+              files << entry.output_path unless entry.output_path.empty?
+              entry.output_paths.each { |path| files << path }
+              entry.derived_paths.each { |path| files << path }
+            end
+          end
+          files
         end
 
         # Save cache to disk using atomic write (temp file + rename)
@@ -417,6 +806,13 @@ module Hwaro
         # otherwise re-serializes every entry just to write identical bytes.
         def save
           return unless @enabled
+          @mutex.synchronize do
+            racy_copies = @racy_copies.to_a.sort!
+            if racy_copies != @metadata.racy_copies
+              @metadata.racy_copies = racy_copies
+              @dirty = true
+            end
+          end
           return unless @dirty
           # Per-process temp name: a shared `.tmp` lets two hwaro processes in
           # the same project (the common `hwaro serve` + `hwaro build` pair)
@@ -436,6 +832,9 @@ module Hwaro
               stamped.generator_version = Hwaro::VERSION
               CacheData.new(metadata: stamped, entries: @entries.values)
             end
+            # SERVE_CACHE_FILE lives under `.hwaro/`, which may not exist yet.
+            parent = File.dirname(@cache_path)
+            Utils::FileSafe.mkdir_p(parent) unless Dir.exists?(parent)
             File.write(tmp_path, data.to_json)
             File.rename(tmp_path, @cache_path)
             @dirty = false
@@ -443,6 +842,25 @@ module Hwaro
             Logger.warn "Cache: failed to save cache file: #{ex.message}"
             # Clean up temp file if rename failed
             File.delete(tmp_path) if File.exists?(tmp_path)
+          end
+        end
+
+        # May a copy whose size and mtime equal its source's skip the byte
+        # compare? Not while the source mtime is racy (#857), nor on the
+        # first check after a copy was made inside that window (#859): the
+        # copy carries the source mtime, so a same-size rewrite in that tick
+        # matches it exactly. That check takes `dest` off the list, since the
+        # caller then compares the bytes or copies again.
+        def copy_stamp_trusted?(dest : String, src_mtime_ms : Int64, now_ms : Int64) : Bool
+          racy = !Cache.stable_mtime?(src_mtime_ms, now_ms)
+          return !racy unless @enabled
+          @mutex.synchronize do
+            if racy
+              @racy_copies << dest
+              false
+            else
+              !@racy_copies.delete(dest)
+            end
           end
         end
 
@@ -465,7 +883,9 @@ module Hwaro
             # Try loading new format with metadata
             data = CacheData.from_json(content)
             @metadata = data.metadata
+            @racy_copies = @metadata.racy_copies.to_set
             data.entries.each { |e| @entries[e.path] = e }
+            @loaded = true
           rescue JSON::ParseException | JSON::SerializableError
             # Fall back to legacy format (plain array of entries); mark dirty
             # so the next save upgrades the file to the metadata format even
@@ -488,12 +908,23 @@ module Hwaro
           # renderer fixes reach incrementally-built sites (see
           # CacheMetadata#generator_version).
           if @metadata.generator_version != Hwaro::VERSION
-            unless @entries.empty?
-              Logger.info "  Cache: hwaro version changed — invalidating all entries."
-              @entries.clear
+            @mutex.synchronize do
+              unless @entries.empty?
+                Logger.info "  Cache: hwaro version changed — invalidating all entries."
+              end
+              # Invalidate the render fingerprints, but keep the previous
+              # output claims so Finalize can remove files that this build no
+              # longer produces. `output_dir` must remain too: the next
+              # `set_global_checksums` compares it with the requested target
+              # and drops relative claims when the build switches directories.
+              previous_generated_outputs = @metadata.generated_outputs
+              previous_output_dir = @metadata.output_dir
+              discard_entries_recording_outputs
+              @metadata = CacheMetadata.new
+              @metadata.generated_outputs = previous_generated_outputs
+              @metadata.output_dir = previous_output_dir
+              @dirty = true
             end
-            @metadata = CacheMetadata.new
-            @dirty = true
           end
         end
 
@@ -517,17 +948,9 @@ module Hwaro
           @enabled
         end
 
-        # Compute MD5 checksum of a file's content (streaming to avoid
-        # loading large files entirely into memory)
+        # MD5 checksum of a file's content (streamed by Digest#file)
         def compute_file_hash(file_path : String) : String
-          digest = Digest::MD5.new
-          buffer = Bytes.new(8192)
-          File.open(file_path, "r") do |io|
-            while (bytes_read = io.read(buffer)) > 0
-              digest.update(buffer[0, bytes_read])
-            end
-          end
-          digest.final.hexstring
+          Digest::MD5.new.file(file_path).final.hexstring
         end
 
         # Compute a combined checksum for a set of template files.
@@ -552,19 +975,10 @@ module Hwaro
           expanded = File.expand_path(output_dir)
           # expand_path preserves a trailing separator; `public/` and `public`
           # are the same directory and must produce the same key.
-          expanded = expanded.rstrip(File::SEPARATOR) unless expanded == File::SEPARATOR_STRING
+          expanded = Utils::PathUtils.chomp_separator(expanded)
           root = File.expand_path(Dir.current)
-          return expanded unless expanded.starts_with?(root + File::SEPARATOR)
-          expanded[(root.size + 1)..]
-        end
-
-        # Compute a checksum for the config file
-        def self.compute_config_hash(config_path : String = "config.toml") : String
-          if File.exists?(config_path)
-            Digest::MD5.hexdigest(File.read(config_path))
-          else
-            ""
-          end
+          relative = Utils::PathUtils.relative_path(expanded, root)
+          relative && !relative.empty? ? relative : expanded
         end
 
         # Fingerprint the CLI options that change what a page RENDERS TO.

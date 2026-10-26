@@ -5,6 +5,37 @@ module Hwaro
     module PathUtils
       extend self
 
+      # `path` without trailing separators, unless it is a filesystem root:
+      # `/`, and on Windows `C:/`, which stripped to `C:` would name that
+      # drive's current directory instead of its root.
+      def chomp_separator(path : String) : String
+        return path if path == File::SEPARATOR_STRING
+        {% if flag?(:windows) %}
+          return path if path.matches?(/\A[A-Za-z]:\/+\z/)
+        {% end %}
+        path.rstrip(File::SEPARATOR)
+      end
+
+      # True when the normalized relative *path* climbs out of its base: its
+      # first segment is exactly `..`. A string-prefix test also matched
+      # legal names such as `..public`.
+      def escapes_parent?(path : String) : Bool
+        Path[path].normalize.parts.first? == ".."
+      end
+
+      # `Path#absolute?`, plus a rooted path (`/x`, `\x`) on Windows. The
+      # stdlib calls those drive-relative, but they never name something
+      # under the current directory: `File.join(root, "/x")` would quietly
+      # nest what the user meant as `C:\x`, and a "no absolute paths" check
+      # would let `/etc/x` through.
+      def absolute?(path : String) : Bool
+        {% if flag?(:windows) %}
+          Path[path].absolute? || path.starts_with?('/') || path.starts_with?('\\')
+        {% else %}
+          Path[path].absolute?
+        {% end %}
+      end
+
       # Sanitize path to prevent directory traversal and normalize separators
       #
       # This method performs the following operations:
@@ -108,6 +139,7 @@ module Hwaro
         end
 
         decoded_parts = [] of String
+        names = [] of String
         separator_refused = false
 
         path.split('/').each do |raw|
@@ -133,12 +165,18 @@ module Hwaro
           end
 
           decoded_parts << decoded
+          # The NAME is decoded once, as a web server decodes a request path:
+          # a page named `a%2520b.md` is requested as `/a%2520b/`, which
+          # reaches the file `a%20b`, never the fully decoded `a b` this
+          # used to write. The full decode above stays the refusal judge.
+          names << (raw.includes?('%') ? URI.decode(raw).gsub("\u0000", "").scrub : decoded)
         end
 
         # The dots-and-spaces predicate stays in ONE place for both paths —
         # see the note above about hand-copied policies drifting.
-        segments, dots_refused = collect_safe_segments(decoded_parts)
-        {segments, separator_refused || dots_refused}
+        _, dots_refused = collect_safe_segments(decoded_parts)
+        segments, name_refused = collect_safe_segments(names)
+        {segments, separator_refused || dots_refused || name_refused}
       end
 
       private def collect_safe_segments(parts : Array(String)) : {Array(String), Bool}
@@ -153,6 +191,47 @@ module Hwaro
           segments << segment
         end
         {segments, refused}
+      end
+
+      # A URL scheme prefix (`https:`, `mailto:`, …) on an alias.
+      ALIAS_SCHEME_RE = /\A[a-z][a-z0-9+.\-]*:/i
+
+      # An alias names an incoming path ON THIS SITE, so one carrying a URL
+      # scheme or an authority (`//host/path`) is not something a build can
+      # publish. The single predicate the build's alias filter
+      # (Phases::ParseContent) and the tools that mirror it (`tool export`,
+      # `tool platform`) share.
+      def external_alias?(value : String) : Bool
+        # `.scrub` before the regex: PCRE2 runs in UTF mode and raises on an
+        # invalid-UTF-8 subject, which a latin-1 byte in a hand-edited front
+        # matter file would produce — one bad alias must not abort the build.
+        trimmed = value.strip
+        trimmed.starts_with?("//") || ALIAS_SCHEME_RE.matches?(trimmed.scrub)
+      end
+
+      # Why the parse phase drops `value` from a page's aliases, or nil.
+      # Besides external URLs: a `?query` or `#fragment` is not part of the
+      # path a static host maps to a file, so `/old/a?x=1` became the
+      # directory `public/old/a?x=1/` — unreachable on every host, and an
+      # illegal filename on Windows.
+      def unpublishable_alias(value : String) : String?
+        if external_alias?(value)
+          "an alias is a path on this site, not an absolute or protocol-relative URL"
+        elsif value.includes?('?') || value.includes?('#')
+          "a `?query` or `#fragment` is not part of a path a static host serves (drop it)"
+        end
+      end
+
+      # Why a build would not publish `value` as an alias, or nil when it
+      # would: external URLs are dropped at parse time, and a path segment
+      # that would traverse (`..`, `.`) is refused when the redirect stub is
+      # written (`url_output_path` in the render phase).
+      def alias_refusal(value : String) : String?
+        if reason = unpublishable_alias(value)
+          return reason
+        end
+        _, refused = split_safe_segments(value.lchop("/"))
+        "a path segment would escape the output directory" if refused
       end
 
       # The output FILE a site-relative URL will be written to, normalized so
@@ -171,6 +250,15 @@ module Hwaro
         segments.join("/")
       end
 
+      # NFC form of `value` (the identity for ASCII, which is nearly every
+      # path). Config patterns are typed precomposed while macOS, zip and
+      # Dropbox hand out decomposed (NFD) file names, so every
+      # pattern-versus-path comparison folds both sides first. Comparison
+      # only: never use it to spell an output path or URL.
+      def nfc(value : String) : String
+        value.ascii_only? ? value : value.unicode_normalize(:nfc)
+      end
+
       # Case- and Unicode-folded form of an `output_file_key`. APFS/HFS+ and
       # NTFS treat `Foo/index.html` and `foo/index.html` as the same file, and
       # APFS additionally folds the NFD and NFC spellings of one accented name
@@ -179,8 +267,7 @@ module Hwaro
       def output_fold_key(key : String) : String
         # NFC is the identity for ASCII, which is nearly every URL, and this
         # runs once per page per build.
-        return key.downcase if key.ascii_only?
-        key.unicode_normalize(:nfc).downcase
+        nfc(key).downcase
       end
 
       # Does the filesystem that `reference` lives on fold letter case in file
@@ -236,7 +323,71 @@ module Hwaro
         rescue File::Error
           return false
         end
-        real_path == real_root || real_path.starts_with?(real_root + File::SEPARATOR)
+        within?(real_path, real_root)
+      end
+
+      # True when `path` is `root` or lies under it. Both must already be in
+      # comparable (expanded or resolved) form. A root that already ends in a
+      # separator — the filesystem root "/" — is not given a second one.
+      def within?(path : String, root : String) : Bool
+        path = comparable_path(path)
+        root = comparable_path(root)
+        return true if path == root
+        path.starts_with?(root.ends_with?(File::SEPARATOR) ? root : root + File::SEPARATOR)
+      end
+
+      # Return a slash-separated path relative to `root`, or nil when it is
+      # outside. This uses the same Windows extended-path normalization as
+      # `within?`, so callers do not slice using the original prefix length.
+      def relative_path(path : String, root : String) : String?
+        path = comparable_path(path)
+        root = chomp_separator(comparable_path(root))
+        return "" if path == root
+
+        prefix = root.ends_with?(File::SEPARATOR) ? root : root + File::SEPARATOR
+        return unless path.starts_with?(prefix)
+        path[prefix.size..]
+      end
+
+      private def comparable_path(path : String) : String
+        {% if flag?(:windows) %}
+          return path unless path.includes?('\\')
+          path = if path.starts_with?("\\\\?\\UNC\\")
+                   "//" + path[8..]
+                 elsif path.starts_with?("\\\\?\\")
+                   path[4..]
+                 else
+                   path
+                 end
+          path.tr("\\", "/")
+        {% else %}
+          path
+        {% end %}
+      end
+
+      # `path` with exactly one leading slash, for joining onto a base URL
+      # that has none (`base_url`). The idiom used to be spelled
+      # inline at every URL-building site.
+      def root_relative(path : String) : String
+        path.starts_with?("/") ? path : "/#{path}"
+      end
+
+      # The project root for a content directory argument: `content` or
+      # `<root>/content` → its parent, a directory that itself holds a
+      # `content/` (or sits beside one) → itself, anything else → itself.
+      # Lets `tool check-links` / `tool unused-assets` run with `-c content`,
+      # `-c .` or from inside a subdirectory and still find config.toml.
+      def find_project_root(content_dir : String) : String
+        if File.basename(content_dir) == "content"
+          parent = File.dirname(content_dir)
+          return parent.empty? || parent == "." ? "." : parent
+        end
+
+        if Dir.exists?(File.join(content_dir, "content")) || Dir.exists?(File.join(content_dir, "../content"))
+          return content_dir
+        end
+
+        content_dir
       end
 
       # `path` with every symlink resolved, including when it does not exist
@@ -270,13 +421,68 @@ module Hwaro
         path
       end
 
+      # `path` with glob metacharacters escaped, so a content-derived
+      # directory can prefix a glob pattern
+      # (`Dir.glob(File.join(glob_escape(dir), "**", "*"))`) and match
+      # literally: unescaped, `posts/[WIP] Hello` or `a{b,c}` matched nothing.
+      #
+      # POSIX: backslash escapes. Windows has no escape character (`\` is a
+      # separator there), so `*`, `?` and `[` become one-character classes
+      # (`[[]`); braces cannot be escaped at all (brace expansion only honours
+      # `\`), so a `{a,b}` directory still matches nothing there.
+      def glob_escape(path : String) : String
+        {% if flag?(:win32) %}
+          return path unless path.each_char.any?(&.in?('*', '?', '['))
+          path.gsub(/[*?\[]/) { |char| "[#{char}]" }
+        {% else %}
+          return path unless path.each_char.any?(&.in?('*', '?', '[', ']', '{', '}', ',', '\\'))
+          path.gsub(/[*?\[\]{},\\]/) { |char| "\\#{char}" }
+        {% end %}
+      end
+
       # File.match? that treats a malformed glob as non-matching instead of
       # raising File::BadPatternError, so a single config typo can't crash a
       # build or deploy.
       def glob_match?(pattern : String, path : String) : Bool
-        File.match?(pattern, path)
+        File.match?(nfc(pattern), nfc(path))
       rescue File::BadPatternError
         false
+      end
+
+      # Collision key for an alias target: one spelling per published path.
+      #
+      # `/foo`, `/foo/`, `/foo/index.html` and `/foo/index.htm` all name the
+      # same file on disk, so they must collapse to ONE key or alias collision
+      # detection cannot see the conflict. `aliases = ["/index.html"]` kept
+      # its own key, never collided with the homepage's `/`, and its redirect
+      # stub was written straight over `public/index.html` — silently, and
+      # order-dependently under the parallel render. Shared by the render
+      # phase and platform redirect generation so the two never drift.
+      def normalize_alias_url(alias_path : String) : String
+        norm = alias_path.starts_with?("/") ? alias_path : "/#{alias_path}"
+        {"index.html", "index.htm"}.each do |leaf|
+          if norm == "/#{leaf}"
+            return "/"
+          elsif norm.ends_with?("/#{leaf}")
+            return norm[0, norm.size - leaf.size]
+          end
+        end
+        return norm if norm.ends_with?("/") || norm.ends_with?(".html") || norm.ends_with?(".htm")
+        "#{norm}/"
+      end
+
+      # The language code an extension-less content filename carries
+      # (`about.ko` → "ko", `_index.zh-tw` → "zh-tw"): the non-empty text
+      # after the last dot, provided a non-empty base name precedes it
+      # (".ko" is not a translation) and the block accepts the code. Callers
+      # pass the site's DECLARED codes (plus the default) — never a shape
+      # check, which read `setup.mac.md` as a translation. Shared by the
+      # build's ReadContent and the tools that must route files the same way.
+      def language_suffix(stem : String, & : String -> Bool) : String?
+        idx = stem.rindex('.')
+        return unless idx && idx > 0
+        code = stem[(idx + 1)..]
+        code if !code.empty? && yield(code)
       end
     end
   end

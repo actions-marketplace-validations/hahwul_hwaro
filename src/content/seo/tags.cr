@@ -10,6 +10,10 @@ module Hwaro
       module Tags
         extend self
 
+        # Emitted after the canonical link for older docs versions when
+        # `[versions] noindex_old` is on (the default).
+        NOINDEX_TAG = %(<meta name="robots" content="noindex">)
+
         # Compute the canonical URL for a page (absolute URL with base_url).
         # `url_override` (the paginator's page-aware URL) self-canonicalizes
         # paginated pages instead of collapsing them onto page 1.
@@ -23,9 +27,9 @@ module Hwaro
           # non-ASCII path (e.g. a Unicode taxonomy term) canonicalizes to
           # the exact same RFC 3986 URL those XML surfaces advertise.
           raw = if u = url_override
-                  "#{config.base_url_stripped}#{u.starts_with?("/") ? u : "/#{u}"}"
+                  "#{config.base_url}#{Utils::PathUtils.root_relative(u)}"
                 else
-                  page.permalink || "#{config.base_url_stripped}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+                  page.permalink || "#{config.base_url}#{Utils::PathUtils.root_relative(page.url)}"
                 end
           Utils::TextUtils.encode_url_path(raw)
         end
@@ -41,12 +45,12 @@ module Hwaro
           return "" unless config.multilingual?
           return "" if page.translations.empty?
 
-          base = config.base_url_stripped
+          base = config.base_url
 
           String.build(page.translations.size * 80) do |str|
             # Add current page. URLs are percent-encoded to match the
             # sitemap's xhtml:link alternates for the same pages.
-            current_url = page.permalink || "#{base}#{page.url.starts_with?("/") ? page.url : "/#{page.url}"}"
+            current_url = page.permalink || "#{base}#{Utils::PathUtils.root_relative(page.url)}"
             current_url = Utils::TextUtils.encode_url_path(current_url)
             lang_code = page.language || config.default_language
             str << %(<link rel="alternate" hreflang="#{HTML.escape(lang_code)}" href="#{HTML.escape(current_url)}">)
@@ -57,7 +61,7 @@ module Hwaro
               abs_url = if Processors::InternalLinkResolver.has_own_origin?(t.url)
                           t.url
                         else
-                          "#{base}#{t.url.starts_with?("/") ? t.url : "/#{t.url}"}"
+                          "#{base}#{Utils::PathUtils.root_relative(t.url)}"
                         end
               abs_url = Utils::TextUtils.encode_url_path(abs_url)
               str << '\n'

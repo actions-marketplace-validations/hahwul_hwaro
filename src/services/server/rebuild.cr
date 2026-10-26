@@ -1,0 +1,335 @@
+# Dev server — applying a ChangeSet (incremental/full rebuilds, static and content-file sync).
+#
+# Split out of server.cr, which keeps the require order, the Server ivars
+# and the boot sequence. Parts only define or reopen types: no requires, no
+# load-time statements (scripts/check_no_toplevel_effects.sh).
+module Hwaro
+  module Services
+    class Server
+      # Choose the cheapest rebuild strategy for a given ChangeSet and execute it.
+      private def apply_changeset(changeset : ChangeSet, build_options : Config::Options::BuildOptions)
+        output_dir = sanitize_output_dir(build_options.output_dir)
+        strategy = effective_strategy(changeset, output_dir)
+        # Recreate a vanished output root before anything writes into it.
+        Hwaro::Utils::FileSafe.mkdir_p(output_dir) unless Dir.exists?(output_dir)
+        # Calm watch timeline: one "↻ <what> · time" event at column 0 (the ↻
+        # glyph carries "changed"), then the rebuild's own spark "rebuilt …"
+        # outcome line below it. The strategy is implied by that outcome
+        # (incremental N/M, re-render, full).
+        timestamp = Time.local.to_s("%H:%M:%S")
+        if Logger.color_enabled?
+          Logger.info "\n#{Logger.glyph(:watch)} #{changeset.display}" \
+                      "#{Logger.paint(" · ", Logger::Role::Dim)}#{Logger.paint(timestamp, Logger::Role::Dim)}"
+        else
+          Logger.info "\n~ #{timestamp}  changed  #{changeset.display}"
+        end
+
+        # Resolve removed sources to their output files BEFORE the rebuild
+        # swaps in a site that no longer knows the deleted page's URL.
+        stale_outputs = if changeset.removed_files.empty?
+                          [] of String
+                        else
+                          @builder.stale_outputs_for_removed(changeset.removed_files, output_dir)
+                        end
+
+        success = case strategy
+                  when :full
+                    run_full_build(build_options)
+                  when :templates
+                    @builder.run_rerender(build_options)
+                  when :incremental
+                    @builder.run_incremental(changeset.modified_content, build_options)
+                  when :content_and_template
+                    @builder.run_incremental_then_rerender(changeset.modified_content, build_options)
+                  when :static
+                    copy_static(changeset, build_options)
+                  when :content_files
+                    copy_content_files(changeset, build_options)
+                  else
+                    true
+                  end
+
+        # A build can fail WITHOUT raising: pre-hook failures and phase
+        # aborts (non-classified exceptions become HookResult::Abort) return
+        # false. Treat that exactly like the rescue path in the caller —
+        # flag it so the next changeset escalates to a full rebuild, push
+        # the overlay, and skip the reload so the browser doesn't refresh
+        # onto a half-built site with no visible error.
+        unless success
+          @rebuild_failed = true
+          push_build_error("Build failed — check the terminal for details.")
+          return
+        end
+
+        # Clear the failure escalation HERE, where success is actually known.
+        # The watch loop must not reset it — apply_changeset returns normally
+        # after a Bool-failure build too (see the `unless success` guard).
+        @rebuild_failed = false
+
+        # A config edit rebuilt the site with the new values, but [serve.*]
+        # keys were consumed at startup — warn instead of silently looking
+        # like they applied.
+        warn_restart_only_serve_settings if changeset.config_changed
+
+        # Copy static files if they changed alongside content/template changes
+        if strategy != :static && strategy != :full && !changeset.modified_static.empty?
+          unless copy_static(changeset, build_options)
+            @rebuild_failed = true
+            push_build_error("Build failed — check the terminal for details.")
+            return
+          end
+        end
+
+        # Republish non-Markdown content assets whenever they accompany any
+        # rebuild that wasn't a full one. A full build already re-copies them
+        # via the ReadContent → Write raw-files path; for incremental,
+        # templates-only, and static-only strategies, the watcher has to do
+        # it explicitly or the served bytes stay stale (issue #530).
+        if strategy != :content_files && strategy != :full && !changeset.modified_content_files.empty?
+          unless copy_content_files(changeset, build_options)
+            @rebuild_failed = true
+            push_build_error("Build failed — check the terminal for details.")
+            return
+          end
+        end
+
+        # The stale list was mapped through the PRE-rebuild site, but a
+        # single changeset can delete one source and re-create the same URL
+        # from another (foo.md removed + foo/index.md added), or hand the
+        # path to an alias stub or a static file. The builder's prune choke
+        # point keeps anything the rebuilt output still stands on.
+        @builder.prune_unclaimed_outputs(stale_outputs, output_dir) unless stale_outputs.empty?
+
+        if strategy == :static && !@static_changed_pages && (css_paths = css_swap_paths(changeset))
+          @live_reload_handler.try(&.notify_css(css_paths))
+        else
+          @live_reload_handler.try(&.notify_reload)
+        end
+      end
+
+      # The URL paths a stylesheet-only static save changed, for an in-place
+      # swap in the browser — or nil when the save needs a full reload. Empty
+      # means "every same-origin stylesheet": Sass entries and asset bundles
+      # publish under names that don't map 1:1 from their sources.
+      protected def css_swap_paths(changeset : ChangeSet) : Array(String)?
+        return unless changeset.css_only?
+        changeset.modified_static.map do |path|
+          verbatim = path.starts_with?("static/") && path.downcase.ends_with?(".css")
+          return [] of String if !verbatim || @builder.asset_bundle_source?(path)
+          path.lchop("static")
+        end
+      end
+
+      # [serve.*] keys are consumed once at startup (headers baked into the
+      # handler chain, fast → skip flags in the frozen watch options). A
+      # config edit triggers a full rebuild that LOOKS like it applied them —
+      # say so instead of leaving the user chasing a phantom.
+      private def warn_restart_only_serve_settings
+        current = @builder.config.try(&.serve)
+        return unless current
+        unless startup = @startup_serve_config
+          # Initial build never loaded a config (it failed) — this rebuild's
+          # values become the baseline.
+          @startup_serve_config = current
+          return
+        end
+        if startup.headers != current.headers || startup.fast != current.fast
+          Logger.warn "  [serve] settings changed in config — restart `hwaro serve` to apply them."
+        end
+      end
+
+      # Returns false when an escalated re-render failed (bundle fingerprint
+      # moved and the page re-render below reported failure); true otherwise.
+      private def copy_static(changeset : ChangeSet, build_options : Config::Options::BuildOptions) : Bool
+        @static_changed_pages = false
+        output_dir = sanitize_output_dir(build_options.output_dir)
+        # Only `static/` publishes verbatim. The bucket can also carry files
+        # from a config-resolved `[assets] source_dir` (see
+        # Server#extra_watch_root?), which reach the output only by way of the
+        # bundle pipeline below — handing them to copy_changed_static would
+        # compute a `../`-relative destination and log a warning for every save.
+        static_sources = changeset.modified_static.select(&.starts_with?("static/"))
+        # True when a copy landed on a file a page renders or a generator
+        # writes (robots.txt, a feed, a taxonomy page, an alias stub): the
+        # static-only strategy re-renders nothing, so that URL would serve the
+        # static bytes for the rest of the session. Escalated below, with the
+        # bundle-fingerprint case, to a full rebuild.
+        static_shadowed_page = @builder.copy_changed_static(static_sources, output_dir, build_options.verbose)
+        # A user's own `static/.hwaro-dev` publishes like any hidden static
+        # file, so the copy above can land on top of serve's stamp. Only the
+        # full-build path re-stamps, so without this the dev dir would sit
+        # unmarked for the rest of the session — and `hwaro deploy` reads the
+        # marker by content, so the user's bytes would not stand in for it.
+        Hwaro::Utils::DevMarker.write(output_dir) unless Hwaro::Utils::DevMarker.present?(output_dir)
+        # Changed image BYTES need their resized variants/LQIP regenerated
+        # too — the resize hook only runs on full builds, so the copy above
+        # alone left variants stale for the whole serve session (A12).
+        unless build_options.skip_image_processing
+          if config = @builder.config
+            Hwaro::Content::Hooks::ImageHooks.reprocess_changed_images(static_sources, config, output_dir)
+          end
+        end
+        # SCSS sources never publish verbatim — when one changed, recompile
+        # the entries instead. A partial edit must rebuild every entry that
+        # imports it, and there is no dependency graph, so the whole tree
+        # recompiles (cheap at static-site scale). Compile errors raise and
+        # reach the watcher rescue → browser overlay. The predicate is the
+        # same one the copy paths use, so the gate can't drift.
+        bundles_changed = false
+        if (config = @builder.config) && changeset.modified_static.any? { |p| config.sass_source?(p) }
+          bundles_changed = @builder.recompile_sass(output_dir)
+        elsif changeset.modified_static.any? { |p| @builder.asset_bundle_source?(p) }
+          # Plain (non-Sass) CSS/JS bundle sources only ever rebuilt inside
+          # the full-build asset pipeline — a static-only save left the
+          # fingerprinted bundle stale for the whole serve session.
+          bundles_changed = @builder.reprocess_asset_bundles(output_dir)
+        end
+
+        # A changed fingerprint means every page referencing the bundle via
+        # `asset()` still points at the OLD hash — rebuild so the HTML on
+        # disk picks the new path up (covers the Sass path too). A full
+        # rebuild, not run_rerender: templates are byte-identical here, so
+        # the rerender's selective path would (correctly, by its own
+        # contract) re-render nothing. Correctness over cleverness — the
+        # rebuild reuses the same options the watcher's :full strategy runs.
+        if bundles_changed
+          @static_changed_pages = true
+          Logger.info "  Asset bundle fingerprints changed — rebuilding pages to update references."
+          return run_full_build(build_options)
+        end
+        # A template reads one of the files through `load_data()`: the
+        # pages printing it must re-render, which the copy alone never does.
+        if @builder.load_data_source_changed?(static_sources)
+          @static_changed_pages = true
+          Logger.info "  A file read by load_data() changed — rebuilding the pages that print it."
+          return run_full_build(build_options)
+        end
+        # A page prints this image's size (`[image_processing] dimensions`) or
+        # a `resize_image(op=…)` variant cut from it.
+        if Hwaro::Content::Hooks::ImageHooks.render_image_source_changed?(static_sources)
+          @static_changed_pages = true
+          Logger.info "  An image a page sizes or crops changed — rebuilding the pages that print it."
+          return run_full_build(build_options)
+        end
+        # The auto OG images embed the logo / background image: only a build
+        # regenerates them.
+        if @builder.og_image_asset_changed?(static_sources, build_options)
+          @static_changed_pages = true
+          Logger.info "  The OG image logo or background changed — rebuilding to regenerate the OG images."
+          return run_full_build(build_options)
+        end
+        if static_shadowed_page
+          @static_changed_pages = true
+          Logger.info "  A static file publishes where a page or generated file is written — rebuilding so the build output wins that path."
+          return run_full_build(build_options)
+        end
+        # Highlight and `[auto_includes]` asset tags carry a `?v=` digest of
+        # these very files, printed into every page that references them;
+        # the copy alone left every page on the old hash (and browsers on
+        # the cached bytes). Only the layout moved — the digest lands in the
+        # global vars — so the pages re-render without the full build's
+        # re-parse, image and OG passes: this is the most frequent theming
+        # save, and a full build made each one a multi-second wait. Only the
+        # `?v=` query moves, never a path, so a stylesheet-only save can still
+        # be swapped in place (see css_swap_paths). Checked after the
+        # full-build escalations above: returning from the re-render first
+        # left a static copy on top of a generated file (an unfingerprinted
+        # bundle) that only a full build puts back.
+        #
+        # A template's `asset_integrity()` prints a digest of an emitted file
+        # (serve emits no `[assets] sri` tags of its own); a stale value makes
+        # the browser refuse the asset. That re-render changes page bytes, so
+        # the browser reloads instead of swapping the stylesheet in place —
+        # a swapped `<link>` would keep the old `integrity`.
+        cache_bust_changed = build_options.cache_busting && @builder.cache_bust_input_changed?(changeset.modified_static)
+        if cache_bust_changed || @builder.asset_integrity_used?
+          if cache_bust_changed
+            Logger.info "  A cache-busted asset changed — re-rendering pages to update its ?v= hash."
+          else
+            Logger.info "  A static file changed and templates call asset_integrity() — re-rendering pages to update it."
+          end
+          @static_changed_pages = true if @builder.asset_integrity_used?
+          if site = @builder.site
+            return @builder.run_rerender(build_options, force_pages: (site.pages + site.sections).as(Array(Models::Page)).select(&.render))
+          end
+          @static_changed_pages = true
+          return run_full_build(build_options)
+        end
+        refresh_service_worker(output_dir, build_options)
+        true
+      end
+
+      # sw.js content-hashes the bytes of the files it precaches; a copy lane
+      # that rewrote one must refresh it or registered service workers keep
+      # serving the old bytes (their CACHE_NAME never moves).
+      private def refresh_service_worker(output_dir : String, build_options : Config::Options::BuildOptions) : Nil
+        @builder.site.try { |site| @builder.regenerate_service_worker(site, output_dir, build_options.verbose) }
+      end
+
+      # Returns false when the escalated full rebuild (a `load_data()`
+      # source changed) failed; true otherwise.
+      private def copy_content_files(changeset : ChangeSet, build_options : Config::Options::BuildOptions) : Bool
+        output_dir = sanitize_output_dir(build_options.output_dir)
+        @builder.copy_changed_content_files(changeset.modified_content_files, output_dir, build_options.verbose, build_options.minify)
+        # Mirror copy_static: modified image bytes under content/ (published
+        # via [content.files] or as page-bundle assets) must refresh their
+        # resized variants/LQIP too (A12).
+        unless build_options.skip_image_processing
+          if config = @builder.config
+            pages = @builder.site.try { |s| (s.pages + s.sections).as(Array(Models::Page)) }
+            # A withheld (draft / future / expired) bundle's image publishes no
+            # variants either — same rule as copy_changed_content_files.
+            changed = @builder.reject_withheld_content_sources(changeset.modified_content_files)
+            Hwaro::Content::Hooks::ImageHooks.reprocess_changed_images(changed, config, output_dir, pages: pages)
+          end
+        end
+        # Same as copy_static: a template reading the file via load_data().
+        if @builder.load_data_source_changed?(changeset.modified_content_files)
+          Logger.info "  A file read by load_data() changed — rebuilding the pages that print it."
+          return run_full_build(build_options)
+        end
+        if @builder.og_image_asset_changed?(changeset.modified_content_files, build_options)
+          Logger.info "  The OG image logo or background changed — rebuilding to regenerate the OG images."
+          return run_full_build(build_options)
+        end
+        if Hwaro::Content::Hooks::ImageHooks.render_image_source_changed?(changeset.modified_content_files)
+          Logger.info "  An image a page sizes or crops changed — rebuilding the pages that print it."
+          return run_full_build(build_options)
+        end
+        # Same as copy_static, and after the full-build escalations above (a
+        # full build re-renders everything anyway): `asset_integrity()` may
+        # name a page-bundle or `[content.files]` asset, whose new bytes the
+        # copy alone never shows.
+        if @builder.asset_integrity_used? && (site = @builder.site)
+          Logger.info "  A content file changed and templates call asset_integrity() — re-rendering pages to update it."
+          return @builder.run_rerender(build_options, force_pages: (site.pages + site.sections).as(Array(Models::Page)).select(&.render))
+        end
+        refresh_service_worker(output_dir, build_options)
+        true
+      end
+
+      # Run a full build — the only strategy that executes `build.hooks` —
+      # and record which config files those hooks rewrote without changing a
+      # byte. Every full-build call site goes through here; one that didn't
+      # would leave built_config_rewrite? blind to its hooks and the #760
+      # loop reachable again. A build that raises still ran its pre hooks, so
+      # the bookkeeping sits in an ensure.
+      private def run_full_build(build_options : Config::Options::BuildOptions) : Bool
+        before = config_stamps
+        begin
+          @builder.run(build_options)
+        ensure
+          note_config_rewrites(before)
+          # A config edit can move `[assets] source_dir`; the build just
+          # reloaded the config, so this is the moment the watcher learns
+          # where the bundle sources now live. (Files under a newly added root
+          # read as additions on the next poll, which costs one more full
+          # rebuild — the honest price of the root having changed.)
+          @builder.config.try do |cfg|
+            @extra_watch_roots = resolve_extra_watch_roots(cfg, sanitize_output_dir(build_options.output_dir))
+          end
+        end
+      end
+    end
+  end
+end

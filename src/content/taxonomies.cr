@@ -20,6 +20,17 @@ module Hwaro
   module Content
     class Taxonomies
       def self.generate(site : Models::Site, output_dir : String, templates : Hash(String, String), verbose : Bool = false, builder : Core::Build::Builder? = nil) : Array(Models::Section)
+        # A caller-supplied builder may have run an earlier pass into this
+        # same output directory (the serve session's builder); it removes
+        # what that pass wrote and this one no longer does. See
+        # `Builder#track_taxonomy_outputs`.
+        return generate_untracked(site, output_dir, templates, verbose, builder) unless builder
+        builder.track_taxonomy_outputs(output_dir) do
+          generate_untracked(site, output_dir, templates, verbose, builder)
+        end
+      end
+
+      private def self.generate_untracked(site : Models::Site, output_dir : String, templates : Hash(String, String), verbose : Bool, builder : Core::Build::Builder?) : Array(Models::Section)
         config = site.config
         return [] of Models::Section if config.taxonomies.empty?
 
@@ -84,8 +95,10 @@ module Hwaro
             next if lang_cfg.taxonomies.empty?
 
             # Build a filtered view of taxonomies for just this language's pages
+            # No early exit on an empty map: like the root, a configured
+            # taxonomy writes its (empty) index so `/<lang>/tags/` links
+            # never 404 on a site with no terms yet.
             lang_taxonomies = build_language_taxonomies(site, lang_cfg.taxonomies)
-            next if lang_taxonomies.empty?
 
             lang_taxonomy_configs = config.taxonomies.select { |t| lang_cfg.taxonomies.includes?(t.name) }
             generate_taxonomies_for_language(lang_taxonomy_configs, site, output_dir, templates, builder, verbose, global_vars, collected,
@@ -125,33 +138,17 @@ module Hwaro
           terms_map = if lt = lang_taxonomies
                         lt[taxonomy.name]? || {} of String => Array(Models::Page)
                       else
-                        site.taxonomies[taxonomy.name]? || {} of String => Array(Models::Page)
+                        # A page the render phase refused to write stays in
+                        # site.taxonomies (a later serve pass may hand its URL
+                        # back) but off the term pages and feeds.
+                        (site.taxonomies[taxonomy.name]? || {} of String => Array(Models::Page))
+                          .transform_values(&.reject(&.output_suppressed)).reject! { |_, pgs| pgs.empty? }
                       end
 
           base_path = "#{lang_prefix}/#{taxonomy.name}/"
           index_page = build_taxonomy_index_page(taxonomy, base_path)
           if language
             index_page.language = language
-          end
-
-          # Assign each term a UNIQUE slug shared by both the index links and
-          # the term-page file paths. Distinct terms can slugify identically
-          # (e.g. "C++"/"C#" → "c", "Hello World"/"hello-world" → "hello-world");
-          # without disambiguation the second term page overwrites the first's
-          # index.html and the index emits two links to the same URL. The same
-          # helper backs the get_taxonomy / get_taxonomy_url template functions
-          # (via build_global_vars) so their links match these written paths.
-          slug_map = Utils::TextUtils.disambiguated_slugs(terms_map.keys)
-
-          # A term too long to be a path segment is shortened (and digest-
-          # suffixed) rather than crashing the build — but that moves its
-          # published URL, so it must never be silent. This is the one place
-          # the term set is enumerated once per taxonomy per build, so the
-          # warning belongs here and not in `safe_slugify`, which runs per
-          # link.
-          terms_map.each_key do |term|
-            next unless Utils::TextUtils.slug_truncated?(term)
-            Logger.warn "Taxonomy term #{term.inspect} is too long for a path segment — its URL was shortened to /#{taxonomy.name}/#{slug_map[term]? || Utils::TextUtils.safe_slugify(term)}/. Shorten the term in the front matter of the pages that use it."
           end
 
           # Only list terms whose term pages are actually written for this
@@ -162,6 +159,31 @@ module Hwaro
                         else
                           terms_map.keys
                         end
+          # Assign each term a UNIQUE slug shared by both the index links and
+          # the term-page file paths. Distinct terms can slugify identically
+          # (e.g. "C++"/"C#" → "c", "Hello World"/"hello-world" → "hello-world");
+          # without disambiguation the second term page overwrites the first's
+          # index.html and the index emits two links to the same URL. The same
+          # helper backs the get_taxonomy / get_taxonomy_url template functions
+          # (via build_global_vars) so their links match these written paths.
+          #
+          # Disambiguated over the terms this output space actually writes
+          # (`index_terms`), not every language's: `/tags/` and `/ko/tags/`
+          # never share a directory, so a Korean-only `Zeta` must not push the
+          # English `zeta` to `/tags/zeta-2/`.
+          slug_map = Utils::TextUtils.disambiguated_slugs(index_terms)
+
+          # A term too long to be a path segment is shortened (and digest-
+          # suffixed) rather than crashing the build — but that moves its
+          # published URL, so it must never be silent. This is the one place
+          # the term set is enumerated once per taxonomy per build, so the
+          # warning belongs here and not in `safe_slugify`, which runs per
+          # link.
+          index_terms.each do |term|
+            next unless Utils::TextUtils.slug_truncated?(term)
+            Logger.warn "Taxonomy term #{term.inspect} is too long for a path segment — its URL was shortened to /#{taxonomy.name}/#{slug_map[term]? || Utils::TextUtils.safe_slugify(term)}/. Shorten the term in the front matter of the pages that use it."
+          end
+
           render_taxonomy_index(index_page, sort_terms(taxonomy, index_terms, terms_map, language, site.config.default_language), templates, site, output_dir, builder, verbose, global_vars, slug_map)
           collected << index_page
 
@@ -180,7 +202,7 @@ module Hwaro
       end
 
       # Order the index page's terms list per the taxonomy's `terms_sort_by`:
-      # "name" (default) is alphabetical ascending; "count" is page count
+      # "name" (default) is alphabetical ascending, ignoring case; "count" is page count
       # descending with a name-ascending tiebreak. Counts use the
       # language-filtered page lists so a per-language index reflects that
       # language's own term sizes.
@@ -191,20 +213,9 @@ module Hwaro
         language : String?,
         default_language : String,
       ) : Array(String)
-        return terms.sort unless taxonomy.terms_sort_by == "count"
-
-        counts = {} of String => Int32
-        terms.each do |term|
+        Utils::SortUtils.sort_term_names(terms, taxonomy.terms_sort_by == "count") do |term|
           pages = terms_map[term]? || [] of Models::Page
-          counts[term] = if language
-                           pages.count { |p| (p.language || default_language) == language }
-                         else
-                           pages.size
-                         end
-        end
-        terms.sort do |a, b|
-          cmp = counts[b] <=> counts[a]
-          cmp == 0 ? (a <=> b) : cmp
+          language ? pages.count { |p| (p.language || default_language) == language } : pages.size
         end
       end
 
@@ -215,12 +226,18 @@ module Hwaro
 
         site.pages.each do |page|
           next if page.excluded_from_listings?
+          next unless site.config.versions.in_taxonomies?(page)
+          # Set by the render phase for pages it refused to write (URL
+          # traverses out of the output dir): the term page would link a
+          # 404 and the term feed would advertise it.
+          next if page.output_suppressed
 
           enabled_taxonomy_names.each do |tax_name|
             values = page.taxonomy_values(tax_name)
             next if values.empty?
 
-            values.each do |term|
+            # `uniq`: a term repeated in one page's front matter lists the page once.
+            values.uniq.each do |term|
               next if term.strip.empty?
 
               tax_map = result[tax_name]? || begin
@@ -251,15 +268,19 @@ module Hwaro
 
         site.pages.each do |page|
           next if page.excluded_from_listings?
+          # `[versions] taxonomies = "latest"` (default): only the latest
+          # version (plus unversioned content) populates term pages.
+          next unless config.versions.in_taxonomies?(page)
 
           config.taxonomies.each do |taxonomy|
             name = taxonomy.name
             next if name.strip.empty?
 
-            values = extract_terms_for(page, taxonomy)
+            values = page.taxonomy_values(name)
             next if values.empty?
 
-            values.each do |term|
+            # `uniq`: a term repeated in one page's front matter lists the page once.
+            values.uniq.each do |term|
               next if term.strip.empty?
 
               terms = site.taxonomies[name]? || begin
@@ -314,7 +335,7 @@ module Hwaro
         html_content = build_term_list(terms, page.url, site.config.base_url, slug_map)
 
         final_html = apply_template(template_content, html_content, page, site, templates, builder: builder, global_vars: global_vars, template_name: template_name)
-        write_output(page, output_dir, final_html, verbose)
+        write_output(page, output_dir, final_html, verbose, builder)
       end
 
       private def self.render_taxonomy_term(
@@ -361,16 +382,16 @@ module Hwaro
           seo_links = renderer.render_seo_links(paginated_page)
           html_content = list_html + pagination_html
 
-          final_html = apply_template(template_content, html_content, index_page, site, templates, paginated_page, builder: builder, global_vars: global_vars, template_name: template_name, pagination_seo_links: seo_links)
+          final_html = apply_template(template_content, html_content, index_page, site, templates, paginated_page, builder: builder, global_vars: global_vars, template_name: template_name, pagination: pagination_html, pagination_seo_links: seo_links)
 
           if paginated_page.page_number == 1
-            write_output(index_page, output_dir, final_html, verbose)
+            write_output(index_page, output_dir, final_html, verbose, builder)
           else
-            write_paginated_output(index_page, paginated_page.page_number, output_dir, final_html, verbose, index_page.paginate_path)
+            write_paginated_output(index_page, paginated_page.page_number, output_dir, final_html, verbose, index_page.paginate_path, builder)
           end
         end
 
-        generate_taxonomy_feed(taxonomy, term, pages, site, output_dir, base_url, verbose, templates, builder) if taxonomy.feed
+        generate_taxonomy_feed(taxonomy, term, pages, site, output_dir, base_url, verbose, templates, builder, language) if taxonomy.feed
 
         index_page
       end
@@ -447,10 +468,6 @@ module Hwaro
         page
       end
 
-      private def self.extract_terms_for(page : Models::Page, taxonomy : Models::TaxonomyConfig) : Array(String)
-        page.taxonomy_values(taxonomy.name)
-      end
-
       private def self.apply_template(
         template_content : String?,
         html_content : String,
@@ -461,6 +478,7 @@ module Hwaro
         builder : Core::Build::Builder? = nil,
         global_vars : Hash(String, Crinja::Value)? = nil,
         template_name : String? = nil,
+        pagination : String = "",
         pagination_seo_links : String = "",
       ) : String
         return html_content unless template_content
@@ -485,7 +503,9 @@ module Hwaro
           section_list: "",
           toc: "",
           templates: templates,
-          pagination: "", # We don't pass pre-rendered pagination here as it is embedded in content? Wait.
+          # Also appended to `content` (the term list), which templates
+          # have always printed; `pagination` serves custom listings.
+          pagination: pagination,
           page_url_override: current_url,
           paginator: paginator,
           global_vars: global_vars,
@@ -504,6 +524,7 @@ module Hwaro
         verbose : Bool = false,
         templates : Hash(String, String)? = nil,
         builder : Core::Build::Builder? = nil,
+        language : String? = nil,
       )
         # No base_url guard on emission: like the main and section feeds,
         # taxonomy feeds emit with relative URLs when base_url is empty.
@@ -512,18 +533,31 @@ module Hwaro
         feed_output_dir = Content::Seo::Feeds.feed_output_dir_for(output_dir, base_url)
         return unless feed_output_dir
         feed_title = "#{site.config.title} - #{taxonomy.name.capitalize}: #{term}"
+        # Same reason as the term page: nothing else records that this feed is
+        # still wanted, so a removed term left `tags/<slug>/rss.xml` behind.
+        # Like section and language feeds, a term feed always takes the
+        # default name for `[feeds] type` — `[feeds] filename` names only the
+        # main feed — so this is the "" that `process_feed` gets below.
+        builder.try(&.claim_generated_output(
+          File.join(feed_output_dir, Content::Seo::Feeds.safe_feed_filename("", site.config.feeds.type))
+        ))
 
         # No caller-side sort/limit: process_feed itself sorts date-desc
         # (SortUtils.compare_by_date) and applies feeds.limit. Dedupe by URL
-        # so collision losers (not written as HTML) never appear in the feed.
+        # so collision losers (not written as HTML) never appear in the feed,
+        # and keep `redirect_to` stubs out like every other feed does. Older
+        # versions follow `[versions] feeds`, not `taxonomies`, as in every
+        # other feed.
+        versions = site.config.versions
         Content::Seo::Feeds.process_feed(
-          Content::Seo::Feeds.dedupe_by_output_url(pages),
+          Content::Seo::Feeds.dedupe_by_output_url(pages.select { |p| p.published_content? && versions.in_feeds?(p) }),
           site.config,
           feed_output_dir,
           "",
           feed_title,
           base_url,
           verbose,
+          Content::Seo::Feeds.feed_language(site.config, language),
           templates: templates,
           renderer: builder.try(&.feed_template_renderer),
           kind: "taxonomy",
@@ -576,15 +610,36 @@ module Hwaro
 
       # Guard against escaping the output dir, then mkdir + write + log a
       # taxonomy output file. Shared by the single-page and paginated writers.
-      private def self.write_to(output_path : String, output_dir : String, content : String, verbose : Bool)
+      private def self.write_to(output_path : String, output_dir : String, content : String, verbose : Bool, builder : Core::Build::Builder? = nil)
         unless Utils::OutputGuard.within_output_dir?(output_path, output_dir)
           Logger.warn "Skipping taxonomy output outside output directory: #{output_path}"
           return
         end
 
+        # The taxonomy page keeps the path it always took — sites put a
+        # `content/tags/_index.md` there to get the section into menus, and
+        # still expect the generated term index — but replacing an authored
+        # page (Builder#page_output_owner) is no longer silent: sitemap, feeds
+        # and search still advertise that page's URL.
+        if owner = builder.try(&.page_output_owner(output_path, output_dir))
+          Logger.warn "Taxonomy page #{output_path} replaces content page '#{owner}', which publishes the same path. Rename that page (slug/path) or the taxonomy term to keep both."
+        end
+
+        # No content file backs a taxonomy page, so nothing else records that
+        # this build still wants it. Claiming it lets the Finalize phase
+        # delete the term pages a previous `--cache` build left behind when
+        # its last post was deleted (the output directory survives a warm
+        # build, and this generator only ever writes the terms that exist).
+        builder.try(&.claim_generated_output(output_path))
+
+        if builder && output_path.ends_with?(".html")
+          content = builder.privacy_rewrite(content)
+        end
+
         begin
           Hwaro::Utils::FileSafe.mkdir_p(Path[output_path].dirname)
           Hwaro::Utils::FileSafe.atomic_write(output_path, content)
+          builder.try(&.record_html_stats(content))
         rescue ex : File::Error
           # Term slugs are unbounded (a pasted phrase in `tags` becomes a
           # 300-character directory name), so this writer is where a term the
@@ -593,7 +648,10 @@ module Hwaro
           # blamed an internal hwaro fault (exit 70) for what is a content
           # problem the author can fix in front matter. Everything else
           # (permissions, full disk) stays an IO error.
-          too_long = ex.os_error == Errno::ENAMETOOLONG
+          # Windows reports a path past MAX_PATH as not-found or invalid-name,
+          # never ENAMETOOLONG; judge the length there instead, of the path
+          # Windows sees (absolute, in UTF-16 units).
+          too_long = {% if flag?(:windows) %} File.expand_path(output_path).to_utf16.size >= 260 {% else %} ex.os_error == Errno::ENAMETOOLONG {% end %}
           raise Hwaro::HwaroError.new(
             code: too_long ? Hwaro::Errors::HWARO_E_CONTENT : Hwaro::Errors::HWARO_E_IO,
             message: "Failed to write taxonomy page #{output_path.inspect}: #{ex.message}",
@@ -609,21 +667,21 @@ module Hwaro
       # page onto the shortened path instead of skipping it. Reachable only if
       # a term ever escapes `safe_slugify`, but every writer family must answer
       # this question the same way.
-      private def self.write_output(page : Models::Section, output_dir : String, content : String, verbose : Bool = false)
+      private def self.write_output(page : Models::Section, output_dir : String, content : String, verbose : Bool = false, builder : Core::Build::Builder? = nil)
         segments, refused = Utils::PathUtils.split_safe_segments(page.url.lchop("/"))
         if refused
           Logger.warn "Skipping taxonomy page #{page.url.inspect}: a path segment would escape the output directory."
           return
         end
         output_path = File.join(output_dir, segments.join("/"), "index.html")
-        write_to(output_path, output_dir, content, verbose)
+        write_to(output_path, output_dir, content, verbose, builder)
       end
 
-      private def self.write_paginated_output(page : Models::Section, page_number : Int32, output_dir : String, content : String, verbose : Bool = false, paginate_path : String = "page")
+      private def self.write_paginated_output(page : Models::Section, page_number : Int32, output_dir : String, content : String, verbose : Bool = false, paginate_path : String = "page", builder : Core::Build::Builder? = nil)
         segments, refused = Utils::PathUtils.split_safe_segments(page.url.lchop("/"))
         return if refused
         output_path = File.join(output_dir, segments.join("/"), paginate_path, page_number.to_s, "index.html")
-        write_to(output_path, output_dir, content, verbose)
+        write_to(output_path, output_dir, content, verbose, builder)
       end
     end
   end

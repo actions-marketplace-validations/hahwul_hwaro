@@ -12,15 +12,15 @@ describe "CLI Tool Commands" do
     Hwaro::CLI::Runner.new
 
     it "has tool command registered" do
-      Hwaro::CLI::CommandRegistry.has?("tool").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("tool").should be_true
     end
 
     it "has new command registered" do
-      Hwaro::CLI::CommandRegistry.has?("new").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("new").should be_true
     end
 
     it "has completion command registered" do
-      Hwaro::CLI::CommandRegistry.has?("completion").should be_true
+      Hwaro::CLI::CommandRegistry.names.includes?("completion").should be_true
     end
   end
 
@@ -35,12 +35,12 @@ describe "CLI Tool Commands" do
         # Initialize project first
         init_output = IO::Memory.new
         init_error = IO::Memory.new
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: init_output, error: init_error)
+        Process.run(hwaro_binary, ["init", project_dir], output: init_output, error: init_error)
 
         # Create new content
         new_output = IO::Memory.new
         new_error = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["new", "blog/my-first-post.md"], chdir: project_dir, output: new_output, error: new_error)
+        status = Process.run(hwaro_binary, ["new", "blog/my-first-post.md"], chdir: project_dir, output: new_output, error: new_error)
 
         status.success?.should be_true
 
@@ -61,13 +61,13 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__),
+        Process.run(hwaro_binary,
           ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         new_output = IO::Memory.new
         new_error = IO::Memory.new
         status = Process.run(
-          File.expand_path("../../bin/hwaro", __DIR__),
+          hwaro_binary,
           ["new", "special chars!@#", "-t", "Special Chars"],
           chdir: project_dir, output: new_output, error: new_error)
 
@@ -90,13 +90,13 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__),
+        Process.run(hwaro_binary,
           ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         new_output = IO::Memory.new
         new_error = IO::Memory.new
         status = Process.run(
-          File.expand_path("../../bin/hwaro", __DIR__),
+          hwaro_binary,
           ["new", "bad path!", "-t", "BP", "--json"],
           chdir: project_dir, output: new_output, error: new_error)
 
@@ -116,13 +116,13 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__),
+        Process.run(hwaro_binary,
           ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         new_output = IO::Memory.new
         new_error = IO::Memory.new
         status = Process.run(
-          File.expand_path("../../bin/hwaro", __DIR__),
+          hwaro_binary,
           ["new", "posts/clean-path.md"],
           chdir: project_dir, output: new_output, error: new_error)
 
@@ -141,11 +141,11 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__),
+        Process.run(hwaro_binary,
           ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         status = Process.run(
-          File.expand_path("../../bin/hwaro", __DIR__),
+          hwaro_binary,
           ["new", "post", "-s", "my section", "-t", "Post"],
           chdir: project_dir, output: IO::Memory.new, error: IO::Memory.new)
 
@@ -164,12 +164,12 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__),
+        Process.run(hwaro_binary,
           ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         new_error = IO::Memory.new
         status = Process.run(
-          File.expand_path("../../bin/hwaro", __DIR__),
+          hwaro_binary,
           ["new", "!!!", "-t", "T"],
           chdir: project_dir, output: IO::Memory.new, error: new_error)
 
@@ -186,7 +186,7 @@ describe "CLI Tool Commands" do
     it "generates bash completion" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
-      status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["completion", "bash"], output: output_io, error: error_io)
+      status = Process.run(hwaro_binary, ["completion", "bash"], output: output_io, error: error_io)
 
       status.success?.should be_true
       output = output_io.to_s
@@ -196,7 +196,7 @@ describe "CLI Tool Commands" do
     it "generates zsh completion" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
-      status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["completion", "zsh"], output: output_io, error: error_io)
+      status = Process.run(hwaro_binary, ["completion", "zsh"], output: output_io, error: error_io)
 
       status.success?.should be_true
       output = output_io.to_s
@@ -206,7 +206,7 @@ describe "CLI Tool Commands" do
     it "generates fish completion" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
-      status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["completion", "fish"], output: output_io, error: error_io)
+      status = Process.run(hwaro_binary, ["completion", "fish"], output: output_io, error: error_io)
 
       status.success?.should be_true
       output = output_io.to_s
@@ -219,7 +219,7 @@ describe "CLI Tool Commands" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
       status = Process.run(
-        File.expand_path("../../bin/hwaro", __DIR__),
+        hwaro_binary,
         ["help", "build"],
         output: output_io, error: error_io)
 
@@ -235,7 +235,7 @@ describe "CLI Tool Commands" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
       status = Process.run(
-        File.expand_path("../../bin/hwaro", __DIR__),
+        hwaro_binary,
         ["help"],
         output: output_io, error: error_io)
 
@@ -247,12 +247,31 @@ describe "CLI Tool Commands" do
       output_io = IO::Memory.new
       error_io = IO::Memory.new
       status = Process.run(
-        File.expand_path("../../bin/hwaro", __DIR__),
+        hwaro_binary,
         ["help", "nosuchcommand"],
         output: output_io, error: error_io)
 
       status.success?.should be_false
       error_io.to_s.should contain("unknown command")
+    end
+
+    it "classifies an unknown command like `hwaro <command>` does" do
+      error_io = IO::Memory.new
+      status = Process.run(hwaro_binary, ["help", "nosuchcommand"], output: IO::Memory.new, error: error_io)
+      status.exit_code.should eq(2)
+      error_io.to_s.should contain("Error [HWARO_E_USAGE]: unknown command 'nosuchcommand'")
+    end
+
+    it "reaches `tool <sub>`: its help, or a usage error when unknown" do
+      output_io = IO::Memory.new
+      status = Process.run(hwaro_binary, ["help", "tool", "list"], output: output_io, error: IO::Memory.new)
+      status.success?.should be_true
+      output_io.to_s.should contain("Usage: hwaro tool list")
+
+      error_io = IO::Memory.new
+      status = Process.run(hwaro_binary, ["help", "tool", "bogus"], output: IO::Memory.new, error: error_io)
+      status.exit_code.should eq(2)
+      error_io.to_s.should contain("unknown command 'tool bogus'")
     end
   end
 
@@ -264,11 +283,11 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
+        Process.run(hwaro_binary, ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["doctor"], chdir: project_dir, output: output_io, error: error_io)
+        status = Process.run(hwaro_binary, ["doctor"], chdir: project_dir, output: output_io, error: error_io)
 
         status.success?.should be_true
       ensure
@@ -285,11 +304,11 @@ describe "CLI Tool Commands" do
         project_dir = File.join(temp_dir, "test_site")
         Dir.mkdir(project_dir)
 
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
+        Process.run(hwaro_binary, ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["tool", "doctor"], chdir: project_dir, output: output_io, error: error_io)
+        status = Process.run(hwaro_binary, ["tool", "doctor"], chdir: project_dir, output: output_io, error: error_io)
 
         status.success?.should be_true
       ensure
@@ -307,11 +326,11 @@ describe "CLI Tool Commands" do
         Dir.mkdir(project_dir)
 
         # Initialize project
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
+        Process.run(hwaro_binary, ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["tool", "list", "all"], chdir: project_dir, output: output_io, error: error_io)
+        status = Process.run(hwaro_binary, ["tool", "list", "all"], chdir: project_dir, output: output_io, error: error_io)
 
         status.success?.should be_true
       ensure
@@ -329,7 +348,7 @@ describe "CLI Tool Commands" do
         Dir.mkdir(project_dir)
 
         # Initialize project
-        Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
+        Process.run(hwaro_binary, ["init", project_dir], output: IO::Memory.new, error: IO::Memory.new)
 
         # Create a YAML frontmatter file
         content_dir = File.join(project_dir, "content")
@@ -337,7 +356,7 @@ describe "CLI Tool Commands" do
 
         output_io = IO::Memory.new
         error_io = IO::Memory.new
-        status = Process.run(File.expand_path("../../bin/hwaro", __DIR__), ["tool", "convert", "to-toml"], chdir: project_dir, output: output_io, error: error_io)
+        status = Process.run(hwaro_binary, ["tool", "convert", "to-toml"], chdir: project_dir, output: output_io, error: error_io)
 
         status.success?.should be_true
 

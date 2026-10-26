@@ -38,7 +38,7 @@ cache_strategy = "cache-first"
 | short_name | string | name | 홈 화면용 짧은 이름 |
 | theme_color | string | "#ffffff" | 브라우저 툴바/상태 표시줄 색상 |
 | background_color | string | "#ffffff" | 스플래시 화면 배경색 |
-| display | string | "standalone" | 표시 모드 |
+| display | string | "standalone" | 표시 모드: `fullscreen`, `standalone`, `minimal-ui`, `browser` 중 하나 (알 수 없는 값은 `standalone`으로 대체) |
 | start_url | string | "/" | 앱 실행 시 열리는 URL |
 | icons | array | [] | 아이콘 파일 경로 |
 | offline_page | string | — | 오프라인일 때 보여줄 폴백 페이지 |
@@ -49,24 +49,42 @@ cache_strategy = "cache-first"
 
 ## 아이콘 크기
 
-아이콘 크기는 파일 이름에서 자동으로 추출됩니다:
+각 아이콘의 `sizes` 값은 파일 자체에서 측정합니다. PNG, JPEG, BMP, GIF, WebP 헤더에서
+읽은 실제 픽셀 크기입니다. 브라우저는 이 값을 보고 설치 아이콘을 고르므로,
+추측한 값보다 측정한 값을 항상 우선합니다.
 
-| 파일 이름 | 인식되는 크기 |
-|----------|--------------|
-| `icon-192.png` | 192x192 |
-| `icon-512x512.png` | 512x512 |
-| `logo-180.svg` | 180x180 |
+| 아이콘 | 선언되는 `sizes` |
+|--------|------------------|
+| `logo.png` (디스크상 200x60) | 200x60 |
+| `icon-2024.jpg` (디스크상 192x192) | 192x192 |
+| `favicon.svg` | `any` (벡터 — 픽셀 크기 없음) |
+| `icon-192.png` (읽을 수 없음 / 없음) | 192x192 (파일 이름에서) |
+| `icon-512x512.png` (읽을 수 없음 / 없음) | 512x512 (파일 이름에서) |
+| `logo.webp` (디스크상 100x100) | 100x100 |
+| `https://cdn.example/icon.png` | 파일 이름에서, 없으면 512x512 |
+
+파일 이름 기반 추정은 대비책일 뿐입니다. Hwaro가 헤더를 읽을 수 없는 형식
+(ICO), 원격 `http(s)://` 아이콘, 그리고 바이트를 읽지 못한 파일에만
+적용되며, 그 경우 빌드 경고가 해당 아이콘을 알려줍니다.
 
 아이콘 파일은 빌드 출력으로 복사되도록 `static/` 디렉터리에 둡니다.
 
 ## 템플릿 연동
 
-베이스 템플릿에 매니페스트 링크와 서비스 워커 등록 코드를 추가합니다:
+가장 간단한 방법은 `{{ pwa_tags }}` 템플릿 변수입니다. 매니페스트 링크, theme-color 메타, 서비스 워커 등록 스크립트로 전개되며(베이스 경로 접두사 포함), `[pwa]`가 비활성일 때는 빈 문자열로 렌더링됩니다. 스캐폴드 헤더 템플릿에는 기본으로 포함돼 있습니다:
+
+```jinja
+<head>
+  {{ pwa_tags }}
+</head>
+```
+
+직접 연동하려면 베이스 템플릿에 매니페스트 링크와 서비스 워커 등록 코드를 추가합니다:
 
 ```html
 <head>
   <link rel="manifest" href="{{ base_url }}/manifest.json">
-  <meta name="theme-color" content="{{ config.pwa.theme_color }}">
+  <meta name="theme-color" content="#1a1a2e"> <!-- [pwa] theme_color 값 -->
 </head>
 <body>
   ...
@@ -88,7 +106,7 @@ cache_strategy = "cache-first"
 
 생성되는 서비스 워커는 다음과 같이 동작합니다:
 
-- **설치 시 프리캐시** — `precache_urls`에 나열한 URL과 `start_url`을 즉시 캐시합니다
+- **설치 시 프리캐시** — `precache_urls`에 나열한 URL과 `start_url`(설정했다면 `offline_page`도)을 즉시 캐시합니다. URL 하나만 없어도 설치 전체가 실패하므로, 대응하는 출력 파일이 없는 항목은 빌드 경고와 함께 제외됩니다
 - **에셋 요청** — `cache_strategy`로 제어합니다 (아래 참고)
 - **내비게이션은 네트워크 우선** — 페이지 이동은 항상 네트워크를 먼저 시도하고, 실패하면 오프라인 페이지로 폴백합니다
 - **자동 캐시 버전 관리** — 서비스 워커 활성화 시 오래된 캐시를 정리합니다

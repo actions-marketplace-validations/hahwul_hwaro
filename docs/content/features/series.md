@@ -36,7 +36,9 @@ series_weight = 1
 | series | string | — | Series name to assign this post to |
 | series_weight | int | 0 | Order within the series (lower = earlier) |
 
-Posts within a series are sorted by `series_weight`, then by date, then by title.
+Posts within a series are sorted by `series_weight`, then by date (oldest first, undated posts last), then by title.
+
+A series is scoped to one language (and, on a [versioned](/features/versioned-docs/) site, one version). On a [multilingual](/features/multilingual/) site, `hello.md` and its translation `hello.ko.md` sharing a `series` name belong to two parallel series, each numbered and linked within its own language.
 
 ## Template Variables
 
@@ -44,20 +46,20 @@ Each page in a series has the following variables:
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| series | string | The series name |
-| series_index | int | 1-based position in the series |
-| series_pages | array | All pages in the same series (sorted) |
+| page.series | string | The series name |
+| page.series_index | int | 1-based position in the series |
+| page.series_pages | array | All pages in the same series (sorted; empty when the series has only one page) |
 
 ## Usage in Templates
 
 ### Series Navigation
 
 ```jinja
-{% if series %}
+{% if page.series %}
 <nav class="series-nav">
-  <h3>{{ series }}</h3>
+  <h3>{{ page.series }}</h3>
   <ol>
-    {% for p in series_pages %}
+    {% for p in page.series_pages %}
     <li{% if p.url == page.url %} class="current"{% endif %}>
       <a href="{{ p.url }}">{{ p.title }}</a>
     </li>
@@ -70,14 +72,14 @@ Each page in a series has the following variables:
 ### Previous / Next Links
 
 ```jinja
-{% if series_pages | length > 1 %}
+{% if page.series_pages | length > 1 %}
 <div class="series-pager">
-  {% if series_index > 1 %}
-    <a href="{{ series_pages[series_index - 2].url }}">← Previous</a>
+  {% if page.series_index > 1 %}
+    <a href="{{ page.series_pages[page.series_index - 2].url }}">← Previous</a>
   {% endif %}
-  <span>Part {{ series_index }} of {{ series_pages | length }}</span>
-  {% if series_index < series_pages | length %}
-    <a href="{{ series_pages[series_index].url }}">Next →</a>
+  <span>Part {{ page.series_index }} of {{ page.series_pages | length }}</span>
+  {% if page.series_index < page.series_pages | length %}
+    <a href="{{ page.series_pages[page.series_index].url }}">Next →</a>
   {% endif %}
 </div>
 {% endif %}
@@ -95,7 +97,7 @@ content/
     cli-part3.md   # series = "CLI Tool", series_weight = 3
 ```
 
-Each post will have `series_pages` containing all three posts in order, and `series_index` set to 1, 2, or 3 respectively.
+Each post will have `page.series_pages` containing all three posts in order, and `page.series_index` set to 1, 2, or 3 respectively.
 
 ## See Also
 

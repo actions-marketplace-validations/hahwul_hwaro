@@ -8,8 +8,23 @@
 #
 # The ldflags backtick command auto-compiles stb_impl.o when missing or stale.
 # It checks all source files (.c and .h) so header updates trigger a rebuild.
+# `D` is double-quoted so a Windows `__DIR__` keeps its backslashes. On
+# Windows the object must be MSVC-compatible, so it is built with `clang-cl`
+# (shipped with LLVM) rather than whatever `cc` is on PATH (often MinGW
+# gcc), and `-Zl` leaves out the CRT default-lib directive: the Crystal link
+# picks the static or DLL CRT itself. A CC you set is used as given. The
+# compiler's stdout goes to stderr: only the object path may reach ldflags.
+# Windows hands ldflags to the linker in a response file, where the quoted
+# path survives a space (`C:\Users\First Last\...`); a POSIX shell would
+# keep the quotes literally.
+#
+# stb's PNG writer deflates through zlib (the STBIW_ZLIB_COMPRESS block in
+# stb_impl.c), so this object needs libz at link time. `lib_z` carries the
+# `@[Link("z")]` that supplies it; requiring it here states the dependency
+# without emitting a second `-lz` (the linker warns about duplicates).
+require "lib_z"
 
-@[Link(ldflags: "`sh -c 'D=#{__DIR__}; OBJ=$D/stb_impl.o; STALE=0; if [ ! -f \"$OBJ\" ]; then STALE=1; else for f in $D/stb_impl.c $D/stb_image.h $D/stb_image_write.h $D/stb_image_resize2.h $D/stb_truetype.h; do [ \"$f\" -nt \"$OBJ\" ] && STALE=1; done; fi; [ $STALE -eq 1 ] && ${CC:-cc} -c -O2 -o \"$OBJ\" \"$D/stb_impl.c\"; echo \"$OBJ\"'`")]
+@[Link(ldflags: "`sh -c 'D=\"#{__DIR__}\"; OBJ=\"$D/stb_impl.o\"; STALE=0; if [ ! -f \"$OBJ\" ]; then STALE=1; else for f in \"$D/stb_impl.c\" \"$D/stb_image.h\" \"$D/stb_image_write.h\" \"$D/stb_image_resize2.h\" \"$D/stb_truetype.h\"; do [ \"$f\" -nt \"$OBJ\" ] && STALE=1; done; fi; case $(uname -s) in MINGW*|MSYS*|CYGWIN*) CC=${CC:-clang-cl -Zl}; Q=\\\";; *) CC=${CC:-cc}; Q=;; esac; [ $STALE -eq 1 ] && $CC -c -O2 -o \"$OBJ\" \"$D/stb_impl.c\" >&2; echo \"$Q$OBJ$Q\"'`")]
 lib LibStb
   # --- stb_image ---
   fun stbi_load(filename : LibC::Char*, x : LibC::Int*, y : LibC::Int*, channels_in_file : LibC::Int*, desired_channels : LibC::Int) : UInt8*
@@ -44,10 +59,6 @@ lib LibStb
   fun hwaro_font_has_glyph(info : HwaroFontInfo, codepoint : LibC::Int) : LibC::Int
   fun hwaro_font_scale_for_pixel_height(info : HwaroFontInfo, pixels : LibC::Float) : LibC::Float
   fun hwaro_font_get_vmetrics(info : HwaroFontInfo, ascent : LibC::Int*, descent : LibC::Int*, line_gap : LibC::Int*)
-  fun hwaro_font_get_codepoint_hmetrics(info : HwaroFontInfo, codepoint : LibC::Int, advance_width : LibC::Int*, left_side_bearing : LibC::Int*)
-  fun hwaro_font_get_codepoint_kern_advance(info : HwaroFontInfo, ch1 : LibC::Int, ch2 : LibC::Int) : LibC::Int
-  fun hwaro_font_get_codepoint_bitmap(info : HwaroFontInfo, scale_x : LibC::Float, scale_y : LibC::Float, codepoint : LibC::Int, width : LibC::Int*, height : LibC::Int*, xoff : LibC::Int*, yoff : LibC::Int*) : UInt8*
-  fun hwaro_font_free_bitmap(bitmap : UInt8*)
   fun hwaro_font_measure_text(info : HwaroFontInfo, text : LibC::Char*, scale : LibC::Float) : LibC::Float
   fun hwaro_font_render_text(info : HwaroFontInfo, pixels : UInt8*, buf_w : LibC::Int, buf_h : LibC::Int, x : LibC::Float, y : LibC::Float, scale : LibC::Float, text : LibC::Char*, color : LibC::UInt, opacity : LibC::Float) : LibC::Float
 end

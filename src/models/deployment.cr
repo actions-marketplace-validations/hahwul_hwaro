@@ -6,14 +6,16 @@ module Hwaro
       property pattern : String
       property cache_control : String?
       property content_type : String?
-      property gzip : Bool
+      # nil = unset; an explicit `false` still claims the file, so an
+      # earlier matcher can opt a path out of a later `gzip = true` one.
+      property gzip : Bool?
       property force : Bool
 
       def initialize
         @pattern = ""
         @cache_control = nil
         @content_type = nil
-        @gzip = false
+        @gzip = nil
         @force = false
       end
     end
@@ -37,6 +39,11 @@ module Hwaro
     end
 
     class DeploymentConfig
+      # Parsed for forward compatibility but not applied by the built-in
+      # sync; `Deployer#warn_unapplied_workers` compares against this to tell
+      # an explicit setting apart from the default.
+      DEFAULT_WORKERS = 10
+
       property target : String?
       property confirm : Bool
       property dry_run : Bool
@@ -53,7 +60,7 @@ module Hwaro
         @dry_run = false
         @force = false
         @max_deletes = 256
-        @workers = 10
+        @workers = DEFAULT_WORKERS
         @source_dir = "public"
         @targets = [] of DeploymentTarget
         @matchers = [] of DeploymentMatcher

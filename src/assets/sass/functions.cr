@@ -27,6 +27,8 @@
 require "./value"
 require "./color"
 require "./expr"
+require "./extend"
+require "./parser"
 
 module Hwaro
   module Assets
@@ -38,17 +40,30 @@ module Hwaro
         # Argument helpers
         # ---------------------------------------------------------------
 
-        private def self.ascii_upcase(text : String) : String
-          text.gsub { |c| c.ascii_lowercase? ? c.upcase : c }
-        end
-
-        private def self.ascii_downcase(text : String) : String
-          text.gsub { |c| c.ascii_uppercase? ? c.downcase : c }
-        end
-
         private def self.no_kwargs!(name : String, kwargs : Hash(String, Value)) : Nil
           return if kwargs.empty?
           raise SoftEvalError.new("#{name}() does not support keyword arguments")
+        end
+
+        # Rebinds keyword arguments onto their positional slots so the
+        # builtin bodies keep reading `args` positionally —
+        # `list.append($l, x, $separator: comma)` reaches the same slots
+        # as `list.append($l, x, comma)`. Trailing unfilled optionals drop
+        # off; a hole before a filled slot (`slice($s, $end-at: 3)` with
+        # no $start-at) is a missing required argument.
+        private def self.args_with_kwargs(name : String, args : Array(Value),
+                                          kwargs : Hash(String, Value),
+                                          params : Array(String),
+                                          defaults : Hash(Int32, Value)? = nil) : Array(Value)
+          return args if kwargs.empty?
+          bound = bind_args(name, args, kwargs, params)
+          while !bound.empty? && bound.last.nil?
+            bound.pop
+          end
+          bound.map_with_index do |value, index|
+            value || defaults.try(&.[index]?) ||
+              raise SoftEvalError.new("#{name}() is missing required argument $#{params[index]}")
+          end
         end
 
         private def self.arity!(name : String, args : Array(Value), min : Int32, max : Int32 = min) : Nil
@@ -65,7 +80,15 @@ module Hwaro
             text = value.is_a?(Raw) ? value.text : value.as(Str).text
             coerced = Expr.coerce(text)
             return coerced if coerced.is_a?(Number)
+            if coerced.is_a?(ListV) && (n = Expr.slash_division?(coerced))
+              return n
+            end
             raise SoftEvalError.new("#{name}() expects a number, got #{value.to_css.inspect}")
+          when ListV
+            # An undivided slash pair (`min(10 / 2, 8)`) is a lazy
+            # division in dart-sass; a numeric context folds it.
+            Expr.slash_division?(value) ||
+              raise SoftEvalError.new("#{name}() expects a number, got #{value.to_css.inspect}")
           else
             raise SoftEvalError.new("#{name}() expects a number, got #{value.to_css.inspect}")
           end
@@ -244,17 +267,45 @@ module Hwaro
           bound
         end
 
+        # Checks every argument is unit-compatible (identical, unitless, or
+        # convertible) and returns the first non-empty unit — the basis the
+        # min/max/clamp comparisons convert into.
         private def self.same_units!(name : String, numbers : Array(Number)) : String
           unit = ""
           numbers.each do |n|
             next if n.unit.empty?
             if unit.empty?
               unit = n.unit
-            elsif unit != n.unit
+            elsif unit != n.unit && Number.conversion_factor(n.unit, unit).nil?
               raise SoftEvalError.new("#{name}(): incompatible units #{unit} and #{n.unit}")
             end
           end
           unit
+        end
+
+        # A number's value expressed in `unit` for comparison purposes
+        # (unitless operands compare as-is — dart-sass semantics).
+        private def self.comparable_value(n : Number, unit : String) : Float64
+          return n.value if unit.empty? || n.unit.empty? || n.unit == unit
+          n.value * (Number.conversion_factor(n.unit, unit) || 1.0)
+        end
+
+        # An angle argument in degrees: bare numbers are radians for the
+        # trig functions? No — dart-sass treats a unitless angle as
+        # RADIANS for sin/cos/tan. Convertible angle units convert.
+        private def self.radians!(name : String, n : Number) : Float64
+          return n.value if n.unit.empty?
+          factor = Number.conversion_factor(n.unit, "rad")
+          raise SoftEvalError.new("#{name}() expects an angle, got #{n.to_css}") unless factor
+          n.value * factor
+        end
+
+        private def self.unitless!(name : String, value : Value) : Float64
+          n = number!(name, value)
+          unless n.unit.empty?
+            raise SoftEvalError.new("#{name}() expects a unitless number, got #{n.to_css}")
+          end
+          n.value
         end
 
         # ---------------------------------------------------------------
@@ -263,25 +314,16 @@ module Hwaro
 
         MATH_FNS = {
           "div" => Fn.new do |args, kwargs|
-            no_kwargs!("math.div", kwargs)
+            args = args_with_kwargs("math.div", args, kwargs, %w[number1 number2])
             arity!("math.div", args, 2)
             a = number!("math.div", args[0])
             b = number!("math.div", args[1])
             raise SoftEvalError.new("math.div(): division by zero") if b.value == 0
-            unit =
-              if a.unit == b.unit
-                "" # units cancel
-              elsif b.unit.empty?
-                a.unit
-              elsif a.unit.empty?
-                raise SoftEvalError.new("math.div(): can't divide unitless by #{b.unit}")
-              else
-                raise SoftEvalError.new("math.div(): incompatible units #{a.unit} and #{b.unit}")
-              end
-            Number.new(a.value / b.value, unit)
+            value, unit = Expr.divide_numbers(a, b)
+            Number.new(value, unit)
           end,
           "percentage" => Fn.new do |args, kwargs|
-            no_kwargs!("math.percentage", kwargs)
+            args = args_with_kwargs("math.percentage", args, kwargs, %w[number])
             arity!("math.percentage", args, 1)
             n = number!("math.percentage", args[0])
             unless n.unit.empty?
@@ -290,7 +332,7 @@ module Hwaro
             Number.new(n.value * 100, "%")
           end,
           "round" => Fn.new do |args, kwargs|
-            no_kwargs!("math.round", kwargs)
+            args = args_with_kwargs("math.round", args, kwargs, %w[number])
             arity!("round", args, 1)
             n = number!("round", args[0])
             # Sass rounds halves away from zero; Crystal's default is
@@ -298,19 +340,19 @@ module Hwaro
             Number.new(n.value.round(mode: :ties_away).to_f, n.unit)
           end,
           "ceil" => Fn.new do |args, kwargs|
-            no_kwargs!("math.ceil", kwargs)
+            args = args_with_kwargs("math.ceil", args, kwargs, %w[number])
             arity!("ceil", args, 1)
             n = number!("ceil", args[0])
             Number.new(n.value.ceil.to_f, n.unit)
           end,
           "floor" => Fn.new do |args, kwargs|
-            no_kwargs!("math.floor", kwargs)
+            args = args_with_kwargs("math.floor", args, kwargs, %w[number])
             arity!("floor", args, 1)
             n = number!("floor", args[0])
             Number.new(n.value.floor.to_f, n.unit)
           end,
           "abs" => Fn.new do |args, kwargs|
-            no_kwargs!("math.abs", kwargs)
+            args = args_with_kwargs("math.abs", args, kwargs, %w[number])
             arity!("abs", args, 1)
             n = number!("abs", args[0])
             Number.new(n.value.abs, n.unit)
@@ -319,34 +361,116 @@ module Hwaro
             no_kwargs!("math.min", kwargs)
             arity!("min", args, 1, Int32::MAX)
             numbers = args.map { |a| number!("min", a) }
-            same_units!("min", numbers) # unit-compatibility check only
+            base = same_units!("min", numbers)
             # Return the winning operand as-is. Stamping the first non-empty
             # unit seen across all args onto the winner fabricates a unit
             # the result never had: `min(1, 2px)` is `1`, not `1px`.
-            winner = numbers.min_by(&.value)
+            # Convertible units compare in a common basis (`min(1in, 50px)`
+            # is `50px`).
+            winner = numbers.min_by { |n| comparable_value(n, base) }
             Number.new(winner.value, winner.unit)
           end,
           "max" => Fn.new do |args, kwargs|
             no_kwargs!("math.max", kwargs)
             arity!("max", args, 1, Int32::MAX)
             numbers = args.map { |a| number!("max", a) }
-            same_units!("max", numbers) # unit-compatibility check only
-            winner = numbers.max_by(&.value)
+            base = same_units!("max", numbers)
+            winner = numbers.max_by { |n| comparable_value(n, base) }
             Number.new(winner.value, winner.unit)
           end,
           "clamp" => Fn.new do |args, kwargs|
-            no_kwargs!("math.clamp", kwargs)
+            args = args_with_kwargs("math.clamp", args, kwargs, %w[min number max])
             arity!("math.clamp", args, 3)
             numbers = args.map { |a| number!("math.clamp", a) }
-            same_units!("math.clamp", numbers) # unit-compatibility check only
+            base = same_units!("math.clamp", numbers)
             # As with min/max, the result is whichever operand wins, unit
             # included — not the value re-stamped with a scanned unit.
             low, mid, high = numbers[0], numbers[1], numbers[2]
-            winner = mid.value < low.value ? low : (mid.value > high.value ? high : mid)
+            lv = comparable_value(low, base)
+            mv = comparable_value(mid, base)
+            hv = comparable_value(high, base)
+            winner = mv < lv ? low : (mv > hv ? high : mid)
             Number.new(winner.value, winner.unit)
           end,
+          "log" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.log", args, kwargs, %w[number base])
+            arity!("math.log", args, 1, 2)
+            value = unitless!("math.log", args[0])
+            raise SoftEvalError.new("math.log() of a non-positive number") if value <= 0
+            result = Math.log(value)
+            if base_arg = args[1]?
+              base = unitless!("math.log", base_arg)
+              raise SoftEvalError.new("math.log(): invalid base #{Number.format(base)}") if base <= 0 || base == 1
+              result /= Math.log(base)
+            end
+            Number.new(result, "")
+          end,
+          "hypot" => Fn.new do |args, kwargs|
+            no_kwargs!("math.hypot", kwargs)
+            arity!("math.hypot", args, 1, Int32::MAX)
+            numbers = args.map { |a| number!("math.hypot", a) }
+            unit = numbers[0].unit
+            sum = numbers.reduce(0.0) do |acc, n|
+              v =
+                if unit.empty? || n.unit.empty? || n.unit == unit
+                  raise SoftEvalError.new("math.hypot(): mixed unit and unitless arguments") if unit.empty? != n.unit.empty?
+                  n.value
+                else
+                  factor = Number.conversion_factor(n.unit, unit)
+                  raise SoftEvalError.new("math.hypot(): incompatible units #{unit} and #{n.unit}") unless factor
+                  n.value * factor
+                end
+              acc + v * v
+            end
+            Number.new(Math.sqrt(sum), unit)
+          end,
+          "sin" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.sin", args, kwargs, %w[number])
+            arity!("math.sin", args, 1)
+            Number.new(Math.sin(radians!("math.sin", number!("math.sin", args[0]))), "")
+          end,
+          "cos" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.cos", args, kwargs, %w[number])
+            arity!("math.cos", args, 1)
+            Number.new(Math.cos(radians!("math.cos", number!("math.cos", args[0]))), "")
+          end,
+          "tan" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.tan", args, kwargs, %w[number])
+            arity!("math.tan", args, 1)
+            Number.new(Math.tan(radians!("math.tan", number!("math.tan", args[0]))), "")
+          end,
+          "asin" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.asin", args, kwargs, %w[number])
+            arity!("math.asin", args, 1)
+            v = unitless!("math.asin", args[0])
+            raise SoftEvalError.new("math.asin() argument must be within -1 and 1") if v < -1 || v > 1
+            Number.new(Math.asin(v) * 180.0 / Math::PI, "deg")
+          end,
+          "acos" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.acos", args, kwargs, %w[number])
+            arity!("math.acos", args, 1)
+            v = unitless!("math.acos", args[0])
+            raise SoftEvalError.new("math.acos() argument must be within -1 and 1") if v < -1 || v > 1
+            Number.new(Math.acos(v) * 180.0 / Math::PI, "deg")
+          end,
+          "atan" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.atan", args, kwargs, %w[number])
+            arity!("math.atan", args, 1)
+            Number.new(Math.atan(unitless!("math.atan", args[0])) * 180.0 / Math::PI, "deg")
+          end,
+          "atan2" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("math.atan2", args, kwargs, %w[y x])
+            arity!("math.atan2", args, 2)
+            y = number!("math.atan2", args[0])
+            x = number!("math.atan2", args[1])
+            unless y.compatible_unit?(x)
+              raise SoftEvalError.new("math.atan2(): incompatible units #{y.unit} and #{x.unit}")
+            end
+            xv = y.unit.empty? ? x.value : y.coerce_value(x)
+            Number.new(Math.atan2(y.value, xv) * 180.0 / Math::PI, "deg")
+          end,
           "pow" => Fn.new do |args, kwargs|
-            no_kwargs!("math.pow", kwargs)
+            args = args_with_kwargs("math.pow", args, kwargs, %w[base exponent])
             arity!("math.pow", args, 2)
             base = number!("math.pow", args[0])
             exp = number!("math.pow", args[1])
@@ -356,7 +480,7 @@ module Hwaro
             Number.new(base.value ** exp.value, "")
           end,
           "sqrt" => Fn.new do |args, kwargs|
-            no_kwargs!("math.sqrt", kwargs)
+            args = args_with_kwargs("math.sqrt", args, kwargs, %w[number])
             arity!("math.sqrt", args, 1)
             n = number!("math.sqrt", args[0])
             unless n.unit.empty?
@@ -366,17 +490,17 @@ module Hwaro
             Number.new(Math.sqrt(n.value), "")
           end,
           "unit" => Fn.new do |args, kwargs|
-            no_kwargs!("math.unit", kwargs)
+            args = args_with_kwargs("math.unit", args, kwargs, %w[number])
             arity!("unit", args, 1)
             Str.new(number!("unit", args[0]).unit, quoted: true)
           end,
           "is-unitless" => Fn.new do |args, kwargs|
-            no_kwargs!("math.is-unitless", kwargs)
+            args = args_with_kwargs("math.is-unitless", args, kwargs, %w[number])
             arity!("unitless", args, 1)
             BoolV.new(number!("unitless", args[0]).unit.empty?)
           end,
           "compatible" => Fn.new do |args, kwargs|
-            no_kwargs!("math.compatible", kwargs)
+            args = args_with_kwargs("math.compatible", args, kwargs, %w[number1 number2])
             arity!("comparable", args, 2)
             a = number!("comparable", args[0])
             b = number!("comparable", args[1])
@@ -387,6 +511,18 @@ module Hwaro
         MATH_VARS = {
           "pi" => "3.1415926536",
           "e"  => "2.7182818285",
+          # Storage is text, so the constants are stored as spellings that
+          # parse back to the right Float64. dart-sass prints $epsilon as
+          # 0 (10-digit rounding) but compares it > 0 — the scientific
+          # spelling keeps the comparison correct and short (a verbatim
+          # emission is invalid CSS either way). $max-number uses dart's
+          # zero-padded shortest-representation digits, which is also what
+          # Number.format prints for computed values of this magnitude.
+          "epsilon"          => "2.220446049250313e-16",
+          "max-safe-integer" => "9007199254740991",
+          "min-safe-integer" => "-9007199254740991",
+          "max-number"       => "17976931348623157" + "0" * 292,
+          "min-number"       => "5e-324",
         }
 
         # ---------------------------------------------------------------
@@ -395,34 +531,37 @@ module Hwaro
 
         STRING_FNS = {
           "quote" => Fn.new do |args, kwargs|
-            no_kwargs!("string.quote", kwargs)
+            args = args_with_kwargs("string.quote", args, kwargs, %w[string])
             arity!("quote", args, 1)
             s = string!("quote", args[0])
             Str.new(s.text, quoted: true)
           end,
           "unquote" => Fn.new do |args, kwargs|
-            no_kwargs!("string.unquote", kwargs)
+            args = args_with_kwargs("string.unquote", args, kwargs, %w[string])
             arity!("unquote", args, 1)
             s = string!("unquote", args[0])
-            Str.new(s.text, quoted: false)
+            # Font Awesome's `unquote("\"#{$icon}\"")` must yield
+            # `"\f101"`, not `\"\f101\"` (see Str.unquote_text).
+            text = s.quoted ? Str.unquote_text(s.text) : s.text
+            Str.new(text, quoted: false)
           end,
           "length" => Fn.new do |args, kwargs|
-            no_kwargs!("string.length", kwargs)
+            args = args_with_kwargs("string.length", args, kwargs, %w[string])
             arity!("str-length", args, 1)
-            Number.new(string!("str-length", args[0]).text.size.to_f, "")
+            Number.new(string!("str-length", args[0]).decoded.size.to_f, "")
           end,
           "index" => Fn.new do |args, kwargs|
-            no_kwargs!("string.index", kwargs)
+            args = args_with_kwargs("string.index", args, kwargs, %w[string substring])
             arity!("str-index", args, 2)
-            haystack = string!("str-index", args[0]).text
-            needle = string!("str-index", args[1]).text
+            haystack = string!("str-index", args[0]).decoded
+            needle = string!("str-index", args[1]).decoded
             idx = haystack.index(needle)
             idx ? Number.new((idx + 1).to_f, "") : NullV.new
           end,
           "slice" => Fn.new do |args, kwargs|
-            no_kwargs!("string.slice", kwargs)
+            args = args_with_kwargs("string.slice", args, kwargs, %w[string start-at end-at])
             arity!("str-slice", args, 2, 3)
-            text = string!("str-slice", args[0]).text
+            text = string!("str-slice", args[0]).decoded
             quoted = string!("str-slice", args[0]).quoted
             start_at = number!("str-slice", args[1]).int_value("str-slice() start")
             end_at = args[2]? ? number!("str-slice", args[2]).int_value("str-slice() end") : -1
@@ -430,20 +569,55 @@ module Hwaro
             from = start_at < 0 ? Math.max(size + start_at, 0) : Math.max(start_at - 1, 0)
             to = end_at < 0 ? size + end_at : Math.min(end_at - 1, size - 1)
             sliced = from > to ? "" : text[from..to]
-            Str.new(sliced, quoted: quoted)
+            Str.new(Str.encode(sliced), quoted: quoted)
+          end,
+          "insert" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("string.insert", args, kwargs, %w[string insert index])
+            arity!("str-insert", args, 3)
+            base = string!("str-insert", args[0])
+            insert = string!("str-insert", args[1]).decoded
+            index = number!("str-insert", args[2]).int_value("str-insert() index")
+            base_text = base.decoded
+            size = base_text.size
+            # 1-based; negative counts from the end where -1 inserts AT the
+            # end (dart-sass: `insert("abc", "X", -1)` is `"abcX"`).
+            index = size + index + 2 if index < 0
+            offset = (index - 1).clamp(0, size)
+            Str.new(Str.encode(base_text[0, offset] + insert + base_text[offset..]),
+              quoted: base.quoted, quote_char: base.quote_char)
+          end,
+          "split" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("string.split", args, kwargs, %w[string separator limit])
+            arity!("string.split", args, 2, 3)
+            text = string!("string.split", args[0]).text
+            sep = string!("string.split", args[1]).text
+            limit =
+              if (arg = args[2]?) && !arg.is_a?(NullV)
+                number!("string.split", arg).int_value("string.split() limit")
+              end
+            parts =
+              if sep.empty?
+                text.chars.map(&.to_s)
+              elsif limit
+                text.split(sep, limit + 1)
+              else
+                text.split(sep)
+              end
+            ListV.new(parts.map { |p| Str.new(p, quoted: true).as(Value) },
+              ListV::Sep::Comma, bracketed: true)
           end,
           "to-upper-case" => Fn.new do |args, kwargs|
-            no_kwargs!("string.to-upper-case", kwargs)
+            args = args_with_kwargs("string.to-upper-case", args, kwargs, %w[string])
             arity!("to-upper-case", args, 1)
             s = string!("to-upper-case", args[0])
             # Sass maps ASCII only; Crystal's `upcase` is Unicode-aware.
-            Str.new(ascii_upcase(s.text), quoted: s.quoted, quote_char: s.quote_char)
+            Str.new(s.text.upcase(Unicode::CaseOptions::ASCII), quoted: s.quoted, quote_char: s.quote_char)
           end,
           "to-lower-case" => Fn.new do |args, kwargs|
-            no_kwargs!("string.to-lower-case", kwargs)
+            args = args_with_kwargs("string.to-lower-case", args, kwargs, %w[string])
             arity!("to-lower-case", args, 1)
             s = string!("to-lower-case", args[0])
-            Str.new(ascii_downcase(s.text), quoted: s.quoted, quote_char: s.quote_char)
+            Str.new(s.text.downcase(Unicode::CaseOptions::ASCII), quoted: s.quoted, quote_char: s.quote_char)
           end,
         }
 
@@ -466,12 +640,12 @@ module Hwaro
 
         LIST_FNS = {
           "length" => Fn.new do |args, kwargs|
-            no_kwargs!("list.length", kwargs)
+            args = args_with_kwargs("list.length", args, kwargs, %w[list])
             arity!("length", args, 1)
             Number.new(list_of(args[0]).size.to_f, "")
           end,
           "nth" => Fn.new do |args, kwargs|
-            no_kwargs!("list.nth", kwargs)
+            args = args_with_kwargs("list.nth", args, kwargs, %w[list n])
             arity!("nth", args, 2)
             items = list_of(args[0])
             n = number!("nth", args[1]).int_value("nth() index")
@@ -483,14 +657,14 @@ module Hwaro
             items[idx]
           end,
           "index" => Fn.new do |args, kwargs|
-            no_kwargs!("list.index", kwargs)
+            args = args_with_kwargs("list.index", args, kwargs, %w[list value])
             arity!("index", args, 2)
             items = list_of(args[0])
             found = items.index(&.eq?(args[1]))
             found ? Number.new((found + 1).to_f, "") : NullV.new
           end,
           "append" => Fn.new do |args, kwargs|
-            no_kwargs!("list.append", kwargs)
+            args = args_with_kwargs("list.append", args, kwargs, %w[list val separator])
             arity!("append", args, 2, 3)
             base = args[0]
             sep = base.is_a?(ListV) ? base.sep : ListV::Sep::Space
@@ -498,8 +672,10 @@ module Hwaro
             ListV.new(list_of(base) + [args[1]], sep_from(args[2]?, sep), bracketed)
           end,
           "join" => Fn.new do |args, kwargs|
-            no_kwargs!("list.join", kwargs)
-            arity!("join", args, 2, 3)
+            # `$separator` may be skipped when `$bracketed` is named.
+            args = args_with_kwargs("list.join", args, kwargs, %w[list1 list2 separator bracketed],
+              defaults: {2 => Str.new("auto", quoted: false).as(Value)})
+            arity!("join", args, 2, 4)
             base = args[0]
             # `$separator: auto` takes $list1's separator, else $list2's,
             # else space. A scalar or a 0/1-element list carries no
@@ -514,7 +690,13 @@ module Hwaro
               else
                 ListV::Sep::Space
               end
-            bracketed = base.is_a?(ListV) && base.bracketed
+            # `$bracketed: auto` (the default) takes $list1's bracketing.
+            bracketed =
+              if (b = args[3]?) && !(b.is_a?(Str) && b.text == "auto")
+                b.truthy?
+              else
+                base.is_a?(ListV) && base.bracketed
+              end
             ListV.new(list_of(base) + list_of(args[1]), sep_from(args[2]?, sep), bracketed)
           end,
           "zip" => Fn.new do |args, kwargs|
@@ -527,8 +709,35 @@ module Hwaro
             end
             ListV.new(items, ListV::Sep::Comma)
           end,
+          "set-nth" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("list.set-nth", args, kwargs, %w[list n value])
+            arity!("set-nth", args, 3)
+            base = args[0]
+            items = list_of(base).dup
+            n = number!("set-nth", args[1]).int_value("set-nth() index")
+            raise SoftEvalError.new("set-nth() index may not be 0") if n == 0
+            idx = n > 0 ? n - 1 : items.size + n
+            unless 0 <= idx < items.size
+              raise SoftEvalError.new("set-nth() index #{n} is out of bounds for a #{items.size}-element list")
+            end
+            items[idx] = args[2]
+            sep = base.is_a?(ListV) ? base.sep : ListV::Sep::Space
+            bracketed = base.is_a?(ListV) && base.bracketed
+            ListV.new(items, sep, bracketed)
+          end,
+          "slash" => Fn.new do |args, kwargs|
+            no_kwargs!("list.slash", kwargs)
+            arity!("list.slash", args, 2, Int32::MAX)
+            ListV.new(args.dup, ListV::Sep::Slash)
+          end,
+          "is-bracketed" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("list.is-bracketed", args, kwargs, %w[list])
+            arity!("is-bracketed", args, 1)
+            value = args[0]
+            BoolV.new(value.is_a?(ListV) && value.bracketed)
+          end,
           "separator" => Fn.new do |args, kwargs|
-            no_kwargs!("list.separator", kwargs)
+            args = args_with_kwargs("list.separator", args, kwargs, %w[list])
             arity!("list-separator", args, 1)
             sep =
               case value = args[0]
@@ -551,7 +760,7 @@ module Hwaro
 
         MAP_FNS = {
           "get" => Fn.new do |args, kwargs|
-            no_kwargs!("map.get", kwargs)
+            args = args_with_kwargs("map.get", args, kwargs, %w[map key])
             arity!("map-get", args, 2, Int32::MAX)
             value = args[0].as(Value)
             # Extra keys drill into nested maps (dart-sass semantics); a
@@ -565,7 +774,7 @@ module Hwaro
             value
           end,
           "has-key" => Fn.new do |args, kwargs|
-            no_kwargs!("map.has-key", kwargs)
+            args = args_with_kwargs("map.has-key", args, kwargs, %w[map key])
             arity!("map-has-key", args, 2, Int32::MAX)
             value = args[0].as(Value)
             found_all = true
@@ -581,17 +790,17 @@ module Hwaro
             BoolV.new(found_all)
           end,
           "keys" => Fn.new do |args, kwargs|
-            no_kwargs!("map.keys", kwargs)
+            args = args_with_kwargs("map.keys", args, kwargs, %w[map])
             arity!("map-keys", args, 1)
             ListV.new(map!("map-keys", args[0]).entries.map(&.key), ListV::Sep::Comma)
           end,
           "values" => Fn.new do |args, kwargs|
-            no_kwargs!("map.values", kwargs)
+            args = args_with_kwargs("map.values", args, kwargs, %w[map])
             arity!("map-values", args, 1)
             ListV.new(map!("map-values", args[0]).entries.map(&.value), ListV::Sep::Comma)
           end,
           "merge" => Fn.new do |args, kwargs|
-            no_kwargs!("map.merge", kwargs)
+            args = args_with_kwargs("map.merge", args, kwargs, %w[map1 map2])
             arity!("map-merge", args, 2)
             base = map!("map-merge", args[0])
             overlay = map!("map-merge", args[1])
@@ -606,7 +815,7 @@ module Hwaro
             MapV.new(entries)
           end,
           "remove" => Fn.new do |args, kwargs|
-            no_kwargs!("map.remove", kwargs)
+            args = args_with_kwargs("map.remove", args, kwargs, %w[map key])
             arity!("map-remove", args, 1, Int32::MAX)
             base = map!("map-remove", args[0])
             keys = args[1..]
@@ -619,11 +828,39 @@ module Hwaro
             map_set(map!("map.set", args[0]), args[1...-1], args[-1])
           end,
           "deep-merge" => Fn.new do |args, kwargs|
-            no_kwargs!("map.deep-merge", kwargs)
+            args = args_with_kwargs("map.deep-merge", args, kwargs, %w[map1 map2])
             arity!("map.deep-merge", args, 2)
             map_deep_merge(map!("map.deep-merge", args[0]), map!("map.deep-merge", args[1]))
           end,
+          # `map.deep-remove($map, $key, $keys...)` — the deep sibling of
+          # `map.remove`, drilling through intermediate keys. Missing while
+          # `deep-merge` shipped, so `@use "sass:map"` sheets that used it
+          # fell through to the literal-text fallback and emitted invalid CSS.
+          "deep-remove" => Fn.new do |args, kwargs|
+            # `deep-remove($map, $key, $keys...)` — `$map:`/`$key:` are legal
+            # keyword spellings, as for `map.remove`.
+            args = args_with_kwargs("map.deep-remove", args, kwargs, %w[map key])
+            arity!("map.deep-remove", args, 2, Int32::MAX)
+            map_deep_remove(map!("map.deep-remove", args[0]), args[1..])
+          end,
         }
+
+        # Remove `keys[-1]` from the nested map reached by `keys[0..-2]`.
+        # A key path that does not resolve to a map leaves the map untouched
+        # (dart-sass semantics).
+        private def self.map_deep_remove(map : MapV, keys : Array(Value)) : MapV
+          key = keys[0]
+          return MapV.new(map.entries.reject(&.key.eq?(key))) if keys.size == 1
+          idx = map.entries.index(&.key.eq?(key))
+          return map unless idx
+          inner = map.entries[idx].value
+          inner_map = inner.as?(MapV) ||
+                      (inner.is_a?(Raw) ? Expr.coerce(inner.text).as?(MapV) : nil)
+          return map unless inner_map
+          entries = map.entries.dup
+          entries[idx] = MapEntry.new(key, map_deep_remove(inner_map, keys[1..]))
+          MapV.new(entries)
+        end
 
         private def self.map_set(map : MapV, keys : Array(Value), value : Value) : MapV
           key = keys[0]
@@ -667,7 +904,7 @@ module Hwaro
 
         META_FNS = {
           "type-of" => Fn.new do |args, kwargs|
-            no_kwargs!("meta.type-of", kwargs)
+            args = args_with_kwargs("meta.type-of", args, kwargs, %w[value])
             arity!("type-of", args, 1)
             name =
               case value = args[0]
@@ -688,7 +925,7 @@ module Hwaro
             Str.new(name, quoted: false)
           end,
           "inspect" => Fn.new do |args, kwargs|
-            no_kwargs!("meta.inspect", kwargs)
+            args = args_with_kwargs("meta.inspect", args, kwargs, %w[value])
             arity!("inspect", args, 1)
             Str.new(inspect_value(args[0]), quoted: false)
           end,
@@ -961,6 +1198,96 @@ module Hwaro
           end,
         }
 
+        # `color.channel($color, $channel, $space: ...)` — the modern
+        # accessor for single components. `$space` is accepted (rgb/hsl/
+        # hwb spellings) but the channel name alone determines the answer;
+        # colors here are always RGBA underneath.
+        COLOR_FNS["channel"] = Fn.new do |args, kwargs|
+          bound = bind!("color.channel", args, kwargs, ["color", "channel", "space"], required: 2)
+          color = color!("color.channel", bound[0].as(Value))
+          channel_arg = bound[1].as(Value)
+          channel =
+            case channel_arg
+            when Str then channel_arg.text
+            else          channel_arg.to_css
+            end
+          case channel.downcase(Unicode::CaseOptions::ASCII)
+          when "red"        then Number.new(color.red8.to_f)
+          when "green"      then Number.new(color.green8.to_f)
+          when "blue"       then Number.new(color.blue8.to_f)
+          when "alpha"      then Number.new(color.alpha)
+          when "hue"        then Number.new(color.hue, "deg")
+          when "saturation" then Number.new(color.saturation, "%")
+          when "lightness"  then Number.new(color.lightness, "%")
+          when "whiteness"
+            Number.new({color.red, color.green, color.blue}.min / 255.0 * 100.0, "%")
+          when "blackness"
+            Number.new((1.0 - {color.red, color.green, color.blue}.max / 255.0) * 100.0, "%")
+          else
+            raise SoftEvalError.new("color.channel(): unknown channel #{channel.inspect}")
+          end
+        end
+
+        # `color.hwb($hue $whiteness $blackness)` — the space-separated
+        # channels form — and the separate-argument spelling
+        # `color.hwb($hue, $whiteness, $blackness, $alpha: 1)`, which
+        # dart-sass also accepts and which used to fail arity here (first
+        # for any separate spelling, then for the fourth `$alpha`). A
+        # slash-alpha in the channels form (`… / 0.5`) is not modeled; use
+        # `color.change($c, $alpha: …)`.
+        COLOR_FNS["hwb"] = Fn.new do |args, kwargs|
+          known_kwargs!("color.hwb", kwargs, ["channels", "hue", "whiteness", "blackness", "alpha"])
+          arity!("color.hwb", args, 0, 4)
+          separate = args.size >= 3 ||
+                     kwargs.has_key?("hue") || kwargs.has_key?("whiteness") || kwargs.has_key?("blackness")
+          alpha : Value? = nil
+          items =
+            if separate
+              bound = bind!("color.hwb", args, kwargs, ["hue", "whiteness", "blackness", "alpha"], required: 3)
+              alpha = bound[3]
+              bound[0, 3].map(&.as(Value))
+            else
+              arity!("color.hwb", args, 0, 1)
+              channels = args[0]? || kwargs["channels"]? ||
+                         raise SoftEvalError.new("color.hwb() is missing required argument $channels")
+              case channels
+              when ListV then channels.items
+              else            raise SoftEvalError.new("color.hwb() expects a space-separated $hue $whiteness $blackness list")
+              end
+            end
+          arity!("color.hwb() channels", items, 3)
+          hue = finite!("color.hwb", number!("color.hwb", items[0]))
+          whiteness = amount!("color.hwb", items[1])
+          blackness = amount!("color.hwb", items[2])
+          color = Builtins.hwb_color(hue, whiteness, blackness)
+          alpha ? color.with_alpha(alpha!("color.hwb", alpha)) : color
+        end
+
+        # `ie-hex-str($color)` — the legacy `#AARRGGBB` spelling IE filters
+        # take.
+        IE_HEX_STR_FN = Fn.new do |args, kwargs|
+          bound = bind!("ie-hex-str", args, kwargs, ["color"], required: 1)
+          color = color!("ie-hex-str", bound[0].as(Value))
+          alpha8 = ColorV.fuzzy_round(color.alpha * 255.0)
+          Str.new("#%02X%02X%02X%02X" % {alpha8, color.red8, color.green8, color.blue8},
+            quoted: false)
+        end
+        COLOR_FNS["ie-hex-str"] = IE_HEX_STR_FN
+
+        # HWB → RGB (CSS Color 4): degenerate w+b ≥ 100 is a flat gray,
+        # otherwise the pure hue scaled between whiteness and blackness.
+        def self.hwb_color(hue : Float64, whiteness : Float64, blackness : Float64) : ColorV
+          w = whiteness / 100.0
+          b = blackness / 100.0
+          if w + b >= 1.0
+            gray = w / (w + b) * 255.0
+            return ColorV.new(gray, gray, gray)
+          end
+          pure = ColorV.from_hsl(hue, 100.0, 50.0)
+          scale = ->(channel : Float64) { (channel / 255.0 * (1.0 - w - b) + w) * 255.0 }
+          ColorV.new(scale.call(pure.red), scale.call(pure.green), scale.call(pure.blue))
+        end
+
         # `color.fade-in` / `color.fade-out` are the module spellings of
         # opacify / transparentize. dart-sass defines both, so the module
         # table needs them or `color.fade-in(...)` leaks its call text.
@@ -976,6 +1303,290 @@ module Hwaro
           bound = shadowed_bind!("rgba", args, kwargs, ["color", "alpha"], required: 2)
           color = shadowed_color!(bound[0].as(Value))
           color.with_alpha(alpha!("rgba", bound[1].as(Value)))
+        end
+
+        # ---------------------------------------------------------------
+        # sass:selector
+        #
+        # String-level implementations of the selector functions: selectors
+        # are comma lists of complex selectors, tokenized with the same
+        # quote/bracket/paren-aware parser @extend uses. Sound for the
+        # class/id/element/pseudo/attribute selectors frameworks feed
+        # these; the full unification semantics (combinator weaving,
+        # pseudo-element rules) are out of scope.
+        # ---------------------------------------------------------------
+
+        # A selector argument as text: strings/raw verbatim, lists joined
+        # by their separator (`&` arrives as a comma list of strings).
+        private def self.selector_text(name : String, value : Value) : String
+          case value
+          when Str   then value.text
+          when Raw   then value.text
+          when ListV then value.items.map { |i| selector_text(name, i) }.join(value.sep == ListV::Sep::Comma ? ", " : " ")
+          when NullV then raise SoftEvalError.new("#{name}: expected a selector, got null")
+          else
+            raise SoftEvalError.new("#{name}: expected a selector, got #{value.to_css.inspect}")
+          end
+        end
+
+        # Comma list of complex selectors, each an array of compounds and
+        # combinators. Attribute selectors and `:is()`/`:not()` parens keep
+        # their internal whitespace — naive String#split would fragment
+        # `[title="a b"]` into two tokens.
+        private def self.selector_complexes(name : String, value : Value) : Array(Array(String))
+          Parser.split_top_level_commas(selector_text(name, value)).map(&.strip).reject(&.empty?).map do |complex|
+            items = Extend.parse_items(complex)
+            raise SoftEvalError.new("#{name}: invalid selector #{complex.inspect}") unless items
+            items.map do |item|
+              case item
+              in Extend::Combinator then item.text
+              in Extend::Compound   then item.simples.join
+              end
+            end
+          end
+        end
+
+        # Splits one compound selector into its leading element (or "") and
+        # the trailing simple selectors (classes, ids, attributes, pseudos,
+        # placeholders).
+        private def self.compound_simples(compound : String) : {String, Array(String)}
+          simples = [] of String
+          element = String::Builder.new
+          i = 0
+          chars = compound.chars
+          while i < chars.size && !".#:[%".includes?(chars[i])
+            element << chars[i]
+            i += 1
+          end
+          while i < chars.size
+            start = i
+            i += 1                     # the delimiter
+            i += 1 if chars[i]? == ':' # `::pseudo-element`
+            depth = 0
+            while i < chars.size
+              c = chars[i]
+              if c == '(' || c == '['
+                depth += 1
+              elsif c == ')' || c == ']'
+                depth -= 1
+                i += 1
+                break if depth == 0 && (chars[i]?.nil? || ".#:[%".includes?(chars[i]))
+                next
+              elsif depth == 0 && ".#:[%".includes?(c) && !(c == ':' && chars[start] == ':' && i == start + 1)
+                break
+              end
+              i += 1
+            end
+            simples << chars[start...i].join
+          end
+          {element.to_s, simples}
+        end
+
+        # Merges two compound selectors into one matching both, or nil when
+        # they can't both match (two different element types).
+        private def self.unify_compounds(a : String, b : String) : String?
+          ea, sa = compound_simples(a)
+          eb, sb = compound_simples(b)
+          element =
+            if ea.empty? || ea == "*"
+              eb.empty? ? ea : eb
+            elsif eb.empty? || eb == "*"
+              ea
+            elsif ea == eb
+              ea
+            else
+              return
+            end
+          merged = sa.dup
+          sb.each { |s| merged << s unless merged.includes?(s) }
+          # Pseudo-classes/-elements sort after the other simple selectors
+          # (dart's compound ordering, same rule Extend.unify_compound
+          # documents): `.x:hover` + `.z` is `.x.z:hover`.
+          plain, pseudo = merged.partition { |s| !s.starts_with?(':') }
+          element + (plain + pseudo).join
+        end
+
+        # True when every element `sub` matches is also matched by `sup`
+        # (subset simples, compounds embedded in order, last-to-last).
+        private def self.complex_superselector?(sup : Array(String), sub : Array(String)) : Bool
+          sup_c = sup.reject { |w| w == ">" || w == "+" || w == "~" }
+          sub_c = sub.reject { |w| w == ">" || w == "+" || w == "~" }
+          return false if sup_c.empty? || sub_c.empty?
+          return false unless compound_subset?(sup_c.last, sub_c.last)
+          si = 0
+          sup_c[0...-1].each do |sc|
+            while si < sub_c.size - 1 && !compound_subset?(sc, sub_c[si])
+              si += 1
+            end
+            return false if si >= sub_c.size - 1
+            si += 1
+          end
+          true
+        end
+
+        private def self.compound_subset?(a : String, b : String) : Bool
+          ea, sa = compound_simples(a)
+          eb, sb = compound_simples(b)
+          element_ok = ea.empty? || ea == "*" || ea == eb
+          element_ok && sa.all? { |s| sb.includes?(s) }
+        end
+
+        private def self.selector_value(complexes : Array(Array(String))) : Value
+          items = complexes.map do |words|
+            ListV.new(words.map { |w| Str.new(w, quoted: false).as(Value) }, ListV::Sep::Space).as(Value)
+          end
+          ListV.new(items, ListV::Sep::Comma)
+        end
+
+        SELECTOR_FNS = {
+          "parse" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("selector.parse", args, kwargs, %w[selector])
+            arity!("selector-parse", args, 1)
+            selector_value(selector_complexes("selector.parse()", args[0]))
+          end,
+          "nest" => Fn.new do |args, kwargs|
+            no_kwargs!("selector.nest", kwargs)
+            arity!("selector-nest", args, 1, Int32::MAX)
+            result = selector_complexes("selector.nest()", args[0])
+            args[1..].each do |arg|
+              parts = selector_complexes("selector.nest()", arg)
+              grown = [] of Array(String)
+              result.each do |parent|
+                parent_text = parent.join(' ')
+                parts.each do |part|
+                  if part.any?(&.includes?('&'))
+                    grown << part.flat_map(&.gsub('&', parent_text).split)
+                  else
+                    grown << parent + part
+                  end
+                end
+              end
+              result = grown
+            end
+            selector_value(result)
+          end,
+          "append" => Fn.new do |args, kwargs|
+            no_kwargs!("selector.append", kwargs)
+            arity!("selector-append", args, 1, Int32::MAX)
+            result = selector_complexes("selector.append()", args[0])
+            args[1..].each do |arg|
+              parts = selector_complexes("selector.append()", arg)
+              grown = [] of Array(String)
+              result.each do |parent|
+                parts.each do |part|
+                  head = part[0]
+                  if [">", "+", "~"].includes?(head) || [">", "+", "~"].includes?(parent.last)
+                    raise SoftEvalError.new("selector.append(): can't append #{part.join(' ').inspect}")
+                  end
+                  grown << parent[0...-1] + [parent.last + head] + part[1..]
+                end
+              end
+              result = grown
+            end
+            selector_value(result)
+          end,
+          "unify" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("selector.unify", args, kwargs, %w[selector1 selector2])
+            arity!("selector-unify", args, 2)
+            a_list = selector_complexes("selector.unify()", args[0])
+            b_list = selector_complexes("selector.unify()", args[1])
+            unified = [] of Array(String)
+            a_list.each do |a|
+              b_list.each do |b|
+                merged = unify_compounds(a.last, b.last)
+                next unless merged
+                unified << a[0...-1] + b[0...-1] + [merged]
+              end
+            end
+            next NullV.new.as(Value) if unified.empty?
+            selector_value(unified)
+          end,
+          "is-superselector" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("selector.is-superselector", args, kwargs, %w[super sub])
+            arity!("is-superselector", args, 2)
+            supers = selector_complexes("is-superselector()", args[0])
+            subs = selector_complexes("is-superselector()", args[1])
+            BoolV.new(subs.all? do |sub|
+              supers.any? { |sup| complex_superselector?(sup, sub) }
+            end)
+          end,
+          "simple-selectors" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("selector.simple-selectors", args, kwargs, %w[selector])
+            arity!("simple-selectors", args, 1)
+            complexes = selector_complexes("selector.simple-selectors()", args[0])
+            unless complexes.size == 1 && complexes[0].size == 1
+              raise SoftEvalError.new("selector.simple-selectors() expects a compound selector, got #{args[0].to_css.inspect}")
+            end
+            element, simples = compound_simples(complexes[0][0])
+            names = [] of String
+            names << element unless element.empty?
+            names.concat(simples)
+            ListV.new(names.map { |n| Str.new(n, quoted: false).as(Value) }, ListV::Sep::Comma)
+          end,
+          "replace" => Fn.new do |args, kwargs|
+            args = args_with_kwargs("selector.replace", args, kwargs, %w[selector original replacement])
+            arity!("selector-replace", args, 3)
+            selector_value(selector_replace("selector.replace()", args[0], args[1], args[2]))
+          end,
+        }
+
+        # `selector.replace`: within each compound of $selector that
+        # contains all of $original's simple selectors, remove them and
+        # unify what's left with $replacement (extend-style semantics for
+        # the practical case: single-compound $original, $replacement
+        # complexes whose leading compounds splice in before the match).
+        private def self.selector_replace(name : String, selector : Value,
+                                          original : Value, replacement : Value) : Array(Array(String))
+          originals = selector_complexes(name, original)
+          replacements = selector_complexes(name, replacement)
+          if originals.any? { |o| o.size != 1 }
+            raise SoftEvalError.new("#{name}: $original must be a compound selector")
+          end
+          result = [] of Array(String)
+          selector_complexes(name, selector).each do |complex|
+            # EVERY matching compound in the complex is replaced (dart:
+            # `.b .b` with `.b` → `.c` yields the single `.c .c`, not one
+            # variant per occurrence). Multiple replacement complexes
+            # cross-multiply across the matched positions.
+            variants = [complex]
+            # Right-to-left so a replacement whose complex has extra
+            # leading compounds doesn't shift the not-yet-visited indices.
+            (complex.size - 1).downto(0) do |index|
+              word = complex[index]
+              next if word == ">" || word == "+" || word == "~"
+              orig = originals.find { |o| compound_subset?(o[0], word) }
+              next unless orig
+              stripped = compound_strip(word, orig[0])
+              grown = [] of Array(String)
+              variants.each do |variant|
+                replacements.each do |repl|
+                  merged = stripped.empty? ? repl.last : unify_compounds(stripped, repl.last)
+                  next unless merged
+                  grown << variant[0...index] + repl[0...-1] + [merged] + variant[index + 1..]
+                end
+              end
+              # A matched compound whose replacement can't unify
+              # eliminates the variant (dart-sass fails the build when
+              # nothing is left — `selector.replace("a.foo", ".foo",
+              # "h1")` must not return `a.foo` with the target intact).
+              variants = grown
+            end
+            result.concat(variants)
+          end
+          if result.empty?
+            raise SoftEvalError.new(
+              "#{name}: $replacement can't be unified with $selector")
+          end
+          result
+        end
+
+        # The compound minus every simple selector `original` mentions
+        # ("" when nothing is left).
+        private def self.compound_strip(compound : String, original : String) : String
+          element, simples = compound_simples(compound)
+          orig_element, orig_simples = compound_simples(original)
+          element = "" if !orig_element.empty? && element == orig_element
+          element + simples.reject { |s| orig_simples.includes?(s) }.join
         end
 
         # ---------------------------------------------------------------
@@ -995,6 +1606,7 @@ module Hwaro
           "str-length"     => STRING_FNS["length"],
           "str-index"      => STRING_FNS["index"],
           "str-slice"      => STRING_FNS["slice"],
+          "str-insert"     => STRING_FNS["insert"],
           "to-upper-case"  => STRING_FNS["to-upper-case"],
           "to-lower-case"  => STRING_FNS["to-lower-case"],
           "length"         => LIST_FNS["length"],
@@ -1003,6 +1615,8 @@ module Hwaro
           "append"         => LIST_FNS["append"],
           "join"           => LIST_FNS["join"],
           "zip"            => LIST_FNS["zip"],
+          "set-nth"        => LIST_FNS["set-nth"],
+          "is-bracketed"   => LIST_FNS["is-bracketed"],
           "list-separator" => LIST_FNS["separator"],
           "map-get"        => MAP_FNS["get"],
           "map-has-key"    => MAP_FNS["has-key"],
@@ -1047,18 +1661,28 @@ module Hwaro
           "lightness"      => COLOR_FNS["lightness"],
           "alpha"          => COLOR_FNS["alpha"],
           "opacity"        => COLOR_FNS["opacity"],
+          "ie-hex-str"     => IE_HEX_STR_FN,
           "rgba"           => RGBA_FN,
           "rgb"            => RGBA_FN,
+          # Legacy global selector functions.
+          "selector-parse"   => SELECTOR_FNS["parse"],
+          "selector-nest"    => SELECTOR_FNS["nest"],
+          "selector-append"  => SELECTOR_FNS["append"],
+          "selector-unify"   => SELECTOR_FNS["unify"],
+          "selector-replace" => SELECTOR_FNS["replace"],
+          "is-superselector" => SELECTOR_FNS["is-superselector"],
+          "simple-selectors" => SELECTOR_FNS["simple-selectors"],
         }
 
         # `sass:<name>` module tables: {functions, variables}.
         MODULE_TABLES = {
-          "math"   => {MATH_FNS, MATH_VARS},
-          "string" => {STRING_FNS, {} of String => String},
-          "list"   => {LIST_FNS, {} of String => String},
-          "map"    => {MAP_FNS, {} of String => String},
-          "meta"   => {META_FNS, {} of String => String},
-          "color"  => {COLOR_FNS, {} of String => String},
+          "math"     => {MATH_FNS, MATH_VARS},
+          "string"   => {STRING_FNS, {} of String => String},
+          "list"     => {LIST_FNS, {} of String => String},
+          "map"      => {MAP_FNS, {} of String => String},
+          "meta"     => {META_FNS, {} of String => String},
+          "color"    => {COLOR_FNS, {} of String => String},
+          "selector" => {SELECTOR_FNS, {} of String => String},
         }
       end
     end

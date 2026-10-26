@@ -37,6 +37,8 @@ module Hwaro
     module ContentWalk
       extend self
 
+      MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+
       # True when `path` is a regular file that can actually be opened.
       #
       # Anything that simply is not a file (a directory, or a FIFO/socket
@@ -44,6 +46,34 @@ module Hwaro
       # was never content. A symlink we cannot follow is named in a single
       # warning instead, matching `Phases::Initialize#static_target_info`, so
       # a file missing from a listing or a validate summary is never silent.
+      # Every Markdown file under `content_dir`, sorted. Unfollowable
+      # symlinks are dropped here (see `readable_file?`) so one bad link
+      # cannot turn a listing, a validate summary or a convert run into a
+      # wall of "Failed to read content file" warnings — or a non-zero exit —
+      # for files the build itself skips. `tool list`, `tool stats`,
+      # `tool validate` and `tool convert` all walk through here, so they
+      # stay consistent with each other.
+      def find_content_files(content_dir : String) : Array(String)
+        files = [] of String
+
+        # Match ReadContent's case-insensitive extension check. Lowercase-only
+        # glob patterns omitted `post.MD` and `post.MARKDOWN`, even though the
+        # build publishes them; every content tool using this walker then
+        # silently disagreed with the build.
+        Dir.glob(File.join(Utils::PathUtils.glob_escape(content_dir), "**", "*")) do |file|
+          next unless markdown?(file)
+          files << file if readable_file?(file)
+        end
+
+        files.sort
+      end
+
+      # True when `path` carries a Markdown page extension, compared
+      # case-insensitively like ReadContent's PAGE_EXTENSIONS check.
+      def markdown?(path : String) : Bool
+        MARKDOWN_EXTENSIONS.includes?(File.extname(path).downcase)
+      end
+
       def readable_file?(path : String) : Bool
         # lstat never follows, so a cycle is an ordinary symlink entry here
         # instead of an ELOOP failure. For the common (non-symlink) case it is
@@ -76,23 +106,90 @@ module Hwaro
       Published
     end
 
+    # Sort key for listing content. `Date` is the historical default
+    # (newest first, path as tie-breaker); `Title` and `Path` sort
+    # ascending. `--reverse` flips whichever order the key produced.
+    #
+    # `Title` matches the template engine's `sort_by="title"` ordering
+    # (`Utils::SortUtils.compare_by_title`): a plain case-sensitive
+    # comparison with path as tie-breaker — the CLI listing and a rendered
+    # section index must not order the same titles differently.
+    enum ContentSort
+      Date
+      Title
+      Path
+    end
+
+    # Publication state a file will have in a DEFAULT `hwaro build`.
+    #
+    # `draft` alone never described that: the build also drops future-dated
+    # pages (`date` in the future) and expired ones (`expires` in the past),
+    # and it honours a `draft` cascaded from an ancestor section. Reporting
+    # all three as "published" made `tool list published` and `tool stats`
+    # disagree with the site the very next build shipped.
+    enum PublishState
+      Published
+      Draft
+      Future
+      Expired
+
+      def label : String
+        case self
+        in Published then "published"
+        in Draft     then "draft"
+        in Future    then "future"
+        in Expired   then "expired"
+        end
+      end
+    end
+
     # Information about a content file
     struct ContentInfo
       include JSON::Serializable
 
       property path : String
       property title : String
+      # Kept for compatibility with existing `--json` consumers: true when the
+      # file is a draft (its own flag or one cascaded from a parent section).
       property draft : Bool
 
       @[JSON::Field(converter: Hwaro::Services::ContentInfo::TimeConverter, emit_null: true)]
       property date : Time?
 
+      # `published` | `draft` | `future` | `expired` — what a default build
+      # does with this file. Only `published` files are actually shipped.
+      property status : String
+
+      @[JSON::Field(converter: Hwaro::Services::ContentInfo::TimeConverter, emit_null: true)]
+      property expires : Time?
+
+      # Provenance of a `[[content.generate]]` page ("data.products"); nil
+      # for authored files. Omitted from JSON when nil, so existing `--json`
+      # consumers see no new key on authored entries.
+      property generated_from : String?
+
+      # The planned source document (front matter, plus the body only for a
+      # plain `body` field spec) of a `[[content.generate]]` page, which has no file at
+      # `path` for `tool stats` to read its taxonomies from. Never emitted.
+      @[JSON::Field(ignore: true)]
+      property generated_source : String? = nil
+
       def initialize(
         @path : String,
-        @title : String = "Untitled",
-        @draft : Bool = false,
-        @date : Time? = nil,
+        @title : String,
+        @draft : Bool,
+        @date : Time?,
+        state : PublishState,
+        @expires : Time? = nil,
+        @generated_from : String? = nil,
+        @generated_source : String? = nil,
       )
+        @status = state.label
+      end
+
+      # Will a default `hwaro build` publish this file?
+      def published? : Bool
+        @status == PublishState::Published.label
       end
 
       module TimeConverter
@@ -102,11 +199,6 @@ module Hwaro
           else
             json.null
           end
-        end
-
-        def self.from_json(pull : JSON::PullParser) : Time?
-          str = pull.read_string_or_null
-          str ? Time.parse_rfc3339(str) : nil
         end
       end
     end
@@ -127,8 +219,13 @@ module Hwaro
 
       # Content directory path
       @content_dir : String
+      @language_setup : LanguageSetup? = nil
+      # Pre-planned `[[content.generate]]` entries (no files on disk for the
+      # walker to find, but part of what a build publishes) — the list
+      # command computes these; see ListCommand#generated_content_infos.
+      @generated : Array(ContentInfo)
 
-      def initialize(@content_dir : String = "content")
+      def initialize(@content_dir : String = "content", @generated : Array(ContentInfo) = [] of ContentInfo)
       end
 
       # List all content files
@@ -136,18 +233,15 @@ module Hwaro
         list_content(ContentFilter::All)
       end
 
-      # List only draft content files
-      def list_drafts : Array(ContentInfo)
-        list_content(ContentFilter::Drafts)
-      end
-
-      # List only published content files
-      def list_published : Array(ContentInfo)
-        list_content(ContentFilter::Published)
-      end
-
-      # List content files based on filter
-      def list_content(filter : ContentFilter) : Array(ContentInfo)
+      # List content files based on filter. `sort` picks the ordering key,
+      # `reverse` flips it, and `limit` caps the result AFTER sorting — so
+      # `--sort date --limit 5` means "the 5 newest", not 5 arbitrary files.
+      def list_content(
+        filter : ContentFilter,
+        sort : ContentSort = ContentSort::Date,
+        reverse : Bool = false,
+        limit : Int32? = nil,
+      ) : Array(ContentInfo)
         unless Dir.exists?(@content_dir)
           Logger.error "Content directory '#{@content_dir}' not found"
           return [] of ContentInfo
@@ -155,9 +249,11 @@ module Hwaro
 
         files = find_content_files
         contents = [] of ContentInfo
+        cascade = collect_cascade_drafts(files)
+        now = Time.utc
 
         files.each do |file_path|
-          info = parse_content_info(file_path)
+          info = parse_content_info(file_path, cascade, now)
           next unless info
 
           case filter
@@ -166,21 +262,73 @@ module Hwaro
           when ContentFilter::Drafts
             contents << info if info.draft
           when ContentFilter::Published
-            contents << info unless info.draft
+            # "Published" now means what the build ships, not merely
+            # "not flagged draft": future and expired files are excluded.
+            contents << info if info.published?
           end
         end
 
-        # Sort by date (newest first), then by path
-        contents.sort_by! do |info|
-          {-(info.date.try(&.to_unix) || 0_i64), info.path}
+        # `[[content.generate]]` entries join under the same filter rules.
+        # They carry no draft front matter of their own, but a parent
+        # section's `[cascade] draft = true` applies to them in the build
+        # (their synthetic path sits under the section like any authored
+        # file), so it must apply here too — publish-state parity with the
+        # build is this lister's contract.
+        @generated.each do |info|
+          if cascaded_draft?(File.join(@content_dir, info.path), cascade)
+            info = info.dup
+            info.draft = true
+            info.status = PublishState::Draft.label
+          end
+          case filter
+          when ContentFilter::All
+            contents << info
+          when ContentFilter::Drafts
+            contents << info if info.draft
+          when ContentFilter::Published
+            contents << info if info.published?
+          end
         end
+
+        case sort
+        in ContentSort::Date
+          # Sort by date (newest first), then by path. Undated entries used
+          # to key as epoch 0 — "older than everything post-1970" — so
+          # `--reverse` (oldest first) ranked them ABOVE every dated post and
+          # polluted `--reverse --limit` results. Undated means "date
+          # unknown": the leading field pins those AFTER every dated entry in
+          # both directions, which requires folding `reverse` into the key
+          # here (the blanket `reverse!` below would flip the pin too); the
+          # path tie-breaker keeps equal keys deterministic.
+          contents.sort_by! do |info|
+            if date = info.date
+              {0, reverse ? date.to_unix : -date.to_unix, info.path}
+            else
+              {1, 0_i64, info.path}
+            end
+          end
+        in ContentSort::Title
+          # Case-sensitive, matching SortUtils.compare_by_title — see the
+          # enum comment. Path keeps equal titles deterministic.
+          contents.sort_by! { |info| {info.title, info.path} }
+        in ContentSort::Path
+          contents.sort_by!(&.path)
+        end
+        # Date sort already applied `reverse` inside its key (see above).
+        contents.reverse! if reverse && sort != ContentSort::Date
+        contents = contents.first(limit) if limit
 
         contents
       end
 
       # Display content list in a formatted table
-      def display(filter : ContentFilter)
-        contents = list_content(filter)
+      def display(
+        filter : ContentFilter,
+        sort : ContentSort = ContentSort::Date,
+        reverse : Bool = false,
+        limit : Int32? = nil,
+      )
+        contents = list_content(filter, sort, reverse, limit)
 
         filter_name = case filter
                       when ContentFilter::Drafts    then "drafts"
@@ -201,7 +349,11 @@ module Hwaro
         # before they reach the terminal (a raw ANSI escape could repaint the
         # console, and it throws the column widths off either way).
         cells = contents.map do |info|
-          {Utils::TextUtils.strip_control(info.title), Utils::TextUtils.strip_control(info.path)}
+          # Generated entries carry their provenance in the path cell —
+          # there is no file at that path to open, and "where does this row
+          # come from" is the first question the marker answers.
+          path_cell = (origin = info.generated_from) ? "#{info.path} ← #{origin}" : info.path
+          {Utils::TextUtils.strip_control(info.title), Utils::TextUtils.strip_control(path_cell)}
         end
 
         # Cap long cells so the table stays scannable; the header labels are
@@ -213,8 +365,15 @@ module Hwaro
 
         table = Logger::Table.new([HEADER_STATUS, HEADER_DATE, HEADER_TITLE, HEADER_PATH])
         contents.each_with_index do |info, index|
-          status = info.draft ? "[draft]" : "[pub]"
-          status_role = info.draft ? Logger::Role::Warn : Logger::Role::Dim
+          # `[future]` / `[expired]` are as unpublished as `[draft]` — a
+          # default build ships none of them — so they get the same warn
+          # colour rather than reading as published.
+          status, status_role = case info.status
+                                when "draft"   then {"[draft]", Logger::Role::Warn}
+                                when "future"  then {"[future]", Logger::Role::Warn}
+                                when "expired" then {"[expired]", Logger::Role::Warn}
+                                else                {"[pub]", Logger::Role::Dim}
+                                end
           title, path = cells[index]
           table.row(
             [
@@ -232,102 +391,312 @@ module Hwaro
         Logger.outcome("listed", "#{contents.size} #{contents.size == 1 ? "file" : "files"}")
       end
 
-      private def find_content_files : Array(String)
-        files = [] of String
-
-        # Unfollowable symlinks are dropped here (see `ContentWalk`) so one
-        # bad link cannot turn a listing into a wall of "Failed to read
-        # content file" warnings for files the build itself skips. `tool
-        # stats` walks through this method too, so both stay consistent.
-        Dir.glob(File.join(@content_dir, "**", "*.md")) do |file|
-          files << file if ContentWalk.readable_file?(file)
+      # Expanded paths of every authored file a build treats as a draft —
+      # its own `draft` flag or one cascaded from an ancestor section —
+      # without the listing's log output. `tool export` reads this so a
+      # cascaded draft is skipped exactly as `build`/`list` skip it.
+      def draft_paths : Set(String)
+        files = find_content_files
+        cascade = collect_cascade_drafts(files)
+        files.each_with_object(Set(String).new) do |file, set|
+          set << File.expand_path(file) if parse_content_info(file, cascade).try(&.draft)
         end
-
-        Dir.glob(File.join(@content_dir, "**", "*.markdown")) do |file|
-          files << file if ContentWalk.readable_file?(file)
-        end
-
-        files.sort
       end
 
-      private def parse_content_info(file_path : String) : ContentInfo?
+      private def find_content_files : Array(String)
+        ContentWalk.find_content_files(@content_dir)
+      end
+
+      private def parse_content_info(
+        file_path : String,
+        cascade : Hash(Tuple(String, String), Bool) = {} of Tuple(String, String) => Bool,
+        now : Time = Time.utc,
+      ) : ContentInfo?
         # Match the build's frontmatter reader: a BOM'd file would otherwise
         # list as "Untitled" with no date while it builds correctly.
         content = Utils::TextUtils.strip_bom(File.read(file_path))
 
         title = "Untitled"
         draft = false
+        # The build resolves a cascade against the DECLARED keys
+        # (`front_matter_keys`), not against the parsed value: a page that
+        # spells `draft = "true"` still shadows an ancestor's cascade even
+        # though the value is not a boolean. Track presence separately so the
+        # two agree.
+        draft_declared = false
         date : Time? = nil
+        expires : Time? = nil
 
-        # Try TOML Front Matter (+++)
-        if match = content.match(Utils::FrontmatterScanner::TOML_FRONTMATTER_RE)
-          begin
-            toml_fm = TOML.parse(match[1])
-            title = toml_fm["title"]?.try(&.as_s?) || title
-            draft = toml_fm["draft"]?.try(&.as_bool?) || false
-            # TOML parser may return Time directly or String
-            if date_val = toml_fm["date"]?
-              raw = date_val.raw
-              if raw.is_a?(Time)
-                date = raw
-              elsif raw.is_a?(String)
-                date = parse_time(raw)
+        # Front matter, in the build's dialect order (TOML → YAML → JSON).
+        if fm = Utils::FrontmatterScanner.detect(content)
+          dialect, source = fm
+          case dialect
+          when :toml
+            begin
+              toml_fm = TOML.parse(source)
+              title = toml_fm["title"]?.try(&.as_s?) || title
+              if declared = toml_fm["draft"]?
+                draft_declared = true
+                draft = declared.as_bool? || false
               end
+              date = toml_date(toml_fm["date"]?)
+              expires = toml_date(toml_fm["expires"]?)
+            rescue ex
+              Logger.debug "TOML front matter parsing failed for #{file_path}: #{ex.message}"
             end
-          rescue ex
-            Logger.debug "TOML front matter parsing failed for #{file_path}: #{ex.message}"
-          end
-          # Try YAML Front Matter (---)
-        elsif match = content.match(Utils::FrontmatterScanner::YAML_FRONTMATTER_RE)
-          begin
-            yaml_fm = YAML.parse(match[1])
-            if yaml_fm.as_h?
-              title = yaml_fm["title"]?.try(&.as_s?) || title
-              draft = yaml_fm["draft"]?.try(&.as_bool?) || false
-              # YAML parser may return Time directly or String
-              if date_val = yaml_fm["date"]?
-                if time_val = date_val.as_time?
-                  date = time_val
-                elsif str_val = date_val.as_s?
-                  date = parse_time(str_val)
+          when :yaml
+            begin
+              yaml_fm = YAML.parse(source)
+              if yaml_fm.as_h?
+                title = yaml_fm["title"]?.try(&.as_s?) || title
+                if declared = yaml_fm["draft"]?
+                  draft_declared = true
+                  draft = declared.as_bool? || false
                 end
+                date = yaml_date(yaml_fm["date"]?)
+                expires = yaml_date(yaml_fm["expires"]?)
               end
+            rescue ex
+              Logger.debug "YAML front matter parsing failed for #{file_path}: #{ex.message}"
             end
-          rescue ex
-            Logger.debug "YAML front matter parsing failed for #{file_path}: #{ex.message}"
-          end
-          # Try JSON Front Matter (balanced {...} at file start)
-        elsif content.starts_with?('{') && (end_idx = Utils::FrontmatterScanner.find_json_end(content))
-          begin
-            # find_json_end returns a BYTE offset; byte_slice keeps multibyte
-            # JSON frontmatter intact so title/date aren't silently lost.
-            json_fm = JSON.parse(content.byte_slice(0, end_idx))
-            if json_fm.as_h?
-              title = json_fm["title"]?.try(&.as_s?) || title
-              draft = json_fm["draft"]?.try(&.as_bool?) || false
-              if str_val = json_fm["date"]?.try(&.as_s?)
-                date = parse_time(str_val)
+          when :json
+            begin
+              json_fm = JSON.parse(source)
+              if json_fm.as_h?
+                title = json_fm["title"]?.try(&.as_s?) || title
+                if declared = json_fm["draft"]?
+                  draft_declared = true
+                  draft = declared.as_bool? || false
+                end
+                date = Utils::DateUtils.parse_content_date(json_fm["date"]?.try(&.as_s?))
+                expires = Utils::DateUtils.parse_content_date(json_fm["expires"]?.try(&.as_s?))
               end
+            rescue ex
+              Logger.debug "JSON front matter parsing failed for #{file_path}: #{ex.message}"
             end
-          rescue ex
-            Logger.debug "JSON front matter parsing failed for #{file_path}: #{ex.message}"
           end
         end
+
+        is_draft = draft_declared ? draft : cascaded_draft?(file_path, cascade)
+        state = publish_state(is_draft, date, expires, now)
 
         ContentInfo.new(
           path: file_path,
           title: title,
-          draft: draft,
-          date: date
+          draft: is_draft,
+          date: date,
+          state: state,
+          expires: expires
         )
       rescue ex
         Logger.warn "Failed to read content file #{file_path}: #{ex.message}"
         nil
       end
 
-      private def parse_time(time_str : String?) : Time?
-        return unless time_str
-        Utils::DateUtils.parse_lenient(time_str)
+      # Mirrors the build's filter ORDER (draft → expired → future) so the
+      # reported reason matches the one `hwaro build` would report.
+      private def publish_state(draft : Bool, date : Time?, expires : Time?, now : Time) : PublishState
+        return PublishState::Draft if draft
+        return PublishState::Expired if expires && expires <= now
+        return PublishState::Future if date && date > now
+        PublishState::Published
+      end
+
+      # String dates go through the build's own front-matter date parser
+      # (zone-less values in the local zone, the same accepted shapes), so a
+      # status and a `date` in the JSON payload agree with what `hwaro build`
+      # does. The lenient importer parser accepted shapes the build rejects —
+      # `"2099-01-01 10:00"` listed as `future` while the build treated it as
+      # undated and published it — and read zone-less values as UTC.
+      private def toml_date(value : TOML::Any?) : Time?
+        return unless value
+        raw = value.raw
+        case raw
+        when Time   then raw
+        when String then Utils::DateUtils.parse_content_date(raw)
+        end
+      end
+
+      private def yaml_date(value : YAML::Any?) : Time?
+        return unless value
+        if time_val = value.as_time?
+          time_val
+        elsif str_val = value.as_s?
+          Utils::DateUtils.parse_content_date(str_val)
+        end
+      end
+
+      # `[cascade] draft = true` on a section `_index` file marks every
+      # descendant a draft, and the build drops them all. Collect those
+      # declarations once per run, keyed by `{relative dir, language}` the
+      # way `Phases::ParseContent#build_cascade_map` does.
+      private def collect_cascade_drafts(files : Array(String)) : Hash(Tuple(String, String), Bool)
+        map = {} of Tuple(String, String) => Bool
+
+        files.each do |file_path|
+          basename = File.basename(file_path)
+          next unless section_index?(basename)
+          value = cascade_draft_value(file_path)
+          next if value.nil?
+          map[{relative_dir(file_path), language_token(basename)}] = value
+        end
+
+        map
+      end
+
+      # The `draft` entry of a section's `[cascade]` table, or nil when the
+      # file declares no cascade (or no `draft` inside it).
+      private def cascade_draft_value(file_path : String) : Bool?
+        content = Utils::TextUtils.strip_bom(File.read(file_path))
+        return unless fm = Utils::FrontmatterScanner.detect(content)
+        dialect, source = fm
+
+        case dialect
+        when :toml
+          TOML.parse(source)["cascade"]?.try(&.as_h?).try(&.["draft"]?).try(&.as_bool?)
+        when :yaml
+          YAML.parse(source).as_h?.try(&.[YAML::Any.new("cascade")]?).try(&.as_h?)
+            .try(&.[YAML::Any.new("draft")]?).try(&.as_bool?)
+        when :json
+          JSON.parse(source).as_h?.try(&.["cascade"]?).try(&.as_h?)
+            .try(&.["draft"]?).try(&.as_bool?)
+        end
+      rescue ex
+        Logger.debug "Cascade parsing failed for #{file_path}: #{ex.message}"
+        nil
+      end
+
+      # Walk the ancestor chain shallowest-first so the nearest section wins.
+      # A section's own `_index` is NOT subject to its own cascade, and the
+      # language must match exactly — `merged_cascade_for` keys strictly on
+      # `{dir, language}`, so a `ko` page never inherits a default-language
+      # section's cascade.
+      private def cascaded_draft?(file_path : String, cascade : Hash(Tuple(String, String), Bool)) : Bool
+        return false if cascade.empty?
+
+        basename = File.basename(file_path)
+        language = language_token(basename)
+        dir = relative_dir(file_path)
+
+        chain = [""] of String
+        unless dir.empty?
+          acc = ""
+          dir.split('/').each do |part|
+            acc = acc.empty? ? part : "#{acc}/#{part}"
+            chain << acc
+          end
+        end
+        # Cascade applies to descendants only.
+        chain.pop if section_index?(basename)
+
+        result = false
+        chain.each do |ancestor|
+          # `if value = cascade[...]?` would drop a cascaded `draft = false`:
+          # Crystal reads the retrieved `false` as a failed match, so a nested
+          # section could never un-draft what an ancestor cascaded. The build
+          # merges per ancestor, deeper wins — `false` included.
+          next unless cascade.has_key?({ancestor, language})
+          result = cascade[{ancestor, language}]
+        end
+        result
+      end
+
+      # Path of `file_path`'s directory relative to the content root, with
+      # `""` for the root itself.
+      private def relative_dir(file_path : String) : String
+        relative = Path[file_path].relative_to?(Path[@content_dir]).try(&.to_s) || file_path
+        dir = File.dirname(relative)
+        dir == "." ? "" : dir
+      end
+
+      # The language suffix of a content filename (`about.ko.md` → `"ko"`),
+      # or `""` for the default language. The build normalizes an absent
+      # language to `config.default_language`, so a file that spells the
+      # DEFAULT code out (`about.en.md` on an `en` site) has to normalize to
+      # the same bucket as `about.md` — otherwise the two stop sharing a
+      # section's cascade.
+      private def language_token(basename : String) : String
+        code = filename_language(basename)
+        return "" if code.nil? || code == language_setup.default
+        code
+      end
+
+      # Mirrors `Phases::ReadContent#extract_language_from_filename`: the
+      # text between the last two dots is a language only on a multilingual
+      # site, and only when it is a DECLARED code (or the default). A
+      # shape-based guess read `setup.mac.md` — or `about.en.md` on a site
+      # with no `[languages]` — as a translation, so the file missed its
+      # section's `[cascade] draft = true` and was listed as published while
+      # the build dropped it.
+      private def filename_language(basename : String) : String?
+        setup = language_setup
+        return unless setup.multilingual
+        ext = File.extname(basename)
+        return if ext.empty?
+        Utils::PathUtils.language_suffix(basename[0, basename.size - ext.size]) do |code|
+          setup.codes.includes?(code) || code == setup.default
+        end
+      end
+
+      # The bare content path (`about.md`) the build also indexes a
+      # default-language file that spells its suffix out (`about.en.md`)
+      # under, as `InternalLinkResolver.add_default_language_aliases` does;
+      # nil when `relative` is no such file.
+      def default_language_bare_path(relative : String) : String?
+        setup = language_setup
+        return unless setup.multilingual
+        ext = File.extname(relative)
+        stem = relative.rchop(ext)
+        suffix = ".#{setup.default}"
+        return unless stem.ends_with?(suffix)
+        bare = stem.rchop(suffix)
+        return if bare.empty? || bare.ends_with?('/')
+        "#{bare}#{ext}"
+      end
+
+      # A section `_index` the way ReadContent decides it: the basename with
+      # any recognised language suffix removed is `_index` + extension. An
+      # undeclared suffix (`_index.old.md`) makes a regular page.
+      private def section_index?(basename : String) : Bool
+        ext = File.extname(basename)
+        clean = if code = filename_language(basename)
+                  "#{basename.rchop(".#{code}#{ext}")}#{ext}"
+                else
+                  basename
+                end
+        clean == "_index#{ext.downcase}"
+      end
+
+      private record LanguageSetup, default : String, codes : Set(String), multilingual : Bool
+
+      # The project's language configuration, read from its `config.toml`
+      # with the build's defaults (`default_language` falls back to "en").
+      # Parsed directly rather than through `Models::Config` so the lister
+      # keeps taking nothing but a directory.
+      private def language_setup : LanguageSetup
+        @language_setup ||= read_language_setup
+      end
+
+      private def read_language_setup : LanguageSetup
+        default = "en"
+        codes = Set(String).new
+        parent = File.dirname(@content_dir.rstrip(File::SEPARATOR))
+        {File.join(parent, "config.toml"), "config.toml"}.each do |path|
+          next unless File.exists?(path)
+          begin
+            raw = TOML.parse(Utils::TextUtils.strip_bom(File.read(path)))
+            default = raw["default_language"]?.try(&.as_s?) || default
+            # Config#load_languages only registers table-valued entries.
+            raw["languages"]?.try(&.as_h?).try &.each do |code, entry|
+              codes << code if entry.as_h?
+            end
+          rescue
+          end
+          break
+        end
+        all = codes.to_a
+        all << default unless default.empty?
+        LanguageSetup.new(default, codes, all.uniq.size > 1)
       end
 
       # Cap a cell at `max_length` terminal COLUMNS. Measuring in codepoints

@@ -33,11 +33,11 @@ weight = 3
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | default_language | string | "en" | Default language code |
-| language_name | string | — | Human-readable language name |
-| weight | int | 0 | Sort order (lower = first) |
-| generate_feed | bool | true | Generate RSS/Atom feed for this language |
+| language_name | string | the language code | Human-readable language name |
+| weight | int | 1 | Sort order (lower = first) |
+| generate_feed | bool | true | Generate the RSS/Atom/JSON feed for this language |
 | build_search_index | bool | true | Include in search index |
-| taxonomies | array | [] | Taxonomies for this language |
+| taxonomies | array | every `[[taxonomies]]` name | Taxonomies for this language; omit to inherit the global set, `[]` for none |
 
 ## Content Structure
 
@@ -66,6 +66,8 @@ content/
 
 The default language pages are served at the root path. Non-default language pages are prefixed with the language code.
 
+Spelling out the default language suffix is optional: `about.en.md` (with `default_language = "en"`) is the same as `about.md`. It is published at `/about/` and listed with the other default-language pages of its section.
+
 ### Section Translations
 
 Section index files also support language suffixes:
@@ -83,6 +85,8 @@ content/
 Hwaro automatically links translated pages based on their filenames. Pages with the same base name (without the language suffix) are considered translations of each other.
 
 For example, `hello.md`, `hello.ko.md`, and `hello.ja.md` are all linked as translations.
+
+To find pages that are not translated yet, run `hwaro doctor`: on a site with more than one language it lists, per language, every page or section missing a translation and every translation without a default-language original, using the same pairing. See [doctor](/start/tools/doctor/#what-it-checks).
 
 ### Template Variables
 
@@ -335,7 +339,7 @@ When the site is multilingual, Hwaro automatically generates separate RSS/Atom f
 | Non-default (e.g., `ko`) | `/ko/rss.xml` | Only Korean pages |
 | Non-default (e.g., `ja`) | `/ja/rss.xml` | Only Japanese pages |
 
-By default, the main site feed (`/rss.xml` or `/atom.xml`) includes **only default language pages**. You can change this behavior with the `default_language_only` option. Each non-default language with `generate_feed = true` gets its own feed under its language prefix regardless of this setting.
+By default, the main site feed (`/rss.xml`, `/atom.xml` or `/feed.json`) includes **only default language pages**. You can change this behavior with the `default_language_only` option. Each non-default language with `generate_feed = true` gets its own feed under its language prefix regardless of this setting.
 
 ### Configuration
 
@@ -365,7 +369,7 @@ Language feeds share the same `sections`, `limit`, `truncate`, and `full_content
 ```toml
 [feeds]
 enabled = true
-type = "rss"           # or "atom"
+type = "rss"           # or "atom", "json"
 limit = 20
 truncate = 0
 full_content = true    # false = description/summary only
@@ -377,10 +381,13 @@ default_language_only = true
 
 - **RSS feeds** include a `<language>` tag (e.g., `<language>ko</language>`)
 - **Atom feeds** include an `xml:lang` attribute (e.g., `<feed xmlns="..." xml:lang="ko">`)
+- **JSON feeds** include a top-level `"language"` field (e.g., `"language": "ko"`)
+- Section feeds (`/ko/blog/rss.xml`) and taxonomy term feeds (`/ko/tags/crystal/rss.xml`) of a non-default language declare it the same way; default-language feeds declare none
 - Feed title includes the language name: `"My Site (한국어)"`
 - Self-referencing links point to the correct language path (e.g., `https://example.com/ko/rss.xml`)
 - Draft pages and section index pages are excluded
-- Language feeds are generated independently of the main feed's `enabled` setting
+- Language feeds require `[feeds] enabled = true`; `generate_feed = false` only opts a language out
+- A language with no published pages gets no feed
 
 ### Template Links
 

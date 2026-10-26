@@ -1,0 +1,800 @@
+require "../../../../spec_helper"
+require "../../../../../src/core/build/builder"
+
+# Reopen Builder to expose private Initialize-phase helpers for testing.
+module Hwaro::Core::Build
+  class Builder
+    def test_setup_output_dir(output_dir : String, incremental : Bool = false)
+      setup_output_dir(output_dir, incremental)
+    end
+
+    def test_copy_static_files(output_dir : String, verbose : Bool = false, incremental : Bool = false)
+      copy_static_files(output_dir, verbose, incremental)
+    end
+
+    def test_copy_static_pairs(pairs : Array({String, String, Time}))
+      copy_static_pairs(pairs)
+    end
+
+    def test_load_templates : Hash(String, String)
+      load_templates
+    end
+
+    def test_load_data_files(site : Models::Site, config : Models::Config = Models::Config.new)
+      load_data_files(site, config)
+    end
+
+    def test_compute_disk_data_hash : String
+      compute_disk_data_hash
+    end
+
+    def test_create_fresh_crinja_env : Crinja
+      create_fresh_crinja_env
+    end
+
+    def test_run_initialize(ctx : Lifecycle::BuildContext, profiler : Profiler)
+      execute_initialize_phase(ctx, profiler)
+    end
+
+    def test_set_config_for_init(config : Models::Config)
+      @config = config
+    end
+
+    def test_get_site
+      @site
+    end
+
+    def test_get_cache
+      @cache
+    end
+
+    def test_get_templates
+      @templates
+    end
+
+    def test_template_var_features
+      @template_var_features
+    end
+  end
+end
+
+describe Hwaro::Core::Build::Phases::Initialize do
+  describe "#setup_output_dir" do
+    it "creates the output directory when it does not exist" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_setup_output_dir("public")
+          Dir.exists?("public").should be_true
+        end
+      end
+    end
+
+    it "wipes the output directory in non-incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          File.write("public/stale.html", "stale")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_setup_output_dir("public", incremental: false)
+
+          Dir.exists?("public").should be_true
+          File.exists?("public/stale.html").should be_false
+        end
+      end
+    end
+
+    it "preserves existing files in incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          File.write("public/keep.html", "keep")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_setup_output_dir("public", incremental: true)
+
+          File.exists?("public/keep.html").should be_true
+        end
+      end
+    end
+
+    it "refuses to wipe the project directory itself (output_dir resolves to cwd)" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("source.md", "important")
+
+          builder = Hwaro::Core::Build::Builder.new
+          ex = expect_raises(Hwaro::HwaroError) do
+            builder.test_setup_output_dir(".", incremental: false)
+          end
+          ex.code.should eq(Hwaro::Errors::HWARO_E_CONFIG)
+          # The guard fires before rm_rf, so project files survive.
+          File.exists?("source.md").should be_true
+        end
+      end
+    end
+
+    it "refuses to wipe a parent of the project directory" do
+      Dir.mktmpdir do |dir|
+        FileUtils.mkdir_p(File.join(dir, "sub"))
+        Dir.cd(File.join(dir, "sub")) do
+          builder = Hwaro::Core::Build::Builder.new
+          expect_raises(Hwaro::HwaroError) do
+            builder.test_setup_output_dir("..", incremental: false)
+          end
+        end
+      end
+    end
+  end
+
+  describe "#copy_static_files" do
+    it "is a no-op when no static directory exists" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_copy_static_files("public")
+          # Nothing copied; directory still empty
+          Dir.children("public").should be_empty
+        end
+      end
+    end
+
+    it "raises instead of publishing without a static file it could not copy" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          File.write("static/ok.css", "ok")
+          File.write("static/locked.css", "secret")
+          File.chmod("static/locked.css", 0o000)
+          FileUtils.mkdir_p("public")
+          begin
+            # Root reads it anyway; nothing to assert there.
+            next if File::Info.readable?("static/locked.css")
+            expect_raises(File::Error, /locked\.css/) do
+              Hwaro::Core::Build::Builder.new.test_copy_static_files("public")
+            end
+            File.read("public/ok.css").should eq("ok")
+          ensure
+            File.chmod("static/locked.css", 0o644)
+          end
+        end
+      end
+    end
+
+    it "skips a static file deleted after the scan instead of failing" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("public")
+          Hwaro::Core::Build::Builder.new.test_copy_static_pairs([{"static/gone.swp", "public/gone.swp", Time.utc}])
+          File.exists?("public/gone.swp").should be_false
+        end
+      end
+    end
+
+    it "copies all files in non-incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css")
+          File.write("static/robots.txt", "User-agent: *")
+          File.write("static/css/main.css", "body{}")
+          FileUtils.mkdir_p("public")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_copy_static_files("public")
+
+          File.exists?("public/robots.txt").should be_true
+          File.exists?("public/css/main.css").should be_true
+          File.read("public/robots.txt").should eq("User-agent: *")
+        end
+      end
+    end
+
+    it "skips unchanged files in incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          File.write("static/a.txt", "src!")
+
+          FileUtils.mkdir_p("public")
+          # Same LENGTH as the source: the incremental skip now requires size
+          # equality as well as a matching mtime, so a differently-sized
+          # sentinel would legitimately be re-copied.
+          File.write("public/a.txt", "dest")
+          # A copy carries the SOURCE's mtime, so matching mtimes is what marks
+          # the destination as already up to date. (A merely *newer* mtime is
+          # not enough — see the regression below.) Settled: a match on an
+          # mtime still inside its timestamp tick is byte-compared (#857).
+          File.utime(Time.utc, Time.utc - 1.hour, "static/a.txt")
+          src_mtime = File.info("static/a.txt").modification_time
+          File.utime(src_mtime, src_mtime, "public/a.txt")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_copy_static_files("public", incremental: true)
+
+          File.read("public/a.txt").should eq("dest")
+        end
+      end
+    end
+
+    # Regression: a source whose mtime moved BACKWARDS — what `git checkout`
+    # of an older revision, `git stash pop` and `rsync --times` all do — was
+    # skipped forever by the old "destination is newer" test, so `public/`
+    # kept serving the previous revision's asset on every incremental build.
+    it "re-copies a file whose source mtime moved backwards in incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          FileUtils.mkdir_p("public")
+          File.write("static/a.txt", "restored old revision")
+          File.write("public/a.txt", "previously published")
+
+          older = Time.utc(2020, 1, 1)
+          File.utime(older, older, "static/a.txt")
+          newer = Time.utc
+          File.utime(newer, newer, "public/a.txt")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_copy_static_files("public", incremental: true)
+
+          File.read("public/a.txt").should eq("restored old revision")
+          # The copy is stamped with the source mtime, so the NEXT incremental
+          # build takes the equality fast path instead of copying again.
+          File.info("public/a.txt").modification_time
+            .should eq(File.info("static/a.txt").modification_time)
+        end
+      end
+    end
+
+    it "copies new files in incremental mode" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          File.write("static/new.txt", "new content")
+          FileUtils.mkdir_p("public")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_copy_static_files("public", incremental: true)
+
+          File.exists?("public/new.txt").should be_true
+          File.read("public/new.txt").should eq("new content")
+        end
+      end
+    end
+
+    # Regression: hidden dot-directories such as `.well-known/` must be
+    # published. Crystal's `Dir.glob` skips hidden entries by default, which
+    # previously dropped them from cached builds (issue #610).
+    {true, false}.each do |incremental|
+      mode = incremental ? "incremental" : "non-incremental"
+
+      it "copies hidden dot-directories like .well-known in #{mode} mode" do
+        Dir.mktmpdir do |dir|
+          Dir.cd(dir) do
+            FileUtils.mkdir_p("static/.well-known")
+            File.write("static/.well-known/security.txt", "Contact: mailto:x@y.z")
+            File.write("static/robots.txt", "User-agent: *")
+            FileUtils.mkdir_p("public")
+
+            builder = Hwaro::Core::Build::Builder.new
+            builder.test_copy_static_files("public", incremental: incremental)
+
+            File.exists?("public/.well-known/security.txt").should be_true
+            File.read("public/.well-known/security.txt").should eq("Contact: mailto:x@y.z")
+            File.exists?("public/robots.txt").should be_true
+          end
+        end
+      end
+
+      it "excludes OS/VCS cruft like .DS_Store and .git in #{mode} mode" do
+        Dir.mktmpdir do |dir|
+          Dir.cd(dir) do
+            FileUtils.mkdir_p("static/css")
+            FileUtils.mkdir_p("static/.git")
+            File.write("static/css/main.css", "body{}")
+            File.write("static/.DS_Store", "junk")
+            File.write("static/css/.DS_Store", "junk")
+            File.write("static/.git/config", "[core]")
+            File.write("static/.main.css.swp", "swap")
+            FileUtils.mkdir_p("public")
+
+            builder = Hwaro::Core::Build::Builder.new
+            builder.test_copy_static_files("public", incremental: incremental)
+
+            File.exists?("public/css/main.css").should be_true
+            File.exists?("public/.DS_Store").should be_false
+            File.exists?("public/css/.DS_Store").should be_false
+            File.exists?("public/.git/config").should be_false
+            File.exists?("public/.main.css.swp").should be_false
+          end
+        end
+      end
+    end
+
+    it "copies an in-project symlink but skips one escaping the project" do
+      # A symlink whose target lives outside the project must not leak that
+      # file into the published output; an in-repo symlink is still copied.
+      Dir.mktmpdir do |outside|
+        secret = File.join(outside, "secret.txt")
+        File.write(secret, "leak")
+
+        Dir.mktmpdir do |dir|
+          Dir.cd(dir) do
+            FileUtils.mkdir_p("static")
+            File.write("static/real.txt", "in-repo")
+            File.symlink(File.expand_path("static/real.txt"), "static/inside.txt")
+            File.symlink(secret, "static/outside.txt")
+            FileUtils.mkdir_p("public")
+
+            builder = Hwaro::Core::Build::Builder.new
+            builder.test_copy_static_files("public")
+
+            File.exists?("public/inside.txt").should be_true
+            File.read("public/inside.txt").should eq("in-repo")
+            File.exists?("public/outside.txt").should be_false
+          end
+        end
+      end
+    end
+
+    # The static walk does not follow a linked directory; the files under it
+    # used to vanish from the output without a word.
+    it "warns about a symlinked directory it does not copy" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p(["static", "shared/img", "public"])
+          File.write("shared/img/a.png", "png")
+          File.symlink(File.expand_path("shared/img"), "static/img")
+
+          log = with_captured_log { Hwaro::Core::Build::Builder.new.test_copy_static_files("public") }
+          log.should contain("Skipping static directory symlink (directory symlinks are not followed): static/img")
+        end
+      end
+    end
+
+    it "honors a custom [static] exclude list from config" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          File.write("static/keep.txt", "keep")
+          File.write("static/secret.bak", "drop")
+          FileUtils.mkdir_p("public")
+
+          config = Hwaro::Models::Config.new
+          config.static.exclude = ["*.bak"]
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_set_config_for_init(config)
+          builder.test_copy_static_files("public")
+
+          File.exists?("public/keep.txt").should be_true
+          File.exists?("public/secret.bak").should be_false
+        end
+      end
+    end
+
+    it "publishes cruft when use_default_excludes is disabled" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static")
+          File.write("static/.DS_Store", "junk")
+          FileUtils.mkdir_p("public")
+
+          config = Hwaro::Models::Config.new
+          config.static.use_default_excludes = false
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_set_config_for_init(config)
+          builder.test_copy_static_files("public")
+
+          File.exists?("public/.DS_Store").should be_true
+        end
+      end
+    end
+  end
+
+  describe "#load_templates" do
+    it "skips the section.pages copy only for templates that never read `section`" do
+      # A substring test matched `page.section`, `<section>` and comments, and
+      # a `{{ fn() }}` call disabled the gate: every page of a large section
+      # copied the whole section listing (quadratic).
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates")
+          File.write("templates/header.html", %(<body data-section="{{ page.section }}">))
+          File.write("templates/post.html", %({% include "header.html" %}<section>{# section nav #}{{ page.section }} {{ get_url(path="/") }}</section>))
+          File.write("templates/list.html", %(<p>{{ section.pages | length }}</p>))
+          File.write("templates/alias.html", %({% set s = section %}{{ s.title }}))
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_load_templates
+          features = builder.test_template_var_features
+          features["post"]?.try(&.needs_section_pages).should be_false
+          features["list"]?.try(&.needs_section_pages).should be_true
+          features["alias"]?.try(&.needs_section_pages).should be_true
+          # A template that may hold shortcodes keeps the SEO/JSON-LD vars.
+          features["post"]?.try(&.needs_seo).should be_true
+        end
+      end
+    end
+
+    it "keeps the section.pages copy for a template whose shortcode prints a `section` read" do
+      # A template-invoked shortcode's output is compiled with the template,
+      # so a raw `{{ section.pages }}` it prints reads `section` although no
+      # lexed identifier in the closure does.
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates/shortcodes")
+          File.write("templates/shortcodes/count.html", %({% raw %}{{ section.pages | length }}{% endraw %}))
+          File.write("templates/post.html", %(<p>{{ count() }}</p>))
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_load_templates
+          builder.test_template_var_features["post"]?.try(&.needs_section_pages).should be_true
+        end
+      end
+    end
+
+    it "returns an empty hash when no templates directory exists" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          templates = builder.test_load_templates
+          templates.should be_empty
+        end
+      end
+    end
+
+    it "loads template files from the templates directory" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates")
+          File.write("templates/page.html", "<p>{{ content }}</p>")
+          File.write("templates/section.html", "<section>{{ content }}</section>")
+
+          builder = Hwaro::Core::Build::Builder.new
+          templates = builder.test_load_templates
+
+          templates.has_key?("page").should be_true
+          templates.has_key?("section").should be_true
+          templates["page"].should contain("{{ content }}")
+        end
+      end
+    end
+
+    it "drops a leading UTF-8 BOM so it never lands in the rendered page" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates/partials")
+          File.write("templates/page.html", "﻿<p>{{ content }}</p>")
+          File.write("templates/partials/hdr.html", "﻿<header>HDR</header>")
+
+          templates = Hwaro::Core::Build::Builder.new.test_load_templates
+
+          templates["page"].should eq("<p>{{ content }}</p>")
+          templates["partials/hdr"].should eq("<header>HDR</header>")
+        end
+      end
+    end
+
+    it "honors extension priority (html beats j2)" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates")
+          File.write("templates/page.html", "from-html")
+          File.write("templates/page.j2", "from-j2")
+
+          builder = Hwaro::Core::Build::Builder.new
+          templates = builder.test_load_templates
+
+          templates["page"].should eq("from-html")
+        end
+      end
+    end
+
+    it "strips a UTF-8 BOM from template sources" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates/shortcodes")
+          File.write("templates/page.html", "\uFEFF<p>{{ content }}</p>")
+          File.write("templates/shortcodes/sc.html", "\uFEFFSC")
+
+          templates = Hwaro::Core::Build::Builder.new.test_load_templates
+
+          templates["page"].should eq("<p>{{ content }}</p>")
+          templates["shortcodes/sc"].should eq("SC")
+        end
+      end
+    end
+
+    it "uses default template as fallback for page when no page template exists" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates")
+          File.write("templates/default.html", "default-body")
+
+          builder = Hwaro::Core::Build::Builder.new
+          templates = builder.test_load_templates
+
+          templates["page"]?.should eq("default-body")
+        end
+      end
+    end
+  end
+
+  describe "#load_data_files" do
+    it "loads YAML data files into site.data" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/people.yml", "alice: { age: 30 }\nbob: { age: 25 }\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data.has_key?("people").should be_true
+        end
+      end
+    end
+
+    it "loads JSON data files" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/menu.json", %({"home": "/"}))
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data.has_key?("menu").should be_true
+        end
+      end
+    end
+
+    it "loads a data file whose extension is not lowercase" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/Team.JSON", %({"lead": "kim"}))
+          File.write("data/notes.txt", "not data")
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+          site.data.keys.should eq(["Team"])
+
+          # ...and `--cache` sees it change.
+          before = builder.test_compute_disk_data_hash
+          File.write("data/Team.JSON", %({"lead": "lee"}))
+          builder.test_compute_disk_data_hash.should_not eq(before)
+        end
+      end
+    end
+
+    it "loads TOML data files" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/config.toml", %(title = "Hello"))
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data.has_key?("config").should be_true
+        end
+      end
+    end
+
+    it "is a no-op when data directory does not exist" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          # Pre-populate data to verify it is cleared
+          site.data["seed"] = Crinja::Value.new("x")
+          builder.test_load_data_files(site)
+          site.data.should be_empty
+        end
+      end
+    end
+
+    it "skips invalid data files but keeps the build alive" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/bad.json", "not valid json")
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data.has_key?("bad").should be_false
+        end
+      end
+    end
+
+    it "exposes subdirectory files as a nested iterable map" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data/users")
+          File.write("data/users/alice.yml", "age: 30\n")
+          File.write("data/users/bob.yml", "age: 25\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          users = site.data["users"]?
+          users.should_not be_nil
+          dict = users.not_nil!.raw.as(Crinja::Dictionary)
+          dict.keys.map { |k| k.raw.as(String) }.sort!.should eq(["alice", "bob"])
+          users.not_nil!["alice"]["age"].raw.should eq(30_i64)
+        end
+      end
+    end
+
+    it "nests arbitrarily deep subdirectories" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data/users/admins")
+          File.write("data/users/admins/root.yml", "level: 99\n")
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data["users"]["admins"]["root"]["level"].raw.should eq(99_i64)
+        end
+      end
+    end
+
+    it "lets directory shadow a same-stem sibling file and warns" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data/users")
+          File.write("data/users.yml", "shadowed: true\n")
+          File.write("data/users/alice.yml", "age: 30\n")
+
+          previous_io = Hwaro::Logger.io
+          sink = IO::Memory.new
+          Hwaro::Logger.io = sink
+
+          begin
+            builder = Hwaro::Core::Build::Builder.new
+            site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+            builder.test_load_data_files(site)
+
+            users = site.data["users"]
+            users["alice"]["age"].raw.should eq(30_i64)
+            users["shadowed"].raw.should be_a(Crinja::Undefined)
+
+            sink.to_s.should contain("data/users.yml")
+            sink.to_s.should contain("directory takes precedence")
+          ensure
+            Hwaro::Logger.io = previous_io
+          end
+        end
+      end
+    end
+
+    it "warns when duplicate stems (e.g. .yml and .yaml) collide" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          File.write("data/config.yml", "theme: light\n")
+          File.write("data/config.yaml", "theme: dark\n")
+
+          previous_io = Hwaro::Logger.io
+          sink = IO::Memory.new
+          Hwaro::Logger.io = sink
+
+          begin
+            builder = Hwaro::Core::Build::Builder.new
+            site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+            builder.test_load_data_files(site)
+
+            sink.to_s.should contain("Duplicate data key")
+          ensure
+            Hwaro::Logger.io = previous_io
+          end
+        end
+      end
+    end
+
+    it "loads files in byte order regardless of directory order" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("data")
+          %w[zeta 9 Alpha 10 beta _x].each { |stem| File.write("data/#{stem}.yml", "v: 1\n") }
+          File.write("data/dup.yml", "v: yml\n")
+          File.write("data/dup.json", %({"v": "json"}))
+
+          builder = Hwaro::Core::Build::Builder.new
+          site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+          builder.test_load_data_files(site)
+
+          site.data.keys.should eq(%w[10 9 Alpha _x beta dup zeta])
+          site.data["dup"]["v"].raw.should eq("yml")
+        end
+      end
+    end
+  end
+
+  describe "#create_fresh_crinja_env" do
+    it "returns a Crinja instance" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          env = builder.test_create_fresh_crinja_env
+          env.should be_a(Crinja)
+        end
+      end
+    end
+
+    it "returns a fresh instance per call" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          env_a = builder.test_create_fresh_crinja_env
+          env_b = builder.test_create_fresh_crinja_env
+          env_a.should_not be(env_b)
+        end
+      end
+    end
+  end
+
+  describe "#execute_initialize_phase" do
+    it "initializes cache, site, and templates" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("templates")
+          File.write("templates/page.html", "{{ content }}")
+
+          builder = Hwaro::Core::Build::Builder.new
+          builder.test_set_config_for_init(Hwaro::Models::Config.new)
+
+          options = Hwaro::Config::Options::BuildOptions.new(output_dir: "public", cache: false)
+          ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
+          profiler = Hwaro::Profiler.new(enabled: false)
+
+          result = builder.test_run_initialize(ctx, profiler)
+
+          result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
+          builder.test_get_site.should_not be_nil
+          builder.test_get_cache.should_not be_nil
+          templates = builder.test_get_templates
+          templates.should_not be_nil
+          templates.not_nil!.has_key?("page").should be_true
+          Dir.exists?("public").should be_true
+        end
+      end
+    end
+
+    it "applies base_url override from options" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          builder = Hwaro::Core::Build::Builder.new
+          config = Hwaro::Models::Config.new
+          config.base_url = "http://default.example"
+          builder.test_set_config_for_init(config)
+
+          options = Hwaro::Config::Options::BuildOptions.new(
+            output_dir: "public",
+            base_url: "http://override.example",
+            cache: false,
+          )
+          ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
+          profiler = Hwaro::Profiler.new(enabled: false)
+
+          builder.test_run_initialize(ctx, profiler)
+
+          ctx.config.not_nil!.base_url.should eq("http://override.example")
+        end
+      end
+    end
+  end
+end

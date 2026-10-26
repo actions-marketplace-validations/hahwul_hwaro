@@ -1,0 +1,898 @@
+require "../../../spec_helper"
+require "../../../../src/core/build/builder"
+require "../../../../src/content/hooks"
+
+# End-to-end cover for what a warm `--cache` build leaves behind.
+#
+# A cold build starts from an empty output directory; `--cache` keeps it, and
+# the render phase only ever walks pages that still exist. So a page that was
+# deleted, renamed or turned into a draft kept its HTML in `public/` — still
+# served, still deployed — and a page turned `render = false` additionally
+# stayed in every SEO surface, because it renders nothing and the "nothing
+# rendered, set unchanged" skip then held.
+private def with_cached_site(&)
+  Dir.mktmpdir do |dir|
+    Dir.cd(dir) do
+      File.write("config.toml", <<-TOML)
+        title = "T"
+        base_url = "http://localhost"
+
+        [sitemap]
+        enabled = true
+
+        [[taxonomies]]
+        name = "tags"
+        TOML
+      FileUtils.mkdir_p("content/posts")
+      # A section index is what paginates, so the pagination specs need one.
+      File.write("content/posts/_index.md", "+++\ntitle = \"Posts\"\n+++\n")
+      File.write("content/posts/keep.md", "+++\ntitle = \"Keep\"\ntags = [\"keep-tag\"]\n+++\nkeep body")
+      File.write("content/posts/gone.md", "+++\ntitle = \"Gone\"\ntags = [\"gone-tag\"]\naliases = [\"/legacy/\"]\n+++\ngone body")
+      FileUtils.mkdir_p("templates")
+      File.write("templates/page.html", "<p>{{ content }}</p>")
+      # A section listing is what paginates; without its own template the
+      # section renders as a plain page and never emits /page/N/.
+      File.write("templates/section.html", "<h1>{{ page.title }}</h1>{{ pagination_nav }}")
+      yield dir
+    end
+  end
+end
+
+private def cached_build
+  builder = Hwaro::Core::Build::Builder.new
+  Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+  builder.run(Hwaro::Config::Options::BuildOptions.new(
+    output_dir: "public", parallel: false, cache: true, highlight: false,
+  )).should be_true
+  builder
+end
+
+private def stale_flag_build(skip_og_image : Bool = false, skip_image_processing : Bool = false)
+  builder = Hwaro::Core::Build::Builder.new
+  Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+  builder.run(Hwaro::Config::Options::BuildOptions.new(
+    output_dir: "public", parallel: false, cache: true, highlight: false,
+    skip_og_image: skip_og_image, skip_image_processing: skip_image_processing,
+  )).should be_true
+end
+
+class Hwaro::Core::Build::Builder
+  def run_delete_orphaned_outputs(paths : Array(String), output_dir : String)
+    delete_orphaned_outputs(paths, output_dir)
+  end
+end
+
+describe "warm --cache builds" do
+  it "removes the output of a deleted page" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/posts/gone/index.html").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      File.exists?("public/posts/gone/index.html").should be_false
+      File.exists?("public/posts/keep/index.html").should be_true
+    end
+  end
+
+  it "removes the output of a renamed page" do
+    with_cached_site do
+      cached_build
+      File.rename("content/posts/gone.md", "content/posts/moved.md")
+      cached_build
+
+      File.exists?("public/posts/gone/index.html").should be_false
+      File.exists?("public/posts/moved/index.html").should be_true
+    end
+  end
+
+  it "removes the old output of a page moved onto another page's URL" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/posts/keep/index.html").should be_true
+
+      # `posts/keep.md` sorts after `posts/gone.md`, so it loses the URL.
+      File.write("content/posts/keep.md", "+++\ntitle = \"Keep\"\npath = \"posts/gone\"\n+++\nkeep body")
+      cached_build
+
+      File.exists?("public/posts/keep/index.html").should be_false
+      File.read("public/posts/gone/index.html").should contain("gone body")
+
+      # Still the winner's file on the next warm build, and the loser
+      # publishes again once the collision is gone.
+      cached_build
+      File.read("public/posts/gone/index.html").should contain("gone body")
+      File.write("content/posts/keep.md", "+++\ntitle = \"Keep\"\n+++\nkeep body")
+      cached_build
+      File.read("public/posts/keep/index.html").should contain("keep body")
+      File.read("public/posts/gone/index.html").should contain("gone body")
+    end
+  end
+
+  it "removes the output of a page turned draft" do
+    with_cached_site do
+      cached_build
+      File.write("content/posts/gone.md", "+++\ntitle = \"Gone\"\ndraft = true\n+++\ngone body")
+      cached_build
+
+      File.exists?("public/posts/gone/index.html").should be_false
+    end
+  end
+
+  it "drops a page turned render = false from the sitemap" do
+    with_cached_site do
+      cached_build
+      File.read("public/sitemap.xml").should contain("/posts/gone/")
+
+      File.write("content/posts/gone.md", "+++\ntitle = \"Gone\"\nrender = false\n+++\ngone body")
+      cached_build
+
+      File.exists?("public/posts/gone/index.html").should be_false
+      File.read("public/sitemap.xml").should_not contain("/posts/gone/")
+    end
+  end
+
+  it "removes the taxonomy term page of a term nobody uses any more" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/tags/gone-tag/index.html").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      File.exists?("public/tags/gone-tag/index.html").should be_false
+      # The surviving post's term page must not be touched.
+      File.exists?("public/tags/keep-tag/index.html").should be_true
+    end
+  end
+
+  it "removes an alias redirect stub with the page that declared it" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/legacy/index.html").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      File.exists?("public/legacy/index.html").should be_false
+    end
+  end
+
+  it "removes an alias the page stopped declaring" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/legacy/index.html").should be_true
+
+      File.write("content/posts/gone.md", "+++\ntitle = \"Gone\"\ntags = [\"gone-tag\"]\n+++\ngone body")
+      cached_build
+
+      File.exists?("public/legacy/index.html").should be_false
+      File.exists?("public/posts/gone/index.html").should be_true
+    end
+  end
+
+  it "removes the pagination page a section no longer fills" do
+    with_cached_site do
+      File.write("config.toml", File.read("config.toml") + "\n[pagination]\nenabled = true\nper_page = 1\n")
+      cached_build
+      File.exists?("public/posts/page/2/index.html").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      File.exists?("public/posts/page/2/index.html").should be_false
+      File.exists?("public/posts/index.html").should be_true
+    end
+  end
+
+  it "regenerates a deleted alias stub and pagination page" do
+    with_cached_site do
+      File.write("config.toml", File.read("config.toml") + "\n[pagination]\nenabled = true\nper_page = 1\n")
+      cached_build
+      File.exists?("public/legacy/index.html").should be_true
+      File.exists?("public/posts/page/2/index.html").should be_true
+
+      FileUtils.rm_rf("public/legacy")
+      FileUtils.rm_rf("public/posts/page/2")
+      cached_build
+
+      File.exists?("public/legacy/index.html").should be_true
+      File.exists?("public/posts/page/2/index.html").should be_true
+    end
+  end
+
+  it "removes the AMP mirror of a deleted page" do
+    with_cached_site do
+      File.write("config.toml", File.read("config.toml") + "\n[amp]\nenabled = true\n")
+      cached_build
+      File.exists?("public/amp/posts/gone/index.html").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      File.exists?("public/amp/posts/gone/index.html").should be_false
+      File.exists?("public/amp/posts/keep/index.html").should be_true
+    end
+  end
+
+  # AMP claims nothing when it is off, so every mirror the last build wrote is
+  # stale — the whole tree goes.
+  it "removes every AMP mirror once AMP is switched off" do
+    with_cached_site do
+      base_config = File.read("config.toml")
+      File.write("config.toml", base_config + "\n[amp]\nenabled = true\n")
+      cached_build
+      File.exists?("public/amp/posts/keep/index.html").should be_true
+
+      File.write("config.toml", base_config + "\n[amp]\nenabled = false\n")
+      cached_build
+
+      File.exists?("public/amp/posts/keep/index.html").should be_false
+      File.exists?("public/posts/keep/index.html").should be_true
+    end
+  end
+
+  # A config edit invalidates every cache entry, which used to take the record
+  # of what the last build wrote with it — so nothing could be pruned, and
+  # (once a prune existed) nothing must be over-pruned either.
+  it "keeps live output across a config change that invalidates the cache" do
+    with_cached_site do
+      File.write("config.toml", File.read("config.toml") + "\n[pagination]\nenabled = true\nper_page = 1\n")
+      cached_build
+      File.exists?("public/posts/page/2/index.html").should be_true
+
+      File.write("config.toml", File.read("config.toml").sub("per_page = 1", "per_page = 5"))
+      cached_build
+
+      # Everything still published survives...
+      File.exists?("public/posts/keep/index.html").should be_true
+      File.exists?("public/posts/gone/index.html").should be_true
+      File.exists?("public/posts/index.html").should be_true
+      File.exists?("public/legacy/index.html").should be_true
+      # ...and the page the section no longer paginates into does not.
+      File.exists?("public/posts/page/2/index.html").should be_false
+    end
+  end
+
+  # OG images prune themselves inside the generator, against the manifest it
+  # already keeps in its own output directory.
+  it "removes the auto-generated OG image of a deleted page" do
+    with_cached_site do
+      File.write("config.toml", File.read("config.toml") + "\n[og.auto_image]\nenabled = true\n")
+      cached_build
+      images = Dir.glob("public/og-images/posts-gone.*")
+      images.should_not be_empty
+
+      File.delete("content/posts/gone.md")
+      cached_build
+
+      Dir.glob("public/og-images/posts-gone.*").should be_empty
+      Dir.glob("public/og-images/posts-keep.*").should_not be_empty
+    end
+  end
+
+  # Switching a generator off (or skipping it by flag) never reaches its own
+  # manifest prune, so the claims diff in Finalize has to remove its files.
+  describe "generated images once the feature stops running" do
+    it "removes auto-generated OG images when auto images are disabled" do
+      with_cached_site do
+        base = File.read("config.toml")
+        File.write("config.toml", base + "\n[og.auto_image]\nenabled = true\n")
+        cached_build
+        Dir.glob("public/og-images/*").should_not be_empty
+
+        File.write("config.toml", base + "\n[og.auto_image]\nenabled = false\n")
+        cached_build
+        Dir.glob("public/og-images/{*,.*}").should be_empty
+      end
+    end
+
+    it "removes auto-generated OG images under --skip-og-image" do
+      with_cached_site do
+        File.write("config.toml", File.read("config.toml") + "\n[og.auto_image]\nenabled = true\n")
+        cached_build
+        Dir.glob("public/og-images/*").should_not be_empty
+
+        stale_flag_build(skip_og_image: true)
+        Dir.glob("public/og-images/{*,.*}").should be_empty
+      end
+    end
+
+    it "removes responsive image variants when processing is disabled or skipped" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        pixels = Bytes.new(64 * 64 * 3, 128_u8)
+        LibStb.stbi_write_png("static/pic.png", 64, 64, 3, pixels.to_unsafe.as(Void*), 64 * 3)
+        base = File.read("config.toml")
+        File.write("config.toml", base + "\n[image_processing]\nenabled = true\nwidths = [16, 32]\n")
+        cached_build
+        File.exists?("public/pic_16w.png").should be_true
+        File.exists?("public/pic_32w.png").should be_true
+
+        # A width that left `widths` goes on its own…
+        File.write("config.toml", base + "\n[image_processing]\nenabled = true\nwidths = [16]\n")
+        cached_build
+        File.exists?("public/pic_16w.png").should be_true
+        File.exists?("public/pic_32w.png").should be_false
+
+        # …and so does everything once processing is skipped.
+        stale_flag_build(skip_image_processing: true)
+        File.exists?("public/pic_16w.png").should be_false
+        File.exists?("public/pic.png").should be_true
+      end
+    end
+  end
+
+  # Files with a SOURCE but no cache entry: `static/` copies,
+  # `[content.files]`/raw copies, page-bundle assets and the fingerprinted
+  # asset bundles. A cold build starts from an empty directory, so all of
+  # them vanish with their source; a warm `--cache` build kept publishing
+  # (and deploying) them forever.
+  describe "source-backed outputs with no cache entry" do
+    it "removes the copy of a deleted static file" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/css")
+        File.write("static/css/site.css", "body{color:red}")
+        cached_build
+        File.exists?("public/css/site.css").should be_true
+
+        File.delete("static/css/site.css")
+        cached_build
+
+        File.exists?("public/css/site.css").should be_false
+        File.exists?("public/posts/keep/index.html").should be_true
+      end
+    end
+
+    it "removes the compiled css of a deleted or renamed sass entry" do
+      with_cached_site do
+        File.write("config.toml", File.read("config.toml") + "\n[sass]\nenabled = true\n")
+        FileUtils.mkdir_p("static/css")
+        File.write("static/css/t.scss", ".a{b:1}")
+        File.write("static/css/keep.scss", ".k{b:1}")
+        cached_build
+        cached_build
+        File.exists?("public/css/t.css").should be_true
+
+        File.rename("static/css/t.scss", "static/css/u.scss")
+        cached_build
+        File.exists?("public/css/t.css").should be_false
+        File.exists?("public/css/u.css").should be_true
+        File.exists?("public/css/keep.css").should be_true
+
+        File.delete("static/css/u.scss")
+        cached_build
+        File.exists?("public/css/u.css").should be_false
+        File.exists?("public/css/keep.css").should be_true
+      end
+    end
+
+    it "keeps an unchanged static file that the warm build skipped copying" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/css")
+        File.write("static/css/site.css", "body{color:red}")
+        cached_build
+        # Second warm build copies nothing (mtime+size match) — the claim must
+        # still be recorded, or the THIRD build would delete a live file.
+        cached_build
+        cached_build
+
+        File.exists?("public/css/site.css").should be_true
+        File.read("public/css/site.css").should eq("body{color:red}")
+      end
+    end
+
+    it "removes the copy of a deleted content file" do
+      with_cached_site do
+        File.write("config.toml", File.read("config.toml") +
+                                  "\n[content.files]\nallow_extensions = [\"txt\"]\n")
+        File.write("content/posts/notes.txt", "hello")
+        cached_build
+        File.exists?("public/posts/notes.txt").should be_true
+
+        File.delete("content/posts/notes.txt")
+        cached_build
+
+        File.exists?("public/posts/notes.txt").should be_false
+      end
+    end
+
+    it "removes a page bundle asset deleted from the bundle" do
+      with_cached_site do
+        File.write("config.toml", File.read("config.toml") +
+                                  "\n[content.files]\nallow_extensions = []\n")
+        FileUtils.mkdir_p("content/posts/bundle")
+        File.write("content/posts/bundle/index.md", "+++\ntitle = \"Bundle\"\n+++\nbody")
+        File.write("content/posts/bundle/pic.svg", "<svg/>")
+        cached_build
+        File.exists?("public/posts/bundle/pic.svg").should be_true
+
+        File.delete("content/posts/bundle/pic.svg")
+        cached_build
+
+        File.exists?("public/posts/bundle/pic.svg").should be_false
+        File.exists?("public/posts/bundle/index.html").should be_true
+      end
+    end
+
+    # A static file and a page can publish the SAME output path (the page
+    # render overwrites the copy). Dropping the static claim must not delete
+    # the file the page still writes — which is why the owned/still-written
+    # filter runs after the source-less list is folded in, not before.
+    it "keeps a path a page still writes when the static copy claiming it is deleted" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/posts/keep")
+        File.write("static/posts/keep/index.html", "<p>from static</p>")
+        cached_build
+        File.read("public/posts/keep/index.html").should contain("keep body")
+
+        File.delete("static/posts/keep/index.html")
+        cached_build
+
+        File.exists?("public/posts/keep/index.html").should be_true
+        File.read("public/posts/keep/index.html").should contain("keep body")
+      end
+    end
+
+    # `static/` is copied in the Initialize phase and the render runs after it,
+    # so a cold build lets the page win a shared output path. On a warm build
+    # the page is a cache hit and never re-renders, so the static copy's bytes
+    # replaced it — `public/posts/keep/index.html` served the static file.
+    it "re-renders a page whose output the static copy overwrote" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/posts/keep")
+        File.write("static/posts/keep/index.html", "<p>from static</p>")
+        cached_build
+        File.read("public/posts/keep/index.html").should contain("keep body")
+
+        File.write("static/posts/keep/index.html", "<p>from static v2</p>")
+        # The copy is skipped on size+mtime equality; make the change
+        # unambiguous rather than depend on filesystem timestamp granularity.
+        File.utime(Time.utc, Time.utc + 1.hour, "static/posts/keep/index.html")
+        cached_build
+
+        File.read("public/posts/keep/index.html").should contain("keep body")
+        File.read("public/posts/keep/index.html").should_not contain("from static")
+      end
+    end
+
+    # A static file and a GENERATED file can be the same file:
+    # `static/robots.txt` publishes exactly where the robots generator
+    # writes, and only the static side is claimed. Deleting the source must
+    # not take the generated output with it.
+    it "keeps a generated file that a deleted static file shadowed" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        File.write("static/robots.txt", "User-agent: custom\n")
+        File.write("templates/404.html", "<p>not found</p>")
+        File.write("static/404.html", "<p>static 404</p>")
+        cached_build
+        File.exists?("public/robots.txt").should be_true
+
+        File.delete("static/robots.txt")
+        File.delete("static/404.html")
+        cached_build
+
+        File.exists?("public/robots.txt").should be_true
+        File.read("public/robots.txt").should_not contain("custom")
+        File.exists?("public/404.html").should be_true
+        File.read("public/404.html").should contain("not found")
+
+        cache = Hwaro::Core::Build::CacheData.from_json(File.read(".hwaro_cache.json"))
+        cache.metadata.generated_outputs.should contain("robots.txt")
+        cache.metadata.generated_outputs.should contain("404.html")
+      end
+    end
+
+    # An `aliases` redirect stub and a section's `/page/N/` pagination pages
+    # are written ONLY by a render, and the cache entry is the only record of
+    # them — so a `static/` file publishing to one of those paths replaced it
+    # outright on every warm build, the owning page being a cache hit.
+    # The generators run after the static copy; on an all-hit warm build they
+    # used to be skipped as unchanged, leaving the static bytes published.
+    it "lets the generated sitemap win over an edited static file at its path" do
+      with_cached_site do
+        cached_build
+        FileUtils.mkdir_p("static")
+        File.write("static/sitemap.xml", "user v1")
+        cached_build
+        File.read("public/sitemap.xml").should contain("<urlset")
+
+        File.write("static/sitemap.xml", "user v2")
+        cached_build
+        File.read("public/sitemap.xml").should contain("<urlset")
+        File.read("public/sitemap.xml").should_not contain("user v2")
+      end
+    end
+
+    # ...while a static edit anywhere else keeps the skip: regenerating the
+    # SEO outputs also hydrates every cached page, which nearly doubled an
+    # all-hit warm build of the docs site for a changed image.
+    it "keeps skipping the SEO generators for a static edit elsewhere" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        File.write("static/logo.svg", "<svg/>")
+        cached_build
+        File.write("public/sitemap.xml", "SENTINEL")
+
+        File.write("static/logo.svg", "<svg>v2</svg>")
+        cached_build
+        File.read("public/logo.svg").should eq("<svg>v2</svg>")
+        File.read("public/sitemap.xml").should eq("SENTINEL")
+      end
+    end
+
+    it "re-renders a page whose alias stub the static copy overwrote" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/legacy")
+        File.write("static/legacy/index.html", "<p>STATIC LEGACY</p>")
+        cached_build
+        File.read("public/legacy/index.html").should contain("0; url=")
+
+        File.write("static/legacy/index.html", "<p>STATIC LEGACY v2</p>")
+        File.utime(Time.utc, Time.utc + 1.hour, "static/legacy/index.html")
+        cached_build
+
+        File.read("public/legacy/index.html").should contain("0; url=")
+        File.read("public/legacy/index.html").should_not contain("STATIC LEGACY")
+      end
+    end
+
+    it "re-renders a section whose pagination page the static copy overwrote" do
+      with_cached_site do
+        File.write("config.toml", File.read("config.toml") +
+                                  "\n[pagination]\nenabled = true\nper_page = 1\n")
+        FileUtils.mkdir_p("static/posts/page/2")
+        File.write("static/posts/page/2/index.html", "<p>STATIC P2</p>")
+        cached_build
+        File.read("public/posts/page/2/index.html").should contain("Posts")
+
+        File.write("static/posts/page/2/index.html", "<p>STATIC P2 v2</p>")
+        File.utime(Time.utc, Time.utc + 1.hour, "static/posts/page/2/index.html")
+        cached_build
+
+        File.read("public/posts/page/2/index.html").should contain("Posts")
+        File.read("public/posts/page/2/index.html").should_not contain("STATIC P2")
+      end
+    end
+
+    it "does not accumulate one fingerprinted asset bundle per edit" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/css")
+        File.write("static/css/site.css", ".a{color:red}")
+        File.write("config.toml", File.read("config.toml") + <<-TOML)
+
+          [assets]
+          enabled = true
+          minify = false
+          fingerprint = true
+          source_dir = "static"
+          output_dir = "assets"
+
+          [[assets.bundles]]
+          name = "main.css"
+          files = ["css/site.css"]
+          TOML
+        cached_build
+        Dir.glob("public/assets/main.*.css").size.should eq(1)
+
+        File.write("static/css/site.css", ".b{color:blue}")
+        cached_build
+        File.write("static/css/site.css", ".c{color:green}")
+        cached_build
+
+        remaining = Dir.glob("public/assets/main.*.css")
+        remaining.size.should eq(1)
+        File.read(remaining.first).should contain(".c{color:green}")
+      end
+    end
+  end
+
+  # The prune runs last, so an output that flipped between file and
+  # directory met the previous build's entry still in the way: a FILE where
+  # mkdir needed a directory failed this and every later warm build, and a
+  # DIRECTORY where a file goes swallowed the copy (`public/x/x`).
+  describe "an output that changed between file and directory" do
+    it "publishes a static directory that replaced a static file" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        File.write("static/thing", "file")
+        cached_build
+
+        File.delete("static/thing")
+        FileUtils.mkdir_p("static/thing")
+        File.write("static/thing/a.txt", "inside")
+        cached_build
+
+        File.read("public/thing/a.txt").should eq("inside")
+      end
+    end
+
+    it "publishes a static file that replaced a static directory" do
+      with_cached_site do
+        FileUtils.mkdir_p("static/dir")
+        File.write("static/dir/x.txt", "inside")
+        cached_build
+
+        FileUtils.rm_rf("static/dir")
+        File.write("static/dir", "file")
+        cached_build
+
+        File.file?("public/dir").should be_true
+        File.read("public/dir").should eq("file")
+      end
+    end
+
+    it "renders a page where a deleted static file was published" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        File.write("static/thing", "file")
+        cached_build
+
+        File.delete("static/thing")
+        File.write("content/thing.md", "+++\ntitle = \"Thing\"\n+++\nthing body")
+        cached_build
+
+        File.read("public/thing/index.html").should contain("thing body")
+      end
+    end
+
+    it "still fails when a live static file and a page claim the same path" do
+      with_cached_site do
+        FileUtils.mkdir_p("static")
+        File.write("static/thing", "file")
+        cached_build
+
+        File.write("content/thing.md", "+++\ntitle = \"Thing\"\n+++\nthing body")
+        builder = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+        expect_raises(Hwaro::HwaroError, /Unable to create directory/) do
+          builder.run(Hwaro::Config::Options::BuildOptions.new(
+            output_dir: "public", parallel: false, cache: true, highlight: false,
+          ))
+        end
+        File.read("public/thing").should eq("file")
+      end
+    end
+  end
+
+  # A `[[content.generate]]` page has no source file, so no cache entry named
+  # its output: when its record disappeared from the data, the page stayed in
+  # `public/` for every later warm build.
+  it "removes the page of a generated record that left the data" do
+    with_cached_site do
+      File.open("config.toml", "a") do |io|
+        io << "\n[[content.generate]]\nsource = \"products\"\nsection = \"posts\"\nslug = \"sku\"\ntitle = \"name\"\n"
+      end
+      FileUtils.mkdir_p("data")
+      File.write("data/products.json", %([{"sku": "stay", "name": "Stay"}, {"sku": "leave", "name": "Leave"}]))
+      cached_build
+      File.exists?("public/posts/leave/index.html").should be_true
+
+      File.write("data/products.json", %([{"sku": "stay", "name": "Stay"}]))
+      cached_build
+      File.exists?("public/posts/leave/index.html").should be_false
+      File.exists?("public/posts/stay/index.html").should be_true
+    end
+  end
+
+  # The search generator claimed nothing, so the claims diff could not see
+  # the files an earlier config published and this one does not.
+  it "removes search outputs the search config stopped publishing" do
+    with_cached_site do
+      base = File.read("config.toml")
+      File.write("config.toml", base + "\n[search]\nenabled = true\nshards = \"section\"\n")
+      cached_build
+      File.exists?("public/search.json").should be_true
+      File.exists?("public/search/index.json").should be_true
+
+      File.write("config.toml", base + "\n[search]\nenabled = true\nshards = \"section\"\nsingle_file = false\n")
+      cached_build
+      File.exists?("public/search.json").should be_false
+      File.exists?("public/search/posts.json").should be_true
+
+      File.write("config.toml", base + "\n[search]\nenabled = true\n")
+      cached_build
+      File.exists?("public/search.json").should be_true
+      Dir.exists?("public/search").should be_false
+
+      File.write("config.toml", base)
+      cached_build
+      File.exists?("public/search.json").should be_false
+    end
+  end
+
+  # Sitemap, feed and llms files were never claimed, so the claims diff
+  # could not see the ones an earlier config published and this one does not.
+  it "removes sitemap.xml once the sitemap is disabled" do
+    with_cached_site do
+      cached_build
+      File.exists?("public/sitemap.xml").should be_true
+
+      File.write("config.toml", File.read("config.toml").sub("[sitemap]\nenabled = true", "[sitemap]\nenabled = false"))
+      cached_build
+      File.exists?("public/sitemap.xml").should be_false
+    end
+  end
+
+  it "removes the main feed once feeds are disabled" do
+    with_cached_site do
+      base = File.read("config.toml")
+      File.write("config.toml", base + "\n[feeds]\nenabled = true\n")
+      cached_build
+      File.exists?("public/rss.xml").should be_true
+
+      File.write("config.toml", base + "\n[feeds]\nenabled = false\n")
+      cached_build
+      File.exists?("public/rss.xml").should be_false
+    end
+  end
+
+  it "removes a section feed once the section stops generating it" do
+    with_cached_site do
+      File.write("content/posts/_index.md", "+++\ntitle = \"Posts\"\ngenerate_feeds = true\n+++\n")
+      cached_build
+      File.exists?("public/posts/rss.xml").should be_true
+
+      File.write("content/posts/_index.md", "+++\ntitle = \"Posts\"\n+++\n")
+      cached_build
+      File.exists?("public/posts/rss.xml").should be_false
+      File.exists?("public/posts/index.html").should be_true
+    end
+  end
+
+  it "removes taxonomy term feeds once the taxonomy stops generating them" do
+    with_cached_site do
+      base = File.read("config.toml")
+      File.write("config.toml", base.sub("name = \"tags\"", "name = \"tags\"\nfeed = true"))
+      cached_build
+      File.exists?("public/tags/keep-tag/rss.xml").should be_true
+
+      File.write("config.toml", base)
+      cached_build
+      File.exists?("public/tags/keep-tag/rss.xml").should be_false
+      File.exists?("public/tags/keep-tag/index.html").should be_true
+    end
+  end
+
+  it "removes the term feed of a removed term under a custom [feeds] filename" do
+    with_cached_site do
+      base = File.read("config.toml")
+      # `filename` names the main feed only; a term feed keeps rss.xml.
+      File.write("config.toml", base.sub("name = \"tags\"", "name = \"tags\"\nfeed = true") +
+                                "\n[feeds]\nenabled = true\nfilename = \"feed.xml\"\n")
+      cached_build
+      File.exists?("public/feed.xml").should be_true
+      File.exists?("public/tags/gone-tag/rss.xml").should be_true
+
+      File.delete("content/posts/gone.md")
+      cached_build
+      File.exists?("public/tags/gone-tag/rss.xml").should be_false
+      File.exists?("public/tags/keep-tag/rss.xml").should be_true
+    end
+  end
+
+  it "removes llms files once they are disabled" do
+    with_cached_site do
+      base = File.read("config.toml")
+      File.write("config.toml", base + "\n[llms]\nenabled = true\nfull_enabled = true\n")
+      cached_build
+      File.exists?("public/llms-full.txt").should be_true
+
+      File.write("config.toml", base + "\n[llms]\nenabled = true\nfull_enabled = false\n")
+      cached_build
+      File.exists?("public/llms-full.txt").should be_false
+      File.exists?("public/llms.txt").should be_true
+
+      File.write("config.toml", base + "\n[llms]\nenabled = false\n")
+      cached_build
+      File.exists?("public/llms.txt").should be_false
+    end
+  end
+
+  describe "when the cache does not describe the output directory" do
+    it "removes a page deleted since a plain (uncached) build" do
+      with_cached_site do
+        builder = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+        builder.run(Hwaro::Config::Options::BuildOptions.new(
+          output_dir: "public", parallel: false, cache: false, highlight: false,
+        )).should be_true
+        File.exists?("public/posts/gone/index.html").should be_true
+
+        File.delete("content/posts/gone.md")
+        cached_build
+
+        File.exists?("public/posts/gone/index.html").should be_false
+        File.exists?("public/legacy/index.html").should be_false
+        File.exists?("public/tags/gone-tag/index.html").should be_false
+        File.exists?("public/posts/keep/index.html").should be_true
+      end
+    end
+
+    it "removes a deleted page when the cache file is corrupt" do
+      with_cached_site do
+        cached_build
+        File.write(".hwaro_cache.json", "{garbage")
+        File.delete("content/posts/gone.md")
+        cached_build
+
+        File.exists?("public/posts/gone/index.html").should be_false
+        File.exists?("public/posts/keep/index.html").should be_true
+      end
+    end
+
+    # Serve keeps its own cache file, so a `serve --cache` session in between
+    # does not make the next `build --cache` forget `public/` (and wipe it,
+    # regenerating every image).
+    it "keeps public/ across a serve --cache session" do
+      with_cached_site do
+        cached_build
+        File.write("public/sentinel.txt", "kept")
+
+        builder = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+        serve_options = Hwaro::Config::Options::BuildOptions.new(
+          output_dir: ".hwaro/serve", parallel: false, cache: true, highlight: false,
+        )
+        serve_options.serve_mode = true
+        builder.run(serve_options).should be_true
+        File.exists?(".hwaro/serve_cache.json").should be_true
+
+        cached_build
+        File.read("public/sentinel.txt").should eq("kept")
+        File.exists?("public/posts/keep/index.html").should be_true
+      end
+    end
+
+    it "removes a deleted page after the cache was used for another output directory" do
+      with_cached_site do
+        cached_build
+        File.delete("content/posts/gone.md")
+        builder = Hwaro::Core::Build::Builder.new
+        Hwaro::Content::Hooks.all.each { |hookable| builder.register(hookable) }
+        builder.run(Hwaro::Config::Options::BuildOptions.new(
+          output_dir: "other", parallel: false, cache: true, highlight: false,
+        )).should be_true
+        cached_build
+
+        File.exists?("public/posts/gone/index.html").should be_false
+        File.exists?("public/posts/keep/index.html").should be_true
+      end
+    end
+  end
+
+  it "leaves an untouched page's output alone" do
+    with_cached_site do
+      cached_build
+      before = File.read("public/posts/keep/index.html")
+      cached_build
+
+      File.exists?("public/posts/keep/index.html").should be_true
+      File.read("public/posts/keep/index.html").should eq(before)
+      File.exists?("public/posts/gone/index.html").should be_true
+    end
+  end
+end
+
+describe "orphaned output deletion" do
+  it "does not follow a symlinked output parent outside the output directory" do
+    Dir.mktmpdir do |dir|
+      output_dir = File.join(dir, "public")
+      outside_dir = File.join(dir, "outside", "nested")
+      FileUtils.mkdir_p(output_dir)
+      FileUtils.mkdir_p(outside_dir)
+      victim = File.join(outside_dir, "victim.html")
+      File.write(victim, "keep")
+      File.symlink(File.dirname(outside_dir), File.join(output_dir, "escape"))
+
+      builder = Hwaro::Core::Build::Builder.new
+      stale = File.join(output_dir, "escape", "nested", "victim.html")
+      builder.run_delete_orphaned_outputs([stale], output_dir)
+
+      File.read(victim).should eq("keep")
+      Dir.exists?(outside_dir).should be_true
+    end
+  end
+end

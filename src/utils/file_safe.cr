@@ -31,13 +31,35 @@ module Hwaro
       # is false because we never reached the leaf — so the EEXIST bubbles
       # out and a render fails ("Unable to create directory: '…': File
       # exists"). Tolerating EEXIST per component avoids the cascade.
+      #
+      # The parent walk runs deepest-first and stops at the first component
+      # that already exists, then creates downward from there. Walking from
+      # the root instead (what `each_parent` yields, and what this used to do)
+      # cost one `Dir.exists?` stat per ancestor on every call — and every
+      # page of a large site creates a fresh leaf directory under an
+      # already-existing tree, so a six-deep output path paid six stats to
+      # create one directory. Only the components actually missing are
+      # touched now, which for that shape is a single stat plus one mkdir.
+      #
+      # EEXIST is still absorbed per component, so the concurrency argument
+      # above is unchanged: another fiber may materialize any of these
+      # directories between our stat and our mkdir.
       def self.mkdir_p(path : String | Path, mode : Int32 = 0o777) : Nil
         path = Path.new(path)
         return if Dir.exists?(path)
 
-        path.each_parent do |parent|
-          mkdir_tolerant(parent, mode)
+        missing = [] of Path
+        current = path
+        while parent = current.parent
+          # `Path#parent` is a fixed point at the root ("/" and "." both
+          # return themselves), which would spin forever without this.
+          break if parent == current
+          break if Dir.exists?(parent)
+          missing << parent
+          current = parent
         end
+
+        missing.reverse_each { |dir| mkdir_tolerant(dir, mode) }
         mkdir_tolerant(path, mode)
       end
 
@@ -78,6 +100,16 @@ module Hwaro
         )
       end
 
+      # Same-directory temp path for an atomic write/copy of `target`. The
+      # name is fixed-length and unrelated to the target's own: suffixing the
+      # target basename pushed any legal name within ~22 bytes of NAME_MAX
+      # over it (ENAMETOOLONG aborted the build). Unique per process AND
+      # fiber, so parallel workers writing siblings can't collide; one fiber
+      # writes one file at a time, so reusing the name sequentially is safe.
+      def self.temp_path(target : String | Path) : String
+        File.join(File.dirname(target.to_s), "hwaro-#{Process.pid}-#{Fiber.current.object_id}.tmp")
+      end
+
       # Write `content` to `path` atomically: write to a same-directory
       # temp file, then rename over the target. `hwaro serve` rewrites
       # output files while HTTP fibers stream them to the browser — a plain
@@ -89,7 +121,7 @@ module Hwaro
       # workers writing sibling outputs can't collide on it.
       def self.atomic_write(path : String | Path, content : String) : Nil
         target = path.to_s
-        tmp = "#{target}.#{Process.pid}.#{Fiber.current.object_id}.tmp"
+        tmp = temp_path(target)
         begin
           File.write(tmp, content)
           File.rename(tmp, target)
@@ -97,8 +129,24 @@ module Hwaro
           # Never leave the temp file behind — a failed write must look
           # exactly like the old non-atomic failure (target unchanged).
           File.delete(tmp) if File.exists?(tmp)
+          raise directory_in_the_way_error(target, ex) if Dir.exists?(target)
           raise ex
         end
+      end
+
+      # A directory where a FILE must go is almost always a content page
+      # whose slug/path names a generated file (`slug = "sitemap.xml"`
+      # publishes `sitemap.xml/index.html`, and the sitemap generator then
+      # cannot rename onto it). Raw, that surfaced as an internal error
+      # ("Error renaming file … Is a directory"); classify it and say why.
+      private def self.directory_in_the_way_error(target : String, cause : Exception) : Hwaro::HwaroError
+        name = File.basename(target)
+        Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_IO,
+          message: "Cannot write '#{target}': a directory already exists at that path",
+          hint: "A content page whose slug or path is '#{name}' publishes '#{target}/index.html' there. Rename that page so it does not shadow the generated '#{name}'.",
+          cause: cause
+        )
       end
 
       # Copy `src` onto `dest` atomically: copy into a same-directory temp
@@ -133,7 +181,7 @@ module Hwaro
           return
         end
 
-        tmp = "#{target}.#{Process.pid}.#{Fiber.current.object_id}.tmp"
+        tmp = temp_path(target)
         begin
           File.copy(source, tmp)
           File.rename(tmp, target)

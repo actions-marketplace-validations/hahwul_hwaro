@@ -11,6 +11,8 @@ Hwaro는 `config.toml`과 템플릿 양쪽에서 환경 변수 치환을 지원�
 
 `config.toml`의 환경 변수는 TOML 파싱 전에 해석됩니다.
 
+큰따옴표 문자열 안에 넣은 값은 변수가 가진 문자 그대로 들어갑니다. 따옴표, 백슬래시, 줄바꿈은 자동으로 이스케이프되므로 `SITE_TITLE='Say "hi"'`나 Windows 경로도 그대로 읽힙니다. 문자열 밖의 플레이스홀더(`paginate = ${PER_PAGE}`)는 TOML로 삽입되어 숫자와 불리언도 쓸 수 있고, `${VAR:-default}`의 기본값은 파일에 적은 그대로 사용됩니다. `#` 주석 안의 플레이스홀더는 치환하지 않습니다.
+
 ### 문법
 
 | 패턴 | 설명 |
@@ -23,7 +25,7 @@ Hwaro는 `config.toml`과 템플릿 양쪽에서 환경 변수 치환을 지원�
 
 ```toml
 # CI/CD용 동적 base URL
-base_url = "${SITE_URL:-https://localhost:1313}"
+base_url = "${SITE_URL:-http://localhost:3000}"
 
 # 축약형
 title = "$SITE_TITLE"
@@ -38,7 +40,7 @@ fb_app_id = "${FB_APP_ID:-}"
 기본값이 없는 미설정 변수는 그대로 남고 빌드 시 경고가 출력됩니다.
 
 ```
-WARN: Environment variable 'SITE_URL' is not set (referenced in config.toml)
+[WARN] Environment variable 'SITE_URL' is not set (referenced in config.toml)
 ```
 
 ## 템플릿 함수
@@ -53,9 +55,9 @@ WARN: Environment variable 'SITE_URL' is not set (referenced in config.toml)
 | 파라미터 | 타입 | 설명 |
 |-----------|------|-------------|
 | name | String | 변수 이름 |
-| default | String? | 미설정 시 대체값(선택) |
+| default | String? | 미설정이거나 비어 있을 때의 대체값. `${VAR:-default}`와 같음(선택) |
 
-변수가 설정되어 있지 않고 기본값도 없으면 빈 문자열이 반환되고 경고가 기록됩니다.
+변수가 설정되어 있지 않고 기본값도 없으면 빈 문자열이 반환되고 경고가 기록됩니다(빌드마다 변수당 한 번).
 
 ### 예시
 
@@ -112,7 +114,7 @@ hwaro build
 `config.toml`을 수정하지 않고도 각 개발자가 자기 셸 환경에서 값을 로컬로 재정의할 수 있습니다.
 
 ```bash
-export SITE_URL="http://localhost:1313"
+export SITE_URL="http://localhost:3000"
 hwaro serve
 ```
 

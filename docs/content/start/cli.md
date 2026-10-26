@@ -46,7 +46,7 @@ Error [HWARO_E_USAGE]: missing <path> argument
 ```
 
 Under `--json` the classified error is emitted as a structured payload
-on stdout instead. (`--quiet` only silences info output — errors keep
+on stdout instead. (`--quiet` only silences info output. Errors keep
 the human `Error [CODE]: …` form on stderr, so pair it with `--json`
 when you want machine-readable failures.)
 
@@ -71,8 +71,8 @@ exit code `1`, so this is a strictly additive contract.
 | `HWARO_E_CONFIG` | config | 3 | `config.toml` missing, unparseable, or invalid |
 | `HWARO_E_TEMPLATE` | template | 4 | Crinja template render error |
 | `HWARO_E_CONTENT` | content | 5 | Content file parse error, invalid frontmatter |
-| `HWARO_E_IO` | io | 6 | Filesystem access error (missing dir, permission denied) |
-| `HWARO_E_NETWORK` | network | 7 | Deploy upload, remote scaffold fetch failure |
+| `HWARO_E_IO` | io | 6 | Filesystem access error (missing dir, permission denied), failed deploy command or sync |
+| `HWARO_E_NETWORK` | network | 7 | Remote scaffold or remote data fetch failure |
 | `HWARO_E_INTERNAL` | internal | 70 | Unrecoverable bug or unexpected state |
 | *(unclassified)* | — | 1 | Legacy/generic failure path |
 | *(success)* | — | 0 | Command completed normally |
@@ -101,7 +101,7 @@ summary and asks to confirm before writing anything. When a path argument is
 given (`hwaro init my-site --wizard`), the wizard skips the directory prompt
 and uses that path directly.
 
-Without `--wizard`, `hwaro init` initializes immediately with defaults — the
+Without `--wizard`, `hwaro init` initializes immediately with defaults, the
 same behaviour scripts and CI already relied on.
 
 Every scaffold follows the reader's OS color scheme automatically (the shared
@@ -122,7 +122,7 @@ hwaro init my-site --scaffold https://github.com/user/repo
 hwaro init my-site --scaffold https://github.com/user/repo/tree/main/docs
 ```
 
-Remote scaffolds fetch `config.toml`, `templates/`, `static/`, and content structure from the repository. Content files keep only front matter (metadata) so you can see the expected page structure without the original body text. Set `GITHUB_TOKEN` environment variable to avoid API rate limits.
+Remote scaffolds fetch `config.toml`, `templates/`, `static/`, `data/`, `i18n/`, `archetypes/`, and content structure from the repository. Content files keep only front matter (metadata) so you can see the expected page structure without the original body text. A `/tree/<branch>/` URL fetches that branch; otherwise the repository's default branch is used. If any file fails to download, nothing is written and init exits with `HWARO_E_NETWORK`. Set the `GITHUB_TOKEN` environment variable to avoid API rate limits or to fetch from a private repository.
 
 **Options:**
 
@@ -131,14 +131,23 @@ Remote scaffolds fetch `config.toml`, `templates/`, `static/`, and content struc
 | --scaffold TYPE | Built-in (`simple`, `bare`, `blog`, `docs`, `book`) or remote source (`github:user/repo[/path]`, URL) |
 | --wizard | Run the interactive wizard (TTY only) |
 | --agents MODE | AGENTS.md content mode: `remote` (lightweight, default) or `local` (full embedded reference) |
-| -f, --force | Force creation even if directory is not empty |
+| -f, --force | Force creation even if directory is not empty (keeps existing files) |
+| --clean | Remove existing files in the target before scaffolding (implies `--force`; refuses if the target contains a `.git` directory or file, or is `/` or your home directory) |
 | --skip-agents-md | Skip creating AGENTS.md file |
-| --skip-sample-content | Skip creating sample content files |
+| --skip-sample-content | Skip the sample content. The pages the scaffold's navigation links to (homepage, section indexes, About, …) are still created, as front-matter-only stubs |
 | --skip-taxonomies | Skip taxonomies configuration and templates |
-| --include-multilingual LANGS | Enable multilingual support (e.g., `en,ko,ja`) |
-| --minimal-config | Generate minimal `config.toml` without comments or optional sections |
+| --include-multilingual LANGS | Enable multilingual support (e.g., `en,ko,ja`). Repeated codes are dropped with a warning |
+| --minimal-config | Generate minimal `config.toml` without comments or optional sections (cannot be combined with `--full-config`) |
+| --full-config | Generate full `config.toml` with every comment and optional section (maximum discoverability). An existing `config.toml` kept by `--force` is not modified |
 | --list-scaffolds | List available built-in scaffolds and exit |
-| --json | Emit machine-readable JSON output (with --list-scaffolds) |
+| -q, --quiet | Suppress info output and the banner (errors still go to stderr) |
+| -j, --json | Emit machine-readable JSON output: the scaffold list with `--list-scaffolds`, otherwise a `{"status","path","scaffold","files_created"}` result |
+
+`init` refuses to create scaffold files or directories that would resolve outside the target
+directory through a symlink, and checks every destination before writing, so a refused run
+leaves the target untouched. Existing entries are kept as they are, so `init --force` still
+works when, for example, `templates/` links to a shared theme elsewhere and nothing new would
+be written through it.
 
 ### new
 
@@ -163,8 +172,8 @@ before writing. Any flags you already passed pre-fill the matching prompt, so
 `hwaro new -t "My Post"` only asks for the rest. Press `Ctrl-D` or answer `n` at the final
 prompt to cancel without creating anything.
 
-The wizard never runs in non-interactive contexts — pipes, CI, agents, `--json`, or
-`--quiet` — which instead print the classified `HWARO_E_USAGE` error, so scripted callers
+The wizard never runs in non-interactive contexts (pipes, CI, agents, `--json`, or
+`--quiet`), which instead print the classified `HWARO_E_USAGE` error, so scripted callers
 stay predictable. Pass a `<path>` (and any flags) to skip the prompts entirely.
 
 **Options:**
@@ -180,7 +189,11 @@ stay predictable. Pass a `<path>` (and any flags) to skip the prompts entirely.
 | --bundle | Create a leaf-bundle directory (`foo/index.md`) instead of a single file |
 | --no-bundle | Force a single file (`foo.md`); overrides `[content.new].bundle = true` |
 | --list-archetypes | List archetypes in the current project and exit |
-| --json | Emit machine-readable JSON output (archetypes listing and classified errors) |
+| -j, --json | Emit machine-readable JSON output (archetypes listing and classified errors) |
+
+`hwaro new` rejects destinations that cannot be resolved within `content/`, including paths through symlinks outside it.
+
+In a multilingual site, a translation suffix is understood: `hwaro new posts/hello.ko.md` titles the page "Hello", and with `--bundle` it creates `posts/hello/index.ko.md`, the translation of the `hello` bundle.
 
 **Archetypes:**
 
@@ -248,6 +261,18 @@ hwaro build -i /path/to/my-site -o ./dist
 | -v, --verbose | Show detailed output |
 | --profile | Print phase-by-phase and per-template build timing |
 | --debug | Print debug information after build |
+| -j, --json | Print one JSON summary (`{"status","pages_generated","duration_ms","cache_hits","raw_files_processed","pages_not_published"}`) on stdout instead of the log; implies `--quiet` |
+
+**About the output directory:** a full build starts from an empty output
+directory, but hwaro only clears a directory it can vouch for: the
+conventional `public/` next to the project, `hwaro serve`'s own `.hwaro/serve`,
+and any directory hwaro created (or found empty) on an earlier build. Pointing
+`-o` at a directory that already holds other files (`-o ~/Documents/site`, a
+`dist/` shared with a bundler) keeps those files: the site is written into it
+and the build warns that files from an earlier build there may be stale. Empty
+the directory once to hand it over. The filesystem root, your home directory,
+the project itself and its input directories (`content/`, `templates/`,
+`static/`, …) are refused outright.
 
 **About `--stream` / `--memory-limit` (Streaming Build):**
 
@@ -266,7 +291,7 @@ For sites with thousands of pages, loading all rendered HTML into memory at once
 | yes | 512M | - | Streaming, batch≈5000 |
 | - | 2G | 1G | CLI wins (2G) |
 
-The build output is identical — streaming only affects memory usage during the build.
+The build output is identical. Streaming only affects memory usage during the build.
 
 **About `--minify`:**
 
@@ -276,13 +301,13 @@ The minify flag shrinks generated files while keeping them visually identical to
 - **JSON**: Removes whitespace and newlines for compact output.
 - **XML**: Removes whitespace between tags for smaller file sizes.
 
-Whitespace-sensitive elements — `<pre>`, `<code>`, `<textarea>`, `<script>`, `<style>`, `<svg>`, `<math>`, `<noscript>` — are extracted before any whitespace pass and restored verbatim, so their contents are never touched.
+Whitespace-sensitive elements (`<pre>`, `<code>`, `<textarea>`, `<script>`, `<style>`, `<svg>`, `<math>`, `<noscript>`) are extracted before any whitespace pass and restored verbatim, so their contents are never touched.
 
 For more aggressive output shrinking (attribute quoting, entity collapsing, etc.) post-process `public/` with a dedicated tool such as `html-minifier-terser` or `minify-html`.
 
 **About `--cache` (Incremental Build):**
 
-When enabled, Hwaro tracks file modification times and content checksums in a `.hwaro_cache.json` file at the project root. On subsequent builds, only files that have changed since the last build are re-rendered. The cache also tracks template and config checksums — if templates or `config.toml` change, all entries are automatically invalidated and every page is rebuilt.
+When enabled, Hwaro tracks file modification times and content checksums in a `.hwaro_cache.json` file at the project root. On subsequent builds, only files that have changed since the last build are re-rendered. The cache also tracks template and config checksums. If templates or `config.toml` change, all entries are automatically invalidated and every page is rebuilt.
 
 Use `--full` together with `--cache` to force a clean rebuild while still saving the cache for the next run:
 
@@ -294,7 +319,7 @@ See [Incremental Build](/features/incremental-build/) for details.
 
 **About `--jobs` (render concurrency):**
 
-By default Hwaro picks the number of concurrent render workers from your site's **listing fan-out** — how many page objects a single page render materializes from a site-wide collection. `--jobs N` overrides that. It never changes the generated output, only how many pages render at once.
+By default Hwaro picks the number of concurrent render workers from your site's **listing fan-out**, the number of page objects a single page render materializes from a site-wide collection. `--jobs N` overrides that. It never changes the generated output, only how many pages render at once.
 
 Fan-out is what caps useful parallelism, not the core count. Every `{% for p in site.pages %}` or `{% for p in section.pages %}` iteration allocates one object per item, and past a small worker count the garbage collector's global allocation lock serializes that work while extra workers add only contention. So the automatic count is:
 
@@ -304,7 +329,7 @@ Fan-out is what caps useful parallelism, not the core count. Every `{% for p in 
 | 100–499 | 2 |
 | Under 100 (most sites) | up to 4 |
 
-A homepage that lists every page does not count against this — the estimate is the mean across rendered pages, so one expensive listing page among thousands of cheap ones leaves the site on the fast path.
+A homepage that lists every page does not count against this. The estimate is the mean across rendered pages, so one expensive listing page among thousands of cheap ones leaves the site on the fast path.
 
 ```bash
 hwaro build --jobs 4   # override the automatic count
@@ -317,9 +342,9 @@ Leave it unset unless you are benchmarking; the automatic count is within a few 
 When specified, Hwaro changes its working directory to the given path before building. This lets you build a site located in another directory without `cd`-ing into it first.
 
 - All site sources (`config.toml`, `content/`, `templates/`, `static/`) are read from the input directory.
-- **Without `-o`:** The default output directory `public/` is created inside the input directory (i.e., the site's own `public/` folder). This is the natural behavior — `hwaro build -i ../my-site` produces `../my-site/public/`.
+- **Without `-o`:** The default output directory `public/` is created inside the input directory (i.e., the site's own `public/` folder). This is the natural behavior: `hwaro build -i ../my-site` produces `../my-site/public/`.
 - **With `-o`:** The output path is resolved relative to **your current directory** (not the input directory), so `hwaro build -i ../my-site -o ./dist` writes output to `./dist` in your shell's CWD.
-- If `-i` is omitted, behavior is unchanged — the current directory is used.
+- If `-i` is omitted, behavior is unchanged and the current directory is used.
 
 ### serve
 
@@ -335,6 +360,8 @@ hwaro serve -i /path/to/my-site
 hwaro serve -i /path/to/my-site -p 8080
 ```
 
+> **Serve output is a dev artifact. Never deploy it.** `hwaro serve` builds into its own directory, `.hwaro/serve/`, and leaves the configured `output_dir` (`public/` by default) completely untouched, so a serve session can never overwrite a deployable build. The pages under `.hwaro/serve/` carry the dev server's `base_url` (e.g. `http://127.0.0.1:3000`) in every link, and the directory is stamped with a `.hwaro-dev` marker that `hwaro deploy` refuses. Run `hwaro build` to produce a deployable site. `.hwaro/` keeps itself out of version control: hwaro writes a self-ignoring `.hwaro/.gitignore` when it creates the directory, and `hwaro init` also scaffolds a project `.gitignore` covering the output dir, `.hwaro/`, and `.hwaro_cache.json`.
+
 **Options:**
 
 | Flag | Description |
@@ -347,17 +374,18 @@ hwaro serve -i /path/to/my-site -p 8080
 | --minify | Serve minified output |
 | --jobs N | Concurrent render workers. Default: auto, derived from the site listing fan-out |
 | --open | Open browser after starting |
+| --no-open | Do not open a browser (the default; overrides an earlier `--open`) |
 | -d, --drafts | Include draft content |
 | --include-expired | Include expired content |
 | --include-future | Include future-dated content |
 | -v, --verbose | Show detailed output |
 | --debug | Print debug information after each rebuild |
-| --access-log | Show HTTP access log (e.g. GET requests) |
+| --access-log | Show HTTP access log (e.g. GET requests). Each line reports the path the browser requested (`/`, not the `/index.html` the dev server resolves it to) |
 | --no-error-overlay | Disable in-browser error overlay (default: enabled) |
 | --live-reload | Enable browser live reload on file changes (default: enabled; kept for backwards compatibility) |
 | --no-live-reload | Disable browser live reload on file changes |
 | --header "NAME: VALUE" | Add custom response header (repeatable). Merged with `[serve.headers]` from `config.toml` (CLI wins). Only affects `hwaro serve`. |
-| --cache | Enable build caching (skip unchanged files) |
+| --cache | Enable build caching (skip unchanged files); kept in `.hwaro/serve_cache.json`, separate from `hwaro build --cache` |
 | --stream | Enable streaming build to reduce memory usage |
 | --memory-limit SIZE | Memory limit for streaming build (e.g. `2G`, `512M`) |
 | --fast-start | Render homepage + latest N pages first, then background-render the rest |
@@ -366,8 +394,10 @@ hwaro serve -i /path/to/my-site -p 8080
 | --skip-og-image | Skip auto OG image generation |
 | --skip-image-processing | Skip image resizing and LQIP generation |
 | --profile | Print phase-by-phase and per-template build timing |
+| --fast | Fast dev mode: skip OG image generation and image processing (same as `--skip-og-image --skip-image-processing`; `[serve] fast = true` sets it by default) |
+| -j, --json | Print the ready event as one JSON line (`{"event":"ready","url",…,"pid"}`) instead of `hwaro serve: ready url=… pid=…`; implies `--quiet` |
 
-> **Fast dev server on large sites:** Set `[og.auto_image] lazy_generate = true` in `config.toml` to skip bulk OG generation during `hwaro serve`. Images are created on first request instead. See the [Performance in Development section](/features/og-images/#performance-in-development) for the full explanation and recommended workflow with `--fast-start`.
+> **Fast dev server on large sites:** Set `[og.auto_image] lazy_generate = true` in `config.toml` to skip bulk OG generation during `hwaro serve`. Images are created on first request instead. See the [Faster Dev Server section](/features/og-images/#faster-dev-server) for the full explanation and recommended workflow with `--fast-start`.
 
 The server watches for file changes and rebuilds automatically. It uses **smart rebuild strategies** based on what changed:
 
@@ -381,11 +411,13 @@ The server watches for file changes and rebuilds automatically. It uses **smart 
 
 **About live reload:**
 
-Live reload is **enabled by default**. The server injects a small WebSocket client script into every HTML response, and after each successful rebuild, connected browsers automatically refresh the page — no manual reload needed. The client uses exponential backoff (1s–30s) for reconnection, so restarting the server won't break the connection permanently.
+Live reload is **enabled by default**. The server injects a small WebSocket client script into every HTML response, and after each successful rebuild, connected browsers automatically refresh the page, so no manual reload is needed. The client uses exponential backoff (1s to 30s) for reconnection, so restarting the server won't break the connection permanently.
+
+When a save changes **only stylesheets** (a `.css` file under `static/`, a Sass source, or a CSS asset-bundle source), the browser swaps the affected `<link rel="stylesheet">` tags in place instead of reloading, so scroll position and page state survive. Plain static CSS is matched by path; Sass and bundle output refresh every same-origin stylesheet. Anything else in the same save (HTML, JS, images, a bundle fingerprint that moves its filename) still triggers a full reload, and a build error still shows the overlay.
 
 Pass `--no-live-reload` to disable this behaviour (useful for testing production-like delivery locally). The `--live-reload` flag is kept as a no-op alias for backwards compatibility with existing invocations.
 
-When `-i` is specified, the server operates as if you had `cd`-ed into the given directory — watching and serving from that project root.
+When `-i` is specified, the server operates as if you had `cd`-ed into the given directory, watching and serving from that project root.
 
 **Subpath preview (`--base-url` with a path):**
 
@@ -393,7 +425,7 @@ When `-i` is specified, the server operates as if you had `cd`-ed into the given
 hwaro serve --base-url http://localhost:3000/myblog/
 ```
 
-The site is built with `/myblog/`-prefixed links and served under that same prefix, so a project-page deployment (GitHub Pages, GitLab Pages) can be previewed exactly as it will be published — instead of a homepage whose every link 404s locally.
+The site is built with `/myblog/`-prefixed links and served under that same prefix, so a project-page deployment (GitHub Pages, GitLab Pages) can be previewed exactly as it will be published, instead of a homepage whose every link 404s locally.
 
 - `/` redirects to `/myblog/`.
 - Unprefixed requests still resolve, so hand-typed asset paths keep working.
@@ -403,9 +435,10 @@ The site is built with `/myblog/`-prefixed links and served under that same pref
 
 - The server answers `GET`, `HEAD`, and `OPTIONS`. Any other method returns `405 Method Not Allowed` with an `Allow: GET, HEAD, OPTIONS` header, rather than the 404 page.
 - Malformed request paths (for example a percent-encoded NUL byte) return `400 Bad Request`.
-- `HEAD` returns exactly the same headers as the matching `GET` — including the `Content-Length` of the live-reload-injected HTML — with no body.
+- `HEAD` returns exactly the same headers as the matching `GET`, including the `Content-Length` of the live-reload-injected HTML, with no body.
 - Text responses (`.txt`, `.json`, `.xml`, `.js`, `.css`, `.svg`, …) always carry `; charset=utf-8`, regardless of file size.
 - Directory redirects emit a percent-encoded `Location` (`/my%20page/`, `/%ED%95%9C%EA%B8%80/`). Paths containing a backslash or an encoded separator (`%2F`, `%5C`) are not served, matching static-host behaviour.
+- Paths are case-sensitive even on macOS and Windows: `/About/` is a 404 when the page lives at `/about/`, as it is on a case-sensitive static host.
 
 **Custom response headers (`--header` / `[serve.headers]`):**
 
@@ -425,7 +458,7 @@ hwaro serve --header "X-Custom: foo" --header "Cache-Control: no-store"
 
 - CLI `--header` values win over the same key in `config.toml`.
 - Headers are injected on **every** dev-server response (HTML, assets, 404s, redirects, live-reload injected pages, CORS preflight (`OPTIONS`) responses).
-- This feature only affects `hwaro serve`. The files written to `public/` are untouched.
+- This feature only affects `hwaro serve`. The files the build writes to disk are untouched.
 
 ### deploy
 
@@ -433,6 +466,7 @@ Deploy the generated site to configured targets.
 
 ```bash
 hwaro deploy [target ...]
+hwaro deploy --target prod
 hwaro deploy --dry-run
 ```
 
@@ -441,12 +475,42 @@ hwaro deploy --dry-run
 | Flag | Description |
 |------|-------------|
 | -s, --source DIR | Source directory to deploy (default: deployment.source_dir or public) |
+| -t, --target NAME | Deploy target name (repeatable; equivalent to a positional target) |
 | --dry-run | Show planned changes without writing |
 | --confirm | Ask for confirmation before deploying |
-| --force | Force upload/copy (ignore file comparisons) |
+| --force | Force upload/copy (ignore file comparisons), and allow clearing a destination from an empty source |
 | --max-deletes N | Maximum number of deletes (default: deployment.maxDeletes or 256, -1 disables) |
 | --list-targets | List configured deployment targets and exit |
-| --json | Emit machine-readable JSON output (with --list-targets) |
+| -j, --json | Emit machine-readable JSON output (plan with `--dry-run`, per-target summary otherwise, target list with `--list-targets`) |
+| -e, --env NAME | Config environment to load (also `HWARO_ENV`) |
+| -q, --quiet | Suppress human log output |
+
+**Safety rules.** `deploy` refuses rather than destroying a destination it
+cannot reconcile:
+
+- An empty source directory (or one where `include`/`exclude` selected
+  nothing) aborts instead of deleting the destination. Run `hwaro build`
+  first, or pass `--force` to clear it deliberately. A `command` target that
+  never interpolates `{source}` is exempt, since it does not read the
+  source at all.
+- `--max-deletes` caps the delete pass (256 by default; any negative value
+  disables it). It applies to the built-in `file://` sync only; a command
+  target's own `--delete` flag is not bounded by it.
+- Symlinks at the destination are never written or deleted *through*. A link
+  standing where a file or directory belongs is replaced; a stale one is
+  unlinked without touching what it points at.
+- Source symlinks are followed when their targets resolve within the project
+  or the resolved source directory; links escaping both are skipped. This also
+  supports a `public/` symlink to an external deploy directory.
+- `--json` is non-interactive: combining it with `--confirm` fails instead of
+  writing a prompt into the JSON document.
+- A command whose template contains shell metacharacters (`|`, `;`, `&`,
+  `` ` ``, `$`, `sudo`, `rm -rf`) asks for confirmation first; `--force` skips
+  that prompt. The template you wrote is what gets checked: `{source}`/`{url}`
+  values are single-quoted, so a path like `r&d/` does not trigger it. A
+  placeholder you wrap in quotes yourself (`"{source}"`) loses that
+  protection, and then its expanded value is checked too.
+- `--dry-run` writes nothing: a missing destination directory is not created.
 
 ### doctor
 
@@ -457,6 +521,9 @@ hwaro doctor               # Diagnose config, template, and structure issues
 hwaro doctor --fix         # Normalize config values (base_url trailing slash, sitemap priority…)
 hwaro doctor --approve     # Add recommended config sections to config.toml
 hwaro doctor --full        # Both (equivalent to --fix --approve)
+hwaro doctor --fix --dry-run  # Preview the config.toml changes without writing
+hwaro doctor -e production    # Check config.toml merged with config.production.toml
+hwaro doctor -c site/content  # Check a non-default content directory
 ```
 
 **Exit codes.** `doctor` returns a classified exit code based on the most
@@ -466,12 +533,13 @@ severe issue reported, so CI pipelines can gate on it directly:
 |---|---|
 | No issues, warnings only, or info-level findings | `0` |
 | Config errors (missing/broken `config.toml`) | `3` (`HWARO_E_CONFIG`) |
-| Template errors (missing required file, unclosed tags) | `4` (`HWARO_E_TEMPLATE`) |
-| Content errors (malformed front matter, when the check lands) | `5` (`HWARO_E_CONTENT`) |
+| Template errors (missing `page.html`, unclosed tags) | `4` (`HWARO_E_TEMPLATE`) |
+| Content errors (malformed front matter, unreadable file) | `5` (`HWARO_E_CONTENT`) |
 | Other error-level issues | `1` |
 
 Warnings (empty `base_url`, trailing slash, duplicate taxonomy names, etc.)
-are advisory and never change the exit code.
+are advisory and do not change the exit code unless you pass `--strict` or
+`--max-warnings N`.
 
 For content validation, use `hwaro tool validate`. See [doctor](/start/tools/doctor/) for details.
 
@@ -507,12 +575,26 @@ hwaro tool agents-md --write      # Write AGENTS.md to file
 
 # JSON output
 hwaro tool list all --json
+hwaro tool convert to-yaml --json
 hwaro tool stats --json
 hwaro tool validate --json
 hwaro tool unused-assets --json
 hwaro tool doctor --json
 hwaro tool check-links --json
+hwaro tool import jekyll /path --json
+hwaro tool export hugo --json
+
+# Preview destructive/bulk operations without writing
+hwaro tool convert to-yaml --dry-run
+hwaro tool import jekyll /path --dry-run
+hwaro tool export hugo --dry-run
 ```
+
+The `list` and `convert` commands accept only the positional arguments shown in
+their usage. `check-links`, `stats`, `validate`, and `unused-assets` accept no
+positional arguments. Extra positional arguments, including arguments after
+`--`, are rejected with a usage error; use the documented flags for additional
+paths and options.
 
 **Subcommands:**
 
@@ -526,7 +608,7 @@ hwaro tool check-links --json
 | Content | [unused-assets](/start/tools/unused-assets/) | Find unreferenced static files |
 | Site | [platform](/start/tools/platform/) | Generate platform config and CI/CD workflow files |
 | Site | [doctor](/start/tools/doctor/) | Diagnose config, template, and structure issues |
-| Site | import | Import content from WordPress, Jekyll, Hugo, Notion, Obsidian, Hexo, Astro, or Eleventy |
+| Site | [import](/start/tools/import/) | Import content from WordPress, Jekyll, Hugo, Notion, Obsidian, Hexo, Astro, or Eleventy |
 | Site | [export](/start/tools/export/) | Export content to Hugo or Jekyll |
 | Site | [agents-md](/start/tools/agents-md/) | Generate or update AGENTS.md file |
 
@@ -534,11 +616,18 @@ hwaro tool check-links --json
 
 | Flag | Description |
 |------|-------------|
-| -c, --content DIR | Limit to specific content directory |
+| -c, --content-dir DIR | Limit to specific content directory |
 | -j, --json | Output result as JSON |
 | -h, --help | Show help |
 
 See [Tools & Completion](/start/tools/) for detailed usage.
+
+`import` follows file symlinks within the site directory you pass it and skips
+(and counts as skipped) those resolving outside it.
+`export` and `convert` follow links within the project and skip links outside
+it. `agents-md --write` writes through an `AGENTS.md`
+symlink that resolves inside the project (such as `AGENTS.md -> CLAUDE.md`) and
+refuses one that resolves outside it.
 
 ### completion
 
@@ -613,8 +702,8 @@ hwaro serve -i ~/projects/my-blog --open
 
 | Flag | Description |
 |------|-------------|
-| -h, --help | Show help |
-| -v, --verbose | Verbose output |
+| -h, --help | Show help (`hwaro <command> --help` for one command) |
+| -v, -V, --version | Print the version and exit (same as `hwaro version`) |
 
 ## See Also
 

@@ -35,6 +35,13 @@ module Hwaro
       class NamespacedEvalError < SoftEvalError
       end
 
+      # Map construction saw two keys that `==` considers equal (`1in` and
+      # `96px` after unit conversion). dart-sass fails the compile; the
+      # lenient SoftEvalError fallback would store the map as text and
+      # later lookups would silently hit the first key.
+      class DuplicateKeyError < SoftEvalError
+      end
+
       # "This call isn't mine" — raised by a built-in whose name shadows a
       # real CSS function (`rgba()`, `grayscale()`, `saturate()`, …) when
       # the arguments are the CSS shape rather than the Sass one.
@@ -58,7 +65,19 @@ module Hwaro
         # as `to_css`: CSS output drops nulls from lists and never
         # parenthesizes a sublist, both of which destroy structure.
         # Mirrors dart-sass's `inspect` vs `toCssString` split.
-        def inspect_css : String
+        #
+        # `storage` asks for the spelling variable storage needs on top of
+        # that: numbers at full precision (see `Number#inspect_css`).
+        def inspect_css(storage : Bool = false) : String
+          to_css
+        end
+
+        # CSS text for this value when it lands inside `#{...}`. dart-sass
+        # renders strings UNQUOTED at every nesting level there, so a list
+        # of quoted strings interpolates as `a, b` — `"a", "b"` would ship
+        # invalid CSS (`content: ""a", "b""`). Only `Str` and the
+        # containers that hold values override this.
+        def interp_css : String
           to_css
         end
 
@@ -91,6 +110,27 @@ module Hwaro
           end
         end
 
+        # Storage keeps every bit of a computed number. The ten-digit CSS
+        # spelling turned a running `$factor: $factor * 0.1` into 0 after
+        # eleven steps (Foundation's long-division `divide()` returned 0px
+        # for 10px / 3) and let rounding error pile up across loops. The
+        # precise spelling is never emitted: see `precise_spelling?`.
+        def inspect_css(storage : Bool = false) : String
+          text = to_css
+          return text unless storage && @lexeme.nil? && @value.finite?
+          return text if Number.format(@value).to_f64? == @value
+          "#{@value}#{@unit}"
+        end
+
+        PRECISE_SPELLING = /\d[eE][+-]?\d|\.\d{11}/
+
+        # True for number text only full-precision storage produces (an
+        # exponent, or more than ten fractional digits). Read back, such a
+        # number formats like a computed one instead of echoing its lexeme.
+        def self.precise_spelling?(text : String) : Bool
+          text.matches?(PRECISE_SPELLING)
+        end
+
         # dart-sass-style number formatting: integers without a decimal
         # point, floats rounded to 10 digits with trailing zeros trimmed.
         #
@@ -104,13 +144,91 @@ module Hwaro
             return "calc(NaN)" if value.nan?
             return value > 0 ? "calc(infinity)" : "calc(-infinity)"
           end
+          # Past 1e15 `round(10)` corrupts the value: the digit-shift
+          # multiply overflows to Infinity near Float64::MAX (printing the
+          # invalid token "inf") and double-rounds integers like 2^53-1 by
+          # one. Ten fractional digits are meaningless at this magnitude
+          # anyway — print the shortest-representation digits, zero-padded
+          # (dart-sass prints `math.$max-number` the same way).
+          return format_large(value) if value.abs >= 1e15
+          # `round(10)` scales by 1e10, which is inexact once the integer
+          # part has a few digits: 33333333333 came back as
+          # 33333333333.000004 and printed that way. It only decides the
+          # fuzzy-integer case; the digits come from the value itself.
+          return value.to_i64.to_s if value == value.trunc # also "-0" → "0"
           rounded = value.round(10)
-          rounded = 0.0 if rounded == 0 # avoid "-0"
-          return rounded.to_i64.to_s if rounded == rounded.trunc && rounded.abs < 1e15
+          return rounded.to_i64.to_s if rounded == rounded.trunc
 
-          s = sprintf("%.10f", rounded)
+          s = sprintf("%.10f", value)
           s = s.rstrip('0').rstrip('.') if s.includes?('.')
-          s
+          s == "-0" ? "0" : s
+        end
+
+        private def self.format_large(value : Float64) : String
+          sign = value < 0 ? "-" : ""
+          text = value.abs.to_s
+          if idx = text.index('e')
+            mantissa = text[0...idx]
+            exp = text[(idx + 1)..].to_i
+            digits = mantissa.delete('.')
+            int_len = (mantissa.index('.') || mantissa.size) + exp
+            if digits.size <= int_len
+              sign + digits + "0" * (int_len - digits.size)
+            else
+              sign + digits[0, int_len] + "." + digits[int_len..]
+            end
+          else
+            text = text.rstrip('0').rstrip('.') if text.includes?('.')
+            sign + text
+          end
+        end
+
+        # Convertible-unit groups (dart-sass's known compatibilities):
+        # {group id, factor to the group's canonical unit}. Lookup is
+        # case-insensitive because CSS units are.
+        UNIT_CONVERSIONS = {
+          # length — canonical px
+          "px" => {0, 1.0}, "cm" => {0, 96.0 / 2.54}, "mm" => {0, 96.0 / 25.4},
+          "q" => {0, 96.0 / 101.6}, "in" => {0, 96.0}, "pt" => {0, 4.0 / 3.0},
+          "pc" => {0, 16.0},
+          # angle — canonical deg
+          "deg" => {1, 1.0}, "grad" => {1, 0.9}, "rad" => {1, 180.0 / Math::PI},
+          "turn" => {1, 360.0},
+          # time — canonical s
+          "s" => {2, 1.0}, "ms" => {2, 0.001},
+          # frequency — canonical Hz
+          "hz" => {3, 1.0}, "khz" => {3, 1000.0},
+          # resolution — canonical dppx
+          "dppx" => {4, 1.0}, "dpi" => {4, 1.0 / 96.0}, "dpcm" => {4, 2.54 / 96.0},
+        }
+
+        # Multiplier that converts a value in `from` units to `to` units;
+        # nil when the units aren't in the same convertible group.
+        def self.conversion_factor(from : String, to : String) : Float64?
+          return 1.0 if from == to
+          f = UNIT_CONVERSIONS[from.downcase]?
+          t = UNIT_CONVERSIONS[to.downcase]?
+          return unless f && t && f[0] == t[0]
+          f[1] / t[1]
+        end
+
+        # dart-sass treats numbers within 1e-11 of each other as equal
+        # (`0.1 * 3 == 0.3`); floor/ceil/round are exact there.
+        EPSILON = 1e-11
+
+        # dart-sass `fuzzyEquals`: within epsilon AND the same value once
+        # scaled and rounded, so `0.4e-11` and `0.6e-11` stay distinct.
+        def self.fuzzy_eq?(a : Float64, b : Float64) : Bool
+          return true if a == b
+          (a - b).abs <= EPSILON && (a / EPSILON).round == (b / EPSILON).round
+        end
+
+        def self.fuzzy_lt?(a : Float64, b : Float64) : Bool
+          a < b && !fuzzy_eq?(a, b)
+        end
+
+        def self.fuzzy_le?(a : Float64, b : Float64) : Bool
+          a < b || fuzzy_eq?(a, b)
         end
 
         def eq?(other : Value) : Bool
@@ -119,18 +237,33 @@ module Hwaro
           # `compatible_unit?` (one side unitless adopts the other's unit)
           # is the right rule for arithmetic and comparison, but using it
           # here silently picks the wrong `@if` branch and collides map
-          # keys that differ only by unit.
-          unit == other.unit && value == other.value
+          # keys that differ only by unit. Convertible units DO compare
+          # equal after conversion (`1in == 96px` is true in dart-sass).
+          return Number.fuzzy_eq?(value, other.value) if unit == other.unit
+          return false if unit.empty? || other.unit.empty?
+          factor = Number.conversion_factor(other.unit, unit)
+          !factor.nil? && Number.fuzzy_eq?(value, other.value * factor)
         end
 
-        # v1 unit model: identical units or one side unitless. No
-        # px↔cm-style conversions.
+        # Identical units, one side unitless, or units in the same
+        # convertible group (px↔in, deg↔turn, s↔ms, ...).
         def compatible_unit?(other : Number) : Bool
-          unit.empty? || other.unit.empty? || unit == other.unit
+          unit.empty? || other.unit.empty? || unit == other.unit ||
+            !Number.conversion_factor(other.unit, unit).nil?
         end
 
         def result_unit(other : Number) : String
           unit.empty? ? other.unit : unit
+        end
+
+        # The other operand's value expressed in THIS number's unit (the
+        # left operand of an arithmetic expression wins the unit, dart-sass
+        # semantics). Callers must have checked `compatible_unit?`.
+        def coerce_value(other : Number) : Float64
+          return other.value if unit.empty? || other.unit.empty? || unit == other.unit
+          factor = Number.conversion_factor(other.unit, unit)
+          raise SoftEvalError.new("incompatible units: #{to_css} and #{other.to_css}") unless factor
+          other.value * factor
         end
 
         def int_value(context : String) : Int32
@@ -151,13 +284,156 @@ module Hwaro
         end
 
         def to_css : String
-          @quoted ? "#{@quote_char}#{@text}#{@quote_char}" : @text
+          return @text unless @quoted
+          quote = @quote_char
+          return "#{quote}#{@text}#{quote}" unless Str.contains_unescaped?(@text, quote)
+          # The text gained a quote it can't hold (`'#{"Don't"}'`,
+          # `"a'b" + 'c"d'`): switch to the other quote, or escape this one
+          # when the text has both. Already-valid strings never get here.
+          other = quote == '"' ? '\'' : '"'
+          return "#{other}#{@text}#{other}" unless Str.contains_unescaped?(@text, other)
+          escaped = String.build do |io|
+            esc = false
+            @text.each_char do |ch|
+              if esc
+                esc = false
+              elsif ch == '\\'
+                esc = true
+              elsif ch == quote
+                io << '\\'
+              end
+              io << ch
+            end
+          end
+          "#{quote}#{escaped}#{quote}"
+        end
+
+        # `text` as unquote() hands it out: a single-character escape
+        # (`\"`, `\'`, `\\`, `\:`) is only an escape inside quotes, so it
+        # becomes that character, and an escaped newline is a line
+        # continuation. Hex escapes (`\f101`) stay verbatim: they mean the
+        # same code point unquoted (dart-sass prints them back the same).
+        def self.unquote_text(text : String) : String
+          return text unless text.includes?('\\')
+          String.build do |io|
+            esc = false
+            text.each_char do |ch|
+              if esc
+                esc = false
+                if ch.hex?
+                  io << '\\' << ch
+                elsif ch != '\n'
+                  io << ch
+                end
+              elsif ch == '\\'
+                esc = true
+              else
+                io << ch
+              end
+            end
+            io << '\\' if esc
+          end
+        end
+
+        def self.contains_unescaped?(text : String, quote : Char) : Bool
+          esc = false
+          text.each_char do |ch|
+            if esc
+              esc = false
+            elsif ch == '\\'
+              esc = true
+            elsif ch == quote
+              return true
+            end
+          end
+          false
+        end
+
+        def interp_css : String
+          @text
+        end
+
+        # The code points the text denotes: `\e900` is one character, `\"`
+        # is a quote. `text` keeps the escapes verbatim so strings pass
+        # through byte-identically; string functions and `==` work on this.
+        def decoded : String
+          Str.decode(@text)
+        end
+
+        def self.decode(text : String) : String
+          return text unless text.includes?('\\')
+          chars = text.chars
+          String.build do |io|
+            i = 0
+            while i < chars.size
+              c = chars[i]
+              if c != '\\' || i + 1 >= chars.size
+                io << c
+                i += 1
+                next
+              end
+              nxt = chars[i + 1]
+              if nxt.ascii_alphanumeric? && nxt.to_i?(16)
+                j = i + 1
+                while j < chars.size && j < i + 7 && chars[j].to_i?(16)
+                  j += 1
+                end
+                code = chars[(i + 1)...j].join.to_i(16)
+                io << ((code == 0 || code > 0x10FFFF || (0xD800 <= code && code <= 0xDFFF)) ? '\uFFFD' : code.chr)
+                # One whitespace character terminates the escape.
+                if (ws = chars[j]?) && ws.ascii_whitespace?
+                  j += 1
+                  j += 1 if ws == '\r' && chars[j]? == '\n'
+                end
+                i = j
+              elsif nxt == '\n'
+                i += 2 # escaped newline: line continuation
+              else
+                io << nxt
+                i += 2
+              end
+            end
+          end
+        end
+
+        # Inverse of `decode` for a computed result: backslashes and
+        # unprintable / private-use code points are escaped (an icon-font
+        # glyph stays `\e900`), everything else is kept literal. A quote
+        # needs no escape here — `to_css` picks a quote that fits.
+        def self.encode(decoded : String) : String
+          chars = decoded.chars
+          String.build do |io|
+            chars.each_with_index do |c, i|
+              code = c.ord
+              if c == '\\'
+                io << "\\\\"
+              elsif code < 0x20 || code == 0x7F || (0xE000 <= code && code <= 0xF8FF) || code >= 0xF0000
+                io << '\\' << code.to_s(16)
+                nxt = chars[i + 1]?
+                io << ' ' if nxt && (nxt.to_i?(16) || nxt.ascii_whitespace?)
+              else
+                io << c
+              end
+            end
+          end
+        end
+
+        # `a + b` on string text: a trailing hex escape would swallow a
+        # following hex digit (`"\f101" + "a"` must stay U+F101), so it is
+        # terminated with a space.
+        def self.join_text(left : String, right : String) : String
+          if (first = right[0]?) && (first.to_i?(16) || first.ascii_whitespace?) &&
+             (m = left.match(/(\\+)[0-9a-fA-F]{1,6}\z/)) && m[1].size.odd?
+            left + " " + right
+          else
+            left + right
+          end
         end
 
         def eq?(other : Value) : Bool
           # Quoted and unquoted strings with the same text are equal
-          # (dart-sass semantics).
-          other.is_a?(Str) && text == other.text
+          # (dart-sass semantics); `"\e900"` equals `"\E900"`.
+          other.is_a?(Str) && (text == other.text || decoded == other.decoded)
         end
       end
 
@@ -186,7 +462,7 @@ module Hwaro
         end
 
         # Null vanishes in CSS output but must survive storage as a value.
-        def inspect_css : String
+        def inspect_css(storage : Bool = false) : String
           "null"
         end
 
@@ -209,25 +485,42 @@ module Hwaro
         getter items : Array(Value)
         getter sep : Sep
         getter bracketed : Bool
+        # True only for a slash pair PARSED as `a / b` (the classic lazy
+        # division): a numeric context may fold it into the quotient.
+        # Constructed slash lists (`list.slash`, `$separator: slash`) are
+        # real lists — dart-sass errors when math coerces them, so they
+        # must not divide. Never part of equality or serialization.
+        getter? lazy_slash : Bool
 
-        def initialize(@items : Array(Value), @sep : Sep = Sep::Space, @bracketed : Bool = false)
+        def initialize(@items : Array(Value), @sep : Sep = Sep::Space, @bracketed : Bool = false,
+                       @lazy_slash : Bool = false)
         end
 
         def to_css : String
+          serialize(&.to_css)
+        end
+
+        def interp_css : String
+          # Membership in the output is decided by `to_css` (that is what
+          # drops nulls), while each surviving member renders unquoted.
+          serialize(&.interp_css)
+        end
+
+        private def serialize(& : Value -> String) : String
           joiner =
             case @sep
             in Sep::Space then " "
             in Sep::Comma then ", "
             in Sep::Slash then " / "
             end
-          inner = @items.map(&.to_css).reject(&.empty?).join(joiner)
+          inner = @items.reject(&.to_css.empty?).map { |item| yield item }.join(joiner)
           @bracketed ? "[#{inner}]" : inner
         end
 
         # Unlike `to_css`: keeps null members (they are real elements, so
         # dropping them changes `length`) and parenthesizes unbracketed
         # sublists so nesting survives a storage round-trip.
-        def inspect_css : String
+        def inspect_css(storage : Bool = false) : String
           return "()" if @items.empty?
           if @sep == Sep::Comma && @items.size == 1 && !@bracketed
             # A single-element comma list has no comma to reveal its
@@ -235,8 +528,8 @@ module Hwaro
             # only spelling that survives a storage round-trip without
             # degrading into a plain value.
             item = @items[0]
-            text = item.inspect_css
-            text = "(#{text})" if item.is_a?(ListV) && !item.bracketed
+            text = item.inspect_css(storage)
+            text = "(#{text})" if element_needs_parens?(Sep::Comma, item)
             return "(#{text},)"
           end
           joiner =
@@ -246,10 +539,39 @@ module Hwaro
             in Sep::Slash then " / "
             end
           inner = @items.map do |item|
-            text = item.inspect_css
-            item.is_a?(ListV) && !item.bracketed ? "(#{text})" : text
+            text = item.inspect_css(storage)
+            element_needs_parens?(@sep, item) ? "(#{text})" : text
           end.join(joiner)
           @bracketed ? "[#{inner}]" : inner
+        end
+
+        # dart-sass's `_elementNeedsParens`: a nested list is
+        # parenthesized only where dropping the parens would merge it into
+        # the outer separator — a comma list inside a comma (or slash)
+        # list, anything inside a space list. Empty and single-element
+        # lists spell their own parens (`()`, `(1,)`); a space list inside
+        # a comma list needs none (`.a .b, .c`). Slash-in-space stays
+        # bare: the common source is an undivided literal slash, which
+        # dart-sass prints as a compact slash number.
+        protected def self.element_needs_parens?(outer : Sep, item : Value) : Bool
+          return false unless item.is_a?(ListV)
+          return false if item.bracketed || item.items.size < 2
+          case outer
+          in Sep::Comma then item.sep == Sep::Comma
+            # dart leaves a space list bare inside a slash list, but our
+            # text storage must re-parse: bare `1 2 / 3` re-associates as
+            # `1 (2/3)`, so the parens stay.
+          in Sep::Slash then true
+            # A LAZY slash pair stays bare inside a space list (the
+            # literal `font: 12px/30px` shape); a constructed
+            # `list.slash` keeps its parens or `(1 / 2) 9` re-reads as a
+            # different structure.
+          in Sep::Space then !(item.sep == Sep::Slash && item.lazy_slash?)
+          end
+        end
+
+        private def element_needs_parens?(outer : Sep, item : Value) : Bool
+          ListV.element_needs_parens?(outer, item)
         end
 
         def eq?(other : Value) : Bool
@@ -278,12 +600,16 @@ module Hwaro
         # map stays parseable as one entry — with `to_css` the commas of a
         # nested list merge into the map's own separator and the text no
         # longer re-parses as a map.
-        def inspect_css : String
+        def inspect_css(storage : Bool = false) : String
           "(" + @entries.map do |e|
             value = e.value
-            text = value.inspect_css
-            text = "(#{text})" if value.is_a?(ListV) && !value.bracketed && value.sep == ListV::Sep::Comma
-            "#{e.key.inspect_css}: #{text}"
+            text = value.inspect_css(storage)
+            # dart-sass wraps ANY unbracketed comma list in a map value —
+            # a singleton included (`(a: ((5,)))`), unlike list nesting.
+            if value.is_a?(ListV) && !value.bracketed && value.sep == ListV::Sep::Comma
+              text = "(#{text})"
+            end
+            "#{e.key.inspect_css(storage)}: #{text}"
           end.join(", ") + ")"
         end
 

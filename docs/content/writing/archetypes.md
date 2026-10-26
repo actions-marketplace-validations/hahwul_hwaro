@@ -69,7 +69,7 @@ When you run `hwaro new`, archetypes are matched in this order:
 ### 1. Explicit Flag (`-a`)
 
 ```bash
-hwaro new -t "My Article" -a posts
+hwaro new notes/my-article.md -t "My Article" -a posts
 ```
 
 Uses `archetypes/posts.md` regardless of the output path.
@@ -111,7 +111,12 @@ bundle = false                        # true: scaffold foo/index.md instead of f
 ```
 
 Fields that overlap with the built-ins (`title`, `date`, `draft`, `tags`)
-are ignored so they aren't duplicated with empty values.
+are ignored so they aren't duplicated with empty values. Keys the build reads
+as a number, boolean, list or table get the value it assumes when the key is
+absent instead of `""` (`weight = 0`, `toc = false`, `in_sitemap = true`,
+`aliases = []`, `extra = {}`), so a new page builds without type warnings.
+Keys with no neutral value (`path`, `redirect_to`, `paginate`, `paginate_by`,
+`pagination_enabled`, `reverse`, `insert_anchor_links`) are left out.
 
 ### Leaf-bundle (directory) layout
 
@@ -146,7 +151,7 @@ hwaro new posts/my-first-post.md
 hwaro new posts/my-post.md -t "My First Post"
 
 # Use specific archetype
-hwaro new -t "Quick Note" -a posts
+hwaro new notes/quick-note.md -t "Quick Note" -a posts
 ```
 
 ### Creating Different Content Types
@@ -214,8 +219,6 @@ draft = {{ draft }}
 description = "{{ description }}"
 tags = {{ tags }}
 +++
-
-# {{ title }}
 ```
 
 This mirrors the `archetypes/default.md` that `hwaro init` ships. The

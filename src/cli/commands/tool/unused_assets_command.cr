@@ -10,6 +10,7 @@ require "option_parser"
 require "../../metadata"
 require "../../prompt"
 require "../../../services/unused_assets"
+require "../../../utils/errors"
 require "../../../utils/logger"
 
 module Hwaro
@@ -25,6 +26,7 @@ module Hwaro
           FLAGS = [
             CONTENT_DIR_FLAG,
             FlagInfo.new(short: "-s", long: "--static-dir", description: "Static files directory (default: static)", takes_value: true, value_hint: "DIR"),
+            FlagInfo.new(short: "-t", long: "--templates-dir", description: "Templates directory scanned for references (default: templates)", takes_value: true, value_hint: "DIR"),
             FlagInfo.new(short: nil, long: "--delete", description: "Delete unused files (with confirmation)"),
             FlagInfo.new(short: "-f", long: "--force", description: "Skip confirmation prompt when deleting"),
             JSON_FLAG,
@@ -43,19 +45,74 @@ module Hwaro
 
           def run(args : Array(String))
             content_dir = "content"
+            content_dir_given = false
             static_dir = "static"
+            static_dir_given = false
+            templates_dir = "templates"
+            templates_dir_given = false
             delete_mode = false
             force = false
             json_output = false
 
             OptionParser.parse(args) do |parser|
               parser.banner = "Usage: hwaro tool unused-assets [options]"
-              CLI.register_flag(parser, CONTENT_DIR_FLAG) { |v| content_dir = v }
-              parser.on("-s DIR", "--static-dir DIR", "Static files directory (default: static)") { |v| static_dir = v }
+              CLI.register_flag(parser, CONTENT_DIR_FLAG) do |v|
+                content_dir = v
+                content_dir_given = true
+              end
+              parser.on("-s DIR", "--static-dir DIR", "Static files directory (default: static)") do |v|
+                static_dir = v
+                static_dir_given = true
+              end
+              # Without this flag a project with a non-default templates
+              # directory silently scanned the wrong (empty) tree: every
+              # template-referenced asset came back "unused", and `--delete`
+              # then removed files the build still needs.
+              parser.on("-t DIR", "--templates-dir DIR", "Templates directory scanned for references (default: templates)") do |v|
+                templates_dir = v
+                templates_dir_given = true
+              end
               parser.on("--delete", "Delete unused files (with confirmation)") { delete_mode = true }
               parser.on("-f", "--force", "Skip confirmation prompt when deleting") { force = true }
               CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
               CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
+              parser.unknown_args do |before_dash, after_dash|
+                unknown = before_dash + after_dash
+                raise Hwaro::HwaroError.new(
+                  code: Hwaro::Errors::HWARO_E_USAGE,
+                  message: "unexpected extra argument(s): '#{unknown.join("', '")}'",
+                  hint: "hwaro tool unused-assets accepts options only.",
+                ) unless unknown.empty?
+              end
+            end
+
+            # An explicit --templates-dir that doesn't exist must fail, not
+            # silently scan zero templates: every template-referenced asset
+            # would come back "unused", and `--delete --force` would then
+            # remove files the build still needs. The default "templates" is
+            # exempt — projects without a templates directory are legitimate.
+            # The same hazard applies to an explicit --content-dir (a typo
+            # makes every referenced asset look unused) and --static-dir.
+            if content_dir_given && !Dir.exists?(content_dir)
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_CONTENT,
+                message: "Content directory '#{content_dir}' does not exist",
+                hint: "Create it or pass --content-dir DIR to point at your content root.",
+              )
+            end
+            if static_dir_given && !Dir.exists?(static_dir)
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_IO,
+                message: "Static directory '#{static_dir}' does not exist",
+                hint: "The path is resolved relative to the current directory. Pass an existing directory to --static-dir.",
+              )
+            end
+            if templates_dir_given && !Dir.exists?(templates_dir)
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_IO,
+                message: "Templates directory '#{templates_dir}' does not exist",
+                hint: "The path is resolved relative to the current directory. Pass an existing directory to --templates-dir.",
+              )
             end
 
             # In JSON mode stdout must stay a single parseable document, so
@@ -65,9 +122,16 @@ module Hwaro
             # below survives.
             Runner.enable_json_mode! if json_output
 
+            # The `*_explicit` flags distinguish an explicitly passed
+            # `--templates-dir templates` / `--static-dir static` (validated
+            # against the CWD above) from the bare defaults: only the true
+            # defaults may be re-rooted to the resolved project root.
             service = Services::UnusedAssets.new(
               content_dir: content_dir,
               static_dir: static_dir,
+              templates_dir: templates_dir,
+              templates_dir_explicit: templates_dir_given,
+              static_dir_explicit: static_dir_given,
             )
             result = service.run
 

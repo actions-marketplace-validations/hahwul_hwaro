@@ -11,6 +11,10 @@ module Hwaro
     module Sass
       module Css
         abstract class Node
+          # True on the last root node produced by a top-level style rule:
+          # the serializer separates such groups with a blank line
+          # (dart-sass's `isGroupEnd`). At-rule statements never set it.
+          property group_end : Bool = false
         end
 
         record Decl, name : String, value : String, important : Bool
@@ -24,14 +28,17 @@ module Hwaro
 
         class Rule < Node
           getter selectors : Array(String)
+          # Line-break flags parallel to `selectors`: true when the source
+          # had a newline in the whitespace before that selector — the
+          # serializer preserves the author's selector-list line structure
+          # (dart-sass behavior). May be shorter than `selectors` (extend
+          # appends without flags); a missing entry reads as false.
+          getter breaks : Array(Bool)
+
+          def initialize(@selectors, @breaks = [] of Bool)
+          end
+
           getter items = [] of Decl | Comment
-
-          def initialize(@selectors)
-          end
-
-          def decls? : Bool
-            @items.any?(Decl)
-          end
         end
 
         class AtRule < Node
@@ -56,10 +63,24 @@ module Hwaro
           extend self
 
           def serialize(nodes : Array(Node)) : String
-            out = String.build do |io|
+            # Source `@charset` declarations are dropped (a merged sheet
+            # can carry one per imported file); the single output charset
+            # is decided below from the bytes actually emitted.
+            nodes = nodes.reject { |n| charset?(n) }
+            text = String.build do |io|
               write_nodes(io, hoist_statements(nodes), 0)
             end
-            out.empty? ? out : out.chomp + "\n"
+            return text if text.empty?
+            text = text.chomp + "\n"
+            # Non-ASCII output needs an encoding declaration or browsers
+            # fall back to the response/platform charset and garble it
+            # (dart-sass emits this too).
+            text = "@charset \"UTF-8\";\n" + text unless text.ascii_only?
+            text
+          end
+
+          private def charset?(node : Node) : Bool
+            node.is_a?(Raw) && node.text.lstrip.starts_with?("@charset")
           end
 
           # Plain-CSS `@import` (and `@charset`) are only honoured before any
@@ -100,12 +121,15 @@ module Hwaro
           end
 
           private def write_nodes(io : IO, nodes : Array(Node), indent : Int32) : Nil
-            emitted = false
+            previous = nil.as(Node?)
             nodes.each do |node|
               next unless emit?(node)
-              io << "\n" if emitted
+              # A blank line only after the output group of a top-level
+              # style rule (dart-sass). Adjacent rules from one group, and
+              # at-rule statements, join without one.
+              io << "\n" if previous && previous.group_end
               write_node(io, node, indent)
-              emitted = true
+              previous = node
             end
           end
 
@@ -113,7 +137,12 @@ module Hwaro
             pad = "  " * indent
             case node
             when Rule
-              io << pad << node.selectors.join(",\n#{pad}") << " {\n"
+              io << pad
+              node.selectors.each_with_index do |selector, index|
+                io << (node.breaks[index]? ? ",\n#{pad}" : ", ") unless index == 0
+                io << selector
+              end
+              io << " {\n"
               write_items(io, node.items, indent + 1)
               io << pad << "}\n"
             when AtRule
@@ -121,10 +150,7 @@ module Hwaro
               io << " " << node.prelude unless node.prelude.empty?
               io << " {\n"
               write_items(io, node.items, indent + 1)
-              unless node.children.empty?
-                io << "\n" unless node.items.empty?
-                write_nodes(io, node.children, indent + 1)
-              end
+              write_nodes(io, node.children, indent + 1)
               io << pad << "}\n"
             when Raw
               io << pad << node.text << "\n"
@@ -138,7 +164,14 @@ module Hwaro
             items.each do |item|
               case item
               in Decl
-                io << pad << item.name << ": " << item.value
+                io << pad << item.name << ":"
+                # A null value kept alive by !important is empty — don't
+                # print the value's leading space or the output carries a
+                # double space (`y:  !important`); dart emits `y: !important`.
+                # An empty value WITHOUT !important keeps the space: the
+                # custom-property `--empty: ;` serializes with it (dart).
+                io << " " unless item.value.empty? && item.important
+                io << item.value
                 io << " !important" if item.important
                 io << ";\n"
               in Comment

@@ -5,7 +5,7 @@ weight = 4
 sort_by = "weight"
 +++
 
-Hwaro ships with a comprehensive set of built-in features — no plugins required. All features are configured through `config.toml` and work out of the box once enabled.
+Hwaro ships with a broad set of built-in features, and no plugins are required. All features are configured through `config.toml` and work out of the box once enabled.
 
 ## At a Glance
 
@@ -15,6 +15,6 @@ Hwaro ships with a comprehensive set of built-in features — no plugins require
 
 **Performance** — Incremental builds, streaming builds for large sites, asset pipeline with minification and fingerprinting, image processing with responsive variants and LQIP placeholders, and cache busting.
 
-**Files & Environment** — Environment variables, environment-specific config overrides, auto-includes for CSS/JS, and content file publishing.
+**Files & Environment** — Environment variables, environment-specific config overrides, auto-includes for CSS/JS, local and remote data, and content file publishing.
 
-**Platform** — Multilingual support, image processing, PWA, AMP, and built-in deployment to multiple targets.
+**Platform** — Multilingual support, versioned docs, image processing, PWA, AMP, and built-in deployment to multiple targets.

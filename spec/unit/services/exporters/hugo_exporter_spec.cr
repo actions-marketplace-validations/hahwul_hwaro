@@ -1,0 +1,679 @@
+require "../../../spec_helper"
+
+describe Hwaro::Services::Exporters::HugoExporter do
+  describe "#run" do
+    it "returns failure when no content files found" do
+      exporter = Hwaro::Services::Exporters::HugoExporter.new
+      options = Hwaro::Config::Options::ExportOptions.new(
+        target_type: "hugo",
+        content_dir: "/nonexistent/content",
+        output_dir: "/tmp/export",
+      )
+      result = exporter.run(options)
+      result.success.should be_false
+    end
+
+    it "exports TOML frontmatter content" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"My Post\"\ndate = 2024-01-15T10:00:00Z\ndescription = \"A post\"\ntags = [\"crystal\", \"web\"]\n+++\n\nHello world\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        result = exporter.run(options)
+
+        result.success.should be_true
+        result.exported_count.should eq(1)
+
+        out_file = File.join(output_dir, "content", "post.md")
+        File.exists?(out_file).should be_true
+        content = File.read(out_file)
+        content.should contain("title = \"My Post\"")
+        content.should contain("+++")
+      end
+    end
+
+    it "exports YAML frontmatter content" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "---\ntitle: YAML Post\ndescription: A post\ndate: \"2024-01-15\"\n---\n\nHello world\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        result = exporter.run(options)
+
+        result.success.should be_true
+        result.exported_count.should eq(1)
+      end
+    end
+
+    it "skips drafts by default" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "draft.md"), "+++\ntitle = \"Draft\"\ndraft = true\n+++\n\nDraft content\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+          drafts: false,
+        )
+        result = exporter.run(options)
+
+        result.skipped_count.should eq(1)
+        result.exported_count.should eq(0)
+      end
+    end
+
+    it "includes drafts when requested" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "draft.md"), "+++\ntitle = \"Draft\"\ndraft = true\n+++\n\nDraft content\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+          drafts: true,
+        )
+        result = exporter.run(options)
+
+        result.exported_count.should eq(1)
+      end
+    end
+
+    it "preserves directory structure" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(File.join(content_dir, "blog"))
+
+        File.write(File.join(content_dir, "blog", "post.md"), "+++\ntitle = \"Blog Post\"\ndescription = \"A post\"\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        exporter.run(options)
+
+        File.exists?(File.join(output_dir, "content", "blog", "post.md")).should be_true
+      end
+    end
+
+    it "maps updated to lastmod" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\nupdated = \"2024-06-01\"\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should contain("lastmod")
+      end
+    end
+
+    it "maps image to images array" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\nimage = \"cover.jpg\"\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should contain("images = [\"cover.jpg\"]")
+      end
+    end
+
+    it "maps expires to expiryDate" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\nexpires = \"2025-12-31\"\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should contain("expiryDate")
+      end
+    end
+
+    it "rewrites @/ internal links" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\n+++\n\n[About](@/about/_index.md)\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should_not contain("@/")
+        content.should contain("[About]")
+      end
+    end
+
+    it "exports files without draft field as published" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "pub.md"), "+++\ntitle = \"Published\"\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir, drafts: false)
+        result = exporter.run(options)
+
+        result.exported_count.should eq(1)
+        result.skipped_count.should eq(0)
+      end
+    end
+
+    it "exports tags correctly" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), "+++\ntitle = \"Post\"\ntags = [\"go\", \"web\"]\n+++\n\nContent\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should contain("tags = [\"go\", \"web\"]")
+      end
+    end
+
+    # Regression for gh#527: Hugo export used a hand-picked allowlist
+    # (`title`, `date`, `description`, `draft`, `weight`, `tags`,
+    # `series`, `aliases`, `image`, `expires`, `updated`) and silently
+    # dropped everything else — including `categories` and `authors`,
+    # which are standard Hugo taxonomies. Pass arbitrary keys through.
+    it "passes categories, authors, and unknown keys through (gh#527)" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(
+          File.join(content_dir, "post.md"),
+          <<-MD
+            +++
+            title = "Post"
+            categories = ["programming"]
+            authors = ["alice"]
+            difficulty = "intermediate"
+            +++
+
+            Body
+            MD
+        )
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo", content_dir: content_dir, output_dir: output_dir,
+        )
+        exporter.run(options)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        content.should contain("categories = [\"programming\"]")
+        content.should contain("authors = [\"alice\"]")
+        content.should contain("difficulty = \"intermediate\"")
+      end
+    end
+
+    it "handles mixed published and draft files" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "pub.md"), "+++\ntitle = \"Pub\"\n+++\n\nA\n")
+        File.write(File.join(content_dir, "draft.md"), "+++\ntitle = \"Draft\"\ndraft = true\n+++\n\nB\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir, drafts: false)
+        result = exporter.run(options)
+
+        result.exported_count.should eq(1)
+        result.skipped_count.should eq(1)
+      end
+    end
+
+    it "quotes a frontmatter key containing a space so the TOML stays parseable" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        # A space-containing key is valid in YAML but bare-invalid in TOML;
+        # it must be emitted as a quoted key, not `my key = "value"`.
+        File.write(File.join(content_dir, "post.md"), "---\ntitle: Post\n\"my key\": value\n---\n\nBody\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        result = exporter.run(options)
+        result.success.should be_true
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        fm = content.split("+++")[1]
+        parsed = TOML.parse(fm)
+        parsed["my key"].as_s.should eq("value")
+        fm.should contain(%("my key" = "value"))
+      end
+    end
+
+    it "preserves nested tables, typed scalars, and non-string arrays" do
+      # `[extra]`/`[taxonomies]` and typed values used to be flattened
+      # through a String|Bool|Array(String) union and silently dropped.
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        File.write(File.join(content_dir, "post.md"), <<-MD)
+          +++
+          title = "Post"
+          weight = 10
+          rating = 4.5
+          numbers = [1, 2, 3]
+          [taxonomies]
+          categories = ["tech"]
+          [extra]
+          subtitle = "hello"
+          [extra.nested]
+          key = "value"
+          +++
+
+          Body
+          MD
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        result = exporter.run(options)
+        result.success.should be_true
+        result.error_count.should eq(0)
+
+        content = File.read(File.join(output_dir, "content", "post.md"))
+        fm = content.match!(/\A\+\+\+\n(.*?)\+\+\+/m)[1]
+        parsed = TOML.parse(fm)
+        parsed["weight"].raw.should eq(10)
+        parsed["rating"].raw.should eq(4.5)
+        parsed["numbers"].raw.as(Array).map(&.as(TOML::Any).raw).should eq([1, 2, 3])
+        # `[taxonomies]` is hoisted to the top level, which is where Hugo
+        # actually reads taxonomy membership from.
+        parsed["taxonomies"]?.should be_nil
+        parsed["categories"].raw.as(Array).first.as(TOML::Any).raw.should eq("tech")
+        parsed["extra"]["subtitle"].raw.should eq("hello")
+        parsed["extra"]["nested"]["key"].raw.should eq("value")
+      end
+    end
+
+    it "counts files with malformed frontmatter as errors instead of stripping metadata" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        output_dir = File.join(dir, "export")
+        FileUtils.mkdir_p(content_dir)
+
+        # The +++ inside the multiline string truncates the frontmatter
+        # regex match; the leftover used to be exported as a corrupted body
+        # with ALL metadata silently dropped.
+        File.write(File.join(content_dir, "tricky.md"), "+++\ntitle = \"M\"\ndescription = \"\"\"\nfoo\n+++\nbar\n\"\"\"\n+++\n\nActual body\n")
+
+        exporter = Hwaro::Services::Exporters::HugoExporter.new
+        options = Hwaro::Config::Options::ExportOptions.new(
+          target_type: "hugo",
+          content_dir: content_dir,
+          output_dir: output_dir,
+        )
+        result = exporter.run(options)
+
+        result.error_count.should eq(1)
+        result.exported_count.should eq(0)
+        File.exists?(File.join(output_dir, "content", "tricky.md")).should be_false
+      end
+    end
+  end
+end
+
+# Regression: hwaro's `path` (the page's whole published path) was passed
+# through as an unknown Hugo param, so the exported page moved to its
+# directory-derived URL. Hugo spells it `url`.
+describe "Hugo export: path" do
+  it "maps path to url" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(content_dir)
+      File.write(File.join(content_dir, "p.md"), "+++\ntitle = \"P\"\npath = \"special/place\"\n+++\nbody\n")
+      File.write(File.join(content_dir, "q.md"), "+++\ntitle = \"Q\"\npath = \"a\"\nurl = \"/kept/\"\n+++\nbody\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      p = File.read(File.join(output_dir, "content", "p.md"))
+      p.should contain(%(url = "/special/place/"))
+      p.should_not contain("path =")
+      # An authored `url` wins; `path` then passes through untouched.
+      File.read(File.join(output_dir, "content", "q.md")).should contain(%(url = "/kept/"))
+    end
+  end
+end
+
+# Regression: Hugo reads `index.md` as a LEAF bundle, which has no descendant
+# pages — every other Markdown file under it becomes an inert resource. The
+# blog/docs/book scaffolds use `content/index.md` as the homepage, so the
+# verbatim export made `hugo` publish the homepage and nothing else.
+describe "Hugo export: index.md with pages below it" do
+  it "exports the site root index.md as Hugo's _index.md" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "posts"))
+      File.write(File.join(content_dir, "index.md"), "+++\ntitle = \"Home\"\n+++\nhome\n")
+      File.write(File.join(content_dir, "index.ko.md"), "+++\ntitle = \"홈\"\n+++\nhome\n")
+      File.write(File.join(content_dir, "about.md"), "+++\ntitle = \"About\"\n+++\nabout\n")
+      File.write(File.join(content_dir, "posts", "a.md"), "+++\ntitle = \"A\"\n+++\na\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.read(File.join(output_dir, "content", "_index.md")).should contain(%(title = "Home"))
+      File.exists?(File.join(output_dir, "content", "_index.ko.md")).should be_true
+      File.exists?(File.join(output_dir, "content", "index.md")).should be_false
+      File.exists?(File.join(output_dir, "content", "index.ko.md")).should be_false
+    end
+  end
+
+  it "exports a nested index.md with sibling pages as a branch bundle, keeping its assets" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "guide", "deep"))
+      File.write(File.join(content_dir, "guide", "index.md"), "+++\ntitle = \"Guide\"\n+++\n![d](diagram.png)\n")
+      File.write(File.join(content_dir, "guide", "diagram.png"), "PNG")
+      File.write(File.join(content_dir, "guide", "deep", "page.md"), "+++\ntitle = \"Deep\"\n+++\ndeep\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.exists?(File.join(output_dir, "content", "guide", "_index.md")).should be_true
+      File.exists?(File.join(output_dir, "content", "guide", "index.md")).should be_false
+      File.exists?(File.join(output_dir, "content", "guide", "diagram.png")).should be_true
+    end
+  end
+
+  it "keeps a leaf bundle, and an index.md whose _index twin exists, as index.md" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "posts", "bundle"))
+      File.write(File.join(content_dir, "posts", "_index.md"), "+++\ntitle = \"Posts\"\n+++\n")
+      File.write(File.join(content_dir, "posts", "index.md"), "+++\ntitle = \"Also posts\"\n+++\n")
+      File.write(File.join(content_dir, "posts", "bundle", "index.md"), "+++\ntitle = \"Bundle\"\n+++\nb\n")
+      File.write(File.join(content_dir, "posts", "bundle", "index.ko.md"), "+++\ntitle = \"번들\"\n+++\nb\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.read(File.join(output_dir, "content", "posts", "_index.md")).should contain(%(title = "Posts"))
+      File.exists?(File.join(output_dir, "content", "posts", "index.md")).should be_true
+      File.exists?(File.join(output_dir, "content", "posts", "bundle", "index.md")).should be_true
+      File.exists?(File.join(output_dir, "content", "posts", "bundle", "index.ko.md")).should be_true
+    end
+  end
+end
+
+# Regression: hwaro roots every alias at the site, but Hugo resolves an alias
+# without a leading slash against the page's section, so `legacy` on
+# `posts/x.md` redirected from `/posts/legacy/` instead of `/legacy/`.
+describe "Hugo export: aliases" do
+  it "roots relative aliases at the site" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "posts"))
+      File.write(File.join(content_dir, "posts", "x.md"),
+        "+++\ntitle = \"X\"\naliases = [\"legacy\", \"old/x/\", \"/kept/\"]\n+++\nbody\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.read(File.join(output_dir, "content", "posts", "x.md"))
+        .should contain(%(aliases = ["/legacy", "/old/x/", "/kept/"]))
+    end
+  end
+
+  # Regression: an `https://…` alias passed through made `hugo` refuse the
+  # whole site (`http* aliases not supported`), and `//host/…` / `../up`
+  # became local redirects. The build skips all three with a warning.
+  it "drops the aliases the build refuses, with a warning" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "posts"))
+      File.write(File.join(content_dir, "posts", "x.md"),
+        "+++\ntitle = \"X\"\naliases = [\"https://old.example/x\", \"//cdn.example/x\", \"../up\", \"/kept/\"]\n+++\nbody\n")
+      File.write(File.join(content_dir, "posts", "y.md"),
+        "+++\ntitle = \"Y\"\naliases = [\"http://old.example/y\"]\n+++\nbody\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      log = with_captured_log do
+        Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+      end
+
+      File.read(File.join(output_dir, "content", "posts", "x.md")).should contain(%(aliases = ["/kept/"]))
+      File.read(File.join(output_dir, "content", "posts", "y.md")).should_not contain("aliases")
+      log.should contain("Skipping alias \"https://old.example/x\"")
+      log.should contain("Skipping alias \"../up\"")
+    end
+  end
+end
+
+# Regression: a section's `[cascade] draft = true` was ignored — only the
+# page's own `draft` key was read, so a page build/list treat as a draft
+# exported as a published Hugo page.
+describe "Hugo export: cascaded drafts" do
+  it "skips a page drafted by its section's cascade, and marks it with --drafts" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "casc"))
+      File.write(File.join(content_dir, "casc", "_index.md"), "+++\ntitle = \"Casc\"\n[cascade]\ndraft = true\n+++\n")
+      File.write(File.join(content_dir, "casc", "c1.md"), "+++\ntitle = \"C1\"\ndate = 2024-01-01\n+++\nx\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      result = Hwaro::Services::Exporters::HugoExporter.new.run(options)
+      result.skipped_count.should eq(1)
+      File.exists?(File.join(output_dir, "content", "casc", "c1.md")).should be_false
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir, drafts: true)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options)
+      File.read(File.join(output_dir, "content", "casc", "c1.md")).should contain("draft = true")
+    end
+  end
+end
+
+# Regression: `@/` links were rewritten to the target's source path, so a
+# target moved by `slug` or `path` (honoured by the build and by Hugo alike)
+# was linked at an address neither publishes.
+describe "Hugo export: links to moved pages" do
+  it "links to the slug or path URL of the target" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "posts", "c"))
+      File.write(File.join(content_dir, "posts", "a.md"), "+++\ntitle = \"A\"\nslug = \"renamed\"\n+++\na\n")
+      File.write(File.join(content_dir, "posts", "c", "index.md"), "---\ntitle: C\nslug: cee\n---\nc\n")
+      File.write(File.join(content_dir, "about.md"), "+++\ntitle = \"About\"\npath = \"/company/about\"\n+++\nx\n")
+      File.write(File.join(content_dir, "posts", "b.md"),
+        "+++\ntitle = \"B\"\n+++\n[A](@/posts/a.md) [C](@/posts/c/index.md#top) [About](@/about.md) [B](@/posts/b.md)\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.read(File.join(output_dir, "content", "posts", "b.md")).should contain(
+        "[A](/posts/renamed/) [C](/posts/cee/#top) [About](/company/about/) [B](/posts/b)")
+    end
+  end
+end
+
+# Regression: Hugo splits the summary only at a literal `<!--more-->`, so the
+# build's `<!-- more -->` exported as an inert comment and the summary was lost.
+describe "Hugo export: summary marker" do
+  it "rewrites the build's summary marker to Hugo's divider, leaving code alone" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(content_dir)
+      File.write(File.join(content_dir, "a.md"),
+        "+++\ntitle = \"A\"\n+++\n```\n<!-- more -->\n```\nIntro\n\n<!-- More -->\n\nRest <!-- more -->\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      File.read(File.join(output_dir, "content", "a.md")).should end_with(
+        "```\n<!-- more -->\n```\nIntro\n\n<!--more-->\n\nRest <!-- more -->\n")
+    end
+  end
+end
+
+# Regression: hwaro's `template` passed through verbatim, a param Hugo
+# ignores, so the exported page lost its layout (the Hugo importer maps
+# `layout` → `template`; the exporter now inverts it).
+describe "Hugo export: template" do
+  it "exports template as layout unless layout is authored" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(content_dir)
+      File.write(File.join(content_dir, "a.md"), "+++\ntitle = \"A\"\ntemplate = \"wide\"\n+++\na\n")
+      File.write(File.join(content_dir, "b.md"), "+++\ntitle = \"B\"\ntemplate = \"wide\"\nlayout = \"own\"\n+++\nb\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      a = File.read(File.join(output_dir, "content", "a.md"))
+      a.should contain(%(layout = "wide"))
+      a.should_not contain("template")
+      b = File.read(File.join(output_dir, "content", "b.md"))
+      b.should contain(%(layout = "own"))
+      b.should contain(%(template = "wide"))
+    end
+  end
+end
+
+# Regression: `render = false` passed through as a param Hugo ignores, so a
+# headless page the build never writes was published by Hugo.
+describe "Hugo export: headless pages" do
+  it "exports render = false as never-render, never-list build options" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(content_dir)
+      File.write(File.join(content_dir, "a.md"), "+++\ntitle = \"A\"\nrender = false\n+++\na\n")
+
+      options = Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir)
+      Hwaro::Services::Exporters::HugoExporter.new.run(options).success.should be_true
+
+      fm = TOML.parse(File.read(File.join(output_dir, "content", "a.md")).split("+++")[1])
+      fm["build"].as_h.transform_values(&.as_s).should eq({"render" => "never", "list" => "never"})
+      fm.has_key?("render").should be_false
+    end
+  end
+end
+
+describe "Hugo export: in_sitemap" do
+  it "maps in_sitemap = false to sitemap.disable" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(content_dir)
+      File.write(File.join(content_dir, "hidden.md"), "+++\ntitle = \"Hidden\"\nin_sitemap = false\n+++\nBody\n")
+
+      Hwaro::Services::Exporters::HugoExporter.new.run(
+        Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir))
+
+      fm = TOML.parse(File.read(File.join(output_dir, "content", "hidden.md")).split("+++")[1])
+      fm["sitemap"].as_h["disable"].as_bool.should be_true
+      fm.has_key?("in_sitemap").should be_false
+    end
+  end
+end
+
+describe "Hugo export: links to translations" do
+  it "links a translation at its language-prefixed URL" do
+    Dir.mktmpdir do |dir|
+      content_dir = File.join(dir, "content")
+      output_dir = File.join(dir, "export")
+      FileUtils.mkdir_p(File.join(content_dir, "docs"))
+      File.write(File.join(dir, "config.toml"), %(title = "T"\ndefault_language = "en"\n[languages.en]\nlanguage_name = "English"\n[languages.ko]\nlanguage_name = "Korean"\n))
+      File.write(File.join(content_dir, "_index.md"), "+++\ntitle = \"Home\"\n+++\n[ko](@/about.ko.md) [en](@/about.en.md) [s](@/sl.ko.md#x) [i](@/docs/_index.ko.md)\n")
+      File.write(File.join(content_dir, "about.ko.md"), "+++\ntitle = \"KO\"\n+++\n")
+      File.write(File.join(content_dir, "about.en.md"), "+++\ntitle = \"EN\"\n+++\n")
+      File.write(File.join(content_dir, "sl.ko.md"), "+++\ntitle = \"S\"\nslug = \"moved\"\n+++\n")
+      File.write(File.join(content_dir, "docs", "_index.ko.md"), "+++\ntitle = \"D\"\n+++\n")
+
+      Hwaro::Services::Exporters::HugoExporter.new.run(
+        Hwaro::Config::Options::ExportOptions.new(target_type: "hugo", content_dir: content_dir, output_dir: output_dir))
+
+      # Where the build serves them: /ko/about/, /about/, /ko/moved/, /ko/docs/.
+      File.read(File.join(output_dir, "content", "_index.md")).should contain("[ko](/ko/about) [en](/about) [s](/ko/moved/#x) [i](/ko/docs/)")
+    end
+  end
+end

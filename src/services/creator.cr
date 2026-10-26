@@ -6,12 +6,19 @@ require "../models/config"
 require "../utils/date_utils"
 require "../utils/errors"
 require "../utils/file_safe"
+require "../utils/frontmatter_scanner"
+require "../utils/frontmatter_writer"
 require "../utils/logger"
+require "../utils/path_utils"
 require "../utils/text_utils"
 
 module Hwaro
   module Services
     class Creator
+      # Language codes a `<name>.<lang>.md` translation suffix may carry — the
+      # site's declared ones, as the build reads them (see `page_name`).
+      @language_codes = Set(String).new
+
       CONTENT_DIR    = "content"
       ARCHETYPES_DIR = "archetypes"
 
@@ -43,7 +50,7 @@ module Hwaro
           raise ArgumentError.new("missing <path> argument")
         end
 
-        if Path[stripped].absolute?
+        if Utils::PathUtils.absolute?(stripped)
           raise ArgumentError.new(
             "Absolute path '#{raw}' is not allowed. " \
             "Paths are relative to #{CONTENT_DIR}/, e.g. 'posts/my-article.md'."
@@ -93,10 +100,12 @@ module Hwaro
       # plus CJK / Unicode letters, which static hosts serve without
       # percent-encoding surprises.
       def self.url_safe_path?(path : String) : Bool
+        prev = PATH_SEP
         path.each_char do |char|
-          next if char == PATH_SEP
-          next if url_safe_char?(char)
-          return false
+          unless char == PATH_SEP || url_safe_char?(char, prev)
+            return false
+          end
+          prev = char
         end
         true
       end
@@ -135,7 +144,27 @@ module Hwaro
       # Creator's title-only fallback and the interactive `new` wizard's
       # recommended-path suggestion.
       def self.slugify(title : String) : String
-        title.downcase.gsub(/[^\p{L}\p{N}]+/, "-").strip("-")
+        unless title.ascii_only?
+          # Emoji variation selectors / keycap enclosure are not word marks.
+          title = title.unicode_normalize(:nfc).gsub(/[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}\x{20E3}]/, "-")
+        end
+        # Marks belong to the word they follow; one with no letter/digit before
+        # it (the emoji variation selector after "❤") is a separator.
+        title.downcase.gsub(/(?<![\p{L}\p{N}\p{M}])\p{M}+/, "-").gsub(/[^\p{L}\p{M}\p{N}]+/, "-").strip("-")
+      end
+
+      # Derive a display title from a filename stem (`my-first-post` ->
+      # "My First Post"). Empty pieces are dropped so a stem carrying a
+      # doubled or trailing hyphen (`emoji-`, `a---b`) cannot leak a
+      # trailing/doubled space into `title = "..."`. A stem made only of
+      # hyphens has no words to title-case, so it is kept verbatim rather
+      # than collapsing to an empty title.
+      # Single source of truth for the filename->title mapping used by every
+      # `hwaro new` branch that infers a title from the path.
+      def self.titleize(stem : String) : String
+        words = stem.split("-").reject(&.empty?)
+        return stem if words.empty?
+        words.map(&.capitalize).join(" ")
       end
 
       # True when the build's front-matter date parser can produce a real
@@ -151,16 +180,26 @@ module Hwaro
         return segment if segment.empty?
         result = String.build(segment.bytesize) do |io|
           last_was_hyphen = false
+          prev = PATH_SEP
           segment.each_char do |char|
-            if url_safe_char?(char)
-              io << char
-              last_was_hyphen = false
+            if url_safe_char?(char, prev)
+              io << char unless char == '-' && last_was_hyphen
+              # A literal `-` is URL-safe, but it still opens a hyphen run:
+              # without this the run-collapse only saw the hyphens it
+              # synthesized itself, so a literal hyphen sitting next to
+              # unsafe characters emitted `a - b.md` -> `a---b.md` and
+              # `emoji-<emoji>.md` -> `emoji-.md`. Treating both spellings as
+              # the same run keeps the documented "collapsed to a single -"
+              # contract and matches `.slugify`, which collapses hyphen runs
+              # the same way.
+              last_was_hyphen = (char == '-')
             else
               unless last_was_hyphen
                 io << '-'
                 last_was_hyphen = true
               end
             end
+            prev = char
           end
         end.strip('-')
           # Drop hyphens that landed next to a dot — e.g. punctuation right
@@ -178,16 +217,19 @@ module Hwaro
         result
       end
 
-      private def self.url_safe_char?(char : Char) : Bool
+      # `prev` is the character before `char`: a combining mark (Thai/Indic
+      # vowel signs, virama) is part of the word only when it follows one.
+      private def self.url_safe_char?(char : Char, prev : Char = PATH_SEP) : Bool
         return true if char.ascii_letter? || char.ascii_number?
         return true if char == '-' || char == '_' || char == '.' || char == '~'
         return true if Utils::TextUtils.cjk_char?(char)
         return true if !char.ascii? && char.letter?
-        false
+        Utils::TextUtils.word_mark?(char) && (prev.alphanumeric? || Utils::TextUtils.word_mark?(prev))
       end
 
       def run(options : Config::Options::NewOptions, config : Models::Config? = nil)
         path = options.path
+        @language_codes = language_codes(config)
         # Strip so a whitespace-only `--title "   "` falls back to deriving
         # the title from the filename instead of scaffolding `title = "   "`.
         title = (options.title || "").strip
@@ -206,7 +248,7 @@ module Hwaro
 
         # --section overrides the base directory
         if section = resolve_section(options.section, path)
-          if path && path.ends_with?(".md")
+          if path && page_path?(path)
             filename = File.basename(path)
             full_path = File.join("content", section, filename)
           elsif path
@@ -214,7 +256,7 @@ module Hwaro
             # -s posts`), don't join it twice into `content/posts/posts/foo`.
             relative = path.starts_with?("#{section}/") ? path : File.join(section, path)
             full_path = File.join("content", relative)
-            full_path += ".md" unless full_path.ends_with?(".md")
+            full_path += ".md" unless page_path?(full_path)
           else
             # No path given; title must be supplied via --title.
             full_path = nil
@@ -223,15 +265,14 @@ module Hwaro
           if full_path
             base_dir = File.dirname(full_path)
             if title.empty?
-              filename_without_ext = File.basename(full_path, ".md")
-              title = filename_without_ext.split("-").map(&.capitalize).join(" ")
+              title = default_title(full_path)
             end
           else
             base_dir = File.join("content", section)
           end
         else
           # Determine if path is a file path or directory
-          is_file_path = path && path.ends_with?(".md")
+          is_file_path = path && page_path?(path)
 
           # When user types something like `posts/my-cool-post` (with a slash, no .md),
           # **and did not pass an explicit --section**, their clear intent is almost
@@ -246,7 +287,7 @@ module Hwaro
           # heuristics below and routes to the container branch instead.
           path_is_dir = options.path_is_dir
 
-          user_intends_file_under_section = !path.nil? && !path.ends_with?(".md") &&
+          user_intends_file_under_section = !path.nil? && !page_path?(path) &&
                                             path.includes?("/") && options.bundle != true &&
                                             !path_is_dir
 
@@ -260,13 +301,13 @@ module Hwaro
           # "the bundle directory name".
           target_dir_for_bare = path && (path.starts_with?("content/") ? path : File.join("content", path))
           bare_dir_exists = target_dir_for_bare ? Dir.exists?(target_dir_for_bare) : false
-          user_intends_bare_flat = !path.nil? && !path.ends_with?(".md") &&
+          user_intends_bare_flat = !path.nil? && !page_path?(path) &&
                                    !path.includes?("/") && options.bundle != true && options.section.nil? &&
                                    !bare_dir_exists && !path_is_dir
 
           # With explicit --no-bundle (or the section-path / bare-path heuristics above), treat the
           # provided path as the desired file location.
-          is_no_bundle_flat = (!path.nil? && options.bundle == false && !path.ends_with?(".md")) || user_intends_file_under_section || user_intends_bare_flat
+          is_no_bundle_flat = (!path.nil? && options.bundle == false && !page_path?(path)) || user_intends_file_under_section || user_intends_bare_flat
 
           if is_file_path && path
             # Honor the path the user typed. Previously a bare `foo.md`
@@ -277,21 +318,17 @@ module Hwaro
             # `hwaro new drafts/foo.md` still lands at `content/drafts/foo.md`
             # (and is_draft picks that up via the path-based heuristic below).
 
-            # Extract title from filename if not provided
-            if title.empty?
-              filename_without_ext = File.basename(path, ".md")
-              title = filename_without_ext.split("-").map(&.capitalize).join(" ")
-            end
-
             full_path = path.starts_with?("content/") ? path : File.join("content", path)
+
+            # Extract title from filename if not provided
+            title = default_title(full_path) if title.empty?
             base_dir = File.dirname(full_path)
           elsif is_no_bundle_flat && path
             normalized = path.starts_with?("content/") ? path : File.join("content", path)
             full_path = "#{normalized}.md"
             base_dir = File.dirname(full_path)
             if title.empty?
-              filename_without_ext = File.basename(full_path, ".md")
-              title = filename_without_ext.split("-").map(&.capitalize).join(" ")
+              title = Creator.titleize(page_name(full_path))
             end
           else
             base_dir = path || "content/drafts"
@@ -303,7 +340,7 @@ module Hwaro
             # demanded --title while the config-driven `bundle = true` derived
             # it — the explicit flag was strictly stricter than the default.
             if title.empty? && path && options.bundle == true
-              title = File.basename(path).split("-").map(&.capitalize).join(" ")
+              title = Creator.titleize(File.basename(path))
             end
           end
         end
@@ -405,7 +442,7 @@ module Hwaro
         # slug layer and land at `<path>/index.md`.
         path_is_dir_bundle = bundle_mode &&
                              options.section.nil? &&
-                             options.path.try { |p| !p.ends_with?(".md") } == true
+                             options.path.try { |p| !page_path?(p) } == true
 
         if bundle_mode && !bundle_path?(full_path)
           candidate = if path_is_dir_bundle
@@ -426,7 +463,7 @@ module Hwaro
                         bundle_path_for(full_path)
                       end
           if bundle_collides_with_sibling?(candidate)
-            sibling = candidate.rchop("/index.md") + ".md"
+            sibling = bundle_sibling_path(candidate)
             raise Hwaro::HwaroError.new(
               code: Hwaro::Errors::HWARO_E_IO,
               message: "Cannot create bundle at #{candidate}: single-file sibling already exists.",
@@ -458,49 +495,31 @@ module Hwaro
           )
         end
 
-        # Prevent creating a page that would produce a duplicate URL with an
-        # existing section index in the same directory (e.g. posts/index.md
-        # next to posts/_index.md both want to be /posts/).
-        dir = File.dirname(full_path)
-        base = File.basename(full_path, ".md")
-        if base == "index"
-          sibling = File.join(dir, "_index.md")
-          if File.exists?(sibling)
-            raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_IO,
-              message: "Cannot create #{full_path}: would collide with existing section index #{sibling} (both resolve to the same URL).",
-              hint: "Use a different title or path, or remove the _index.md if this is meant to replace the section index.",
-            )
-          end
-        end
-        if base == "_index"
-          sibling = File.join(dir, "index.md")
-          if File.exists?(sibling)
-            raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_IO,
-              message: "Cannot create #{full_path}: would collide with existing page #{sibling}.",
-              hint: "Remove #{sibling} first if you intend to make this the section index.",
-            )
-          end
-        end
-
-        # Mirror of the bundle-over-flat guard above: a flat `<name>.md` next
-        # to an existing `<name>/index.md` bundle (or `<name>/_index.md`
-        # section) renders to the same URL, and the build then drops one of
-        # them with only a warning. Refuse at creation time instead.
-        if base != "index" && base != "_index"
-          {File.join(dir, base, "index.md"), File.join(dir, base, "_index.md")}.each do |nested_sibling|
-            next unless File.exists?(nested_sibling)
-            raise Hwaro::HwaroError.new(
-              code: Hwaro::Errors::HWARO_E_IO,
-              message: "Cannot create #{full_path}: would collide with existing #{nested_sibling} (both resolve to the same URL).",
-              hint: "Pick a different <path>, or edit #{nested_sibling} directly.",
-            )
-          end
+        # Refuse a page that would render to the same URL as an existing
+        # one: `<name>.md`, `<name>/index.md` and `<name>/_index.md` (in any
+        # page extension) all claim `/<name>/`, and the build then drops one
+        # of them with only a warning.
+        if sibling = url_sibling(full_path)
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_IO,
+            message: "Cannot create #{full_path}: would collide with existing #{sibling} (both resolve to the same URL).",
+            hint: "Pick a different <path>, or edit #{sibling} directly.",
+          )
         end
 
         # Last step before the write, so a rejected create never leaves a
         # directory behind (see the note where the path is resolved).
+        content_root = Utils::PathUtils.resolved_real_path(CONTENT_DIR)
+        resolved_path = Utils::PathUtils.resolved_real_path(full_path)
+        within_content = Utils::PathUtils.within?(resolved_path, content_root)
+        if File.symlink?(full_path) || !within_content
+          raise Hwaro::HwaroError.new(
+            code: Hwaro::Errors::HWARO_E_IO,
+            message: "Cannot create #{full_path}: destination cannot be safely resolved within #{CONTENT_DIR}/.",
+            hint: "Remove the symlink or choose a path that resolves within #{CONTENT_DIR}/.",
+          )
+        end
+
         ensure_dir!(base_dir)
 
         begin
@@ -560,13 +579,80 @@ module Hwaro
       # index. Wrapping either into `<name>/index.md` would be nonsense
       # (`posts/_index/index.md` creates a phantom section).
       private def bundle_path?(path : String) : Bool
-        basename = File.basename(path)
-        basename == "index.md" || basename == "_index.md"
+        {"index", "_index"}.includes?(page_name(path))
       end
 
+      # `posts/bund.ko.md` → `posts/bund/index.ko.md`: the translation of the
+      # `bund` bundle, not a bundle named `bund.ko`.
       private def bundle_path_for(path : String) : String
-        base = File.basename(path, ".md")
-        File.join(File.dirname(path), base, "index.md")
+        File.join(File.dirname(path), page_name(path), "index#{language_ext(path)}#{File.extname(path)}")
+      end
+
+      private def page_path?(path : String) : Bool
+        Core::Build::Phases::ReadContent::PAGE_EXTENSIONS.includes?(File.extname(path))
+      end
+
+      private def page_stem(path : String) : String
+        File.basename(path, File.extname(path))
+      end
+
+      # The site's declared language codes (default included) when it is
+      # multilingual, else none: only then does the build read `.<lang>` as a
+      # translation rather than part of the name (`v1.2.md`, `setup.mac.md`).
+      private def language_codes(config : Models::Config?) : Set(String)
+        codes = Set(String).new
+        if config && config.multilingual?
+          codes.concat(config.languages.keys)
+          codes << config.default_language unless config.default_language.empty?
+        end
+        codes
+      end
+
+      # The language code of a `<name>.<lang>.md` translation, or nil.
+      private def page_language(path : String) : String?
+        Utils::PathUtils.language_suffix(page_stem(path)) { |code| @language_codes.includes?(code) }
+      end
+
+      # `.ko` for `hello.ko.md`, "" otherwise.
+      private def language_ext(path : String) : String
+        (lang = page_language(path)) ? ".#{lang}" : ""
+      end
+
+      # The file's name without extension or translation suffix: the page
+      # name titles, bundle directories and URLs are built from.
+      private def page_name(path : String) : String
+        page_stem(path).rchop(language_ext(path))
+      end
+
+      # The title `hwaro new` derives for *full_path* (under `content/`):
+      # the page name (see `page_name`), and for a bundle / section index
+      # (`index` / `_index`) the containing directory's name. An index
+      # directly under `content/` has no directory name to use and keeps
+      # the stem.
+      private def default_title(full_path : String) : String
+        name = page_name(full_path)
+        dir = File.dirname(full_path)
+        if (name == "index" || name == "_index") && dir != CONTENT_DIR && dir != "."
+          name = File.basename(dir)
+        end
+        Creator.titleize(name)
+      end
+
+      # An existing page file other than `full_path` that renders to the
+      # same URL, if any.
+      private def url_sibling(full_path : String) : String?
+        stem = page_name(full_path)
+        lang = language_ext(full_path)
+        dir = File.dirname(full_path)
+        page_dir = bundle_path?(full_path) ? dir : File.join(dir, stem)
+        Core::Build::Phases::ReadContent::PAGE_EXTENSIONS.each do |ext|
+          candidates = [File.join(page_dir, "index#{lang}#{ext}"), File.join(page_dir, "_index#{lang}#{ext}")]
+          candidates << "#{page_dir}#{lang}#{ext}" unless page_dir == CONTENT_DIR
+          candidates.each do |candidate|
+            return candidate if candidate != full_path && File.file?(candidate)
+          end
+        end
+        nil
       end
 
       # True when switching `<name>.md` to `<name>/index.md` would
@@ -574,8 +660,13 @@ module Hwaro
       # render to the same URL, so we refuse rather than silently create
       # a duplicate.
       private def bundle_collides_with_sibling?(full_path : String) : Bool
-        sibling_md = full_path.rchop("/index.md") + ".md"
-        File.exists?(sibling_md) && File.file?(sibling_md)
+        sibling_md = bundle_sibling_path(full_path)
+        sibling_md != full_path && File.file?(sibling_md)
+      end
+
+      # `<dir>/<name>/index[.<lang>].md` → `<dir>/<name>[.<lang>].md`.
+      private def bundle_sibling_path(bundle_file : String) : String
+        bundle_file.sub(/\/index((?:\.[^.\/]+)?)\.md\z/) { "#{$1}.md" }
       end
 
       # Reconcile `-s section` with a path argument that already carries
@@ -608,7 +699,7 @@ module Hwaro
           # read arbitrary on-disk `.md` files (e.g. ../../etc/passwd.md).
           # Nested archetypes (tools/develop) stay allowed — only block `..`
           # and absolute paths.
-          if explicit_archetype.includes?("..") || Path[explicit_archetype].absolute?
+          if explicit_archetype.includes?("..") || Utils::PathUtils.absolute?(explicit_archetype)
             raise Hwaro::HwaroError.new(
               code: Hwaro::Errors::HWARO_E_USAGE,
               message: "Invalid archetype name: #{explicit_archetype}",
@@ -616,7 +707,7 @@ module Hwaro
             )
           end
           archetype_path = File.join(ARCHETYPES_DIR, "#{explicit_archetype}.md")
-          if File.exists?(archetype_path)
+          if File.file?(archetype_path)
             Logger.debug "Using archetype: #{archetype_path}"
             return File.read(archetype_path)
           else
@@ -643,7 +734,7 @@ module Hwaro
             archetype_name = parts[0...i].join("/")
             archetype_path = File.join(ARCHETYPES_DIR, "#{archetype_name}.md")
 
-            if File.exists?(archetype_path)
+            if File.file?(archetype_path)
               Logger.debug "Using archetype: #{archetype_path}"
               return File.read(archetype_path)
             end
@@ -652,13 +743,23 @@ module Hwaro
 
         # 3. Try default archetype
         default_archetype = File.join(ARCHETYPES_DIR, "default.md")
-        if File.exists?(default_archetype)
+        if File.file?(default_archetype)
           Logger.debug "Using default archetype: #{default_archetype}"
           return File.read(default_archetype)
         end
 
         # 4. No archetype found
         nil
+      rescue ex : IO::Error
+        # `File.file?` keeps directories and FIFOs out, but an archetype can
+        # still be unreadable (permissions, a dangling target raced away).
+        # Surface it as a classified error naming the file instead of the
+        # runner's bare "Error: Error opening file ...".
+        raise Hwaro::HwaroError.new(
+          code: Hwaro::Errors::HWARO_E_IO,
+          message: "Cannot read archetype: #{ex.message}",
+          hint: "Check the file permissions under #{ARCHETYPES_DIR}/.",
+        )
       end
 
       # Tell the author once, per invocation, that the archetype — not
@@ -681,25 +782,36 @@ module Hwaro
         # the same way `tags` already is — otherwise a title/date containing a
         # double quote (e.g. `My "Quoted" Post`) yields invalid TOML and the
         # generated file fails to build.
-        safe_title = escape_string(title)
-        safe_date = escape_string(date)
+        tags_str = tags.empty? ? "[]" : "[#{tags.map { |t| "\"#{escape_string(t)}\"" }.join(", ")}]"
         # An unset description substitutes to "" so an archetype that ships a
         # `description = "{{ description }}"` line still produces valid output.
-        safe_description = escape_string(description || "")
-        tags_str = tags.empty? ? "[]" : "[#{tags.map { |t| "\"#{escape_string(t)}\"" }.join(", ")}]"
-        content = archetype_content
-          .gsub("{{ title }}", safe_title)
-          .gsub("{{title}}", safe_title)
-          .gsub("{{ date }}", safe_date)
-          .gsub("{{date}}", safe_date)
-          .gsub("{{ description }}", safe_description)
-          .gsub("{{description}}", safe_description)
-          .gsub("{{ draft }}", is_draft.to_s)
-          .gsub("{{draft}}", is_draft.to_s)
-          .gsub("{{ tags }}", tags_str)
-          .gsub("{{tags}}", tags_str)
+        front_values = {
+          "title"       => escape_string(title),
+          "date"        => escape_string(date),
+          "description" => escape_string(description || ""),
+          "draft"       => is_draft.to_s,
+          "tags"        => tags_str,
+        }
+        # The body is Markdown, not a quoted string: escaping there printed
+        # `# My \"Quoted\" Post` for the documented `# {{ title }}` heading.
+        body_values = front_values.merge({
+          "title"       => title.gsub("\n", " "),
+          "date"        => date,
+          "description" => (description || "").gsub("\n", " "),
+        })
+        body = Utils::FrontmatterScanner.strip_frontmatter(archetype_content)
+        front = archetype_content.byte_slice(0, archetype_content.bytesize - body.bytesize)
+        fill_placeholders(front, front_values) + fill_placeholders(body, body_values)
+      end
 
-        content
+      # One pass over the text: chained `.gsub`s rescanned text an earlier one
+      # had just inserted, so a title like "Using {{ tags }}" was expanded
+      # again (injecting a raw array into a quoted string). Only `{{ name }}`
+      # and `{{name}}` are placeholders.
+      private def fill_placeholders(text : String, values : Hash(String, String)) : String
+        text.gsub(/\{\{(?: (title|date|description|draft|tags) |(title|date|description|draft|tags))\}\}/) do |_, match|
+          values[match[1]? || match[2]]
+        end
       end
 
       # Built-in scaffold used when no archetype matches. Format and extra
@@ -726,12 +838,45 @@ module Hwaro
           extra_fields = ["description"] + extra_fields unless extra_fields.includes?("description")
         end
 
+        fields = scaffold_fields(extra_fields, field_values)
         if content_new.json?
-          build_json_front_matter(title, date, is_draft, tags, extra_fields, field_values)
+          build_json_front_matter(title, date, is_draft, tags, fields)
         elsif content_new.yaml?
-          build_yaml_front_matter(title, date, is_draft, tags, extra_fields, field_values)
+          build_yaml_front_matter(title, date, is_draft, tags, fields)
         else
-          build_toml_front_matter(title, date, is_draft, tags, extra_fields, field_values)
+          build_toml_front_matter(title, date, is_draft, tags, fields)
+        end
+      end
+
+      # Front matter keys the build reads as something other than a string,
+      # mapped to the value it assumes when the key is absent: scaffolding
+      # `weight = ""` made the very next build warn "`weight` must be an
+      # integer". The literals are valid TOML, YAML and JSON alike. `nil`
+      # marks a key with no neutral value — any value changes what the page
+      # does (`path = ""` claims the homepage URL, `redirect_to = ""` turns
+      # the page into a redirect stub, `paginate`/`reverse`/... override the
+      # section) — so it is left out of the scaffold.
+      TYPED_FIELD_PLACEHOLDERS = {
+        "weight" => "0", "series_weight" => "0",
+        "toc" => "false", "transparent" => "false", "generate_feeds" => "false",
+        "in_sitemap" => "true", "in_search_index" => "true", "render" => "true",
+        "aliases" => "[]", "authors" => "[]", "categories" => "[]",
+        "extra" => "{}", "taxonomies" => "{}", "cascade" => "{}",
+        "paginate" => nil, "paginate_by" => nil, "pagination_enabled" => nil,
+        "reverse" => nil, "insert_anchor_links" => nil, "path" => nil, "redirect_to" => nil,
+      } of String => String?
+
+      # `{name, value, literal?}` per scaffolded field: a supplied value or
+      # `""` is written as a quoted string, a typed placeholder verbatim.
+      private def scaffold_fields(extra_fields : Array(String), field_values : Hash(String, String)) : Array({String, String, Bool})
+        extra_fields.compact_map do |f|
+          if value = field_values[f]?
+            {f, value, false}
+          elsif TYPED_FIELD_PLACEHOLDERS.has_key?(f)
+            TYPED_FIELD_PLACEHOLDERS[f].try { |literal| {f, literal, true} }
+          else
+            {f, "", false}
+          end
         end
       end
 
@@ -746,14 +891,14 @@ module Hwaro
       # `<h1>{{ page.title | e }}</h1>`, so injecting a markdown `# title`
       # here would produce two H1s on every page created via `hwaro new`
       # (gh#525).
-      private def build_toml_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), extra_fields : Array(String), field_values : Hash(String, String) = {} of String => String) : String
+      private def build_toml_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), fields : Array({String, String, Bool})) : String
         safe_title = escape_string(title)
         date_literal = date.matches?(TOML_DATETIME_RE) ? date : "\"#{escape_string(date)}\""
         String.build do |str|
           str << "+++\n"
           str << "title = \"#{safe_title}\"\n"
           str << "date = #{date_literal}\n"
-          extra_fields.each { |f| str << "#{f} = \"#{escape_string(field_values[f]? || "")}\"\n" }
+          fields.each { |(f, v, literal)| str << "#{Utils::FrontmatterWriter.format_toml_key(f)} = #{literal ? v : "\"#{escape_string(v)}\""}\n" }
           str << "draft = true\n" if is_draft
           unless tags.empty?
             rendered = tags.map { |t| "\"#{escape_string(t)}\"" }.join(", ")
@@ -763,7 +908,7 @@ module Hwaro
         end
       end
 
-      private def build_yaml_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), extra_fields : Array(String), field_values : Hash(String, String) = {} of String => String) : String
+      private def build_yaml_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), fields : Array({String, String, Bool})) : String
         safe_title = escape_string(title)
         String.build do |str|
           str << "---\n"
@@ -772,7 +917,7 @@ module Hwaro
           # valid YAML, and a normal date parses back as a String scalar (an
           # unquoted YYYY-MM-DD parses as a Time node and is silently dropped).
           str << "date: \"#{escape_string(date)}\"\n"
-          extra_fields.each { |f| str << "#{f}: \"#{escape_string(field_values[f]? || "")}\"\n" }
+          fields.each { |(f, v, literal)| str << "#{Utils::FrontmatterWriter.yaml_scalar(f)}: #{literal ? v : "\"#{escape_string(v)}\""}\n" }
           str << "draft: true\n" if is_draft
           unless tags.empty?
             str << "tags:\n"
@@ -782,11 +927,11 @@ module Hwaro
         end
       end
 
-      private def build_json_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), extra_fields : Array(String), field_values : Hash(String, String) = {} of String => String) : String
+      private def build_json_front_matter(title : String, date : String, is_draft : Bool, tags : Array(String), extra : Array({String, String, Bool})) : String
         fields = {} of String => JSON::Any
         fields["title"] = JSON::Any.new(title)
         fields["date"] = JSON::Any.new(date)
-        extra_fields.each { |f| fields[f] = JSON::Any.new(field_values[f]? || "") }
+        extra.each { |(f, v, literal)| fields[f] = literal ? JSON.parse(v) : JSON::Any.new(v) }
         fields["draft"] = JSON::Any.new(true) if is_draft
         unless tags.empty?
           fields["tags"] = JSON::Any.new(tags.map { |t| JSON::Any.new(t) })

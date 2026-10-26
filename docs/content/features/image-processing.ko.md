@@ -5,7 +5,7 @@ weight = 23
 toc = true
 +++
 
-Hwaro는 빌드 중에 리사이즈된 이미지 변형을 자동으로 생성할 수 있습니다. 반응형 이미지, 썸네일, 성능 최적화에 유용합니다. 외부 도구는 필요 없습니다 — 이미지 처리는 [stb](https://github.com/nothings/stb) 라이브러리 기반으로 바이너리에 내장되어 있습니다.
+Hwaro는 빌드 중에 리사이즈된 이미지 변형을 자동으로 생성할 수 있습니다. 반응형 이미지, 썸네일, 성능 최적화에 유용합니다. 외부 도구는 필요 없습니다. 이미지 처리는 [stb](https://github.com/nothings/stb) 라이브러리 기반으로 바이너리에 내장되어 있습니다.
 
 ## 지원 포맷
 
@@ -31,6 +31,7 @@ quality = 85
 | enabled | bool | false | 이미지 리사이즈 활성화 |
 | widths | array | [] | 생성할 대상 너비(픽셀) |
 | quality | int | 85 | JPEG 출력 품질 (1-100) |
+| dimensions | bool | false | 콘텐츠 이미지에 원본 `width`/`height` 추가 (`enabled` 없이도 동작) |
 
 ### LQIP (저화질 이미지 플레이스홀더)
 
@@ -49,7 +50,26 @@ quality = 20
 | width | int | 32 | 플레이스홀더 이미지 너비(픽셀, 8-128) |
 | quality | int | 20 | 플레이스홀더 JPEG 품질 (1-100, 낮을수록 작음) |
 
-너비 32, 품질 20이면 이미지당 보통 400-800바이트 정도의 base64 문자열이 나옵니다 — HTML에 바로 인라인해도 될 만큼 작습니다.
+너비 32, 품질 20이면 이미지당 보통 400-800바이트 정도의 base64 문자열이 나옵니다. HTML에 바로 인라인해도 될 만큼 작습니다.
+
+### 이미지 크기 속성
+
+`dimensions = true`를 설정하면 렌더링된 페이지 콘텐츠의 로컬 이미지마다 원본 크기를 붙여, 파일이 도착하기 전에 브라우저가 알맞은 자리를 잡아 둡니다(레이아웃 이동 없음):
+
+```toml
+[image_processing]
+dimensions = true   # enabled = true가 필요 없습니다
+```
+
+```html
+<!-- ![Logo](/hwaro.png)는 이렇게 렌더링됩니다 -->
+<img width="512" height="512" src="/hwaro.png" alt="Logo" />
+```
+
+- 크기는 디코딩하지 않고 파일 헤더에서 읽습니다: JPEG, PNG, BMP, GIF, WebP, SVG(픽셀 단위 `width`/`height`, 없으면 `viewBox`).
+- 로컬 파일로 이어지는 이미지만 다룹니다: 페이지 번들 에셋, `static/` 파일, `[content.files]` 복사본. 외부 URL이나 없거나 읽을 수 없는 파일은 그대로 둡니다.
+- 이미 `width`나 `height`가 있는 태그는 건드리지 않습니다.
+- 반응형 `srcset` 변형이 붙어도 속성 값은 원본 이미지의 크기입니다.
 
 ## 동작 방식
 
@@ -61,6 +81,7 @@ quality = 20
 3. 종횡비는 항상 유지됩니다
 4. 대상 너비가 원본보다 크면 업스케일 없이 원본을 그대로 복사합니다
 5. 원본 이미지는 한 번만 디코딩한 뒤 모든 너비로 리사이즈합니다 (효율적)
+6. EXIF 방향 정보가 있는 JPEG 사진(휴대폰·카메라 촬영본)은 먼저 바로 세워서 처리하므로, 변형·LQIP 플레이스홀더·`fill`/`crop` 결과가 브라우저가 보여 주는 원본과 일치합니다. `dimensions = true`는 화면에 표시되는 크기를 기록합니다
 
 ## 출력 파일 이름
 
@@ -73,6 +94,8 @@ static/hwaro.png
   -> public/hwaro_1024w.png
   -> public/hwaro_1280w.png
 ```
+
+직접 게시하는 파일이 이 이름 중 하나와 같으면(예: 직접 만든 `static/hwaro_320w.png`) 덮어쓰지 않습니다. 해당 너비는 생성하지 않고 `srcset`에서도 제외합니다.
 
 ## 템플릿에서 사용
 
@@ -143,6 +166,35 @@ LQIP가 활성화되면 `resize_image()`가 두 속성을 추가로 반환합니
 
 LQIP가 비활성화 상태면 `lqip`와 `dominant_color`는 빈 문자열을 반환하므로 템플릿을 고치지 않아도 됩니다.
 
+투명도가 있는 이미지(PNG 로고, 아이콘)에서는 `dominant_color`가 불투명도로 가중 평균되므로 투명 픽셀 때문에 색이 어두워지지 않습니다. 알파 채널이 없는 `lqip` JPEG는 투명한 영역을 흰색으로 표시합니다.
+
+### 자르기와 채우기
+
+`resize_image()`는 썸네일이나 고정 크기 카드를 위해 `op`와 `anchor`를 받습니다:
+
+```jinja
+{# 400x300 상자를 덮도록 맞춘 뒤 넘치는 부분을 가운데 기준으로 자릅니다 #}
+{% set card = resize_image(path="/images/hero.jpg", width=400, height=300, op="fill") %}
+<img src="{{ card.url }}" width="{{ card.width }}" height="{{ card.height }}">
+
+{# 크기를 바꾸지 않고 왼쪽 위에서 200x200 영역을 잘라냅니다 #}
+{% set corner = resize_image(path="/images/hero.jpg", width=200, height=200, op="crop", anchor="top_left") %}
+```
+
+| op | 동작 |
+|----|-----------|
+| `fit` | 기본값. 미리 생성된 너비 변형 중 가장 가까운 것을 고릅니다(위 참고). 확대하지 않습니다. |
+| `fill` | `width`x`height`를 덮도록 크기를 맞춘 뒤 `anchor` 기준으로 정확히 그 크기로 자릅니다. |
+| `crop` | 크기를 바꾸지 않습니다. `anchor` 위치에서 `width`x`height` 영역을 잘라냅니다(이미지 크기로 제한). |
+
+`anchor`는 `center`(기본값), `top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right` 중 하나입니다.
+
+- `fill`과 `crop`에는 `width`와 `height`가 모두 필요합니다. 크기가 빠졌거나 `op`, `anchor`를 알 수 없으면 템플릿 오류입니다.
+- 이 변형은 페이지가 처음 렌더링될 때 만들어지고, 원본과 `quality`가 그대로인 동안 다음 빌드에서 재사용됩니다(기록은 `.hwaro/`에 보관). `enabled = true`나 `widths`가 필요 없습니다. `--skip-image-processing`에서는 원본 URL을 반환합니다.
+- 파일 이름에는 크기, op, anchor가 들어갑니다. 예: 원본 옆의 `hero_400x300_fill_center.jpg`.
+- 결과의 `width`/`height`는 실제로 쓴 파일의 크기입니다. 이 변형에서 `lqip`과 `dominant_color`는 빈 문자열입니다.
+- JPEG, PNG, BMP 원본만 자를 수 있습니다. 다른 포맷은 원본 URL을 반환합니다.
+
 ## 라이브 데모
 
 ### 리사이즈 데모
@@ -165,12 +217,12 @@ LQIP가 비활성화 상태면 `lqip`와 `dominant_color`는 빈 문자열을 �
 
 <img src="/hwaro_512w.png" alt="Hwaro 로고 - 가로 512px">
 
-이 파일들은 빌드 시점에 생성됩니다 — 런타임 리사이즈나 외부 서비스가 필요 없습니다. 템플릿에서는 `resize_image()`로 참조합니다:
+이 파일들은 빌드 시점에 생성되므로 런타임 리사이즈나 외부 서비스가 필요 없습니다. 템플릿에서는 `resize_image()`로 참조합니다:
 
 ```jinja
 {% set img = resize_image(path="/hwaro.png", width=256) %}
 <img src="{{ img.url }}">
-{# renders as: <img src="/hwaro_256w.png"> #}
+{# renders as: <img src="https://example.com/hwaro_256w.png"> (img.url is absolute, under base_url) #}
 ```
 
 ### LQIP 데모

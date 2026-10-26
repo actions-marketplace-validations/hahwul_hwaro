@@ -5,7 +5,7 @@ weight = 1
 toc = true
 +++
 
-페이지는 사이트의 HTML 페이지가 되는 마크다운 파일입니다. 이 문서는 **콘텐츠 작성 방법** — 프론트 매터 필드, 마크다운 문법, 파일 구성을 다룹니다. 이 필드를 템플릿에서 읽는 방법은 [데이터 모델](/ko/templates/data-model/)을 참고합니다.
+페이지는 사이트의 HTML 페이지가 되는 마크다운 파일입니다. 이 문서는 **콘텐츠 작성 방법**, 즉 프론트 매터 필드, 마크다운 문법, 파일 구성을 다룹니다. 이 필드를 템플릿에서 읽는 방법은 [데이터 모델](/ko/templates/data-model/#page)을 참고합니다.
 
 ## 기본 구조
 
@@ -52,13 +52,13 @@ JSON은 파일 맨 앞에서 처음으로 짝이 맞는 `{...}`가 프론트 매
 
 | 필드 | 타입 | 기본값 | 설명 |
 |-------|------|---------|-------------|
-| date | string | — | 발행일. `YYYY-MM-DD`, 시간 포함 가능(`YYYY-MM-DD HH:MM:SS` 또는 RFC 3339 datetime). 따옴표 없는 TOML/YAML 날짜도 허용 |
+| date | string | — | 발행일. `YYYY-MM-DD`, 시간 포함 가능(`YYYY-MM-DD HH:MM:SS` 또는 RFC 3339 datetime). 따옴표 없는 TOML/YAML 날짜도 허용. 오프셋이 없는 날짜는 TOML·YAML·JSON 모두 빌드 머신의 로컬 시간대로 해석. 적어 둔 UTC 오프셋(`+09:00`, `+0900` 또는 공백 뒤의 `2024-01-15 10:00:00 +0900` 형태도 포함)은 유지되므로 TOML과 YAML 모두 적은 날짜 그대로 표시. TOML 오프셋 날짜는 날짜 퍼머링크 토큰(`:year`/`:month`/`:day`)과 연/월 그룹에도 적은 그대로 쓰이므로, 이전 버전에서 UTC 날짜로 만든 URL이 바뀔 수 있음(예: `/2024/02/29/` → `/2024/03/01/`). 예전 URL을 유지하려면 `aliases`에 추가 |
 | description | string | — | SEO 설명 |
 | draft | bool | false | 프로덕션 빌드에서 제외 |
 | template | string | "page" | 사용할 템플릿 |
 | weight | int | 0 | 정렬 순서(낮을수록 앞) |
-| image | string | — | 소셜 공유용 대표 이미지 |
-| tags | array | [] | 태그 택소노미 항목 |
+| image | string | — | 소셜 공유용 대표 이미지. 페이지 번들 안의 파일을 가리키는 상대 경로(`index.md` 옆의 `image = "cover.png"`)는 그 파일로 해석됨 |
+| tags | array | [] | 태그 택소노미 항목. 문자열과 정수(`tags = [2024, "crystal"]`)는 유지되고(`2024`), `3.10` 같은 실수는 경고와 함께 건너뛰므로 따옴표로 감싸세요(`"3.10"`). 항목은 NFC로 정규화되어 NFD와 NFC 표기가 같은 항목이 됨 |
 | categories | array | [] | 카테고리 택소노미 항목 |
 
 ### 전체 필드
@@ -74,12 +74,15 @@ JSON은 파일 맨 앞에서 처음으로 짝이 맞는 `{...}`가 프론트 매
 | in_search_index | bool | 검색 포함 여부 |
 | in_sitemap | bool | 사이트맵 포함 여부 |
 | insert_anchor_links | bool | 헤딩 앵커 추가 |
-| redirect_to | string | 페이지를 이 URL로 리다이렉트 |
+| redirect_to | string | 페이지를 이 URL 또는 `@/` 경로로 지정한 콘텐츠 파일(`@/blog/post.md`)로 리다이렉트(리다이렉트 페이지는 사이트맵, 피드, 검색 인덱스, llms.txt에서 빠짐) |
 | render | bool | 페이지를 출력으로 렌더링(기본값: true) |
 | expires | date | 이 날짜 이후 자동 제외 |
 | series | string | 묶음용 시리즈 이름 |
 | series_weight | int | 시리즈 내 정렬 순서 |
+| menus | string / array / table | 페이지를 내비게이션 메뉴에 등록(`menu`는 별칭). [메뉴](/ko/features/menus/) 참고 |
 | extra | table | 커스텀 메타데이터 |
+
+타입이 틀린 필드(`draft = "true"`, `weight = "5"`, `date = 20240315`, `categories = "News"`)는 변환 없이 무시되며, 빌드가 파일과 키를 담아 경고합니다. 특히 `draft = "true"`는 초안이 아니므로 발행됩니다. `draft = true`로 쓰세요.
 
 ## 예시
 
@@ -153,7 +156,7 @@ series_weight = 1
 First part of the series.
 ```
 
-`config.toml`에서 `[series]`를 켜면 빌드 시점에 `page.series_index`(1부터 시작하는 위치)와 `page.series_pages`(시리즈의 전체 페이지)가 계산됩니다. 둘 다 템플릿 전용 값이며 프론트 매터 필드가 아닙니다. [데이터 모델](/ko/templates/data-model/)을 참고합니다.
+`config.toml`에서 `[series]`를 켜면 빌드 시점에 `page.series_index`(1부터 시작하는 위치)와 `page.series_pages`(시리즈의 전체 페이지)가 계산됩니다. 둘 다 템플릿 전용 값이며 프론트 매터 필드가 아닙니다. [데이터 모델](/ko/templates/data-model/#계산-속성)을 참고합니다.
 
 ### 커스텀 템플릿
 
@@ -194,6 +197,14 @@ aliases = ["/old-url/", "/another-old-url/"]
 
 Redirects from old URLs to this page.
 ```
+
+각 alias는 **이 사이트 안의 경로**입니다. 빌드가 해당 위치에 리다이렉트
+스텁을 씁니다. 스텁에는 `<meta name="robots" content="noindex">`와 페이지의 절대
+URL(`base_url` + 경로)을 가리키는 `<link rel="canonical">`이 들어가므로,
+검색 엔진은 스텁을 색인하지 않고 옛 URL을 해당 페이지로 합칩니다.
+절대 URL(`https://example.com/old/`)이나 프로토콜 상대
+URL(`//example.com/old/`)은 이 빌드가 게시할 수 있는 대상이 아니므로
+경고와 함께 건너뜁니다.
 
 ### 커스텀 메타데이터
 
@@ -247,7 +258,13 @@ custom_field = "value"
 
 ## 콘텐츠 요약
 
-`<!-- more -->`로 요약 범위를 지정합니다:
+`page.summary`는 목록 페이지, 피드, 소셜 카드에 표시되는 글의 요약입니다. 다음 소스 중 먼저 존재하는 것으로 채워집니다:
+
+1. `<!-- more -->` 마커 앞의 콘텐츠 (HTML로 렌더링)
+2. 프론트 매터의 `description` 필드
+3. 렌더링된 본문에서 자동으로 잘라낸 발췌문
+
+`<!-- more -->`로 요약 범위를 명시적으로 지정합니다:
 
 ```markdown
 +++
@@ -260,6 +277,24 @@ This is the summary shown in listings.
 
 The full article continues here...
 ```
+
+요약은 본문과 같은 방식으로 렌더링되며 숏코드, Markdown 확장, 렌더 훅이 모두 적용됩니다. 블록 숏코드 본문(`{% note() %}` … `{% end %}`) 안에 마커를 두면 요약은 그 블록 안에서 끝나고, 요약 쪽에서 그 지점에서 블록을 닫습니다. 원시 HTML도 마찬가지입니다. `<details>` … `</details>`처럼 열린 요소 안에 마커를 두면 요약은 그 지점에서 끝나고 열린 요소를 닫으므로, 요약을 출력하는 목록 페이지가 닫히지 않은 태그에 묻히지 않습니다.
+
+### 자동 요약
+
+마커도 `description`도 없는 페이지에는 자동 요약이 생성됩니다. 렌더링된 본문의 처음 70단어를 `<p>` 하나로 감싸고, 텍스트가 잘린 경우에만 말줄임표(`…`)를 붙입니다. 발췌문은 렌더링된 HTML에서 만들어지므로 숏코드는 확장되고 코드 블록, 헤딩, 이미지, figure는 건너뛰어 자연스러운 산문으로 읽힙니다.
+
+단어가 공백으로 구분되지 않는 CJK 위주 텍스트(한국어, 일본어, 중국어)는 설정값의 2배를 글자 수로 셉니다. `summary_length = 70`이면 최대 140자입니다. 절단은 단어 경계(CJK는 글자 경계)에서 이루어지며 엔티티나 멀티바이트 문자를 쪼개지 않습니다.
+
+`config.toml`에서 조정하거나 끌 수 있습니다:
+
+```toml
+[content]
+summary_length = 70      # 단어 수 (CJK: 글자 수 ×2); 0이면 자동 요약 비활성화
+summary_ellipsis = "…"   # 텍스트가 실제로 잘린 경우에만 추가
+```
+
+`page.summary_truncated`는 자동 발췌문이 잘렸을 때만 `true`이므로, 필요한 곳에만 "더 읽기" 링크를 표시할 수 있습니다. 자동 요약은 마커나 `description`을 대체하지 않으므로 이미 요약이 있는 페이지의 출력은 그대로 유지됩니다.
 
 ## 마크다운 문법
 
@@ -298,7 +333,7 @@ console.log("Hello");
 | Cell   | Cell   |
 ```
 
-표 셀 안에서도 인라인 마크다운이 동작합니다: **굵게**, *기울임*, `코드 스팬`, `[links](url)`, `![images](url)`, ~~취소선~~.
+표 셀 안에서도 인라인 마크다운이 동작합니다: **굵게**, *기울임*, `코드 스팬`, `[links](url)`, `![images](url)`, ~~취소선~~. 링크와 이미지는 본문과 같은 대상 형식을 받습니다: 괄호가 짝을 이루는 URL(`[W](https://en.wikipedia.org/wiki/Foo_(bar))`), 선택적 제목(`[T](/x/ "the title")`), `<angle>` 대상. 백슬래시는 구두점을 이스케이프합니다(`\*not emphasis\*`). 정의 목록과 각주 본문도 같습니다.
 
 ```markdown
 | Feature        | Example                          |
@@ -321,7 +356,9 @@ console.log("Hello");
 [With anchor](@/blog/my-post.md#introduction)
 ```
 
-최종 URL을 몰라도 된다는 점이 장점입니다 — Hwaro가 콘텐츠 경로에서 URL을 계산합니다. 대상 페이지가 없으면 링크는 그대로 남고 빌드 중 경고가 기록됩니다.
+최종 URL을 몰라도 된다는 점이 장점입니다. Hwaro가 콘텐츠 경로에서 URL을 계산합니다. 대상 페이지가 없으면 링크는 그대로 남고 빌드 중 경고가 기록됩니다.
+
+`@/` 링크는 페이지 콘텐츠(Markdown, 그리고 그 안의 HTML이나 숏코드 출력)에서만 해석됩니다. 템플릿은 다시 쓰지 않으므로 `page.html`에 쓴 `<a href="@/about.md">`는 그대로 출력됩니다. 템플릿에서는 `{{ get_page(path="about.md").url }}`을 사용하세요.
 
 | 문법 | 변환된 URL |
 |--------|-------------|
@@ -359,13 +396,18 @@ GitHub 스타일 알림 블록(admonition)이 스타일이 적용된 콜아웃�
 > [!WARNING]
 >
 > Body can also live in its own paragraph.
+
+> [!TIP] 커스텀 제목
+> 마커와 같은 줄에 적은 텍스트는 제목이 됩니다(Obsidian / Hugo 문법).
 ```
 
-출력은 `<div class="admonition admonition-{type}">`이며, 제목 문단(`<p class="admonition-title">`) 뒤에 본문이 이어집니다. 스타일은 사이트 CSS에서 지정합니다 — Hwaro는 시맨틱 마크업만 내보냅니다.
+출력은 `<div class="admonition admonition-{type}">`이며, 제목 문단(`<p class="admonition-title">`) 뒤에 본문이 이어집니다. 커스텀 제목이 없으면 타입 이름(`Note`, `Tip`, …)이 제목으로 쓰입니다. 스타일은 사이트 CSS에서 지정합니다. Hwaro는 시맨틱 마크업만 내보냅니다.
+
+어드모니션과 일반 인용문 안에서도 테이블을 쓸 수 있습니다. 평소처럼 각 행 앞에 `>`를 붙이면 됩니다(`> | a | b |`, `> |---|---|`).
 
 `config.toml`의 `[markdown]` 아래에 `admonitions = false`를 두면 비활성화됩니다.
 
-제한 사항: 타입은 대소문자를 구분하며(`[!NOTE]`만 인식, `[!note]`는 안 됨), 어드모니션 본문 안에 중첩된 인용문이 있으면 바깥 어드모니션이 일찍 닫힙니다. 인라인 이스케이프는 없습니다 — 백슬래시 이스케이프(`\[!NOTE\]`)도 같은 문자를 렌더링하면서 여전히 어드모니션을 발동시키므로, 토큰을 문자 그대로 출력해야 한다면 기능 자체를 끄면 됩니다.
+제한 사항: 어드모니션 본문 안에 중첩된 인용문이 있으면 바깥 어드모니션이 일찍 닫힙니다. 인라인 이스케이프는 없습니다. 백슬래시 이스케이프(`\[!NOTE\]`)도 같은 문자를 렌더링하면서 여전히 어드모니션을 발동시키므로, 토큰을 문자 그대로 출력해야 한다면 기능 자체를 끄면 됩니다.
 
 ### 커스텀 헤딩 ID
 
@@ -376,12 +418,13 @@ GitHub 스타일 알림 블록(admonition)이 스타일이 적용된 콜아웃�
 ```
 
 `<h2 id="install">Installation Guide</h2>`로 렌더링됩니다. 목차와 `[link](#install)` 링크 모두 커스텀 id를 사용합니다.
+인용문 안의 헤딩에도 같은 문법을 사용할 수 있습니다.
 
-id에 허용되는 문자: 영문자, 숫자, `_`, `-`, `:`. id는 영문자로 시작해야 합니다. CommonMark는 ATX 헤딩 앞에 공백을 3칸까지 허용하며, 더 깊이 들여 쓰면 그 줄이 코드 블록이 되어 `{#id}`가 적용되지 않습니다.
+id에 허용되는 문자: 문자(모든 문자 체계), 숫자, `_`, `-`, `:`. id는 숫자로 시작해도 됩니다 — `{#1-create-a-project}`도 유효하며, 번호가 붙은 헤딩을 번역할 때 원문 앵커를 그대로 유지하려면 이 형태가 필요합니다. 다만 `-`나 `:`로 시작할 수는 없습니다. CommonMark는 ATX 헤딩 앞에 공백을 3칸까지 허용하며, 더 깊이 들여 쓰면 그 줄이 코드 블록이 되어 `{#id}`가 적용되지 않습니다.
 
 `config.toml`의 `[markdown]` 아래에 `heading_ids = false`를 두면 비활성화됩니다.
 
-커스텀 헤딩 ID에는 `markdown.safe = false`가 필요합니다. safe 모드에서는 `{#id}` 문법이 출력에서 제거되고 id도 적용되지 않습니다 — safe 모드와 명시적 id가 동시에 필요하면 raw HTML 헤딩을 사용합니다. 한 페이지에 같은 `{#id}`를 두 번 쓰면 id 속성이 중복되며, 앵커는 첫 번째가 우선합니다.
+커스텀 헤딩 ID에는 `markdown.safe = false`가 필요합니다. safe 모드에서는 `{#id}` 문법이 출력에서 제거되고 커스텀 id도 적용되지 않아 헤딩은 자동 생성된 id를 유지합니다(safe 모드는 raw HTML도 제거하므로 raw HTML 헤딩으로 우회할 수 없습니다). 한 페이지에 같은 `{#id}`를 두 번 쓰면 첫 번째 헤딩이 그 id를 갖고, 뒤의 헤딩은 숫자 접미사(`#id-1`)로 이름이 바뀌며 빌드 경고가 출력됩니다.
 
 `{#id}` 단축 문법은 더 일반적인 `{#id .class key=val}` 속성 블록(`[markdown] attributes = true`)의 특수한 경우이며, 속성 블록은 인라인 이미지에도 적용됩니다. [마크다운 확장](/ko/features/markdown-extensions/)을 참고합니다.
 
@@ -400,7 +443,7 @@ Another term
 
 ## 에셋 코로케이션
 
-이미지, PDF 같은 관련 에셋을 콘텐츠 파일과 같은 디렉터리에 함께 둘 수 있습니다. 이를 **페이지 번들(Page Bundle)**이라고 부릅니다.
+이미지, PDF 같은 관련 에셋을 콘텐츠 파일과 같은 디렉터리에 함께 둘 수 있습니다. 이를 **페이지 번들**(Page Bundle)이라고 부릅니다.
 
 이 기능을 쓰려면 마크다운 파일 이름을 `index.md`(일반 페이지) 또는 `_index.md`(섹션 페이지)로 바꾸고, 페이지 이름을 딴 디렉터리 안에 넣습니다.
 
@@ -416,7 +459,7 @@ content/
     └── _index.md
 ```
 
-Hwaro는 페이지 번들 디렉터리의 마크다운이 아닌 파일 전부를 상대 경로를 유지한 채 출력 디렉터리로 복사합니다.
+Hwaro는 페이지 번들 디렉터리의 마크다운이 아닌 파일 전부를 상대 경로를 유지한 채 출력 디렉터리로 복사합니다. [`[content.files]`](/ko/features/content-files/)를 설정했다면(`hwaro init` 스캐폴드는 이미지 허용 목록을 설정함) 그 규칙이 허용하는 파일만 복사합니다.
 
 마크다운에서는 상대 경로로 이 에셋에 링크하면 됩니다:
 
@@ -428,7 +471,7 @@ Hwaro는 페이지 번들 디렉터리의 마크다운이 아닌 파일 전부�
 
 ### 템플릿에서 에셋 접근
 
-템플릿에서는 `page.assets`로 함께 둔 에셋 목록에 접근합니다. 파일의 상대 경로 배열을 반환합니다.
+템플릿에서는 `page.assets`로 함께 둔 에셋 목록에 접근합니다. `content/` 기준 경로(`blog/my-trip/photo.jpg`)의 배열을 반환합니다.
 
 ```jinja
 {% for asset in page.assets %}

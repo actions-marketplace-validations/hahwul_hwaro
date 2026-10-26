@@ -41,6 +41,11 @@ module Hwaro
 
       CONTENT_EXTENSIONS = Set{".md", ".markdown"}
 
+      # Files browsers request by a well-known root URL with no markup
+      # reference (`/favicon.ico`, `/apple-touch-icon[-precomposed][-WxH].png`),
+      # so the textual scan can never see them used.
+      IMPLICIT_ROOT_ASSET = /\A(?:favicon\.ico|apple-touch-icon(?:-precomposed)?(?:-\d+x\d+)?\.png)\z/i
+
       # Template files that may reference an asset. `.html` alone was not
       # enough: `Builder::TEMPLATE_EXTENSION_REGEX` also accepts `.j2`,
       # `.jinja`, `.jinja2` and `.ecr`, and feed/manifest templates are
@@ -71,34 +76,59 @@ module Hwaro
       @static_dir : String
       @templates_dir : String
       @project_root : String
+      @site_config : Models::Config? = nil
+      @site_config_loaded = false
 
       def initialize(
         @content_dir : String = "content",
         @static_dir : String = "static",
         @templates_dir : String = "templates",
+        templates_dir_explicit : Bool = false,
+        static_dir_explicit : Bool = false,
       )
-        if File.exists?("config.toml")
-          @project_root = "."
-        else
-          @project_root = find_project_root(@content_dir)
-        end
+        @project_root = resolve_project_root
 
-        if @templates_dir == "templates"
-          @templates_dir = File.join(@project_root, "templates")
+        # Only the true defaults get re-rooted. An explicitly passed
+        # `--templates-dir templates` (or `--static-dir static`) was
+        # existence-checked by the command against the CWD; silently
+        # re-rooting it would scan a different directory than the one the
+        # user named — the `*_explicit` flags keep that path as given.
+        if !templates_dir_explicit && @templates_dir == "templates"
+          @templates_dir = rooted("templates")
+        end
+        if !static_dir_explicit && @static_dir == "static"
+          @static_dir = rooted("static")
         end
       end
 
-      private def find_project_root(content_dir : String) : String
-        if File.basename(content_dir) == "content"
-          parent = File.dirname(content_dir)
-          return parent.empty? || parent == "." ? "." : parent
-        end
+      # One coherent project root for every derived input (static/,
+      # templates/, data/, i18n/, config.toml). The root used to be pinned to
+      # "." as soon as the CWD held a config.toml — even when --content-dir
+      # pointed into a DIFFERENT project — so the scan mixed two trees:
+      # assets came from one project, references from another, and
+      # `--delete --force` removed files the other project still uses.
+      private def resolve_project_root : String
+        candidate = Utils::PathUtils.find_project_root(@content_dir)
+        # A config.toml next to the content tree is authoritative.
+        return candidate if File.exists?(File.join(candidate, "config.toml"))
+        # Fall back to the CWD only when the content tree actually lives
+        # inside it; a foreign tree without its own config.toml still roots
+        # at itself rather than borrowing the CWD's project files.
+        return "." if File.exists?("config.toml") && inside_cwd?(@content_dir)
+        candidate
+      end
 
-        if Dir.exists?(File.join(content_dir, "content")) || Dir.exists?(File.join(content_dir, "../content"))
-          return content_dir
-        end
+      private def inside_cwd?(path : String) : Bool
+        expanded = File.expand_path(path)
+        cwd = Dir.current
+        Hwaro::Utils::PathUtils.within?(expanded, cwd)
+      end
 
-        content_dir
+      # Join `name` under the project root, keeping the historical relative
+      # form ("static", not "./static") for the in-project case so reported
+      # paths stay byte-identical.
+      private def rooted(name : String) : String
+        @project_root == "." ? name : File.join(@project_root, name)
       end
 
       def run : UnusedAssetsResult
@@ -111,7 +141,18 @@ module Hwaro
         unused = [] of String
         assets.each do |asset_path|
           basename = File.basename(asset_path)
+          # A non-UTF-8 basename (possible on Linux filesystems; APFS refuses
+          # them) cannot be matched against the UTF-8 scan corpus — building
+          # a PCRE2 Regex from it raises ArgumentError, which used to abort
+          # the whole command. Warn and leave the file alone rather than flag
+          # it unused and let `--delete` remove something we could not check.
+          unless basename.valid_encoding?
+            Logger.warn "Skipping #{asset_path.inspect}: file name is not valid UTF-8"
+            next
+          end
           next if referenced.includes?(basename)
+          # Only the copy at the root of the static dir is served at that URL.
+          next if basename.matches?(IMPLICIT_ROOT_ASSET) && File.dirname(asset_path) == File.dirname(File.join(@static_dir, basename))
           # Safety net against the `delete_unused` data-loss path: the
           # reference regex only captures filenames built from [\w\-.], so a
           # referenced asset whose name contains a space or parenthesis (e.g.
@@ -123,8 +164,7 @@ module Hwaro
           # a raw substring) still rescues the space/paren names while keeping a
           # genuinely-unused `header.png` flagged when only `page-header.png` is
           # referenced (their shared suffix is preceded by `-`, inside the token).
-          next if scanned_text.matches?(/(?<![\w\-.])#{Regex.escape(basename)}(?![\w\-.])/)
-          next if scanned_text.matches?(/(?<![\w\-.])#{Regex.escape(URI.encode_path(basename))}(?![\w\-.])/)
+          next if UnusedAssets.boundary_referenced?(scanned_text, basename)
           unused << asset_path
         end
 
@@ -134,6 +174,18 @@ module Hwaro
           referenced_count: assets.size - unused.size,
           unused_count: unused.size,
         )
+      end
+
+      # Boundary-anchored literal check backing the safety net above. A class
+      # method so it stays testable on filesystems (APFS) that refuse to
+      # create non-UTF-8 filenames at all. A basename that is not valid UTF-8
+      # cannot become a PCRE2 pattern — `Regex.new` raises `ArgumentError` —
+      # so it is reported as not-referenced here without raising; `run` skips
+      # (and warns about) such assets before this check is reached.
+      def self.boundary_referenced?(scanned_text : String, basename : String) : Bool
+        return false unless basename.valid_encoding?
+        return true if scanned_text.matches?(/(?<![\w\-.])#{Regex.escape(basename)}(?![\w\-.])/)
+        scanned_text.matches?(/(?<![\w\-.])#{Regex.escape(URI.encode_path(basename))}(?![\w\-.])/)
       end
 
       def delete_unused(files : Array(String))
@@ -161,7 +213,7 @@ module Hwaro
 
         # Static directory assets
         if Dir.exists?(@static_dir)
-          Dir.glob(File.join(@static_dir, "**", "*")) do |path|
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(@static_dir), "**", "*")) do |path|
             ext = File.extname(path).downcase
             next unless ASSET_EXTENSIONS.includes?(ext)
             assets << path if ContentWalk.readable_file?(path)
@@ -170,7 +222,7 @@ module Hwaro
 
         # Co-located assets in content directory
         if Dir.exists?(@content_dir)
-          Dir.glob(File.join(@content_dir, "**", "*")) do |path|
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(@content_dir), "**", "*")) do |path|
             ext = File.extname(path).downcase
             next if CONTENT_EXTENSIONS.includes?(ext)
             next unless ASSET_EXTENSIONS.includes?(ext)
@@ -188,12 +240,11 @@ module Hwaro
         scan_files = [] of String
 
         if Dir.exists?(@content_dir)
-          Dir.glob(File.join(@content_dir, "**", "*.md")) { |f| scan_files << f }
-          Dir.glob(File.join(@content_dir, "**", "*.markdown")) { |f| scan_files << f }
+          scan_files.concat(ContentWalk.find_content_files(@content_dir))
         end
 
         if Dir.exists?(@templates_dir)
-          Dir.glob(File.join(@templates_dir, "**", "*.{#{TEMPLATE_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(@templates_dir), "**", "*.{#{TEMPLATE_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
         end
 
         # Stylesheets/scripts shipped under static/ commonly reference other
@@ -202,8 +253,21 @@ module Hwaro
         # them, those fonts are misreported as unused — and `--delete` would
         # remove in-use files (data loss).
         if Dir.exists?(@static_dir)
-          Dir.glob(File.join(@static_dir, "**", "*.{#{STATIC_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(@static_dir), "**", "*.{#{STATIC_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
         end
+
+        # The asset pipeline's own source dir (`[assets] source_dir =
+        # "assets"`): a bundled stylesheet's `url(/images/bg.png)` ships in
+        # the compiled bundle, yet the file was never read, so `bg.png` was
+        # reported unused and `--delete` removed it.
+        if source_dir = asset_source_dir
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(source_dir), "**", "*.{#{STATIC_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
+        end
+
+        # Environment overrides (`config.production.toml`, merged by
+        # `hwaro build --env production`) are config too: an asset named only
+        # there — a production `og.default_image`, say — is still in use.
+        Dir.glob(File.join(Utils::PathUtils.glob_escape(@project_root), "config.*.toml")).sort.each { |f| scan_files << f }
 
         # `data/` and `i18n/` are build inputs too — templates read them as
         # `site.data.*` / translation strings, so an asset path that lives only
@@ -213,7 +277,7 @@ module Hwaro
         {"data", "i18n"}.each do |rel_dir|
           dir = File.join(@project_root, rel_dir)
           next unless Dir.exists?(dir)
-          Dir.glob(File.join(dir, "**", "*.{#{DATA_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "**", "*.{#{DATA_SCAN_EXTENSIONS.join(",")}}")) { |f| scan_files << f }
         end
 
         String.build do |sb|
@@ -222,11 +286,13 @@ module Hwaro
             sb << text << '\n'
           end
 
+          # config.toml goes through the same UTF-8 gate as every other scan
+          # source: concatenated raw, one invalid byte in it aborted the whole
+          # command with a PCRE2 ArgumentError.
           config_path = File.join(@project_root, "config.toml")
           if File.exists?(config_path)
-            begin
-              sb << File.read(config_path) << '\n'
-            rescue IO::Error
+            if text = readable_scan_source(config_path)
+              sb << text << '\n'
             end
           end
         end
@@ -241,6 +307,8 @@ module Hwaro
       # `.svg`/`.txt`, which are often machine-generated. Skip the file with a
       # warning instead — the same degradation `check-links` performs.
       private def readable_scan_source(file : String) : String?
+        # A FIFO matching the glob would block `File.read` forever.
+        return unless ContentWalk.readable_file?(file)
         text = File.read(file)
         # Force the decode failure here, where it can be attributed to a file,
         # rather than later inside a regex over the whole corpus.
@@ -278,9 +346,16 @@ module Hwaro
       end
 
       private def add_config_references(refs : Set(String)) : Nil
-        config_path = File.join(@project_root, "config.toml")
-        return unless File.exists?(config_path)
-        config = Models::Config.load(config_path)
+        return unless config = site_config
+        # `[highlight] use_cdn = false` makes the build itself link the
+        # self-hosted highlight.js files (`highlight_css` / `highlight_js`
+        # template variables, see `Render#missing_local_highlight_assets`).
+        # Their names appear in no scanned file, so they were reported unused
+        # and `--delete` broke syntax highlighting.
+        if config.highlight.enabled && !config.highlight.use_cdn
+          refs << "#{config.highlight.theme}.min.css"
+          refs << "highlight.min.js" unless config.highlight.server?
+        end
         config.assets.bundles.each do |bundle|
           bundle.files.each { |path| refs << File.basename(path) }
           # The compiled bundle name (e.g. `main.css`) is referenced
@@ -291,7 +366,7 @@ module Hwaro
         config.auto_includes.dirs.each do |rel_dir|
           dir = File.join(@static_dir, rel_dir)
           next unless Dir.exists?(dir)
-          Dir.glob(File.join(dir, "**", "*")) do |path|
+          Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "**", "*")) do |path|
             # `File.directory?` raises on a symlink cycle, and the blanket
             # rescue below would have swallowed it — dropping EVERY
             # config-declared reference, so `--delete` removed bundle and
@@ -305,6 +380,28 @@ module Hwaro
         # Treat config-load failures as "no extra references" so the
         # tool stays best-effort rather than crashing on a partial
         # site.
+      end
+
+      # The project's `config.toml`, loaded once; nil when absent or
+      # unloadable (the scan stays best-effort on a partial site).
+      private def site_config : Models::Config?
+        return @site_config if @site_config_loaded
+        @site_config_loaded = true
+        config_path = File.join(@project_root, "config.toml")
+        @site_config = File.exists?(config_path) ? Models::Config.load(config_path) : nil
+      rescue Exception
+        nil
+      end
+
+      # `[assets] source_dir` when the pipeline reads its bundles from
+      # somewhere other than the static dir: those stylesheets and scripts
+      # ship (bundled) and reference static files like any other.
+      private def asset_source_dir : String?
+        return unless config = site_config
+        return unless config.assets.enabled
+        dir = rooted(config.assets.source_dir)
+        return if File.expand_path(dir) == File.expand_path(@static_dir)
+        dir if Dir.exists?(dir)
       end
     end
   end

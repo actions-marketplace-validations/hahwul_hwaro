@@ -1,5 +1,7 @@
 require "file_utils"
+require "json"
 require "set"
+require "../file_action"
 require "../../config/options/import_options"
 require "../../utils/date_utils"
 require "../../utils/file_safe"
@@ -16,6 +18,13 @@ module Hwaro
       # `generate_frontmatter` renders it as TOML.
       alias FieldValue = (String | Bool | Int64 | Array(String))?
 
+      # Every importer computes `success: imported > 0 || errors == 0` —
+      # DELIBERATELY more lenient than the exporters' `errors == 0` rule.
+      # Imports digest messy third-party dumps where some items are simply
+      # unimportable; a best-effort partial migration is the expected
+      # outcome, and per-item failures are counted and reported alongside
+      # it. Exports and conversions operate on the user's own valid content,
+      # where any error means the run must fail.
       struct ImportResult
         property success : Bool
         property message : String
@@ -36,6 +45,13 @@ module Hwaro
       abstract class Base
         abstract def run(options : Config::Options::ImportOptions) : ImportResult
 
+        # When set, the run resolves and reports every destination (counts,
+        # manifest, collision renames) but writes nothing to disk.
+        property dry_run : Bool = false
+
+        # Per-file manifest of this run, in write order.
+        getter file_actions = [] of FileAction
+
         # Regex matching YAML frontmatter: opening `---` on the first line and a
         # closing `---` on its own line (multiline mode so ^ matches line starts).
         YAML_FM_REGEX = /\A---[ \t]*\n(.*?\n?)^---[ \t]*$\n?(.*)\z/m
@@ -47,8 +63,13 @@ module Hwaro
         # leaking raw YAML into the page body. A leading U+FEFF does the same
         # to the `\A---` / `\A+++` anchors — every other reader hwaro hands
         # file text to already goes through `TextUtils.strip_bom`.
+        #
+        # `scrub` because sources are third-party exports: a single invalid
+        # UTF-8 byte made every downstream regex pass raise ArgumentError,
+        # dropping the whole file with a cryptic error. This is the single
+        # choke point, so scrubbing here protects every importer.
         protected def read_text(path : String) : String
-          Utils::TextUtils.strip_bom(File.read(path)).gsub("\r\n", "\n")
+          Utils::TextUtils.strip_bom(File.read(path).scrub).gsub("\r\n", "\n")
         end
 
         # Split YAML frontmatter from a document body. Returns {frontmatter, body}
@@ -67,19 +88,36 @@ module Hwaro
         # `extensions`. `skip_dir`, when given, receives each subdirectory's
         # basename and skips recursion into it when it returns true.
         #
+        # `source_root` is the site the user pointed `tool import` at, not
+        # `dir`: importers walk subdirectories (`_posts/`, `content/`), and a
+        # post linked in from a sibling directory of the same site
+        # (`_posts/x.md -> ../_shared/x.md`) is part of the source. Only file
+        # links resolving outside `source_root` are skipped; they are counted
+        # in the run's `skipped_count` (see `import_each`).
+        #
         # Entries are walked in sorted order. `Dir.each_child` yields in
         # filesystem order, which varies by platform and by directory history
         # — and since destination collisions are resolved in walk order, an
         # unsorted walk made *which* file got the `-1` suffix differ between
         # machines for the same source tree.
-        protected def walk_files(dir : String, extensions : Array(String) = [".md", ".markdown"], skip_dir : Proc(String, Bool)? = nil) : Array(String)
+        protected def walk_files(dir : String, extensions : Array(String) = [".md", ".markdown"], skip_dir : Proc(String, Bool)? = nil, *, source_root : String) : Array(String)
           files = [] of String
-          walk_files_into(dir, files, extensions, skip_dir)
+          walk_files_into(dir, Utils::PathUtils.resolved_real_path(source_root), files, extensions, skip_dir)
           files
         end
 
-        private def walk_files_into(dir : String, files : Array(String), extensions : Array(String), skip_dir : Proc(String, Bool)?)
-          Dir.children(dir).sort!.each do |entry|
+        private def walk_files_into(dir : String, source_root : String, files : Array(String), extensions : Array(String), skip_dir : Proc(String, Bool)?)
+          # An unreadable subdirectory (permissions, or one removed mid-walk)
+          # raised straight out of the recursion and aborted the entire
+          # import. Skip it and keep importing everything that is readable.
+          entries = begin
+            Dir.children(dir).sort!
+          rescue ex : File::Error
+            Logger.warn "Skipped unreadable directory: #{dir} (#{ex.message})"
+            return
+          end
+
+          entries.each do |entry|
             full_path = File.join(dir, entry)
             if File.directory?(full_path)
               # A symlinked directory can close a cycle (`ln -s .. sub`), and
@@ -91,9 +129,15 @@ module Hwaro
                 next
               end
               next if skip_dir && skip_dir.call(entry)
-              walk_files_into(full_path, files, extensions, skip_dir)
+              walk_files_into(full_path, source_root, files, extensions, skip_dir)
             elsif extensions.any? { |ext| entry.ends_with?(ext) }
-              files << full_path
+              if File.symlink?(full_path) && !Utils::PathUtils.resolves_within?(full_path, source_root)
+                Logger.warn "Skipped symlinked file outside source directory: #{full_path}"
+                @outside_source_skips += 1
+                next
+              end
+              # A FIFO would block the importer's `File.read` forever.
+              files << full_path if ContentWalk.readable_file?(full_path)
             end
           end
         end
@@ -149,11 +193,30 @@ module Hwaro
           lines.join("\n")
         end
 
-        # Convert title to a URL-safe slug
-        protected def slugify(title : String) : String
-          Utils::TextUtils.slugify(title)
+        # hwaro front-matter keys the source generators give no meaning of
+        # their own, carried through as-is: a value there came from
+        # `tool export` or a theme param with the same intent (`toc`). hwaro
+        # keys Hugo uses differently (`menu`, `cascade`, `path`, …) are page
+        # params there, so they join every other unrecognised key in `[extra]`.
+        CARRIED_KEYS = Set{
+          "toc", "template", "page_template", "image", "updated", "expires",
+          "render", "in_sitemap", "in_search_index", "insert_anchor_links",
+          "transparent", "generate_feeds", "paginate", "paginate_by",
+          "pagination_enabled", "paginate_path", "sort_by", "reverse",
+          "redirect_to", "series_weight",
+        }
+
+        # Append extra keys/tables to a `generate_frontmatter` document.
+        # TomlBuilder emits scalars before tables, so appending after the
+        # mapped (scalar) lines keeps the document valid TOML.
+        protected def append_frontmatter(frontmatter : String, more : Hash(String, YAML::Any)) : String
+          return frontmatter if more.empty?
+          toml = Hwaro::Utils::FrontmatterWriter::TomlBuilder.new.build(more)
+          toml = "\n#{toml}" if toml.starts_with?('[')
+          "#{frontmatter.rchop("+++")}#{toml}+++"
         end
 
+        # Convert title to a URL-safe slug
         # If the imported body's first non-blank line is an H1 matching the
         # front-matter title, drop it. Hwaro page templates render
         # `<h1>{{ page.title }}</h1>` themselves, so keeping the body H1
@@ -209,6 +272,10 @@ module Hwaro
         # with many collisions otherwise buries every other diagnostic.
         @collision_count = 0
 
+        # Source files `walk_files` dropped because they are symlinks
+        # resolving outside the import source; folded into `skipped_count`.
+        getter outside_source_skips = 0
+
         # Reset per-run state. Importers call this at the top of `run` so a
         # reused importer instance doesn't disambiguate against a previous
         # run's destinations.
@@ -216,6 +283,64 @@ module Hwaro
           @claimed_paths.clear
           @claim_suffixes.clear
           @collision_count = 0
+          @outside_source_skips = 0
+          @file_actions.clear
+        end
+
+        # The per-item import loop every importer runs: yield each item,
+        # tally the outcome it returns (:imported / :imported_wrapped /
+        # :skipped), turn a raised exception into a counted error (see
+        # `import_error_message`), then warn once about files that kept
+        # engine-specific syntax verbatim (`wrapped_note`, the sentence after
+        # "N file(s)"), report path collisions and build the ImportResult
+        # (`summary_message`). Both messages have per-engine overrides.
+        protected def import_each(items : Array(T), engine : String, wrapped_note : String? = nil, & : T -> Symbol) : ImportResult forall T
+          imported = 0
+          skipped = @outside_source_skips
+          errors = 0
+          wrapped = 0
+
+          items.each do |item|
+            result = yield item
+            case result
+            when :imported
+              imported += 1
+            when :imported_wrapped
+              imported += 1
+              wrapped += 1
+            when :skipped
+              skipped += 1
+            end
+          rescue ex
+            errors += 1
+            Logger.warn import_error_message(item, ex)
+          end
+
+          if wrapped > 0 && wrapped_note
+            Logger.warn "#{wrapped} file(s) #{wrapped_note}"
+          end
+
+          report_collisions
+
+          ImportResult.new(
+            success: imported > 0 || errors == 0,
+            message: summary_message(engine, imported, skipped, errors),
+            imported_count: imported,
+            skipped_count: skipped,
+            error_count: errors,
+          )
+        end
+
+        protected def import_error_message(item : String, ex : Exception) : String
+          "Error importing #{item}: #{ex.message}"
+        end
+
+        protected def import_error_message(item : NamedTuple, ex : Exception) : String
+          "Error importing #{item[:path]}: #{ex.message}"
+        end
+
+        protected def summary_message(engine : String, imported : Int32, skipped : Int32, errors : Int32) : String
+          "#{engine} import complete: #{imported} imported, #{skipped} skipped, #{errors} errors"
         end
 
         # Emit the single end-of-run collision summary, if any. Importers call
@@ -234,11 +359,11 @@ module Hwaro
         # escape `output_dir` and plant or overwrite files anywhere the
         # running user can write. Neutralise traversal at this single sink so
         # every current and future importer is protected.
-        protected def resolve_content_path(output_dir : String, section : String, slug : String, verbose : Bool = false) : String?
+        protected def resolve_content_path(output_dir : String, section : String, slug : String, quiet : Bool = false) : String?
           safe_section = Utils::PathUtils.sanitize_path(section)
           safe_slug = safe_filename_component(slug)
           if safe_slug.empty?
-            Logger.warn "Skipped (unsafe slug #{slug.inspect})" if verbose
+            Logger.warn "Skipped (unusable slug #{slug.inspect}; it is empty or only path separators/dots)" unless quiet
             return
           end
 
@@ -249,7 +374,7 @@ module Hwaro
           # Belt-and-suspenders: refuse to write outside output_dir even if a
           # component slipped past the sanitisers above.
           unless Utils::OutputGuard.within_output_dir?(path, output_dir)
-            Logger.warn "Skipped (escapes output directory): #{path}"
+            Logger.warn "Skipped (escapes output directory): #{path}" unless quiet
             return
           end
 
@@ -269,17 +394,29 @@ module Hwaro
         # either way, and resolving it properly would mean computing every
         # destination before writing any — a two-pass restructure of all eight
         # importers for a cosmetic difference.
+        # True when an earlier item of this run already wrote to `path`.
+        protected def destination_claimed?(path : String) : Bool
+          @claimed_paths.includes?(path)
+        end
+
         private def claim_path(path : String) : String
-          return path if @claimed_paths.add?(path)
+          claim_path_in(@claimed_paths, @claim_suffixes, path)
+        end
+
+        # `claim_path` over caller-owned state, so a pre-pass can predict the
+        # destinations the real run will settle on (links between notes need
+        # them before any note is written).
+        protected def claim_path_in(claimed : Set(String), suffixes : Hash(String, Int32), path : String) : String
+          return path if claimed.add?(path)
 
           ext = File.extname(path)
           stem = path.chomp(ext)
-          n = @claim_suffixes[stem]? || 0
+          n = suffixes[stem]? || 0
           loop do
             n += 1
-            break if @claimed_paths.add?("#{stem}-#{n}#{ext}")
+            break if claimed.add?("#{stem}-#{n}#{ext}")
           end
-          @claim_suffixes[stem] = n
+          suffixes[stem] = n
           "#{stem}-#{n}#{ext}"
         end
 
@@ -319,31 +456,39 @@ module Hwaro
           verbose : Bool = false,
           force : Bool = false,
         ) : {Bool, String?}
-          resolved = resolve_content_path(output_dir, section, slug, verbose)
+          resolved = resolve_content_path(output_dir, section, slug)
           return {false, nil} unless resolved
 
           path = claim_path(resolved)
           dir = File.dirname(path)
 
-          Hwaro::Utils::FileSafe.mkdir_p(dir) unless Dir.exists?(dir)
+          Hwaro::Utils::FileSafe.mkdir_p(dir) unless @dry_run || Dir.exists?(dir)
 
           # `within_output_dir?` above is lexical. If the section directory
           # (or any ancestor) is a symlink pointing out of the tree, that
           # check still passes and `File.write` follows the link straight out
           # of `output_dir`. Re-check with symlinks resolved now that the
-          # directory exists.
-          unless Utils::PathUtils.resolves_within?(dir, output_dir)
+          # directory exists. A dry run creates no directories, so it can only
+          # perform this resolved check against directories that already exist
+          # — which is exactly the pre-existing-symlink case the real run
+          # would refuse, keeping the dry-run manifest honest.
+          if Dir.exists?(dir) && !Utils::PathUtils.resolves_within?(dir, output_dir)
             Logger.warn "Skipped (destination directory resolves outside the output directory): #{dir}"
             return {false, nil}
           end
 
           if File.exists?(path) && !force
             Logger.warn "Skipped (already exists): #{path}" if verbose
+            @file_actions << FileAction.new(path, "skipped")
             return {false, path}
           end
 
-          content = "#{frontmatter}\n\n#{body}\n"
-          File.write(path, content)
+          action = File.exists?(path) ? "overwritten" : "imported"
+
+          unless @dry_run
+            content = "#{frontmatter}\n\n#{body}\n"
+            File.write(path, content)
+          end
 
           # Only now is the rename real. Counting/announcing it at claim time
           # asserted a write that never happened when the disambiguated
@@ -353,7 +498,11 @@ module Hwaro
             Logger.debug "Renamed: #{File.basename(resolved)} → #{File.basename(path)} (claimed by an earlier source in this run)" if verbose
           end
 
-          Logger.debug(force ? "Overwrote: #{path}" : "Imported: #{path}") if verbose
+          @file_actions << FileAction.new(path, action)
+          if verbose
+            label = @dry_run ? "Would import" : (action == "overwritten" ? "Overwrote" : "Imported")
+            Logger.debug "#{label}: #{path}"
+          end
           {true, path}
         end
 
@@ -363,7 +512,7 @@ module Hwaro
         # an import that carries only the `.md` leaves every
         # `![](cover.png)` in the post 404ing. Symlinks are skipped for the
         # same reason `walk_files_into` skips them, and every destination is
-        # re-checked against `output_dir`.
+        # re-checked against `output_dir` (see BundleAssets.copy).
         protected def copy_bundle_assets(
           source_dir : String,
           dest_dir : String,
@@ -371,37 +520,21 @@ module Hwaro
           verbose : Bool = false,
           force : Bool = false,
         ) : Int32
-          return 0 unless Dir.exists?(source_dir)
-          return 0 unless Utils::OutputGuard.within_output_dir?(dest_dir, output_dir)
-          # `within_output_dir?` is lexical. If the destination directory —
-          # or any ancestor — is a symlink out of the tree, `Dir.exists?`
-          # follows it and `File.copy` would write straight through it.
-          return 0 unless Utils::PathUtils.resolves_within?(dest_dir, output_dir)
+          BundleAssets.copy(source_dir, dest_dir, output_dir, @dry_run, "copy") do |src, dest|
+            if File.exists?(dest) && !force
+              @file_actions << FileAction.new(dest, "skipped")
+              next false
+            end
 
-          copied = 0
-          Dir.children(source_dir).sort!.each do |entry|
-            src = File.join(source_dir, entry)
-            next if File.directory?(src) || File.symlink?(src)
-            next if entry.ends_with?(".md") || entry.ends_with?(".markdown")
-
-            # `entry` is a single directory component — it can never contain
-            # `/`, `.` or `..`, so the guard below is the real protection.
-            # Running it through `safe_filename_component` only split on `\`,
-            # renaming a legitimate `C:\photo.png` to `photo.png` and leaving
-            # the `![](C:\photo.png)` reference this copy exists to repair
-            # still broken. The exporter twin does the same.
-            dest = File.join(dest_dir, entry)
-            next unless Utils::OutputGuard.within_output_dir?(dest, output_dir)
-            next if File.exists?(dest) && !force
-
-            Hwaro::Utils::FileSafe.mkdir_p(dest_dir) unless Dir.exists?(dest_dir)
-            File.copy(src, dest)
-            Logger.debug "Copied bundle asset: #{dest}" if verbose
-            copied += 1
-          rescue ex
-            Logger.warn "Could not copy bundle asset #{src}: #{ex.message}"
+            action = File.exists?(dest) ? "overwritten" : "imported"
+            unless @dry_run
+              Hwaro::Utils::FileSafe.mkdir_p(dest_dir) unless Dir.exists?(dest_dir)
+              File.copy(src, dest)
+            end
+            @file_actions << FileAction.new(dest, action)
+            Logger.debug "#{@dry_run ? "Would copy" : "Copied"} bundle asset: #{dest}" if verbose
+            true
           end
-          copied
         end
 
         # Collapse an untrusted slug to a single safe filename component so it
@@ -411,16 +544,54 @@ module Hwaro
         # carry a trailing ".md"). Unicode is preserved. We intentionally do NOT
         # URL-decode: the filesystem treats `%2f` as a literal, so decoding
         # would only manufacture separators that aren't really there.
+        # `scrub` first: URI-decoded slugs (`a%ffb`) can carry invalid UTF-8,
+        # and the split regex raises ArgumentError on an invalid byte
+        # sequence — scrubbing here protects every caller.
         protected def safe_filename_component(value : String) : String
-          value.delete(Char::ZERO)
+          value.scrub
+            .delete(Char::ZERO)
             .split(/[\/\\]/)
             .reject { |seg| seg.empty? || seg == "." || seg == ".." }
             .last? || ""
         end
 
         # Parse a date string in common formats, returns nil on failure.
-        protected def parse_date(date_str : String) : Time?
-          Utils::DateUtils.parse_lenient(date_str, Utils::DateUtils::IMPORT_FORMATS)
+        # Map a source page's literal URL (Hugo `url`, Jekyll `permalink`) onto
+        # hwaro's `path` front matter so the page keeps its published address.
+        # hwaro publishes `path = "a/b"` at `/a/b/`, so:
+        #
+        # - a query or fragment is dropped (it is not part of the page path);
+        # - a trailing `index.html` names the directory itself
+        #   (`/docs/index.html` is served at `/docs/`), so it maps to that
+        #   directory with no alias;
+        # - any other `.html` URL becomes the extensionless path plus an alias
+        #   at the old address (its redirect stub keeps inbound links working);
+        # - a URL naming another kind of file (`/feed.xml`) cannot be a page
+        #   path, so it is left unmapped with a warning, as before.
+        #
+        # Patterns (`:title`), external URLs and the site root are left alone.
+        protected def apply_source_url(fields : Hash(String, FieldValue), url : String?, source : String = "") : Nil
+          return unless url
+          url = url.strip.split(/[?#]/, 2).first
+          return if url.empty? || url.includes?(':') || url.starts_with?("//")
+          trimmed = url.strip('/')
+          return if trimmed.empty?
+          segments = trimmed.split('/')
+          last = segments.last
+          if last =~ /\Aindex\.html?\z/i
+            dir = segments[0...-1].join('/')
+            fields["path"] = dir unless dir.empty?
+          elsif last =~ /\.html?\z/i
+            fields["path"] = trimmed.sub(/\.html?\z/i, "")
+            aliases = (fields["aliases"]?.as?(Array(String)) || [] of String).dup
+            original = "/#{trimmed}"
+            aliases << original unless aliases.includes?(original)
+            fields["aliases"] = aliases
+          elsif last.includes?('.')
+            Logger.warn "#{source.empty? ? "" : "#{source}: "}URL #{url.inspect} names a file, not a page; it is not kept as the imported page's path."
+          else
+            fields["path"] = trimmed
+          end
         end
 
         # Format a Time to the standard frontmatter date format, keeping the
@@ -432,9 +603,36 @@ module Hwaro
         end
 
         # YAML::Any scalar → String: string scalars pass through, anything
-        # else falls back to its raw representation.
+        # else falls back to its raw representation. An unquoted date
+        # (`title: 2024-05-01`) arrives as a Time; `Time#to_s` would add a
+        # midnight time and the importing machine's zone offset, so it goes
+        # through the front matter date writer (a bare date stays a bare date).
         protected def yaml_string(value : YAML::Any) : String
-          value.as_s? || value.raw.to_s
+          raw = value.raw
+          raw.is_a?(Time) ? Utils::FrontmatterWriter.serialize_time(raw) : (value.as_s? || raw.to_s)
+        end
+
+        # A front matter `title:` as text, or nil when it is blank or null (the
+        # Obsidian Properties template writes a bare `title:`), so callers can
+        # fall back to a filename or heading title instead of storing "".
+        protected def yaml_title(value : YAML::Any) : String?
+          title = yaml_string(value)
+          title.blank? ? nil : title
+        end
+
+        # Words of a file stem as a display title (`my-great_post` → "My Great
+        # Post"), for sources that fall back to the filename.
+        protected def title_from_stem(stem : String) : String
+          stem.gsub(/[-_]/, " ").split.map(&.capitalize).join(" ")
+        end
+
+        # Slug for an output filename. Emoji- or symbol-only names slugify to
+        # "", which `resolve_content_path` rejects, silently dropping the note;
+        # those get `safe_slugify`'s deterministic token instead. Blank text
+        # stays "" so callers keep their own fallback.
+        protected def file_slug(text : String) : String
+          slug = Utils::TextUtils.slugify(text)
+          slug.empty? && !text.blank? ? Utils::TextUtils.safe_slugify(text) : slug
         end
 
         # Assign a date-valued frontmatter field that may be a YAML timestamp
@@ -445,7 +643,7 @@ module Hwaro
           when Time
             fields[key] = format_date(raw)
           when String
-            parsed = parse_date(raw)
+            parsed = Utils::DateUtils.parse_import(raw)
             fields[key] = format_date(parsed) if parsed
           end
         end
@@ -455,10 +653,36 @@ module Hwaro
         protected def collect_string_list(value : YAML::Any, into list : Array(String)) : Nil
           case value.raw
           when Array
-            value.as_a.each { |v| list << yaml_string(v) }
+            # Filter blank items like the string branch below does — an
+            # empty array element otherwise became an empty taxonomy term.
+            value.as_a.each do |v|
+              s = yaml_string(v)
+              list << s unless s.blank?
+            end
           when String
             value.as_s.split(/[\s,]+/).each { |v| list << v.strip unless v.strip.empty? }
           end
+        end
+
+        # First value among `keys` that is present AND non-null. The naive
+        # `yaml["a"]? || yaml["b"]?` chain can't express this: YAML::Any is a
+        # struct, so a present-but-null key (`pubDate:` with no value) is
+        # truthy and silently discards every fallback after it.
+        protected def first_present(yaml : YAML::Any, *keys : String) : YAML::Any?
+          keys.each do |key|
+            value = yaml[key]?
+            return value if value && !value.raw.nil?
+          end
+          nil
+        end
+
+        # :ditto:
+        protected def first_present(yaml : Hash(YAML::Any, YAML::Any), *keys : String) : YAML::Any?
+          keys.each do |key|
+            value = yaml[key]?
+            return value if value && !value.raw.nil?
+          end
+          nil
         end
       end
     end

@@ -65,8 +65,7 @@ module Hwaro
         end
 
         def run(args : Array(String))
-          result, input_dir, json_output = parse_options(args)
-          options, output_dir_explicit = result
+          options, input_dir, json_output = parse_options(args)
 
           # --json implies quiet so only the final JSON document reaches stdout.
           Runner.enable_json_mode! if json_output
@@ -77,10 +76,7 @@ module Hwaro
                 code: Hwaro::Errors::HWARO_E_IO,
                 message: "Input directory does not exist: #{dir}",
               )
-              if json_output
-                puts err.to_error_payload.to_json
-                exit(err.exit_code)
-              end
+              Runner.exit_with_error_payload(err) if json_output
               Logger.error "Error [#{err.code}]: #{err.message}"
               exit(err.exit_code)
             end
@@ -88,7 +84,7 @@ module Hwaro
             # Only resolve output_dir to absolute path when -o was explicitly
             # specified, so it stays relative to the original CWD.
             # The default "public" should remain relative to the input directory.
-            if output_dir_explicit && !Path[options.output_dir].absolute?
+            if options.output_dir_explicit && !Path[options.output_dir].absolute?
               options.output_dir = File.expand_path(options.output_dir)
             end
 
@@ -96,6 +92,7 @@ module Hwaro
           end
 
           builder = Core::Build::Builder.new
+          Core::Build::ParallelHelper.wake_idle_threads = true
 
           # Set logger level based on verbose option
           if options.verbose
@@ -123,8 +120,7 @@ module Hwaro
             # Classified errors (config, template, content, …) are raised at
             # their source sites now, so we just forward the payload / rethrow.
             if json_output
-              puts ex.to_error_payload.to_json
-              exit(ex.exit_code)
+              Runner.exit_with_error_payload(ex)
             else
               raise ex
             end
@@ -161,13 +157,13 @@ module Hwaro
           end
         end
 
-        def parse_options(args : Array(String)) : { {Config::Options::BuildOptions, Bool}, String?, Bool }
+        def parse_options(args : Array(String)) : {Config::Options::BuildOptions, String?, Bool}
           # Path & URL
           input_dir = nil.as(String?)
           output_dir = "public"
           output_dir_explicit = false
           base_url = nil.as(String?)
-          env_name = ENV["HWARO_ENV"]? || nil
+          env_name = ENV["HWARO_ENV"]?.presence
 
           # Content filtering
           drafts = false
@@ -181,7 +177,7 @@ module Hwaro
           cache = false
           full = false
           stream = false
-          memory_limit = ENV["HWARO_MEMORYLIMIT"]? || nil
+          memory_limit = ENV["HWARO_MEMORYLIMIT"]?.presence
 
           # Skip options
           highlight = true
@@ -233,6 +229,20 @@ module Hwaro
             CLI.register_flag(parser, DEBUG_FLAG) { |_| debug = true }
             CLI.register_flag(parser, JSON_FLAG) { |_| json_output = true }
             CLI.register_flag(parser, HELP_FLAG) { |_| Logger.info parser.to_s; exit }
+            # `hwaro build` takes no positional arguments. Without this the
+            # parser dropped them silently, so `hwaro build mysite` (the shape
+            # other generators accept) and `hwaro build content/post.md` both
+            # built the current directory and exited 0 — the user's argument
+            # having no effect and no diagnostic. Mirrors the `hwaro tool *`
+            # subcommands.
+            parser.unknown_args do |before_dash, after_dash|
+              unknown = before_dash + after_dash
+              raise Hwaro::HwaroError.new(
+                code: Hwaro::Errors::HWARO_E_USAGE,
+                message: "unexpected extra argument(s): '#{unknown.join("', '")}'",
+                hint: "hwaro build accepts options only; use -i/--input DIR to build another directory.",
+              ) unless unknown.empty?
+            end
           end
 
           # `--no-parallel` renders on a single fiber, so a worker count has
@@ -243,7 +253,7 @@ module Hwaro
             Logger.warn "--jobs #{workers} is ignored because --no-parallel disables parallel rendering."
           end
 
-          { {Config::Options::BuildOptions.new(
+          build_options = Config::Options::BuildOptions.new(
             output_dir: output_dir,
             base_url: base_url,
             drafts: drafts,
@@ -264,7 +274,11 @@ module Hwaro
             env: env_name,
             skip_og_image: skip_og_image,
             skip_image_processing: skip_image_processing,
-          ), output_dir_explicit}, input_dir, json_output }
+          )
+          # Carried on the struct rather than alongside it: the Builder needs it
+          # to decide whether `[build] output_dir` may override the flag.
+          build_options.output_dir_explicit = output_dir_explicit
+          {build_options, input_dir, json_output}
         end
       end
     end

@@ -2,6 +2,15 @@ module Hwaro
   module Config
     module Options
       struct ServeOptions
+        # Where `hwaro serve` builds. A dedicated directory, NOT the
+        # configured output_dir (issue #756): serve derives base_url from its
+        # bind address, so its pages carry dev URLs (http://127.0.0.1:3000) —
+        # sharing the output dir let a serve session silently poison a
+        # previously deployable `hwaro build`, and hosting the leftover tree
+        # leaked those dev links. Keep this directory out of version control
+        # (alongside .hwaro_cache.json).
+        DEV_OUTPUT_DIR = ".hwaro/serve"
+
         property host : String
         property port : Int32
         property base_url : String?
@@ -61,6 +70,15 @@ module Hwaro
         )
         end
 
+        # `-b 0.0.0.0` / `-b ::` listen on every interface but are not an
+        # address anything can connect TO: as the derived base_url they put
+        # `http://0.0.0.0:3000/…` into every link, stylesheet and canonical
+        # (unconnectable on Windows, meaningless from another device). Like an
+        # empty host, they stand for "localhost" in URLs.
+        def self.wildcard_host?(host : String) : Bool
+          {"0.0.0.0", "::", "[::]"}.includes?(host.strip)
+        end
+
         # Host as it must appear inside a URL. An IPv6 literal has to be
         # bracketed (RFC 3986) — without this `hwaro serve -b ::1` produced
         # `http://::1:3000`, which no browser can resolve, and baked that
@@ -75,7 +93,7 @@ module Hwaro
           # (`[::1]` on macOS), so a hard-coded 127.0.0.1 would point at an
           # address nothing is listening on. "localhost" follows the same
           # resolution the bind did.
-          return "localhost" if host.blank?
+          return "localhost" if host.blank? || wildcard_host?(host)
           return host unless host.includes?(':')
           return host if host.starts_with?('[')
           # RFC 6874: a zone id's "%" separator must be percent-encoded inside
@@ -90,8 +108,8 @@ module Hwaro
           # so that generated URLs reflect the actual server address
           effective_base_url = @base_url || "http://#{ServeOptions.url_host(@host)}:#{@port}"
 
-          BuildOptions.new(
-            output_dir: "public",
+          build = BuildOptions.new(
+            output_dir: DEV_OUTPUT_DIR,
             base_url: effective_base_url,
             drafts: @drafts,
             include_expired: @include_expired,
@@ -113,6 +131,13 @@ module Hwaro
             fast_start: @fast_start,
             fast_start_count: @fast_start_count,
           )
+          # Pin the dev output dir the same way an explicit `-o` is pinned:
+          # `apply_build_config!` runs both in Server#run and inside
+          # Builder#run on EVERY watch rebuild, and without this flag a
+          # `[build] output_dir` in config.toml would pull serve right back
+          # into the deployable tree this directory exists to protect.
+          build.output_dir_explicit = true
+          build
         end
       end
     end

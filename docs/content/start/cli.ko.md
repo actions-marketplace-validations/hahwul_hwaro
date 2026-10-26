@@ -17,6 +17,8 @@ Hwaro는 사이트를 만들고, 빌드하고, 서빙하는 명령을 제공합�
 |----------------|-------------|
 | `-q`, `--quiet` | 정보성 출력과 시작 배너를 숨김. 경고와 오류는 stderr에 계속 표시 |
 | `NO_COLOR` (env) | 비어 있지 않은 값이면 모든 명령 출력에서 ANSI 색상 코드를 제거. [no-color.org](https://no-color.org)의 도구 공통 규약을 따름 |
+| `GC_MARKERS` (env) | GC 마커 스레드 수. `hwaro build`에 한해 Hwaro가 `1`을 기본값으로 지정합니다(할당이 많은 사이트에서 3~5배 빠르게 측정됨). 직접 export 하면 덮어쓸 수 있습니다. 다른 명령은 가비지 컬렉터의 기본 동작을 그대로 씁니다 |
+| `GC_INITIAL_HEAP_SIZE` (env) | GC 초기 힙 크기. `hwaro build`에 한해 Hwaro가 `256M`을 기본값으로 지정해 힙 확장-수집 사이클 반복을 피합니다. 직접 export 하면 덮어쓸 수 있습니다. `--memory-limit` / `HWARO_MEMORYLIMIT`가 설정되어 있으면 자동으로 건너뜁니다 |
 
 stdout이 TTY가 아니면(예: `cat`으로 파이프, 파일로 리디렉션, 대부분의
 CI 환경) 색상은 자동으로 꺼집니다. 어디서든 색상을 강제로 끄려면
@@ -43,7 +45,7 @@ Error [HWARO_E_USAGE]: missing <path> argument
 ```
 
 `--json`에서는 분류된 오류가 대신 stdout에 구조화된 페이로드로
-출력됩니다. (`--quiet`는 정보성 출력만 숨깁니다 — 오류는 그대로
+출력됩니다. (`--quiet`는 정보성 출력만 숨깁니다. 오류는 그대로
 stderr에 사람이 읽는 `Error [CODE]: …` 형태로 남으므로, 기계가 읽을
 수 있는 실패 출력이 필요하면 `--json`과 함께 사용합니다.)
 
@@ -68,8 +70,8 @@ stderr에 사람이 읽는 `Error [CODE]: …` 형태로 남으므로, 기계가
 | `HWARO_E_CONFIG` | config | 3 | `config.toml` 누락, 파싱 불가 또는 유효하지 않음 |
 | `HWARO_E_TEMPLATE` | template | 4 | Crinja 템플릿 렌더링 오류 |
 | `HWARO_E_CONTENT` | content | 5 | 콘텐츠 파일 파싱 오류, 유효하지 않은 프론트 매터 |
-| `HWARO_E_IO` | io | 6 | 파일시스템 접근 오류 (디렉터리 없음, 권한 거부) |
-| `HWARO_E_NETWORK` | network | 7 | 배포 업로드, 원격 스캐폴드 가져오기 실패 |
+| `HWARO_E_IO` | io | 6 | 파일시스템 접근 오류 (디렉터리 없음, 권한 거부), 배포 명령 또는 동기화 실패 |
+| `HWARO_E_NETWORK` | network | 7 | 원격 스캐폴드 또는 원격 데이터 가져오기 실패 |
 | `HWARO_E_INTERNAL` | internal | 70 | 복구 불가능한 버그 또는 예기치 않은 상태 |
 | *(미분류)* | — | 1 | 기존/일반 실패 경로 |
 | *(성공)* | — | 0 | 명령 정상 완료 |
@@ -97,7 +99,7 @@ hwaro init my-site --scaffold book
 나서야 파일을 씁니다. 경로 인자를 함께 주면(`hwaro init my-site --wizard`)
 위저드는 디렉터리 프롬프트를 건너뛰고 그 경로를 그대로 사용합니다.
 
-`--wizard` 없이 실행하면 `hwaro init`은 기본값으로 즉시 초기화합니다 —
+`--wizard` 없이 실행하면 `hwaro init`은 기본값으로 즉시 초기화합니다.
 스크립트와 CI가 기존에 의존하던 동작 그대로입니다.
 
 모든 스캐폴드는 읽는 사람의 OS 색상 모드를 자동으로 따릅니다(공유 토큰
@@ -120,9 +122,13 @@ hwaro init my-site --scaffold https://github.com/user/repo/tree/main/docs
 ```
 
 원격 스캐폴드는 저장소에서 `config.toml`, `templates/`, `static/`,
-콘텐츠 구조를 가져옵니다. 콘텐츠 파일은 프론트 매터(메타데이터)만
-유지하므로 원본 본문 없이도 기대되는 페이지 구조를 확인할 수 있습니다.
-API 요청 제한을 피하려면 `GITHUB_TOKEN` 환경 변수를 설정합니다.
+`data/`, `i18n/`, `archetypes/`, 콘텐츠 구조를 가져옵니다. 콘텐츠 파일은
+프론트 매터(메타데이터)만 유지하므로 원본 본문 없이도 기대되는 페이지
+구조를 확인할 수 있습니다. `/tree/<branch>/` URL은 해당 브랜치를
+가져오고, 그 외에는 저장소의 기본 브랜치를 사용합니다. 파일 하나라도
+내려받지 못하면 아무것도 쓰지 않고 `HWARO_E_NETWORK`로 종료합니다.
+API 요청 제한을 피하거나 비공개 저장소에서 가져오려면 `GITHUB_TOKEN`
+환경 변수를 설정합니다.
 
 **옵션:**
 
@@ -131,14 +137,22 @@ API 요청 제한을 피하려면 `GITHUB_TOKEN` 환경 변수를 설정합니�
 | --scaffold TYPE | 내장 스캐폴드(`simple`, `bare`, `blog`, `docs`, `book`) 또는 원격 소스(`github:user/repo[/path]`, URL) |
 | --wizard | 대화형 위저드 실행 (TTY 전용) |
 | --agents MODE | AGENTS.md 콘텐츠 모드: `remote`(가벼움, 기본값) 또는 `local`(전체 레퍼런스 내장) |
-| -f, --force | 디렉터리가 비어 있지 않아도 강제로 생성 |
+| -f, --force | 디렉터리가 비어 있지 않아도 강제로 생성 (기존 파일은 유지) |
+| --clean | 스캐폴드 전에 대상의 기존 파일을 삭제 (`--force` 포함, 대상에 `.git` 디렉터리나 파일이 있거나 대상이 `/` 또는 홈 디렉터리면 거부) |
 | --skip-agents-md | AGENTS.md 파일 생성 생략 |
-| --skip-sample-content | 샘플 콘텐츠 파일 생성 생략 |
+| --skip-sample-content | 샘플 콘텐츠 생략. 스캐폴드 내비게이션이 가리키는 페이지(홈, 섹션 인덱스, About 등)는 프론트 매터만 있는 스텁으로 생성 |
 | --skip-taxonomies | 택소노미 설정과 템플릿 생략 |
-| --include-multilingual LANGS | 다국어 지원 활성화 (예: `en,ko,ja`) |
-| --minimal-config | 주석과 선택 섹션 없는 최소 `config.toml` 생성 |
+| --include-multilingual LANGS | 다국어 지원 활성화 (예: `en,ko,ja`). 중복 코드는 경고와 함께 제거됩니다 |
+| --minimal-config | 주석과 선택 섹션 없는 최소 `config.toml` 생성 (`--full-config`와 함께 쓸 수 없음) |
+| --full-config | 모든 주석과 선택 섹션을 포함한 전체 `config.toml` 생성 (탐색성 최대). `--force`로 유지되는 기존 `config.toml`은 수정하지 않음 |
 | --list-scaffolds | 사용 가능한 내장 스캐폴드 목록 출력 후 종료 |
-| --json | 기계가 읽을 수 있는 JSON 출력 (--list-scaffolds와 함께) |
+| -q, --quiet | 정보 출력과 배너 숨김 (오류는 stderr로 계속 출력) |
+| -j, --json | 기계가 읽을 수 있는 JSON 출력: `--list-scaffolds`와 함께면 스캐폴드 목록, 그 외에는 `{"status","path","scaffold","files_created"}` 결과 |
+
+`init`은 심볼릭 링크를 따라 대상 디렉터리 밖으로 이어지는 스캐폴드 파일이나 디렉터리는
+만들지 않습니다. 쓰기 전에 모든 대상 경로를 먼저 확인하므로 거부된 실행은 대상 디렉터리를
+건드리지 않습니다. 이미 있는 항목은 그대로 두므로, 예를 들어 `templates/`가 외부의 공용 테마를
+가리키더라도 그 링크를 통해 새로 쓸 파일이 없으면 `init --force`는 정상 동작합니다.
 
 ### new
 
@@ -164,7 +178,7 @@ hwaro new my-post.md --section blog --draft --tags "go,web" --date 2026-03-22
 나머지만 묻습니다. 마지막 확인에서 `Ctrl-D`를 누르거나 `n`으로 답하면 아무것도
 만들지 않고 취소합니다.
 
-위저드는 비대화형 컨텍스트 — 파이프, CI, 에이전트, `--json`, `--quiet` — 에서는
+위저드는 비대화형 컨텍스트(파이프, CI, 에이전트, `--json`, `--quiet`)에서는
 절대 실행되지 않고 대신 분류된 `HWARO_E_USAGE` 오류를 출력하므로, 스크립트
 호출은 예측 가능하게 유지됩니다. `<path>`(그리고 필요한 플래그)를 주면
 프롬프트를 완전히 건너뜁니다.
@@ -182,7 +196,11 @@ hwaro new my-post.md --section blog --draft --tags "go,web" --date 2026-03-22
 | --bundle | 단일 파일 대신 리프 번들 디렉터리(`foo/index.md`) 생성 |
 | --no-bundle | 단일 파일(`foo.md`) 강제; `[content.new].bundle = true`보다 우선 |
 | --list-archetypes | 현재 프로젝트의 아키타입 목록 출력 후 종료 |
-| --json | 기계가 읽을 수 있는 JSON 출력 (아키타입 목록과 분류된 오류) |
+| -j, --json | 기계가 읽을 수 있는 JSON 출력 (아키타입 목록과 분류된 오류) |
+
+`hwaro new`는 `content/` 안에서 확인할 수 없는 경로(디렉터리 밖으로 이어지는 심볼릭 링크 포함)를 거부합니다.
+
+다국어 사이트에서는 번역 접미사를 인식합니다. `hwaro new posts/hello.ko.md`는 페이지 제목을 "Hello"로 하고, `--bundle`과 함께 쓰면 `hello` 번들의 번역인 `posts/hello/index.ko.md`를 만듭니다.
 
 **아키타입:**
 
@@ -250,6 +268,17 @@ hwaro build -i /path/to/my-site -o ./dist
 | -v, --verbose | 상세 출력 |
 | --profile | 단계별·템플릿별 빌드 시간 출력 |
 | --debug | 빌드 후 디버그 정보 출력 |
+| -j, --json | 로그 대신 JSON 요약 하나(`{"status","pages_generated","duration_ms","cache_hits","raw_files_processed","pages_not_published"}`)를 stdout에 출력. `--quiet` 포함 |
+
+**출력 디렉터리에 대해:** 전체 빌드는 빈 출력 디렉터리에서 시작하지만, hwaro는
+자신이 책임질 수 있는 디렉터리만 비웁니다. 프로젝트 옆의 관례적인 `public/`,
+`hwaro serve`가 쓰는 `.hwaro/serve`, 그리고 이전 빌드에서 hwaro가 직접 만들었거나
+비어 있는 상태로 발견한 디렉터리입니다. 다른 파일이 이미 들어 있는 디렉터리를
+`-o`로 지정하면(`-o ~/Documents/site`, 번들러와 공유하는 `dist/` 등) 그 파일들은
+그대로 두고 사이트를 그 안에 씁니다. 이때 이전 빌드의 파일이 남아 있을 수 있다는
+경고가 출력됩니다. 한 번 디렉터리를 비워 주면 이후부터는 hwaro가 관리합니다.
+파일시스템 루트, 홈 디렉터리, 프로젝트 자체와 입력 디렉터리(`content/`,
+`templates/`, `static/` 등)는 아예 거부됩니다.
 
 **`--stream` / `--memory-limit` (스트리밍 빌드):**
 
@@ -268,7 +297,7 @@ hwaro build -i /path/to/my-site -o ./dist
 | yes | 512M | - | 스트리밍, 배치≈5000 |
 | - | 2G | 1G | CLI 우선 (2G) |
 
-빌드 결과물은 동일합니다 — 스트리밍은 빌드 중 메모리 사용량에만 영향을 줍니다.
+빌드 결과물은 동일합니다. 스트리밍은 빌드 중 메모리 사용량에만 영향을 줍니다.
 
 **`--minify`:**
 
@@ -278,13 +307,13 @@ hwaro build -i /path/to/my-site -o ./dist
 - **JSON**: 공백과 줄바꿈을 제거해 압축된 출력을 만듭니다.
 - **XML**: 태그 사이 공백을 제거해 파일 크기를 줄입니다.
 
-공백에 민감한 요소 — `<pre>`, `<code>`, `<textarea>`, `<script>`, `<style>`, `<svg>`, `<math>`, `<noscript>` — 는 공백 처리 전에 추출했다가 그대로 복원하므로 내용을 절대 건드리지 않습니다.
+공백에 민감한 요소(`<pre>`, `<code>`, `<textarea>`, `<script>`, `<style>`, `<svg>`, `<math>`, `<noscript>`)는 공백 처리 전에 추출했다가 그대로 복원하므로 내용을 절대 건드리지 않습니다.
 
 더 공격적인 축소(속성 따옴표 처리, 엔티티 축약 등)가 필요하면 `html-minifier-terser`나 `minify-html` 같은 전용 도구로 `public/`을 후처리합니다.
 
 **`--cache` (증분 빌드):**
 
-켜면 Hwaro가 파일 수정 시각과 콘텐츠 체크섬을 프로젝트 루트의 `.hwaro_cache.json` 파일에 기록합니다. 이후 빌드에서는 지난 빌드 이후 바뀐 파일만 다시 렌더링합니다. 캐시는 템플릿과 설정 체크섬도 추적합니다 — 템플릿이나 `config.toml`이 바뀌면 모든 항목이 자동으로 무효화되어 전체 페이지가 재빌드됩니다.
+켜면 Hwaro가 파일 수정 시각과 콘텐츠 체크섬을 프로젝트 루트의 `.hwaro_cache.json` 파일에 기록합니다. 이후 빌드에서는 지난 빌드 이후 바뀐 파일만 다시 렌더링합니다. 캐시는 템플릿과 설정 체크섬도 추적합니다. 템플릿이나 `config.toml`이 바뀌면 모든 항목이 자동으로 무효화되어 전체 페이지가 재빌드됩니다.
 
 `--full`을 `--cache`와 함께 쓰면 깨끗하게 재빌드하면서도 다음 실행을 위한 캐시는 저장합니다:
 
@@ -296,7 +325,7 @@ hwaro build --cache --full
 
 **`--jobs` (렌더 동시성):**
 
-기본적으로 Hwaro는 사이트의 **리스팅 fan-out** — 페이지 하나를 렌더링할 때 사이트 전역 컬렉션에서 만들어내는 페이지 객체 수 — 을 기준으로 동시 렌더 워커 수를 정합니다. `--jobs N`은 그 값을 직접 지정합니다. 생성 결과물은 절대 바뀌지 않고, 한 번에 렌더링하는 페이지 수만 달라집니다.
+기본적으로 Hwaro는 사이트의 **리스팅 fan-out**(페이지 하나를 렌더링할 때 사이트 전역 컬렉션에서 만들어내는 페이지 객체 수)을 기준으로 동시 렌더 워커 수를 정합니다. `--jobs N`은 그 값을 직접 지정합니다. 생성 결과물은 절대 바뀌지 않고, 한 번에 렌더링하는 페이지 수만 달라집니다.
 
 유효한 병렬성의 상한을 결정하는 건 코어 수가 아니라 이 fan-out입니다. `{% for p in site.pages %}`나 `{% for p in section.pages %}` 반복은 항목마다 객체를 하나씩 할당하는데, 워커가 일정 수를 넘어가면 가비지 컬렉터의 전역 할당 락이 이 작업을 직렬화해서 추가 워커는 경합만 늘립니다. 그래서 자동 산정 값은 다음과 같습니다.
 
@@ -319,9 +348,9 @@ hwaro build --jobs 4   # 자동 산정 값을 직접 지정
 지정하면 Hwaro가 빌드 전에 작업 디렉터리를 해당 경로로 바꿉니다. 먼저 `cd`하지 않고도 다른 디렉터리에 있는 사이트를 빌드할 수 있습니다.
 
 - 모든 사이트 소스(`config.toml`, `content/`, `templates/`, `static/`)를 입력 디렉터리에서 읽습니다.
-- **`-o` 없이:** 기본 출력 디렉터리 `public/`은 입력 디렉터리 안에 만들어집니다(즉, 그 사이트 자신의 `public/` 폴더). 이것이 자연스러운 동작입니다 — `hwaro build -i ../my-site`는 `../my-site/public/`을 만듭니다.
+- **`-o` 없이:** 기본 출력 디렉터리 `public/`은 입력 디렉터리 안에 만들어집니다(즉, 그 사이트 자신의 `public/` 폴더). 이것이 자연스러운 동작입니다. `hwaro build -i ../my-site`는 `../my-site/public/`을 만듭니다.
 - **`-o`와 함께:** 출력 경로는 (입력 디렉터리가 아니라) **현재 디렉터리** 기준으로 해석되므로, `hwaro build -i ../my-site -o ./dist`는 셸의 CWD에 있는 `./dist`에 출력합니다.
-- `-i`를 생략하면 동작은 그대로입니다 — 현재 디렉터리를 사용합니다.
+- `-i`를 생략하면 동작은 그대로이며 현재 디렉터리를 사용합니다.
 
 ### serve
 
@@ -337,6 +366,8 @@ hwaro serve -i /path/to/my-site
 hwaro serve -i /path/to/my-site -p 8080
 ```
 
+> **serve 출력은 개발용 산출물입니다. 절대 배포하지 마세요.** `hwaro serve`는 전용 디렉터리 `.hwaro/serve/`에 빌드하고, 설정된 `output_dir`(기본 `public/`)은 전혀 건드리지 않습니다. 따라서 serve 세션이 배포 가능한 빌드를 덮어쓰는 일은 생기지 않습니다. `.hwaro/serve/`의 페이지들은 모든 링크에 개발 서버의 `base_url`(예: `http://127.0.0.1:3000`)이 박혀 있고, 디렉터리에는 `hwaro deploy`가 거부하는 `.hwaro-dev` 마커가 찍힙니다. 배포할 사이트는 `hwaro build`로 만드세요. `.hwaro/`는 알아서 버전 관리에서 빠집니다. hwaro가 디렉터리를 만들 때 자기 자신을 무시하는 `.hwaro/.gitignore`를 함께 쓰고, `hwaro init`도 출력 디렉터리·`.hwaro/`·`.hwaro_cache.json`을 포함한 프로젝트 `.gitignore`를 스캐폴드합니다.
+
 **옵션:**
 
 | 플래그 | 설명 |
@@ -349,17 +380,18 @@ hwaro serve -i /path/to/my-site -p 8080
 | --minify | 압축된 출력 서빙 |
 | --jobs N | 동시 렌더 워커 수. 기본값은 자동이며 사이트의 리스팅 fan-out에서 산정 |
 | --open | 시작 후 브라우저 열기 |
+| --no-open | 브라우저를 열지 않음(기본값. 앞선 `--open`을 덮어씀) |
 | -d, --drafts | 초안 콘텐츠 포함 |
 | --include-expired | 만료된 콘텐츠 포함 |
 | --include-future | 미래 날짜 콘텐츠 포함 |
 | -v, --verbose | 상세 출력 |
 | --debug | 재빌드마다 디버그 정보 출력 |
-| --access-log | HTTP 접근 로그 표시 (예: GET 요청) |
+| --access-log | HTTP 접근 로그 표시 (예: GET 요청). 각 줄에는 브라우저가 요청한 경로가 그대로 기록됩니다(개발 서버가 내부적으로 찾아가는 `/index.html`이 아니라 `/`) |
 | --no-error-overlay | 브라우저 내 오류 오버레이 끄기 (기본값: 활성화) |
 | --live-reload | 파일 변경 시 브라우저 라이브 리로드 켜기 (기본값: 활성화; 하위 호환용으로 유지) |
 | --no-live-reload | 파일 변경 시 브라우저 라이브 리로드 끄기 |
 | --header "NAME: VALUE" | 커스텀 응답 헤더 추가 (반복 가능). `config.toml`의 `[serve.headers]`와 병합 (CLI 우선). `hwaro serve`에만 적용 |
-| --cache | 빌드 캐시 사용 (변경 없는 파일 생략) |
+| --cache | 빌드 캐시 사용 (변경 없는 파일 생략). `hwaro build --cache`와 별도로 `.hwaro/serve_cache.json`에 저장 |
 | --stream | 메모리 사용을 줄이는 스트리밍 빌드 사용 |
 | --memory-limit SIZE | 스트리밍 빌드 메모리 제한 (예: `2G`, `512M`) |
 | --fast-start | 홈페이지 + 최신 N개 페이지를 먼저 렌더링하고 나머지는 백그라운드에서 렌더링 |
@@ -368,8 +400,10 @@ hwaro serve -i /path/to/my-site -p 8080
 | --skip-og-image | 자동 OG 이미지 생성 생략 |
 | --skip-image-processing | 이미지 리사이즈와 LQIP 생성 생략 |
 | --profile | 단계별·템플릿별 빌드 시간 출력 |
+| --fast | 빠른 개발 모드: OG 이미지 생성과 이미지 처리를 생략(`--skip-og-image --skip-image-processing`와 동일. `[serve] fast = true`로 기본 적용) |
+| -j, --json | 준비 이벤트를 `hwaro serve: ready url=… pid=…` 대신 JSON 한 줄(`{"event":"ready","url",…,"pid"}`)로 출력. `--quiet` 포함 |
 
-> **대규모 사이트의 빠른 개발 서버:** `config.toml`에 `[og.auto_image] lazy_generate = true`를 설정하면 `hwaro serve` 중 일괄 OG 생성을 생략합니다. 이미지는 첫 요청 시 생성됩니다. 전체 설명과 `--fast-start`를 곁들인 권장 워크플로는 [자동 OG 이미지](/ko/features/og-images/) 문서를 참고합니다.
+> **대규모 사이트의 빠른 개발 서버:** `config.toml`에 `[og.auto_image] lazy_generate = true`를 설정하면 `hwaro serve` 중 일괄 OG 생성을 생략합니다. 이미지는 첫 요청 시 생성됩니다. 전체 설명과 `--fast-start`를 곁들인 권장 워크플로는 [개발 서버 속도 개선](/ko/features/og-images/#개발-서버-속도-개선) 절을 참고합니다.
 
 서버는 파일 변경을 감시해 자동으로 재빌드합니다. 무엇이 바뀌었는지에 따라 **스마트 재빌드 전략**을 사용합니다:
 
@@ -383,11 +417,13 @@ hwaro serve -i /path/to/my-site -p 8080
 
 **라이브 리로드:**
 
-라이브 리로드는 **기본으로 켜져 있습니다**. 서버가 모든 HTML 응답에 작은 WebSocket 클라이언트 스크립트를 주입하고, 재빌드가 성공할 때마다 연결된 브라우저가 자동으로 페이지를 새로 고칩니다 — 수동 새로 고침이 필요 없습니다. 클라이언트는 재연결에 지수 백오프(1초–30초)를 사용하므로 서버를 재시작해도 연결이 영구히 끊기지 않습니다.
+라이브 리로드는 **기본으로 켜져 있습니다**. 서버가 모든 HTML 응답에 작은 WebSocket 클라이언트 스크립트를 주입하고, 재빌드가 성공할 때마다 연결된 브라우저가 자동으로 페이지를 새로 고치므로 수동 새로 고침이 필요 없습니다. 클라이언트는 재연결에 지수 백오프(1초~30초)를 사용하므로 서버를 재시작해도 연결이 영구히 끊기지 않습니다.
+
+저장한 변경이 **스타일시트뿐**이라면(`static/` 아래의 `.css` 파일, Sass 소스, CSS 에셋 번들 소스) 브라우저는 페이지를 새로 고치지 않고 해당 `<link rel="stylesheet">` 태그를 그 자리에서 교체하므로 스크롤 위치와 페이지 상태가 유지됩니다. 일반 정적 CSS는 경로로 대응시키고, Sass와 번들 출력은 같은 출처의 스타일시트를 모두 새로 불러옵니다. 같은 저장에 다른 변경(HTML, JS, 이미지, 파일 이름을 바꾸는 번들 핑거프린트)이 섞여 있으면 기존처럼 전체 새로 고침을 하고, 빌드 오류가 나면 오류 오버레이가 표시됩니다.
 
 이 동작을 끄려면 `--no-live-reload`를 줍니다(프로덕션과 비슷한 전달 방식을 로컬에서 테스트할 때 유용합니다). `--live-reload` 플래그는 기존 호출과의 하위 호환을 위해 아무 동작 없는 별칭으로 남아 있습니다.
 
-`-i`를 지정하면 서버는 해당 디렉터리로 `cd`한 것처럼 동작합니다 — 그 프로젝트 루트를 감시하고 서빙합니다.
+`-i`를 지정하면 서버는 해당 디렉터리로 `cd`한 것처럼 동작하여 그 프로젝트 루트를 감시하고 서빙합니다.
 
 **서브패스 미리보기 (`--base-url`에 경로 지정):**
 
@@ -395,7 +431,7 @@ hwaro serve -i /path/to/my-site -p 8080
 hwaro serve --base-url http://localhost:3000/myblog/
 ```
 
-사이트가 `/myblog/` 접두사가 붙은 링크로 빌드되고 같은 접두사 아래에서 서빙됩니다. 덕분에 프로젝트 페이지 배포(GitHub Pages, GitLab Pages)를 실제 게시될 모습 그대로 미리 볼 수 있습니다 — 모든 링크가 로컬에서 404가 되는 홈페이지를 보게 되는 대신에 말입니다.
+사이트가 `/myblog/` 접두사가 붙은 링크로 빌드되고 같은 접두사 아래에서 서빙됩니다. 덕분에 프로젝트 페이지 배포(GitHub Pages, GitLab Pages)를 실제 게시될 모습 그대로 미리 볼 수 있습니다. 모든 링크가 로컬에서 404가 되는 홈페이지를 보는 대신에 말입니다.
 
 - `/`는 `/myblog/`로 리디렉션됩니다.
 - 접두사가 없는 요청도 그대로 해석되므로, 직접 입력한 에셋 경로가 계속 동작합니다.
@@ -405,9 +441,10 @@ hwaro serve --base-url http://localhost:3000/myblog/
 
 - 서버는 `GET`, `HEAD`, `OPTIONS`에 응답합니다. 그 외 메서드는 404 페이지가 아니라 `Allow: GET, HEAD, OPTIONS` 헤더와 함께 `405 Method Not Allowed`를 반환합니다.
 - 잘못된 형식의 요청 경로(예: 퍼센트 인코딩된 NUL 바이트)는 `400 Bad Request`를 반환합니다.
-- `HEAD`는 대응하는 `GET`과 정확히 같은 헤더를 반환하며 — 라이브 리로드가 주입된 HTML의 `Content-Length`까지 포함합니다 — 본문은 없습니다.
+- `HEAD`는 대응하는 `GET`과 정확히 같은 헤더(라이브 리로드가 주입된 HTML의 `Content-Length`까지 포함)를 반환하며, 본문은 없습니다.
 - 텍스트 응답(`.txt`, `.json`, `.xml`, `.js`, `.css`, `.svg`, …)은 파일 크기와 관계없이 항상 `; charset=utf-8`을 포함합니다.
 - 디렉터리 리디렉션은 퍼센트 인코딩된 `Location`을 보냅니다(`/my%20page/`, `/%ED%95%9C%EA%B8%80/`). 백슬래시나 인코딩된 구분자(`%2F`, `%5C`)가 포함된 경로는 정적 호스트와 동일하게 서빙하지 않습니다.
+- macOS와 Windows에서도 경로는 대소문자를 구분합니다. 페이지가 `/about/`에 있으면 `/About/`은 대소문자를 구분하는 정적 호스트에서처럼 404입니다.
 
 **커스텀 응답 헤더 (`--header` / `[serve.headers]`):**
 
@@ -427,7 +464,7 @@ hwaro serve --header "X-Custom: foo" --header "Cache-Control: no-store"
 
 - CLI `--header` 값이 `config.toml`의 같은 키보다 우선합니다.
 - 헤더는 **모든** 개발 서버 응답(HTML, 에셋, 404, 리디렉션, 라이브 리로드가 주입된 페이지, CORS 프리플라이트(`OPTIONS`) 응답)에 붙습니다.
-- 이 기능은 `hwaro serve`에만 적용됩니다. `public/`에 쓰이는 파일은 그대로입니다.
+- 이 기능은 `hwaro serve`에만 적용됩니다. 빌드가 디스크에 쓰는 파일은 그대로입니다.
 
 ### deploy
 
@@ -435,6 +472,7 @@ hwaro serve --header "X-Custom: foo" --header "Cache-Control: no-store"
 
 ```bash
 hwaro deploy [target ...]
+hwaro deploy --target prod
 hwaro deploy --dry-run
 ```
 
@@ -443,12 +481,39 @@ hwaro deploy --dry-run
 | 플래그 | 설명 |
 |------|-------------|
 | -s, --source DIR | 배포할 소스 디렉터리 (기본값: deployment.source_dir 또는 public) |
+| -t, --target NAME | 배포 대상 이름 (반복 지정 가능, 위치 인자와 동일) |
 | --dry-run | 실제로 쓰지 않고 계획된 변경만 표시 |
 | --confirm | 배포 전 확인 요청 |
-| --force | 강제 업로드/복사 (파일 비교 무시) |
+| --force | 강제 업로드/복사 (파일 비교 무시). 빈 소스로 대상을 비우는 것도 허용 |
 | --max-deletes N | 최대 삭제 수 (기본값: deployment.maxDeletes 또는 256, -1이면 제한 없음) |
 | --list-targets | 설정된 배포 대상 목록 출력 후 종료 |
-| --json | 기계가 읽을 수 있는 JSON 출력 (--list-targets와 함께) |
+| -j, --json | 기계가 읽을 수 있는 JSON 출력 (`--dry-run`이면 계획, 아니면 대상별 요약, `--list-targets`면 대상 목록) |
+| -e, --env NAME | 불러올 설정 환경 (`HWARO_ENV`로도 지정) |
+| -q, --quiet | 사람이 읽는 로그 출력 억제 |
+
+**안전 규칙.** `deploy`는 정합성을 맞출 수 없는 대상을 파괴하는 대신 거부합니다.
+
+- 소스 디렉터리가 비어 있거나 `include`/`exclude`가 아무 파일도 고르지 못하면
+  대상을 지우지 않고 중단합니다. 먼저 `hwaro build`를 실행하거나, 의도적으로
+  비우려면 `--force`를 넘기세요. `{source}`를 쓰지 않는 `command` 타깃은 소스를
+  읽지 않으므로 이 검사에서 제외됩니다.
+- `--max-deletes`는 삭제 단계를 제한합니다(기본 256, 음수면 해제). 내장
+  `file://` 동기화에만 적용되며, 커맨드 대상이 자체적으로 쓰는 `--delete`는
+  제한하지 않습니다.
+- 대상에 있는 심볼릭 링크를 **따라가서** 쓰거나 지우지 않습니다. 파일이나
+  디렉터리가 있어야 할 자리의 링크는 교체하고, 오래된 링크는 가리키는 대상을
+  건드리지 않은 채 링크만 제거합니다.
+- 소스 심볼릭 링크는 대상이 프로젝트 디렉터리 안 또는 확인된 소스 디렉터리
+  안에 있으면 따라갑니다. 두 경계 모두 벗어난 링크는 건너뜁니다. 따라서
+  `public/` 자체가 외부 배포 디렉터리를 가리키는 심볼릭 링크여도 동작합니다.
+- `--json`은 비대화형입니다. `--confirm`과 함께 쓰면 JSON 문서에 프롬프트를
+  섞어 넣는 대신 오류로 실패합니다.
+- 템플릿에 셸 메타문자(`|`, `;`, `&`, `` ` ``, `$`, `sudo`, `rm -rf`)가 있는
+  명령은 먼저 확인을 요청하며, `--force`로 이 프롬프트를 건너뜁니다. 검사는
+  작성한 템플릿을 대상으로 합니다. `{source}`/`{url}` 값은 작은따옴표로 감싸지므로
+  `r&d/` 같은 경로는 걸리지 않습니다. 플레이스홀더를 직접 따옴표로 감싸면
+  (`"{source}"`) 이 보호가 풀리므로 확장된 값도 검사합니다.
+- `--dry-run`은 아무것도 쓰지 않습니다. 없는 대상 디렉터리도 만들지 않습니다.
 
 ### doctor
 
@@ -459,6 +524,9 @@ hwaro doctor               # 설정, 템플릿, 구조 문제 진단
 hwaro doctor --fix         # 설정 값 정규화 (base_url 끝 슬래시, sitemap priority…)
 hwaro doctor --approve     # 권장 설정 섹션을 config.toml에 추가
 hwaro doctor --full        # 둘 다 (--fix --approve와 동일)
+hwaro doctor --fix --dry-run  # config.toml 변경 사항을 쓰지 않고 미리 보기
+hwaro doctor -e production    # config.production.toml을 병합한 설정으로 검사
+hwaro doctor -c site/content  # 기본값이 아닌 콘텐츠 디렉터리 검사
 ```
 
 **종료 코드.** `doctor`는 보고된 가장 심각한 문제를 기준으로 분류된
@@ -469,12 +537,12 @@ hwaro doctor --full        # 둘 다 (--fix --approve와 동일)
 |---|---|
 | 문제 없음, 경고만, 또는 info 수준 발견 | `0` |
 | 설정 오류 (`config.toml` 누락/손상) | `3` (`HWARO_E_CONFIG`) |
-| 템플릿 오류 (필수 파일 누락, 닫히지 않은 태그) | `4` (`HWARO_E_TEMPLATE`) |
-| 콘텐츠 오류 (잘못된 프론트 매터, 해당 검사가 도입되면) | `5` (`HWARO_E_CONTENT`) |
+| 템플릿 오류 (`page.html` 누락, 닫히지 않은 태그) | `4` (`HWARO_E_TEMPLATE`) |
+| 콘텐츠 오류 (잘못된 프론트 매터, 읽을 수 없는 파일) | `5` (`HWARO_E_CONTENT`) |
 | 그 외 error 수준 문제 | `1` |
 
 경고(빈 `base_url`, 끝 슬래시, 중복 택소노미 이름 등)는 참고용이며
-종료 코드를 바꾸지 않습니다.
+`--strict`나 `--max-warnings N`을 주지 않는 한 종료 코드를 바꾸지 않습니다.
 
 콘텐츠 검증에는 `hwaro tool validate`를 사용합니다. 자세한 내용은 [doctor](/ko/start/tools/doctor/)를 참고합니다.
 
@@ -510,12 +578,25 @@ hwaro tool agents-md --write      # AGENTS.md를 파일로 쓰기
 
 # JSON 출력
 hwaro tool list all --json
+hwaro tool convert to-yaml --json
 hwaro tool stats --json
 hwaro tool validate --json
 hwaro tool unused-assets --json
 hwaro tool doctor --json
 hwaro tool check-links --json
+hwaro tool import jekyll /path --json
+hwaro tool export hugo --json
+
+# 파괴적/대량 작업을 쓰기 없이 미리보기
+hwaro tool convert to-yaml --dry-run
+hwaro tool import jekyll /path --dry-run
+hwaro tool export hugo --dry-run
 ```
+
+`list`와 `convert` 명령은 사용법에 표시된 위치 인자만 받습니다.
+`check-links`, `stats`, `validate`, `unused-assets`는 위치 인자를 받지 않습니다.
+`--` 뒤의 인자를 포함한 추가 위치 인자는 사용법 오류로 거부되므로, 경로나
+다른 옵션에는 문서에 나온 플래그를 사용하세요.
 
 **서브커맨드:**
 
@@ -529,7 +610,7 @@ hwaro tool check-links --json
 | 콘텐츠 | [unused-assets](/ko/start/tools/unused-assets/) | 참조되지 않는 정적 파일 찾기 |
 | 사이트 | [platform](/ko/start/tools/platform/) | 플랫폼 설정과 CI/CD 워크플로 파일 생성 |
 | 사이트 | [doctor](/ko/start/tools/doctor/) | 설정, 템플릿, 구조 문제 진단 |
-| 사이트 | import | WordPress, Jekyll, Hugo, Notion, Obsidian, Hexo, Astro, Eleventy에서 콘텐츠 가져오기 |
+| 사이트 | [import](/ko/start/tools/import/) | WordPress, Jekyll, Hugo, Notion, Obsidian, Hexo, Astro, Eleventy에서 콘텐츠 가져오기 |
 | 사이트 | [export](/ko/start/tools/export/) | 콘텐츠를 Hugo 또는 Jekyll로 내보내기 |
 | 사이트 | [agents-md](/ko/start/tools/agents-md/) | AGENTS.md 파일 생성 또는 갱신 |
 
@@ -537,11 +618,18 @@ hwaro tool check-links --json
 
 | 플래그 | 설명 |
 |------|-------------|
-| -c, --content DIR | 특정 콘텐츠 디렉터리로 제한 |
+| -c, --content-dir DIR | 특정 콘텐츠 디렉터리로 제한 |
 | -j, --json | 결과를 JSON으로 출력 |
 | -h, --help | 도움말 표시 |
 
 자세한 사용법은 [도구와 자동 완성](/ko/start/tools/)을 참고합니다.
+
+`import`는 지정한 사이트 디렉터리 안을 가리키는 파일 심볼릭 링크는 따라가고,
+그 밖을 가리키는 링크는 건너뛰고 건너뛴 파일 수에 포함합니다.
+`export`와 `convert`는 프로젝트 내부의 링크는 따르고 프로젝트 밖의 링크는
+건너뜁니다. `agents-md --write`는
+`AGENTS.md`가 프로젝트 안을 가리키는 심볼릭 링크(예: `AGENTS.md -> CLAUDE.md`)이면 링크 대상에
+쓰고, 프로젝트 밖을 가리키는 링크이면 쓰기를 거부합니다.
 
 ### completion
 
@@ -616,8 +704,8 @@ hwaro serve -i ~/projects/my-blog --open
 
 | 플래그 | 설명 |
 |------|-------------|
-| -h, --help | 도움말 표시 |
-| -v, --verbose | 상세 출력 |
+| -h, --help | 도움말 표시 (명령별 도움말은 `hwaro <command> --help`) |
+| -v, -V, --version | 버전을 출력하고 종료 (`hwaro version`과 동일) |
 
 ## 함께 보기
 

@@ -28,31 +28,31 @@ taxonomies = ["tags"]
 1. Hwaro builds an inverted index of taxonomy terms to pages
 2. For each page, it counts how many taxonomy terms are shared with other pages
 3. Pages with more shared terms rank higher
-4. Results are filtered by language (multilingual sites only show same-language posts)
+4. Results are filtered by language (multilingual sites only show same-language posts) and by version ([versioned docs](/features/versioned-docs/) never cross a version boundary)
 5. The top N results (up to `limit`) are assigned as related posts
 
-Draft pages, index pages, and generated pages are excluded from related post computation.
+Draft pages, the home page, section index pages (`_index.md`), headless pages (`render = false`), and generated pages are excluded from related post computation. Page bundles (`post/index.md`) are ordinary posts and take part.
 
 ## Template Variable
 
-Each page has a `related_posts` array containing the related pages sorted by relevance:
+Each page exposes `page.related_posts`, an array of the related pages sorted by relevance:
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| related_posts | array | Pages related to the current page, sorted by shared term count |
+| page.related_posts | array | Pages related to the current page, sorted by shared term count |
 
-Each item in `related_posts` is a full page object with access to all page variables (`title`, `url`, `description`, `date`, `tags`, etc.).
+Each item in `page.related_posts` is a full page object with access to all page variables (`title`, `url`, `description`, `date`, `tags`, etc.).
 
 ## Usage in Templates
 
 ### Basic Related Posts
 
 ```jinja
-{% if related_posts | length > 0 %}
+{% if page.related_posts | length > 0 %}
 <section class="related-posts">
   <h2>Related Posts</h2>
   <ul>
-    {% for post in related_posts %}
+    {% for post in page.related_posts %}
     <li>
       <a href="{{ post.url }}">{{ post.title }}</a>
       {% if post.description %}
@@ -68,10 +68,10 @@ Each item in `related_posts` is a full page object with access to all page varia
 ### With Tags Display
 
 ```jinja
-{% if related_posts | length > 0 %}
+{% if page.related_posts | length > 0 %}
 <aside class="related">
   <h3>You might also like</h3>
-  {% for post in related_posts %}
+  {% for post in page.related_posts %}
   <article>
     <a href="{{ post.url }}">{{ post.title }}</a>
     <div class="tags">

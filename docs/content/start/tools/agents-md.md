@@ -28,9 +28,9 @@ hwaro tool agents-md --write --force
 | Mode | Description |
 |------|-------------|
 | `--local` (default) | Full embedded reference (~260 lines). Includes content format, template variables, configuration reference, and AI agent notes. Best for offline or local LLM environments. |
-| `--remote` | Lightweight version (~50 lines). Includes project structure, essential commands, and AI agent notes with links to [online documentation](https://hwaro.hahwul.com) and [LLM reference](https://hwaro.hahwul.com/llms-full.txt). |
+| `--remote` | Lightweight version (~70 lines). Includes project structure, essential commands, and AI agent notes with links to [online documentation](https://hwaro.hahwul.com) and [LLM reference](https://hwaro.hahwul.com/llms-full.txt). |
 
-Both modes include a **Site-Specific Instructions** section where you can add your own project rules and conventions.
+Both modes include a **Site-Specific Instructions** section where you can add your own project rules and conventions. Regenerating with `--write` preserves that section from the existing file. The generated parts are refreshed (or switched between modes) while whatever you wrote under `## Site-Specific Instructions` is carried over unchanged. Preservation keys on that exact heading: an existing file without a `## Site-Specific Instructions` heading is replaced entirely (the prompt, or a warning under `--force`, says so before it happens).
 
 ## Options
 
@@ -39,10 +39,12 @@ Both modes include a **Site-Specific Instructions** section where you can add yo
 | --remote | Generate lightweight version with links to online docs |
 | --local | Generate full embedded reference (default) |
 | --write | Write to AGENTS.md file instead of stdout |
-| -f, --force | Overwrite existing file without confirmation |
+| -f, --force | Regenerate an existing file without confirmation (Site-Specific Instructions still preserved) |
 | -h, --help | Show help |
 
-By default, the command prints to stdout so you can inspect the content before saving. Use `--write` to save to file. If `AGENTS.md` already exists, you'll be prompted for confirmation unless `--force` is used.
+By default, the command prints to stdout so you can inspect the content before saving. Use `--write` to save to file. If `AGENTS.md` already exists, you'll be prompted for confirmation unless `--force` is used. Without a terminal to answer the prompt (piped or redirected stdin, CI), the command refuses with a usage error (exit 2) instead of writing. Either way, your **Site-Specific Instructions** section is preserved across the rewrite.
+
+When `AGENTS.md` is a symlink, `--write` updates the file it points at as long as that file resolves inside the project (for example `AGENTS.md -> CLAUDE.md`); a link resolving outside the project is refused.
 
 ## Relation to `hwaro init`
 

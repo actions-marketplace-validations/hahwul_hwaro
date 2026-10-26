@@ -1,0 +1,439 @@
+require "../../../spec_helper"
+require "../../../support/build_helper"
+
+private def make_page(path : String, url : String) : Hwaro::Models::Page
+  page = Hwaro::Models::Page.new(path)
+  page.url = url
+  page
+end
+
+describe Hwaro::Content::Processors::InternalLinkResolver do
+  describe ".resolve" do
+    it "resolves a basic @/ link" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/">link</a>)
+    end
+
+    it "resolves a @/ link with anchor" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md#section">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/#section">link</a>)
+    end
+
+    it "resolves a section _index.md link" do
+      pages = {"blog/_index.md" => make_page("blog/_index.md", "/blog/")}
+      html = %(<a href="@/blog/_index.md">blog</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/">blog</a>)
+    end
+
+    it "leaves broken link unchanged and logs warning" do
+      pages = {} of String => Hwaro::Models::Page
+      html = %(<a href="@/nonexistent.md">broken</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="@/nonexistent.md">broken</a>)
+    end
+
+    it "collects unresolved and empty links into the misses accumulator" do
+      pages = {} of String => Hwaro::Models::Page
+      html = %(<a href="@/nonexistent.md">broken</a> <a href="@/">empty</a>)
+      misses = [] of {String, String}
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md", misses: misses)
+      # Markup stays unchanged — strict mode fails the build later, but the
+      # resolver itself never rewrites what it cannot resolve.
+      result.should eq html
+      misses.should eq [{"nonexistent.md", "page not found"}, {"", "empty link"}]
+    end
+
+    # Regression: the warning printed the href Markdown percent-encoded
+    # (`p7-%C3%BCn%C3%AF.md`) instead of the file name.
+    it "reports an unresolved non-ASCII target decoded" do
+      pages = {} of String => Hwaro::Models::Page
+      html = %(<a href="@/notes/p7-%C3%BCn%C3%AF.md">x</a>)
+      misses = [] of {String, String}
+      log = with_captured_log do
+        Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "a.md", misses: misses)
+      end
+      log.should contain("'@/notes/p7-ünï.md'")
+      misses.should eq [{"notes/p7-ünï.md", "page not found"}]
+    end
+
+    it "collects nothing for resolved links" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md">link</a>)
+      misses = [] of {String, String}
+      Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md", misses: misses)
+      misses.should be_empty
+    end
+
+    it "keeps warn-only behavior when no accumulator is passed" do
+      pages = {} of String => Hwaro::Models::Page
+      html = %(<a href="@/nonexistent.md">broken</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq html
+    end
+
+    it "passes through HTML without @/ links unchanged" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="/about/">about</a><p>hello</p>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq html
+    end
+
+    it "resolves multiple @/ links in one HTML string" do
+      pages = {
+        "blog/post.md"   => make_page("blog/post.md", "/blog/post/"),
+        "about/index.md" => make_page("about/index.md", "/about/"),
+      }
+      html = %(<a href="@/blog/post.md">post</a> and <a href="@/about/index.md">about</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/">post</a> and <a href="/about/">about</a>)
+    end
+
+    it "only resolves @/ links and leaves regular links untouched" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="https://example.com">ext</a> <a href="@/blog/post.md">int</a> <a href="/static/">static</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="https://example.com">ext</a> <a href="/blog/post/">int</a> <a href="/static/">static</a>)
+    end
+
+    it "does not match entity-encoded @/ in code blocks" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      # markd entity-encodes content inside <code>, so @/ becomes &#64;/
+      html = %(<code>href="&#64;/blog/post.md"</code>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq html
+    end
+
+    it "prepends base_url path component when site is served from a subpath" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(
+        html, pages, "index.md", "https://example.github.io/project"
+      )
+      result.should eq %(<a href="/project/blog/post/">link</a>)
+    end
+
+    it "prepends base_url path to links with anchors" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md#section">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(
+        html, pages, "index.md", "https://example.github.io/project"
+      )
+      result.should eq %(<a href="/project/blog/post/#section">link</a>)
+    end
+
+    it "does not add prefix when base_url has no path component" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(
+        html, pages, "index.md", "https://example.com"
+      )
+      result.should eq %(<a href="/blog/post/">link</a>)
+    end
+
+    it "handles trailing slash in base_url" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(
+        html, pages, "index.md", "https://example.github.io/project/"
+      )
+      result.should eq %(<a href="/project/blog/post/">link</a>)
+    end
+
+    it "handles nested base path" do
+      pages = {"docs/_index.md" => make_page("docs/_index.md", "/docs/")}
+      html = %(<a href="@/docs/_index.md">docs</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(
+        html, pages, "index.md", "https://example.com/a/b"
+      )
+      result.should eq %(<a href="/a/b/docs/">docs</a>)
+    end
+
+    it "resolves a @/ link carrying a query string (ampersand escaped once)" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md?page=2&sort=asc">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/?page=2&amp;sort=asc">link</a>)
+    end
+
+    it "resolves a @/ link to a page whose file name contains '&' (rendered as &amp;)" do
+      pages = {"Q&A.md" => make_page("Q&A.md", "/Q&A/")}
+      misses = [] of {String, String}
+      html = %(<a href="@/Q&amp;A.md">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md", "", misses)
+      result.should eq %(<a href="/Q&amp;A/">link</a>)
+      misses.should be_empty
+    end
+
+    it "resolves a @/ link carrying both a query string and an anchor (query before anchor)" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md?page=2&sort=asc#sec">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/?page=2&amp;sort=asc#sec">link</a>)
+    end
+
+    it "does not double-escape an already-rendered &amp; in a query string" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      html = %(<a href="@/blog/post.md?page=2&amp;sort=asc">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/?page=2&amp;sort=asc">link</a>)
+    end
+
+    it "resolves a page whose path holds a & that Markd rendered as &amp;" do
+      pages = {"odd/a&b.md" => make_page("odd/a&b.md", "/odd/a&b/")}
+      misses = [] of {String, String}
+      html = %(<a href="@/odd/a&amp;b.md">A</a> <a href="@/odd/a&amp;b.md#s">B</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md", misses: misses)
+      result.should eq %(<a href="/odd/a&amp;b/">A</a> <a href="/odd/a&amp;b/#s">B</a>)
+      misses.should be_empty
+    end
+
+    it "does not decode semicolon-less legacy entities in query params" do
+      pages = {"blog/post.md" => make_page("blog/post.md", "/blog/post/")}
+      # `&copy` is a legacy no-semicolon entity — a full HTML.unescape would
+      # turn `?a=1&copy=2` into `?a=1©=2`, destroying the parameter.
+      html = %(<a href="@/blog/post.md?a=1&copy=2">link</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "index.md")
+      result.should eq %(<a href="/blog/post/?a=1&amp;copy=2">link</a>)
+    end
+
+    it "ignores a host-only base_url instead of prefixing it onto links" do
+      pages = {"a.md" => make_page("a.md", "/a/")}
+      html = %(<a href="@/a.md">x</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "src.md", "example.com")
+      result.should eq %(<a href="/a/">x</a>)
+    end
+
+    it "does not raise or embed a malformed base_url into resolved links" do
+      pages = {"a.md" => make_page("a.md", "/a/")}
+      html = %(<a href="@/a.md">x</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.resolve(html, pages, "src.md", "not a url")
+      result.should eq %(<a href="/a/">x</a>)
+    end
+  end
+
+  describe ".prefix_root_relative_links" do
+    it "prefixes plain root-relative href with the base_url subpath" do
+      html = %(<a href="/posts/">Posts</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://user.github.io/myrepo"
+      ).should eq %(<a href="/myrepo/posts/">Posts</a>)
+    end
+
+    it "prefixes root-relative src too" do
+      html = %(<img src="/img/logo.png">)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://user.github.io/myrepo"
+      ).should eq %(<img src="/myrepo/img/logo.png">)
+    end
+
+    it "prefixes every root-relative srcset candidate" do
+      html = %(<picture><source srcset="/img/a.webp 1x, /myrepo/img/b.webp 2x"><img src="/img/a.png" srcset="/img/a.png 1x,https://cdn.example/a2.png 2x, //cdn.example/a3.png 3x, rel.png 4x"></picture>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://user.github.io/myrepo"
+      ).should eq %(<picture><source srcset="/myrepo/img/a.webp 1x, /myrepo/img/b.webp 2x"><img src="/myrepo/img/a.png" srcset="/myrepo/img/a.png 1x,https://cdn.example/a2.png 2x, //cdn.example/a3.png 3x, rel.png 4x"></picture>)
+    end
+
+    it "prefixes a bare root link" do
+      html = %(<a href="/">Home</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://example.com/docs"
+      ).should eq %(<a href="/docs/">Home</a>)
+    end
+
+    it "is a no-op when base_url has no subpath (domain-root deploy)" do
+      html = %(<a href="/posts/">Posts</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://example.com"
+      ).should eq html
+    end
+
+    it "is a no-op when base_url is empty" do
+      html = %(<a href="/posts/">Posts</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(html, "").should eq html
+    end
+
+    it "leaves protocol-relative, absolute, and anchor links untouched" do
+      html = %(<a href="//cdn.example.com/x.js">cdn</a> <a href="https://x.io/y">abs</a> <a href="#top">anchor</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://example.com/repo"
+      ).should eq html
+    end
+
+    it "does not double-prefix links already carrying the base_path" do
+      html = %(<a href="/repo/posts/">Posts</a> <a href="/repo/">Home</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://user.github.io/repo"
+      ).should eq html
+    end
+
+    it "prefixes a multi-segment nested base path" do
+      html = %(<a href="/guide/intro/">Intro</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.prefix_root_relative_links(
+        html, "https://example.com/a/b"
+      ).should eq %(<a href="/a/b/guide/intro/">Intro</a>)
+    end
+  end
+
+  describe ".absolutize_links" do
+    it "absolutizes document-relative and root-relative links against the page URL" do
+      html = %(<a href="../quick-start/">q</a> <img src="/img/a.png"/> <a href="./sub/">s</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(
+        html, "https://h.com/guide/config/"
+      )
+      result.should contain(%(href="https://h.com/guide/quick-start/"))
+      result.should contain(%(src="https://h.com/img/a.png"))
+      result.should contain(%(href="https://h.com/guide/config/sub/"))
+    end
+
+    it "leaves absolute, protocol-relative, scheme, and anchor links untouched" do
+      html = %(<a href="https://ext.com/x">e</a> <a href="//cdn.com/y">c</a> <a href="mailto:a@b.com">m</a> <a href="#sec">s</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(
+        html, "https://h.com/p/"
+      )
+      result.should eq(html)
+    end
+
+    it "is a no-op when the page URL has no host (empty base_url deploy)" do
+      html = %(<a href="../x/">x</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(html, "/p/").should eq(html)
+    end
+
+    it "leaves an empty href value untouched" do
+      html = %(<a href="">empty</a>)
+      Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(html, "https://h.com/p/").should eq(html)
+    end
+
+    it "absolutizes every srcset candidate and keeps the descriptors" do
+      html = %(<img srcset="/sub/img/a_200w.png 200w, ../b.png 2x,https://cdn.com/c.png 3x, //cdn.com/d.png" sizes="100vw" src="/sub/img/a.png">)
+      result = Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(html, "https://h.com/sub/p/q/")
+      result.should contain(%(srcset="https://h.com/sub/img/a_200w.png 200w, https://h.com/sub/p/b.png 2x,https://cdn.com/c.png 3x, //cdn.com/d.png"))
+      result.should contain(%(src="https://h.com/sub/img/a.png"))
+      result.should contain(%(sizes="100vw"))
+    end
+
+    it "absolutizes a srcset that is the only link attribute" do
+      html = %(<picture><source srcset="/a.webp 1x, /b.webp 2x"></picture>)
+      Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(html, "https://h.com/p/")
+        .should eq(%(<picture><source srcset="https://h.com/a.webp 1x, https://h.com/b.webp 2x"></picture>))
+    end
+
+    it "resolves a relative link carrying an encoded entity without double-encoding it" do
+      html = %(<a href="sub/?a=1&amp;b=2">q</a>)
+      result = Hwaro::Content::Processors::InternalLinkResolver.absolutize_links(html, "https://h.com/p/")
+      result.should contain(%(href="https://h.com/p/sub/?a=1&amp;b=2"))
+      result.should_not contain("&amp;amp;")
+    end
+  end
+
+  describe ".anchor_ids" do
+    it "collects quoted, unquoted and entity-encoded id/name values but not data-id" do
+      html = %(<h2 id="intro">I</h2><a name='old'></a><p id=bare>x</p><b data-id="no"></b><i id="a&amp;b"></i>)
+      ids = Hwaro::Content::Processors::InternalLinkResolver.anchor_ids(html)
+      ids.should eq(Set{"intro", "old", "bare", "a&b"})
+    end
+  end
+
+  describe ".anchor_ids name= targets" do
+    it "accepts name= only on <a>, id= on any element" do
+      html = %(<meta name="description" content="x"><meta name=viewport><form><input name="q" id="search"></form>) +
+             %(<a name=old>o</a><A NAME="Up">u</A><a title="a>b" name='quoted'>q</a><b title=" name=fake">t</b>)
+      ids = Hwaro::Content::Processors::InternalLinkResolver.anchor_ids(html)
+      ids.should eq(Set{"search", "old", "Up", "quoted"})
+    end
+
+    it "scans a tag with thousands of attributes without exhausting the regex JIT stack" do
+      html = %(<div ) + (%(a="b" ) * 20_000) + %(id="end">)
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_ids(html).should eq(Set{"end"})
+    end
+  end
+
+  describe "FRAGMENT_LINK_REGEX" do
+    it "ignores data-href and other *href attributes" do
+      html = %(<a data-href="#x">a</a><a xlink:href="#y">b</a><a href="#z">c</a>)
+      html.scan(Hwaro::Content::Processors::InternalLinkResolver::FRAGMENT_LINK_REGEX).map(&.[2]).should eq(["z"])
+    end
+  end
+
+  describe ".anchor_exists?" do
+    ids = Set{"caf\u00e9", "a&b"}
+
+    it "decodes percent and entity escapes in the fragment" do
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("caf%C3%A9", ids).should be_true
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("a&amp;b", ids).should be_true
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("nope", ids).should be_false
+    end
+
+    it "accepts scroll-to-text fragment directives" do
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?(":~:text=Hello", ids).should be_true
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("a&amp;b:~:text=x", ids).should be_true
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("nope:~:text=x", ids).should be_false
+    end
+
+    it "accepts an id that literally contains a percent escape" do
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("a%20b", Set{"a%20b"}).should be_true
+    end
+
+    it "always accepts #top" do
+      Hwaro::Content::Processors::InternalLinkResolver.anchor_exists?("TOP", ids).should be_true
+    end
+  end
+end
+
+describe "Hwaro::Content::Processors::InternalLinkResolver.page_for" do
+  it "prefers the decoded path, so `%20` names the page with a space" do
+    space = Hwaro::Models::Page.new("a b.md")
+    pct = Hwaro::Models::Page.new("a%20b.md")
+    map = {"a b.md" => space, "a%20b.md" => pct}
+    Hwaro::Content::Processors::InternalLinkResolver.page_for(map, "a%20b.md").should be(space)
+    Hwaro::Content::Processors::InternalLinkResolver.page_for(map, "a%2520b.md").should be(pct)
+    Hwaro::Content::Processors::InternalLinkResolver.page_for({"a%20b.md" => pct}, "a%20b.md").should be(pct)
+  end
+
+  it "matches an NFC link to an NFD file name (and the reverse), preferring the exact spelling" do
+    nfc = "posts/caf\u00E9.md"
+    nfd = "posts/cafe\u0301.md"
+    page = Hwaro::Models::Page.new(nfd)
+    resolver = Hwaro::Content::Processors::InternalLinkResolver
+    resolver.page_for({nfd => page}, nfc).should be(page)
+    resolver.page_for({nfd => page}, URI.encode_path(nfc)).should be(page)
+    resolver.page_for({nfc => page}, nfd).should be(page)
+
+    exact = Hwaro::Models::Page.new(nfc)
+    resolver.page_for({nfd => page, nfc => exact}, nfc).should be(exact)
+    resolver.page_for({nfd => page}, "posts/missing.md").should be_nil
+  end
+end
+
+describe "`@/` links to a default-language page with an explicit suffix" do
+  it "resolves `@/about.md` to `about.en.md`, as get_page does" do
+    config = <<-TOML
+      title = "T"
+      base_url = "http://localhost"
+      default_language = "en"
+      [languages.en]
+      language_name = "English"
+      [languages.ko]
+      language_name = "Korean"
+      TOML
+    build_site(config,
+      content_files: {
+        "about.en.md" => "+++\ntitle = \"About\"\n+++\nabout",
+        "post.md"     => "+++\ntitle = \"Post\"\n+++\nsee [about](@/about.md)",
+      },
+      template_files: {"page.html" => "{{ content }}"}) do |dir|
+      File.read(File.join(dir, "public/post/index.html")).should contain(%(href="/about/"))
+    end
+  end
+
+  it "leaves the suffix part of the name on a single-language site" do
+    page = Hwaro::Models::Page.new("about.en.md")
+    map = {"about.en.md" => page}
+    Hwaro::Content::Processors::InternalLinkResolver.add_default_language_aliases(map, Hwaro::Models::Config.new)
+    map.keys.should eq(["about.en.md"])
+  end
+end

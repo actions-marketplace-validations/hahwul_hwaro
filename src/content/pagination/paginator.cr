@@ -156,19 +156,27 @@ module Hwaro
             return enabled
           end
 
-          # If paginate (per_page) is explicitly set, enable pagination
-          if section.paginate
-            return true
+          # If paginate (per_page) is explicitly set, it decides: a positive
+          # count enables pagination, `paginate = 0` (or negative) disables it
+          # — the same rule as a taxonomy's `paginate_by`. A bare truthiness
+          # check let 0 enable pagination at one item per page.
+          if per_page = section.paginate
+            return per_page > 0
           end
 
-          # Fall back to global config
-          @config.pagination.enabled
+          # Fall back to global config, under the same rule: a non-positive
+          # global `per_page` is no page size, so it disables pagination
+          # rather than paging one item at a time.
+          @config.pagination.enabled && @config.pagination.per_page > 0
         end
 
         # Get per_page setting for a section (minimum 1 to avoid division by zero)
         private def per_page_for_section(section : Models::Section) : Int32
-          # Section-level override takes precedence
-          per_page = if section_per_page = section.paginate
+          # Section-level override takes precedence. A non-positive `paginate`
+          # is not a page size (it disables pagination unless
+          # `pagination_enabled = true` forces it on), so fall back to the
+          # global size rather than one item per page.
+          per_page = if (section_per_page = section.paginate) && section_per_page > 0
                        section_per_page
                      else
                        # Fall back to global config

@@ -1,0 +1,1302 @@
+require "../../spec_helper"
+
+# Helper to build a pipeline config quickly
+private def make_config(
+  minify = false,
+  fingerprint = false,
+  source_dir = "static",
+  output_dir = "assets",
+)
+  config = Hwaro::Models::AssetsConfig.new
+  config.enabled = true
+  config.minify = minify
+  config.fingerprint = fingerprint
+  config.source_dir = source_dir
+  config.output_dir = output_dir
+  config
+end
+
+describe Hwaro::Assets::Pipeline do
+  # ===========================================================================
+  # Bundling — combining files
+  # ===========================================================================
+  describe "#process — bundling" do
+    it "bundles multiple CSS files" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(File.join(static_dir, "css"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "css", "reset.css"), "* { margin: 0; }")
+        File.write(File.join(static_dir, "css", "style.css"), "body { color: red; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "main.css", files: ["css/reset.css", "css/style.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "main.css"))
+        content.should contain("margin: 0")
+        content.should contain("color: red")
+      end
+    end
+
+    it "bundles multiple JS files" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(File.join(static_dir, "js"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "js", "util.js"), "function log(msg) { console.log(msg); }")
+        File.write(File.join(static_dir, "js", "app.js"), "log('hello');")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "app.js", files: ["js/util.js", "js/app.js"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "app.js"))
+        content.should contain("console.log")
+        content.should contain("log('hello')")
+      end
+    end
+
+    it "preserves file order in bundle" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), "/* FILE A */")
+        File.write(File.join(static_dir, "b.css"), "/* FILE B */")
+        File.write(File.join(static_dir, "c.css"), "/* FILE C */")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "all.css", files: ["a.css", "b.css", "c.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "all.css"))
+        idx_a = content.index!("FILE A")
+        idx_b = content.index!("FILE B")
+        idx_c = content.index!("FILE C")
+        (idx_a < idx_b).should be_true
+        (idx_b < idx_c).should be_true
+      end
+    end
+
+    it "separates files with newlines in bundle" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), ".a{}")
+        File.write(File.join(static_dir, "b.css"), ".b{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "all.css", files: ["a.css", "b.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "all.css"))
+        content.should contain("\n")
+      end
+    end
+
+    it "does not add leading newline before first file" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), ".a{}")
+        File.write(File.join(static_dir, "b.css"), ".b{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "all.css", files: ["a.css", "b.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "all.css"))
+        content.starts_with?(".a{}").should be_true
+      end
+    end
+
+    # Regression: a bare "\n" between JS sources does not trigger automatic
+    # semicolon insertion when the next file opens with `(`. Two individually
+    # valid files concatenated into `1(function(){…})()` — a runtime
+    # TypeError, with exit 0 and nothing in the build log.
+    it "separates JS files with an explicit statement terminator" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.js"), "const a = 1")
+        File.write(File.join(static_dir, "b.js"), "(function(){ window.x = 1 })()\n")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "app.js", files: ["a.js", "b.js"]
+        )
+
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "app.js"))
+        content.should eq("const a = 1\n;\n(function(){ window.x = 1 })()\n")
+      end
+    end
+
+    # The `;` sits on its own line so a source ending in an unterminated
+    # `// line comment` cannot swallow it.
+    it "keeps the JS separator out of a trailing line comment" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.js"), "const a = 1 // trailing")
+        File.write(File.join(static_dir, "b.js"), "[1].forEach(function(){})\n")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "app.js", files: ["a.js", "b.js"]
+        )
+
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "app.js"))
+        content.lines[1].should eq(";")
+      end
+    end
+
+    # CSS keeps the bare newline: a stray top-level `;` is a parse error
+    # browsers only recover from.
+    it "does not add a semicolon between CSS sources" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), ".a{}")
+        File.write(File.join(static_dir, "b.css"), ".b{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "all.css", files: ["a.css", "b.css"]
+        )
+
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        File.read(File.join(output_dir, "assets", "all.css")).should eq(".a{}\n.b{}")
+      end
+    end
+
+    # The separator is keyed off what was written, not the loop index: a
+    # skipped first entry used to leave the bundle starting with a separator.
+    it "does not emit a separator when the first source is missing" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "b.js"), "var b = 1;")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "app.js", files: ["missing.js", "b.js"]
+        )
+
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        File.read(File.join(output_dir, "assets", "app.js")).should eq("var b = 1;")
+      end
+    end
+
+    it "handles single-file bundles" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "only.css"), "body { color: blue; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "only.css", files: ["only.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        File.read(File.join(output_dir, "assets", "only.css")).should contain("color: blue")
+      end
+    end
+
+    it "handles multiple bundles" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), ".a{}")
+        File.write(File.join(static_dir, "b.js"), "var b;")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["a.css"])
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "script.js", files: ["b.js"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        File.exists?(File.join(output_dir, "assets", "style.css")).should be_true
+        File.exists?(File.join(output_dir, "assets", "script.js")).should be_true
+        pipeline.manifest.size.should eq(2)
+      end
+    end
+
+    it "handles files with unicode content" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "i18n.css"), ".日本語 { content: '한국어'; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "i18n.css", files: ["i18n.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "i18n.css"))
+        content.should contain("日本語")
+        content.should contain("한국어")
+      end
+    end
+
+    it "strips UTF-8 BOMs so they never glue onto a later file's first selector" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), "﻿body{color:red}\n")
+        File.write(File.join(static_dir, "b.css"), "﻿h1{color:blue}\n")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["a.css", "b.css"])
+
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        File.read(File.join(output_dir, "assets", "main.css")).should eq("body{color:red}\n\nh1{color:blue}\n")
+      end
+    end
+
+    it "handles source file that is empty (0 bytes)" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "empty.css"), "")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "empty.css", files: ["empty.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        # Empty content → bundle not created
+        pipeline.manifest.has_key?("empty.css").should be_false
+      end
+    end
+
+    it "handles source file with only whitespace" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "ws.css"), "   \n\n   ")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "ws.css", files: ["ws.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        # Whitespace-only content is still non-empty
+        pipeline.manifest.has_key?("ws.css").should be_true
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Minification
+  # ===========================================================================
+  describe "#process — minification" do
+    it "minifies CSS bundles" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body {\n  color: red;\n  /* comment */\n}")
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "style.css"))
+        content.should_not contain("/* comment */")
+        content.should_not contain("\n")
+      end
+    end
+
+    it "minifies JS bundles" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "app.js"), "var x = 1; // comment\n\n\nvar y = 2;")
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "app.js", files: ["app.js"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "app.js"))
+        content.should_not contain("// comment")
+        content.should contain("var x = 1;")
+      end
+    end
+
+    it "does not minify when disabled" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body {\n  /* comment */\n  color: red;\n}")
+
+        config = make_config(minify: false, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "style.css"))
+        content.should contain("/* comment */")
+      end
+    end
+
+    it "does not minify unknown file types" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        original = "some content with /* pseudo comment */"
+        File.write(File.join(static_dir, "data.txt"), original)
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "data.txt", files: ["data.txt"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "data.txt"))
+        content.should eq(original)
+      end
+    end
+
+    it "minifies CSS with URL preservation" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        css = "body { background: url(http://example.com/bg.png); color: red; }"
+        File.write(File.join(static_dir, "style.css"), css)
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "style.css"))
+        content.should contain("url(http://example.com/bg.png)")
+      end
+    end
+
+    it "minification + fingerprinting combined" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body {\n  /* remove me */\n  color: red;\n}")
+
+        config = make_config(minify: true, fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        manifest_path = pipeline.manifest["style.css"]
+        manifest_path.should match(/style\.[a-f0-9]{8}\.css/)
+
+        content = File.read(File.join(output_dir, manifest_path.lstrip("/")))
+        content.should_not contain("/* remove me */")
+        content.should contain("color:red")
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Fingerprinting
+  # ===========================================================================
+  describe "#process — fingerprinting" do
+    it "generates fingerprinted filenames" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body { color: red; }")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        manifest_path = pipeline.manifest["style.css"]
+        manifest_path.should match(/\/assets\/style\.[a-f0-9]{8}\.css/)
+        File.exists?(File.join(output_dir, manifest_path.lstrip("/"))).should be_true
+      end
+    end
+
+    it "produces consistent fingerprints for same content" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), "body { color: blue; }")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "a.css", files: ["a.css"])
+
+        p1 = Hwaro::Assets::Pipeline.new(config)
+        p1.process(output_dir)
+
+        p2 = Hwaro::Assets::Pipeline.new(config)
+        p2.process(output_dir)
+
+        p1.manifest["a.css"].should eq(p2.manifest["a.css"])
+      end
+    end
+
+    it "produces different fingerprints for different content" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body { color: red; }")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        p1 = Hwaro::Assets::Pipeline.new(config)
+        p1.process(output_dir)
+        hash1 = p1.manifest["style.css"]
+
+        File.write(File.join(static_dir, "style.css"), "body { color: blue; }")
+
+        p2 = Hwaro::Assets::Pipeline.new(config)
+        p2.process(output_dir)
+        hash2 = p2.manifest["style.css"]
+
+        hash1.should_not eq(hash2)
+      end
+    end
+
+    it "handles bundle names with subdirectories" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(File.join(static_dir, "css"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "css", "a.css"), ".a{}")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "css/main.css", files: ["css/a.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        manifest_path = pipeline.manifest["css/main.css"]
+        manifest_path.should match(/\/assets\/css\/main\.[a-f0-9]{8}\.css/)
+        File.exists?(File.join(output_dir, manifest_path.lstrip("/"))).should be_true
+      end
+    end
+
+    it "works without fingerprinting (plain filenames)" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body{}")
+
+        config = make_config(fingerprint: false, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest["style.css"].should eq("/assets/style.css")
+      end
+    end
+
+    it "fingerprint hash is 8 hex chars" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "x.css"), "body{}")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "x.css", files: ["x.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        # Extract hash part
+        manifest_path = pipeline.manifest["x.css"]
+        match = manifest_path.match(/x\.([a-f0-9]+)\.css/)
+        match.should_not be_nil
+        match.not_nil![1].size.should eq(8)
+      end
+    end
+
+    it "same content in different bundles produces same hash" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "shared.css"), "body{}")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "a.css", files: ["shared.css"])
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "b.css", files: ["shared.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        # Both should have same hash since content is identical
+        hash_a = pipeline.manifest["a.css"].match!(/\.([a-f0-9]{8})\./)[1]
+        hash_b = pipeline.manifest["b.css"].match!(/\.([a-f0-9]{8})\./)[1]
+        hash_a.should eq(hash_b)
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Manifest
+  # ===========================================================================
+  describe "manifest" do
+    it "maps bundle names to output paths" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "a.css"), ".a{}")
+        File.write(File.join(static_dir, "b.js"), "var b;")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "a.css", files: ["a.css"])
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "b.js", files: ["b.js"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest["a.css"].should eq("/assets/a.css")
+        pipeline.manifest["b.js"].should eq("/assets/b.js")
+      end
+    end
+
+    it "starts empty before processing" do
+      config = Hwaro::Models::AssetsConfig.new
+      config.enabled = true
+      pipeline = Hwaro::Assets::Pipeline.new(config)
+      pipeline.manifest.empty?.should be_true
+    end
+
+    it "does not include empty bundles in manifest" do
+      Dir.mktmpdir do |dir|
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(output_dir)
+
+        config = make_config(source_dir: dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "missing.css", files: ["nonexistent.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("missing.css").should be_false
+      end
+    end
+
+    it "uses custom output_dir in manifest paths" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body{}")
+
+        config = make_config(source_dir: static_dir, output_dir: "static/dist")
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest["style.css"].should eq("/static/dist/style.css")
+        File.exists?(File.join(output_dir, "static", "dist", "style.css")).should be_true
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Edge cases and error handling
+  # ===========================================================================
+  describe "edge cases" do
+    it "does nothing when disabled" do
+      config = Hwaro::Models::AssetsConfig.new
+      config.enabled = false
+
+      pipeline = Hwaro::Assets::Pipeline.new(config)
+      pipeline.process("/nonexistent")
+      pipeline.manifest.empty?.should be_true
+    end
+
+    it "skips missing source file but processes remaining" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "exists.css"), ".a{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "bundle.css", files: ["missing.css", "exists.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("bundle.css").should be_true
+        content = File.read(File.join(output_dir, "assets", "bundle.css"))
+        content.should contain(".a{}")
+      end
+    end
+
+    it "first file missing, second exists" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "second.css"), ".second{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "out.css", files: ["first.css", "second.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("out.css").should be_true
+      end
+    end
+
+    it "handles all files missing in a bundle" do
+      Dir.mktmpdir do |dir|
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(output_dir)
+
+        config = make_config(source_dir: dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "empty.css", files: ["a.css", "b.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("empty.css").should be_false
+      end
+    end
+
+    it "handles empty file list in bundle config" do
+      Dir.mktmpdir do |dir|
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(output_dir)
+
+        config = make_config(source_dir: dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "empty.css", files: [] of String
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("empty.css").should be_false
+      end
+    end
+
+    it "handles no bundles configured" do
+      Dir.mktmpdir do |dir|
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(output_dir)
+
+        config = make_config(source_dir: dir)
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.empty?.should be_true
+      end
+    end
+
+    it "creates output subdirectories as needed" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        File.exists?(File.join(output_dir, "assets", "style.css")).should be_true
+      end
+    end
+
+    it "handles duplicate files in a bundle" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "dup.css"), ".dup { color: red; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "duped.css", files: ["dup.css", "dup.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        content = File.read(File.join(output_dir, "assets", "duped.css"))
+        content.scan(".dup").size.should eq(2)
+      end
+    end
+
+    it "handles files with special characters in name" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "my-style_v2.css"), "body{}")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "my-style_v2.css", files: ["my-style_v2.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest["my-style_v2.css"].should match(/my-style_v2\.[a-f0-9]{8}\.css/)
+      end
+    end
+
+    it "handles large CSS files" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        big_css = (1..1000).map { |i| ".c-#{i}{color:##{"%06x" % (i*137)}}" }.join("\n")
+        File.write(File.join(static_dir, "big.css"), big_css)
+
+        config = make_config(minify: true, fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "big.css", files: ["big.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        pipeline.manifest.has_key?("big.css").should be_true
+      end
+    end
+
+    it "processing twice is idempotent (overwrites cleanly)" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "style.css"), "body{color:red}")
+
+        config = make_config(fingerprint: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "style.css", files: ["style.css"])
+
+        p1 = Hwaro::Assets::Pipeline.new(config)
+        p1.process(output_dir)
+
+        p2 = Hwaro::Assets::Pipeline.new(config)
+        p2.process(output_dir)
+
+        p1.manifest["style.css"].should eq(p2.manifest["style.css"])
+
+        output_file = File.join(output_dir, p2.manifest["style.css"].lstrip("/"))
+        File.exists?(output_file).should be_true
+      end
+    end
+
+    it "deeply nested output directory" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "a", "b", "c", "public")
+        FileUtils.mkdir_p(static_dir)
+
+        File.write(File.join(static_dir, "x.css"), ".x{}")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "x.css", files: ["x.css"])
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        pipeline.process(output_dir)
+
+        File.exists?(File.join(output_dir, "assets", "x.css")).should be_true
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Output-path containment — bundles must stay within the build output dir
+  # ===========================================================================
+  describe "output path containment guard" do
+    # An escaping `[assets] output_dir` used to publish the bundles above the
+    # site root: public/ got no CSS at all while every page still linked one.
+    it "skips processing when output_dir escapes the output directory" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "site", "public")
+        FileUtils.mkdir_p(File.join(static_dir, "css"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "css", "a.css"), "body { color: red; }")
+
+        config = make_config(source_dir: static_dir, output_dir: "../../oops")
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "b.css", files: ["css/a.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        log = with_captured_log do
+          pipeline.process(output_dir)
+        end
+
+        Dir.exists?(File.join(dir, "oops")).should be_false
+        pipeline.manifest.should be_empty
+        log.should contain("escapes the output directory")
+      end
+    end
+
+    # A bundle name is joined (subdirectory names are legitimate), so it can
+    # traverse too — the fingerprinted file would land outside assets_output.
+    it "skips a bundle whose name traverses out of the asset output directory" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(File.join(static_dir, "css"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "css", "a.css"), "body { color: red; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "../../evil.css", files: ["css/a.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        log = with_captured_log do
+          pipeline.process(output_dir)
+        end
+
+        File.exists?(File.join(dir, "evil.css")).should be_false
+        pipeline.manifest.should be_empty
+        log.should contain("outside the asset output directory")
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Source-path traversal guard — files must stay within source_dir
+  # ===========================================================================
+  describe "source path traversal guard" do
+    it "skips a `../`-traversal source file and warns" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        # File written one level ABOVE source_dir; referenced via `../`.
+        File.write(File.join(dir, "outside.css"), ".secret { color: leak; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "evil.css", files: ["../outside.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        log = with_captured_log do
+          pipeline.process(output_dir)
+        end
+
+        # Only file was traversal-skipped → empty bundle → not created.
+        pipeline.manifest.has_key?("evil.css").should be_false
+        File.exists?(File.join(output_dir, "assets", "evil.css")).should be_false
+        log.should contain("outside source directory")
+      end
+    end
+
+    it "does not include outside-source content when mixed with a valid file" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(dir, "outside.css"), ".secret { color: leak; }")
+        File.write(File.join(static_dir, "inside.css"), ".ok { color: green; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "mixed.css", files: ["../outside.css", "inside.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        log = with_captured_log do
+          pipeline.process(output_dir)
+        end
+
+        pipeline.manifest.has_key?("mixed.css").should be_true
+        content = File.read(File.join(output_dir, "assets", "mixed.css"))
+        content.should contain("color: green")
+        content.should_not contain("color: leak")
+        log.should contain("outside source directory")
+      end
+    end
+
+    it "allows legitimate nested files within source_dir" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(File.join(static_dir, "css", "vendor"))
+        FileUtils.mkdir_p(output_dir)
+
+        File.write(File.join(static_dir, "css", "vendor", "lib.css"), ".lib { color: blue; }")
+
+        config = make_config(source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(
+          name: "nested.css", files: ["css/vendor/lib.css"]
+        )
+
+        pipeline = Hwaro::Assets::Pipeline.new(config)
+        log = with_captured_log do
+          pipeline.process(output_dir)
+        end
+
+        pipeline.manifest.has_key?("nested.css").should be_true
+        File.read(File.join(output_dir, "assets", "nested.css")).should contain("color: blue")
+        log.should_not contain("outside source directory")
+      end
+    end
+  end
+
+  describe "#process — @import in a later CSS entry" do
+    it "warns when an entry after the first carries an @import" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css")
+          File.write("static/css/a.css", "@import url(x.css);\n.a{color:red}")
+          File.write("static/css/b.css", "/* @import none */ .b{content:\"@import\"}")
+          File.write("static/css/c.css", "@IMPORT url(https://fonts.example/f.css);\n.c{color:blue}")
+
+          config = make_config
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css", "css/b.css"])
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "late.css", files: ["css/b.css", "css/c.css"])
+          log = with_captured_log { Hwaro::Assets::Pipeline.new(config).process("public") }
+
+          log.should_not contain("'css/a.css' has an @import")
+          log.should_not contain("'css/b.css' has an @import")
+          log.should contain("'css/c.css' has an @import")
+        end
+      end
+    end
+  end
+
+  # Regression: a bundle is published under `[assets] output_dir`, but a
+  # stylesheet's relative `url(...)` resolves against the stylesheet's own
+  # directory — `url(img/x.png)` from `static/css/a.css` pointed at
+  # `/assets/img/x.png`, a 404 (and vendor CSS lost its fonts).
+  describe "#process — relative url() in CSS bundles" do
+    it "rebases a url() that points at a file beside the source stylesheet" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css/img")
+          FileUtils.mkdir_p("static/fonts")
+          File.write("static/css/img/x.png", "png")
+          File.write("static/fonts/f.woff2", "font")
+          File.write("static/css/a.css",
+            ".a{background:url(img/x.png)}\n" \
+            ".b{src:url('../fonts/f.woff2?v=2#f')}\n" \
+            ".c{background:url(missing.png)}\n" \
+            ".d{background:url(/abs.png)} .e{background:url(data:image/png;base64,AA)}")
+
+          config = make_config
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css"])
+          Hwaro::Assets::Pipeline.new(config).process("public")
+
+          css = File.read("public/assets/main.css")
+          css.should contain("url(../css/img/x.png)")
+          css.should contain("url('../fonts/f.woff2?v=2#f')")
+          css.should contain("url(missing.png)") # no such file beside the source: untouched
+          css.should contain("url(/abs.png)")
+          css.should contain("url(data:image/png;base64,AA)")
+        end
+      end
+    end
+
+    it "leaves a url() containing an encoded NUL as written" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css")
+          File.write("static/css/a.css", ".a{background:url(img/a%00.png)}")
+
+          config = make_config
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css"])
+          Hwaro::Assets::Pipeline.new(config).process("public")
+
+          File.read("public/assets/main.css").should contain("url(img/a%00.png)")
+        end
+      end
+    end
+
+    # PCRE2 validates the whole subject on every match: one Latin-1 byte
+    # anywhere in a bundled file raised ArgumentError (url() rebasing, either
+    # minifier) and failed the build.
+    it "bundles files that are not valid UTF-8, rebased or minified" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css/img")
+          FileUtils.mkdir_p("static/assets")
+          File.write("static/css/img/x.png", "png")
+          File.write("static/css/a.css", ".a{background:url(img/x.png)}\n/* \xA9 1999 */\n")
+          File.write("static/assets/b.css", ".caf\xE9 { color : red }\n")
+          File.write("static/assets/c.js", "// \xA9 1999\nvar a = 1;\n")
+
+          config = make_config(minify: true)
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css", "assets/b.css"])
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "app.js", files: ["assets/c.js"])
+          log = with_captured_log { Hwaro::Assets::Pipeline.new(config).process("public") }
+
+          css = File.read("public/assets/main.css")
+          css.should contain("url(../css/img/x.png)")
+          css.should contain(".caf\uFFFD{color:red}")
+          File.read("public/assets/app.js").should contain("var a")
+          log.should contain("'assets/b.css' is not valid UTF-8")
+        end
+      end
+    end
+
+    it "does not rewrite url( text inside a CSS string or comment" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css")
+          File.write("static/css/sp.png", "png")
+          File.write("static/css/a.css",
+            ".a:after{content:\"url(sp.png)\"}\n" \
+            ".b:after{content:'it\\'s url(sp.png)'}\n" \
+            "/* don't url(sp.png) */\n" \
+            ".c{background:url(sp.png)}\n" \
+            ".d{background:URL( \"sp.png\" )}")
+
+          config = make_config
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css"])
+          Hwaro::Assets::Pipeline.new(config).process("public")
+
+          css = File.read("public/assets/main.css")
+          css.should contain(%(content:"url(sp.png)"))
+          css.should contain(%(content:'it\\'s url(sp.png)'))
+          css.should contain("/* don't url(sp.png) */")
+          css.should contain(".c{background:url(../css/sp.png)}")
+          css.should contain(%(.d{background:url("../css/sp.png")}))
+        end
+      end
+    end
+
+    it "rebases a percent-encoded url() whose decoded name is beside the source" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("static/css/fonts")
+          File.write("static/css/fonts/A B.woff2", "font")
+          File.write("static/css/a.css",
+            ".a{src:url(fonts/A%20B.woff2)}\n" \
+            ".b{src:url(fonts%2FA%20B.woff2)}")
+
+          config = make_config
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css"])
+          Hwaro::Assets::Pipeline.new(config).process("public")
+
+          css = File.read("public/assets/main.css")
+          css.should contain("url(../css/fonts/A%20B.woff2)")
+          css.should contain("url(fonts%2FA%20B.woff2)") # encoded separator: as written
+        end
+      end
+    end
+
+    it "leaves url()s alone when the source dir is not the published static/ tree" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          FileUtils.mkdir_p("src/css/img")
+          File.write("src/css/img/x.png", "png")
+          File.write("src/css/a.css", ".a{background:url(img/x.png)}")
+
+          config = make_config(source_dir: "src")
+          config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "main.css", files: ["css/a.css"])
+          Hwaro::Assets::Pipeline.new(config).process("public")
+
+          File.read("public/assets/main.css").should contain("url(img/x.png)")
+        end
+      end
+    end
+  end
+
+  describe "#process — UTF-8 BOM and .mjs" do
+    it "drops a BOM at the start of a non-first CSS entry" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+        File.write(File.join(static_dir, "a.css"), ".a{x:1}\n")
+        File.write(File.join(static_dir, "b.css"), "\u{FEFF}.b{y:2}\n")
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "app.css", files: ["a.css", "b.css"])
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        File.read(File.join(output_dir, "assets", "app.css")).should eq(".a{x:1}.b{y:2}")
+      end
+    end
+
+    it "minifies .mjs bundles like .js" do
+      Dir.mktmpdir do |dir|
+        static_dir = File.join(dir, "static")
+        output_dir = File.join(dir, "public")
+        FileUtils.mkdir_p(static_dir)
+        FileUtils.mkdir_p(output_dir)
+        File.write(File.join(static_dir, "in.mjs"), "// c\nexport const a = 1; /* x */\n\n\nexport const b = 2;\n")
+
+        config = make_config(minify: true, source_dir: static_dir)
+        config.bundles << Hwaro::Models::AssetBundleConfig.new(name: "out.mjs", files: ["in.mjs"])
+        Hwaro::Assets::Pipeline.new(config).process(output_dir)
+
+        out = File.read(File.join(output_dir, "assets", "out.mjs"))
+        out.should_not contain("// c")
+        out.should_not contain("/* x */")
+        out.should contain("export const a = 1;")
+      end
+    end
+  end
+end

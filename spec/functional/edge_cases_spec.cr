@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 
 # =============================================================================
 # Edge case functional tests
@@ -167,7 +167,7 @@ describe "Edge Cases: Template changes on rebuild" do
         # First build
         builder1 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
-        builder1.run(output_dir: "public", parallel: false, cache: false, highlight: false, verbose: false, profile: false)
+        builder1.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: false, highlight: false, verbose: false, profile: false))
 
         html1 = File.read("public/page/index.html")
         html1.should contain("V1=")
@@ -178,7 +178,7 @@ describe "Edge Cases: Template changes on rebuild" do
         # Rebuild
         builder2 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
-        builder2.run(output_dir: "public", parallel: false, cache: false, highlight: false, verbose: false, profile: false)
+        builder2.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: false, highlight: false, verbose: false, profile: false))
 
         html2 = File.read("public/page/index.html")
         html2.should contain("V2=")
@@ -204,7 +204,7 @@ describe "Edge Cases: Cache rebuild after file deletion" do
         # First build
         builder1 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder1.register(h) }
-        builder1.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder1.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
 
         File.exists?("public/page1/index.html").should be_true
         File.exists?("public/page2/index.html").should be_true
@@ -216,7 +216,7 @@ describe "Edge Cases: Cache rebuild after file deletion" do
         # Rebuild
         builder2 = Hwaro::Core::Build::Builder.new
         Hwaro::Content::Hooks.all.each { |h| builder2.register(h) }
-        builder2.run(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false)
+        builder2.run(Hwaro::Config::Options::BuildOptions.new(output_dir: "public", parallel: false, cache: true, highlight: false, verbose: false, profile: false))
 
         File.exists?("public/page1/index.html").should be_true
         # page2 output should no longer exist after rebuild
@@ -610,6 +610,7 @@ describe "Edge Cases: Duplicate output path detection" do
   # Windows, and browsers rewrite it to `/` inside a URL path — so it too used
   # to split into directories and clobber the real page.
   it "refuses a page whose URL contains a backslash" do
+    posix_only!("`\\` is a path separator on Windows, so the setup can't create both pages")
     log = with_captured_log do
       build_site(
         BASIC_CONFIG,
@@ -698,6 +699,92 @@ describe "Edge Cases: Duplicate output path detection" do
         llms.should contain("[A]")
         llms.should_not contain("[B]")
       end
+    end
+  end
+
+  # Same hole for the OTHER kind of unwritten page: a URL that traverses out
+  # of the output directory is refused at write time ("Not publishing"), but
+  # it was never marked suppressed, so sitemap.xml, search.json and llms.txt
+  # still advertised `/posts/../../escape/` — a guaranteed 404.
+  it "does not advertise the URL of a page it refuses to publish" do
+    log = with_captured_log do
+      build_site(
+        <<-TOML,
+          title = "Test Site"
+          base_url = "http://localhost"
+          [sitemap]
+          enabled = true
+          [search]
+          enabled = true
+          TOML
+        content_files: {
+          "posts/ok.md"        => "---\ntitle: Ok\n---\nOK-BODY",
+          "posts/traversal.md" => "---\ntitle: Traversal\nslug: ../../escape\n---\nESCAPE-BODY",
+        },
+        template_files: {"page.html" => "{{ content }}"},
+      ) do
+        File.read("public/sitemap.xml").should_not contain("escape")
+        File.read("public/search.json").should_not contain("escape")
+
+        llms = File.read("public/llms.txt")
+        llms.should contain("[Ok]")
+        llms.should_not contain("[Traversal]")
+      end
+    end
+
+    log.should contain("Not publishing posts/traversal.md")
+  end
+
+  # The section feed and the taxonomy term feed/page only deduped by URL, so
+  # the traversal page's UNIQUE `/posts/../../escape/` still rode into
+  # `posts/rss.xml`, `tags/t/rss.xml` and the term listing.
+  it "keeps a refused page out of section feeds, taxonomy feeds and term pages" do
+    with_captured_log do
+      build_site(
+        <<-TOML,
+          title = "Test Site"
+          base_url = "http://localhost"
+          [feeds]
+          enabled = true
+          [[taxonomies]]
+          name = "tags"
+          feed = true
+          TOML
+        content_files: {
+          "posts/_index.md"    => "---\ntitle: Posts\ngenerate_feeds: true\n---\n",
+          "posts/ok.md"        => "---\ntitle: Ok\ntags: [t]\n---\nOK-BODY",
+          "posts/traversal.md" => "---\ntitle: Traversal\ntags: [t]\nslug: ../../escape\n---\nESCAPE-BODY",
+        },
+        template_files: {
+          "page.html"          => "{{ content }}",
+          "section.html"       => "{{ content }}",
+          "taxonomy.html"      => "{{ content }}",
+          "taxonomy_term.html" => "{{ content }}",
+        },
+      ) do
+        section_feed = File.read("public/posts/rss.xml")
+        section_feed.should contain("Ok")
+        section_feed.should_not contain("escape")
+        File.read("public/tags/t/rss.xml").should_not contain("escape")
+        File.read("public/tags/t/index.html").should_not contain("escape")
+      end
+    end
+  end
+
+  # A Markdown link destination cannot hold a raw space, so a page whose slug
+  # has one rendered as `- [T](http://localhost/posts/custom slug/)` — not a
+  # link at all. The sitemap already percent-encoded; llms.txt and the alias
+  # redirect stub must agree with it.
+  it "percent-encodes page URLs with spaces in llms.txt and alias redirects" do
+    build_site(
+      BASIC_CONFIG,
+      content_files: {
+        "posts/spaced.md" => "---\ntitle: Spaced\nslug: custom slug\naliases:\n  - /old-url/\n---\nSPACED-BODY",
+      },
+      template_files: {"page.html" => "{{ content }}"},
+    ) do
+      File.read("public/llms.txt").should contain("[Spaced](http://localhost/posts/custom%20slug/)")
+      File.read("public/old-url/index.html").should contain("url=/posts/custom%20slug/")
     end
   end
 end

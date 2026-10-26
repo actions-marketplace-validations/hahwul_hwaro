@@ -5,7 +5,7 @@ weight = 1
 toc = true
 +++
 
-Pages are Markdown files that become HTML pages on your site. This page covers **how to write content** — front matter fields, Markdown syntax, and file organization. For how these fields are accessed in templates, see the [Data Model](/templates/data-model/#page).
+Pages are Markdown files that become HTML pages on your site. This page covers **how to write content**: front matter fields, Markdown syntax, and file organization. For how these fields are accessed in templates, see the [Data Model](/templates/data-model/#page).
 
 ## Basic Structure
 
@@ -38,7 +38,7 @@ Your content in **Markdown**.
 Your content in **Markdown**.
 ```
 
-For JSON, the first balanced `{...}` at the very start of the file is the front matter — no fence is needed. The file must begin with `{` (no leading whitespace).
+For JSON, the first balanced `{...}` at the very start of the file is the front matter, and no fence is needed. The file must begin with `{` (no leading whitespace).
 
 ## Front Matter
 
@@ -52,13 +52,13 @@ For JSON, the first balanced `{...}` at the very start of the file is the front 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| date | string | — | Publication date: `YYYY-MM-DD`, optionally with time (`YYYY-MM-DD HH:MM:SS` or RFC 3339 datetime); unquoted TOML/YAML dates also work |
+| date | string | — | Publication date: `YYYY-MM-DD`, optionally with time (`YYYY-MM-DD HH:MM:SS` or RFC 3339 datetime); unquoted TOML/YAML dates also work. A date without an offset is read in the build machine's local time zone, in TOML, YAML and JSON alike. A written UTC offset (`+09:00`, also `+0900` or after a space: `2024-01-15 10:00:00 +0900`) is kept, so the date prints as written in both TOML and YAML. A TOML offset date also feeds date permalink tokens (`:year`/`:month`/`:day`) and year/month grouping as written, so a URL built in older versions from the UTC day can move (e.g. `/2024/02/29/` → `/2024/03/01/`); add the old URL to `aliases` to keep it working |
 | description | string | — | SEO description |
 | draft | bool | false | Exclude from production builds |
 | template | string | "page" | Template to use |
 | weight | int | 0 | Sort order (lower = first) |
-| image | string | — | Featured image for social sharing |
-| tags | array | [] | Tag taxonomy terms |
+| image | string | — | Featured image for social sharing. A relative path naming a file in the page bundle (`image = "cover.png"` beside `index.md`) resolves to that file |
+| tags | array | [] | Tag taxonomy terms. Strings and integers (`tags = [2024, "crystal"]`) are kept (as `2024`); a float such as `3.10` is skipped with a warning, so quote it (`"3.10"`). Terms are NFC-normalised, so an NFD and an NFC spelling of one tag are the same term |
 | categories | array | [] | Category taxonomy terms |
 
 ### All Fields
@@ -74,12 +74,15 @@ For JSON, the first balanced `{...}` at the very start of the file is the front 
 | in_search_index | bool | Include in search |
 | in_sitemap | bool | Include in sitemap |
 | insert_anchor_links | bool | Add heading anchors |
-| redirect_to | string | Redirect page to this URL |
+| redirect_to | string | Redirect page to this URL, or to a content file given as an `@/` path (`@/blog/post.md`) (the redirect stub is left out of the sitemap, feeds, search index and llms.txt) |
 | render | bool | Render page to output (default: true) |
 | expires | date | Auto-exclude after this date |
 | series | string | Series name for grouping |
 | series_weight | int | Sort order within series |
+| menus | string / array / table | Register the page in navigation menus (`menu` is an alias). See [Menus](/features/menus/) |
 | extra | table | Custom metadata |
+
+A field holding the wrong type (`draft = "true"`, `weight = "5"`, `date = 20240315`, `categories = "News"`) is ignored, never coerced, and the build warns with the file and key. In particular `draft = "true"` is not a draft and gets published; write `draft = true`.
 
 ## Examples
 
@@ -153,7 +156,7 @@ series_weight = 1
 First part of the series.
 ```
 
-With `[series]` enabled in `config.toml`, `page.series_index` (1-based position) and `page.series_pages` (all pages in the series) are computed at build time — they are template-only values, not front matter fields. See [Data Model](/templates/data-model/#computed-properties).
+With `[series]` enabled in `config.toml`, `page.series_index` (1-based position) and `page.series_pages` (all pages in the series) are computed at build time. They are template-only values, not front matter fields. See [Data Model](/templates/data-model/#computed-properties).
 
 ### Custom Template
 
@@ -194,6 +197,13 @@ aliases = ["/old-url/", "/another-old-url/"]
 
 Redirects from old URLs to this page.
 ```
+
+Each alias is a path **on this site**, and the build writes a redirect stub at it.
+The stub carries `<meta name="robots" content="noindex">` and a
+`<link rel="canonical">` to the page's absolute URL (`base_url` + its path), so
+search engines fold the old URL into the page instead of indexing the stub.
+An absolute (`https://example.com/old/`) or protocol-relative (`//example.com/old/`)
+value is not something this build can publish, so it is skipped with a warning.
 
 ### Custom Metadata
 
@@ -247,7 +257,13 @@ custom_field = "value"
 
 ## Content Summary
 
-Use `<!-- more -->` to define a summary:
+`page.summary` is what list pages, feeds and social cards show for a post. It is filled from the first of these sources that exists:
+
+1. The content before a `<!-- more -->` marker (rendered as HTML)
+2. The `description` front matter field
+3. An automatic excerpt cut from the rendered body
+
+Use `<!-- more -->` to define a summary explicitly:
 
 ```markdown
 +++
@@ -260,6 +276,24 @@ This is the summary shown in listings.
 
 The full article continues here...
 ```
+
+The summary renders like the body: shortcodes, Markdown extensions and render hooks apply. A marker placed inside a block shortcode's body (`{% note() %}` … `{% end %}`) ends the summary inside that block, and the summary closes the block at that point. The same goes for raw HTML: a marker inside `<details>` … `</details>` (or any element left open) ends the summary there, and the summary closes the open elements, so a listing that prints it is not swallowed by an unclosed tag.
+
+### Automatic summaries
+
+A page with neither a marker nor a `description` gets an automatic summary: the first 70 words of its rendered body, wrapped in a single `<p>` and followed by an ellipsis (`…`) when text was cut. The excerpt is built from the rendered HTML, so shortcodes are expanded and code blocks, headings, images and figures are skipped, so it reads as prose.
+
+For CJK-dominant text (Chinese, Japanese, Korean), where words are not space-delimited, the limit counts characters at twice the configured number: `summary_length = 70` yields up to 140 characters. Cuts land on word boundaries (character boundaries for CJK) and never split an entity or a multibyte character.
+
+Tune or disable it in `config.toml`:
+
+```toml
+[content]
+summary_length = 70      # words (CJK: characters ×2); 0 disables the automatic summary
+summary_ellipsis = "…"   # appended only when text was actually cut
+```
+
+`page.summary_truncated` is `true` only when the automatic excerpt was cut, so a template can show a "Read more" link only where it makes sense. Automatic summaries never replace a marker or a `description`; pages that have one keep their existing output.
 
 ## Markdown Syntax
 
@@ -298,7 +332,7 @@ console.log("Hello");
 | Cell   | Cell   |
 ```
 
-Table cells support inline Markdown: **bold**, *italic*, `code spans`, `[links](url)`, `![images](url)`, and ~~strikethrough~~.
+Table cells support inline Markdown: **bold**, *italic*, `code spans`, `[links](url)`, `![images](url)`, and ~~strikethrough~~. Links and images take the same destinations as in a paragraph: balanced parentheses (`[W](https://en.wikipedia.org/wiki/Foo_(bar))`), an optional title (`[T](/x/ "the title")`) and `<angle>` destinations; a backslash escapes punctuation (`\*not emphasis\*`). The same applies to definition list and footnote bodies.
 
 ```markdown
 | Feature        | Example                          |
@@ -321,7 +355,9 @@ Use `@/` to link to other content pages by their source path. Hwaro resolves the
 [With anchor](@/blog/my-post.md#introduction)
 ```
 
-This is useful because you don't need to know the final URL — Hwaro calculates it from the content path. If the target page doesn't exist, the link is left unchanged and a warning is logged during build.
+This is useful because you don't need to know the final URL, because Hwaro calculates it from the content path. If the target page doesn't exist, the link is left unchanged and a warning is logged during build.
+
+`@/` links are resolved in page content only (Markdown, and HTML or shortcode output inside it). Templates are not rewritten, so `<a href="@/about.md">` in `page.html` is emitted as-is; in a template use `{{ get_page(path="about.md").url }}` instead.
 
 | Syntax | Resolved URL |
 |--------|-------------|
@@ -359,13 +395,18 @@ GitHub-style alert blocks render as styled callouts. Recognised types: `NOTE`, `
 > [!WARNING]
 >
 > Body can also live in its own paragraph.
+
+> [!TIP] Custom title
+> Text after the marker on the same line becomes the title (Obsidian / Hugo syntax).
 ```
 
-The output is a `<div class="admonition admonition-{type}">` with a title paragraph (`<p class="admonition-title">`) followed by the body. Style it from your CSS — Hwaro emits semantic markup only.
+The output is a `<div class="admonition admonition-{type}">` with a title paragraph (`<p class="admonition-title">`) followed by the body. Without a custom title the type name is used (`Note`, `Tip`, …). Style it from your CSS, since Hwaro emits semantic markup only.
+
+Tables work inside admonitions and plain blockquotes: prefix every row with `>` as usual (`> | a | b |`, `> |---|---|`).
 
 Disable by setting `admonitions = false` under `[markdown]` in `config.toml`.
 
-Limitations: matching is type-case-sensitive (`[!NOTE]` only, not `[!note]`), and a nested blockquote inside an admonition body closes the outer admonition early. There is no inline escape — backslash-escaping (`\[!NOTE\]`) renders the same characters and still triggers the admonition, so disable the feature if you need to render the literal token.
+Limitations: a nested blockquote inside an admonition body closes the outer admonition early. There is no inline escape. Backslash-escaping (`\[!NOTE\]`) renders the same characters and still triggers the admonition, so disable the feature if you need to render the literal token.
 
 ### Custom Heading IDs
 
@@ -376,14 +417,15 @@ Append `{#custom-id}` to a heading line to override the auto-generated slug. Use
 ```
 
 Renders as `<h2 id="install">Installation Guide</h2>`. The TOC and any `[link](#install)` will use the custom id.
+The same syntax works on headings inside blockquotes.
 
-Allowed id characters: letters, digits, `_`, `-`, `:`. The id must start with a letter. CommonMark allows up to 3 leading spaces before an ATX heading; deeper indentation makes the line a code block, in which case `{#id}` is not applied.
+Allowed id characters: letters (any script), digits, `_`, `-`, `:`. The id may start with a digit — `{#1-create-a-project}` is valid, which matters for translated numbered headings that need to keep the original anchor — but not with `-` or `:`. CommonMark allows up to 3 leading spaces before an ATX heading; deeper indentation makes the line a code block, in which case `{#id}` is not applied.
 
 Disable by setting `heading_ids = false` under `[markdown]` in `config.toml`.
 
-Custom heading IDs require `markdown.safe = false`. Under safe mode the `{#id}` syntax is stripped from the rendered output and no id is applied — use raw HTML headings if you need both safe mode and explicit ids. Writing the same `{#id}` twice in one page produces duplicate id attributes; the first anchor wins.
+Custom heading IDs require `markdown.safe = false`. Under safe mode the `{#id}` syntax is stripped from the rendered output and no custom id is applied: the heading keeps its generated id (a raw HTML heading is no way around this, since safe mode strips raw HTML too). Writing the same `{#id}` twice in one page keeps it on the first heading and renames the later one with a numeric suffix (`#id-1`), with a build warning.
 
-This `{#id}` shorthand is a special case of the more general `{#id .class key=val}` attribute block (`[markdown] attributes = true`), which also applies to inline images — see [Markdown Extensions](/features/markdown-extensions/).
+This `{#id}` shorthand is a special case of the more general `{#id .class key=val}` attribute block (`[markdown] attributes = true`), which also applies to inline images. See [Markdown Extensions](/features/markdown-extensions/).
 
 ### Definition Lists
 
@@ -416,7 +458,7 @@ content/
     └── _index.md
 ```
 
-Hwaro will copy all non-markdown files from the page bundle directory to the output directory, maintaining the relative path.
+Hwaro will copy all non-markdown files from the page bundle directory to the output directory, maintaining the relative path. When [`[content.files]`](/features/content-files/) is configured (the `hwaro init` scaffolds set an image allowlist), only the files its rules allow are copied.
 
 In your markdown, you can link to these assets using relative paths:
 
@@ -428,7 +470,7 @@ In your markdown, you can link to these assets using relative paths:
 
 ### Accessing Assets in Templates
 
-You can access the list of colocated assets in your templates using `page.assets`. This returns an array of relative paths to the files.
+You can access the list of colocated assets in your templates using `page.assets`. This returns an array of paths relative to `content/` (`blog/my-trip/photo.jpg`).
 
 ```jinja
 {% for asset in page.assets %}

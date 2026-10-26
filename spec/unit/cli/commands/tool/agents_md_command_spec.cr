@@ -1,0 +1,265 @@
+require "../../../../spec_helper"
+
+# Command-level tests for `hwaro tool agents-md`.
+#
+# The generated content itself is exercised in spec/unit/defaults_agents_md_spec.cr;
+# these tests cover the command wrapper: metadata and the `--write` path
+# (local and remote) that persists AGENTS.md. The interactive overwrite prompt
+# itself (which reads stdin and may `exit`) is not exercised here; only its
+# non-TTY refusal is.
+describe Hwaro::CLI::Commands::Tool::AgentsMdCommand do
+  describe ".metadata" do
+    it "reports the command name and description" do
+      meta = Hwaro::CLI::Commands::Tool::AgentsMdCommand.metadata
+      meta.name.should eq("agents-md")
+      meta.description.should_not be_empty
+    end
+
+    it "exposes the remote, local, write and force flags" do
+      meta = Hwaro::CLI::Commands::Tool::AgentsMdCommand.metadata
+      meta.flags.any? { |f| f.long == "--remote" }.should be_true
+      meta.flags.any? { |f| f.long == "--local" }.should be_true
+      meta.flags.any? { |f| f.long == "--write" }.should be_true
+      meta.flags.any? { |f| f.long == "--force" }.should be_true
+    end
+  end
+
+  describe "#run" do
+    it "writes the local AGENTS.md and logs success" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          output = with_captured_log do
+            cmd = Hwaro::CLI::Commands::Tool::AgentsMdCommand.new
+            cmd.run(["--write"])
+          end
+
+          output.should contain("local mode")
+          File.exists?(File.join(dir, "AGENTS.md")).should be_true
+          File.read(File.join(dir, "AGENTS.md")).should eq(Hwaro::Services::Defaults::AgentsMd.content)
+        end
+      end
+    end
+
+    it "writes the remote AGENTS.md variant when --remote is given" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          output = with_captured_log do
+            cmd = Hwaro::CLI::Commands::Tool::AgentsMdCommand.new
+            cmd.run(["--remote", "--write"])
+          end
+
+          output.should contain("remote mode")
+          File.read(File.join(dir, "AGENTS.md")).should eq(Hwaro::Services::Defaults::AgentsMd.remote_content)
+        end
+      end
+    end
+
+    it "refuses to write through a dangling AGENTS.md symlink outside the project" do
+      Dir.mktmpdir do |dir|
+        project = File.join(dir, "project")
+        outside = File.join(dir, "outside")
+        Dir.mkdir(project)
+        Dir.mkdir(outside)
+        target = File.join(outside, "generated.md")
+        Dir.cd(project) do
+          File.symlink(target, "AGENTS.md")
+
+          expect_raises(Hwaro::HwaroError) do
+            Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write"])
+          end
+        end
+
+        File.exists?(target).should be_false
+      end
+    end
+
+    it "refuses to write through an AGENTS.md symlink to an existing file outside the project" do
+      Dir.mktmpdir do |dir|
+        project = File.join(dir, "project")
+        Dir.mkdir(project)
+        target = File.join(dir, "shared.md")
+        File.write(target, "shared")
+        Dir.cd(project) do
+          File.symlink("../shared.md", "AGENTS.md")
+
+          expect_raises(Hwaro::HwaroError) do
+            Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--force"])
+          end
+        end
+
+        File.read(target).should eq("shared")
+      end
+    end
+
+    it "writes through an AGENTS.md symlink to a file inside the project" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("CLAUDE.md", "old")
+          File.symlink("CLAUDE.md", "AGENTS.md")
+
+          with_captured_log do
+            Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--force"])
+          end
+
+          File.symlink?("AGENTS.md").should be_true
+          File.read("CLAUDE.md").should eq(Hwaro::Services::Defaults::AgentsMd.content)
+        end
+      end
+    end
+
+    it "creates the target of a dangling AGENTS.md symlink inside the project" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          Dir.mkdir("docs")
+          File.symlink("docs/agents.md", "AGENTS.md")
+
+          with_captured_log do
+            Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write"])
+          end
+
+          File.symlink?("AGENTS.md").should be_true
+          File.read(File.join("docs", "agents.md")).should eq(Hwaro::Services::Defaults::AgentsMd.content)
+        end
+      end
+    end
+
+    # The marker/fence regexes raise ArgumentError on invalid UTF-8, which
+    # surfaced as an unclassified `Error: Regex match error` (exit 1).
+    it "refuses with a classified HWARO_E_IO error when the existing AGENTS.md is not valid UTF-8" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          bytes = Bytes[0x23, 0x20, 0x78, 0x0a, 0xff, 0xfe, 0x0a]
+          File.write("AGENTS.md", bytes)
+
+          err = expect_raises(Hwaro::HwaroError) do
+            with_captured_log { Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--force"]) }
+          end
+          err.code.should eq(Hwaro::Errors::HWARO_E_IO)
+          File.size("AGENTS.md").should eq(bytes.size) # left untouched
+        end
+      end
+    end
+
+    # File.exists? is true for a directory, so File.read raised EISDIR as an
+    # unclassified `Error: read (AGENTS.md): Is a directory`.
+    it "refuses with a classified HWARO_E_IO error when AGENTS.md is a directory" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          Dir.mkdir("AGENTS.md")
+
+          err = expect_raises(Hwaro::HwaroError) do
+            with_captured_log { Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--force"]) }
+          end
+          err.code.should eq(Hwaro::Errors::HWARO_E_IO)
+          Dir.exists?("AGENTS.md").should be_true
+        end
+      end
+    end
+
+    it "refuses with a classified HWARO_E_IO error when AGENTS.md is unreadable" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("AGENTS.md", "# mine\n")
+          File.chmod("AGENTS.md", 0o000)
+
+          err = expect_raises(Hwaro::HwaroError) do
+            with_captured_log { Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--force"]) }
+          end
+          err.code.should eq(Hwaro::Errors::HWARO_E_IO)
+        ensure
+          File.chmod("AGENTS.md", 0o644)
+        end
+      end
+    end
+
+    it "overwrites an existing AGENTS.md when --force is given" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("AGENTS.md", "stale content")
+
+          with_captured_log do
+            cmd = Hwaro::CLI::Commands::Tool::AgentsMdCommand.new
+            cmd.run(["--write", "--force"])
+          end
+
+          File.read(File.join(dir, "AGENTS.md")).should eq(Hwaro::Services::Defaults::AgentsMd.content)
+        end
+      end
+    end
+
+    it "logs 'updated' when overwriting an existing AGENTS.md with --force" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("AGENTS.md", "stale content")
+
+          output = with_captured_log do
+            cmd = Hwaro::CLI::Commands::Tool::AgentsMdCommand.new
+            cmd.run(["--write", "--force"])
+          end
+
+          output.should contain("updated")
+          output.should_not contain("created")
+        end
+      end
+    end
+
+    # Regression: without a TTY the overwrite prompt read EOF, printed
+    # "Aborted." and exited 0 — a script could not tell it wrote nothing.
+    it "refuses with a usage error when AGENTS.md exists and stdin is not a TTY" do
+      Dir.mktmpdir do |dir|
+        Dir.cd(dir) do
+          File.write("AGENTS.md", "stale content")
+          Hwaro::CLI::Prompt.interactive = false
+          Hwaro::CLI::Prompt.input = IO::Memory.new
+          begin
+            ex = expect_raises(Hwaro::HwaroError) do
+              with_captured_log { Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write"]) }
+            end
+            ex.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+            ex.hint.to_s.should contain("--force")
+            File.read("AGENTS.md").should eq("stale content")
+          ensure
+            Hwaro::CLI::Prompt.interactive = nil
+            Hwaro::CLI::Prompt.input = STDIN
+          end
+        end
+      end
+    end
+  end
+end
+
+# Regression: `hwaro tool agents-md AGENTS.md` printed to stdout, wrote
+# nothing, and exited 0.
+describe "tool agents-md positional argument validation" do
+  it "rejects positional arguments" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        ex = expect_raises(Hwaro::HwaroError) do
+          Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["AGENTS.md"])
+        end
+        ex.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+        ex.message.to_s.should contain("unexpected extra argument(s): 'AGENTS.md'")
+
+        ex = expect_raises(Hwaro::HwaroError) do
+          Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--write", "--", "extra"])
+        end
+        ex.code.should eq(Hwaro::Errors::HWARO_E_USAGE)
+        File.exists?("AGENTS.md").should be_false
+      end
+    end
+  end
+end
+
+# Regression: an unknown flag reached unknown_args and was reported as an
+# "unexpected extra argument", blaming the valid positional instead.
+describe "tool agents-md unknown flags" do
+  it "reports an unknown flag as an invalid option" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        expect_raises(OptionParser::InvalidOption, "Invalid option: --bogus") do
+          Hwaro::CLI::Commands::Tool::AgentsMdCommand.new.run(["--bogus"])
+        end
+      end
+    end
+  end
+end

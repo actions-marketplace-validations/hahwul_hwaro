@@ -19,14 +19,14 @@ templates/
 ├── taxonomy_term.html  # Taxonomy term page
 ├── 404.html            # Error page
 ├── shortcodes/         # Shortcode templates
-└── hooks/              # Markdown render-element overrides (link/image/heading/codeblock)
+└── hooks/              # Markdown render-element overrides (link/image/heading/codeblock/blockquote/table)
 ```
 
 The `shortcodes/` directory contains reusable components you can embed in Markdown. See [Writing: Shortcodes](/writing/shortcodes/) for usage and how to create custom shortcodes.
 
-Beyond HTML, a page/section can additionally render sibling `templates/page.<fmt>.jinja` / `templates/section.<fmt>.jinja` files (JSON, XML, TXT, CSV) enabled via `[outputs]` — see [Output Formats](/features/output-formats/).
+Beyond HTML, a page/section can additionally render sibling `templates/page.<fmt>.jinja` / `templates/section.<fmt>.jinja` files (JSON, XML, TXT, CSV) enabled via `[outputs]`. See [Output Formats](/features/output-formats/).
 
-The `hooks/` directory overrides how individual Markdown elements render — see [Render Hooks](/templates/render-hooks/).
+The `hooks/` directory overrides how individual Markdown elements render. See [Render Hooks](/templates/render-hooks/).
 
 ## Template Selection
 

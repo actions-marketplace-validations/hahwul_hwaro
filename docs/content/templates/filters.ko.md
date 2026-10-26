@@ -7,7 +7,7 @@ toc = true
 
 필터는 템플릿에서 값을 변환합니다. 파이프 `|` 연산자로 적용합니다.
 
-Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`, `select`, `batch` 등 — 위에 자체 필터를 얹어 제공하므로, 아래 어디서든 두 종류 모두 사용할 수 있습니다.
+Hwaro는 표준 Crinja(Jinja2) 내장 필터(`upper`, `lower`, `join`, `map`, `select`, `batch` 등) 위에 자체 필터를 얹어 제공하므로, 아래 어디서든 두 종류 모두 사용할 수 있습니다.
 
 ## 문법
 
@@ -48,8 +48,8 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 | 필터 | 설명 | 예시 |
 |--------|-------------|---------|
 | length | 길이 | {{ items \| length }} |
-| first | 첫 요소 | {{ items \| first }} |
-| last | 마지막 요소 | {{ items \| last }} |
+| first | 첫 요소(빈 컬렉션이면 빈 값) | {{ items \| first }} |
+| last | 마지막 요소(빈 컬렉션이면 빈 값) | {{ items \| last }} |
 | reverse | 순서 뒤집기 | {{ items \| reverse }} |
 | sort | 배열 정렬 | {{ items \| sort }} |
 | join | 요소 이어 붙이기 | {{ tags \| join(", ") }} |
@@ -62,8 +62,8 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 
 | 필터 | 설명 | 예시 |
 |--------|-------------|---------|
-| unique | 중복 제거 | {{ items \| unique }} |
-| flatten | 중첩 배열 평탄화 | {{ nested \| flatten }} |
+| unique | 서로 다른 값의 타입은 구분해 중복 제거 | {{ items \| unique }} |
+| flatten | 중첩 배열을 한 단계 평탄화 | {{ nested \| flatten }} |
 | compact | nil/빈 값 제거 | {{ items \| compact }} |
 
 ## 수학 필터
@@ -93,7 +93,7 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 | 필터 | 설명 | 예시 |
 |--------|-------------|---------|
 | absolute_url | base를 포함한 전체 URL | {{ "/about/" \| absolute_url }} |
-| relative_url | base_url 접두사 추가 | {{ "/img.png" \| relative_url }} |
+| relative_url | base_url의 경로 부분(스킴과 호스트 제외)을 접두사로 추가 | {{ "/img.png" \| relative_url }} |
 | active_path | 이 URL이 현재 페이지(또는 그 상위)인지 | {{ item.url \| active_path }} |
 
 `active_path`는 URL(보통 [메뉴](/ko/features/menus/) 엔트리의 `item.url`)을 현재 페이지와 비교합니다. 기본은 정확히 일치할 때만 참이고, `ancestor=true`를 넘기면 하위 페이지도 매칭합니다.
@@ -109,9 +109,10 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 
 | 필터 | 설명 | 예시 |
 |--------|-------------|---------|
-| default | 폴백 값 | {{ value \| default(value="N/A") }} |
+| default | 정의되지 않았거나 none이거나 빈 값일 때의 폴백 값([기본값](#기본값) 참고) | {{ value \| default(value="N/A") }} |
 | jsonify | JSON 인코딩 | {{ data \| jsonify }} |
-| date | 날짜 포맷 | {{ page.date \| date("%Y-%m-%d") }} |
+| tojson | JSON 인코딩. `indent`를 주면 그만큼의 공백(0–16)으로 들여쓰기 | {{ data \| tojson(indent=2) }} |
+| date | 날짜 포맷(기본 포맷 `%Y-%m-%d`) | {{ page.date \| date("%Y-%m-%d") }} |
 
 ## 예시
 
@@ -131,6 +132,8 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 {{ page.description | default(value=site.description) }}
 {{ page.image | default(value="/images/default.png") }}
 ```
+
+`default`는 값이 정의되지 않았거나 `none`이거나 빈 문자열일 때 폴백 값을 반환합니다. 폴백 값은 원래 타입을 유지하므로 `default(value=0)`의 결과로 산술 연산을 할 수 있으며, `none` 폴백(`default(value=none)`)은 빈 문자열로 렌더링됩니다. 값이 비어 있지 않으면 배열, 맵, 객체는 그대로 반환하고, 그 밖의 값(문자열, 숫자, 불리언)은 문자열로 반환하므로 뒤에 `length`나 `replace` 같은 문자열 필터를 이어서 쓸 수 있습니다. `boolean=true`를 함께 넘기면(`default(value="N/A", boolean=true)`) `false`, `0`, 빈 리스트나 맵처럼 거짓으로 평가되는 값도 폴백 값으로 바꿉니다.
 
 ### 날짜 포맷
 
@@ -207,10 +210,11 @@ Hwaro는 표준 Crinja(Jinja2) 내장 필터 — `upper`, `lower`, `join`, `map`
 |------|-------------|---------|
 | startswith | ~로 시작 | `{% if page.url is startswith("/blog/") %}` |
 | endswith | ~로 끝남 | `{% if page.url is endswith("/") %}` |
-| containing | 포함 | `{% if page.url is containing("docs") %}` |
+| containing | 부분 문자열(문자열) 또는 요소(리스트) 포함 | `{% if page.url is containing("docs") %}` |
 | matching | 정규식 일치 | `{% if asset is matching("[.](jpg\|png)$") %}` |
 | empty | 비어 있음 | `{% if page.description is empty %}` |
 | present | 비어 있지 않음 | `{% if page.title is present %}` |
+| eq, ne, lt, le, gt, ge | 값과 비교(`==`, `!=`, `<`, `<=`, `>`, `>=`, `equalto`, `lessthan`, `greaterthan`도 사용 가능) | `{{ posts \| selectattr("extra.year", ">=", 2020) \| list }}` |
 
 ### 테스트 예시
 

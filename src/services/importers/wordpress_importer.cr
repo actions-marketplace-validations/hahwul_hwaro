@@ -16,14 +16,20 @@ module Hwaro
 
           reset_written_paths
 
-          unless File.exists?(wxr_path)
+          # `File.file?`, not `File.exists?`: a directory passes the latter
+          # and then crashes File.read with a bare "Is a directory".
+          unless File.file?(wxr_path)
+            message = Dir.exists?(wxr_path) ? "WXR path is a directory, not a file: #{wxr_path}" : "WXR file not found: #{wxr_path}"
             return ImportResult.new(
               success: false,
-              message: "WXR file not found: #{wxr_path}"
+              message: message
             )
           end
 
-          xml_content = File.read(wxr_path)
+          # `scrub` because the export is third-party bytes: a single invalid
+          # UTF-8 byte made the DOCTYPE guard's regex below raise
+          # ArgumentError, aborting the whole import.
+          xml_content = File.read(wxr_path).scrub
 
           # Guard against XML entity-expansion / recursive-entity DoS. A
           # malicious WXR can declare nested internal entities (e.g.
@@ -42,34 +48,17 @@ module Hwaro
 
           doc = XML.parse(xml_content)
 
-          imported = 0
-          skipped = 0
-          errors = 0
-
-          items = find_items(doc)
-
-          items.each do |item|
-            result = process_item(item, output_dir, include_drafts, verbose, force)
-            case result
-            when :imported
-              imported += 1
-            when :skipped
-              skipped += 1
-            end
-          rescue ex
-            errors += 1
-            Logger.warn "Error processing item: #{ex.message}"
+          import_each(find_items(doc), "WordPress") do |item|
+            process_item(item, output_dir, include_drafts, verbose, force)
           end
+        end
 
-          report_collisions
+        protected def import_error_message(item : XML::Node, ex : Exception) : String
+          "Error processing item: #{ex.message}"
+        end
 
-          ImportResult.new(
-            success: imported > 0 || errors == 0,
-            message: "Imported #{imported} items, skipped #{skipped}, errors #{errors}",
-            imported_count: imported,
-            skipped_count: skipped,
-            error_count: errors
-          )
+        protected def summary_message(engine : String, imported : Int32, skipped : Int32, errors : Int32) : String
+          "Imported #{imported} items, skipped #{skipped}, errors #{errors}"
         end
 
         private def find_items(doc : XML::Node) : Array(XML::Node)
@@ -106,9 +95,19 @@ module Hwaro
           start = xml.index(/<!DOCTYPE/i)
           return false unless start
 
+          # A real DOCTYPE can only live in the prolog, before the root
+          # element. A `<!DOCTYPE` mention inside a post body (a DTD tutorial,
+          # escaped markup) must not seed the scan: its surrounding prose can
+          # hold unbalanced brackets/quotes that would never "close" and get
+          # the whole file refused.
+          if root = xml.index(/<[A-Za-z]/)
+            return false if start > root
+          end
+
           window = xml[start, 1 << 16]
           in_quote : Char? = nil
           depth = 0
+          closed = false
           doctype = String.build do |io|
             window.each_char do |c|
               io << c
@@ -121,10 +120,17 @@ module Hwaro
               elsif c == ']'
                 depth -= 1 if depth > 0
               elsif c == '>' && depth == 0
+                closed = true
                 break
               end
             end
           end
+          # The DOCTYPE never terminated inside the scan window, so an
+          # internal subset longer than the window could smuggle its
+          # `<!ENTITY` declarations past the scan. No legitimate WXR carries
+          # a DOCTYPE anywhere near this size — treat it as if it declared
+          # entities and refuse.
+          return true unless closed
           doctype.matches?(/<!ENTITY/i)
         end
 
@@ -214,7 +220,7 @@ module Hwaro
           # (`sanitize_title`); decode so the filename matches what servers
           # and browsers will show for the URL. Traversal is neutralized at
           # the write_content_file sink.
-          slug = post_name.empty? ? slugify(title) : URI.decode(post_name)
+          slug = post_name.empty? ? file_slug(title) : URI.decode(post_name)
           return :skipped if slug.empty?
 
           # Determine section
@@ -223,9 +229,9 @@ module Hwaro
           # Parse and format date — prefer the precise `<wp:post_date>`
           # (local time, no TZ noise) and fall back to RFC 822 `<pubDate>`.
           date_str : String? = nil
-          if !post_date.empty? && (parsed = parse_date(post_date))
+          if !post_date.empty? && (parsed = Utils::DateUtils.parse_import(post_date))
             date_str = format_date(parsed)
-          elsif !pub_date.empty? && (parsed = parse_date(pub_date))
+          elsif !pub_date.empty? && (parsed = Utils::DateUtils.parse_import(pub_date))
             date_str = format_date(parsed)
           end
 

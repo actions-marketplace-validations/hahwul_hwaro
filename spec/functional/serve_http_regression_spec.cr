@@ -126,8 +126,9 @@ end
           ensure
             socket.close
           end
-          status.should contain("404")
-          status.should_not contain("500")
+          # Crystal >= 1.22 refuses a non-ASCII request target itself with a 400
+          # before any handler runs; either way it must not be a 500.
+          status.should match(/ (400|404) /)
         end
       end
     end
@@ -146,7 +147,11 @@ end
     it "serves unicode routes percent-encoded and raw" do
       with_dev_server(base_path: mount || "") do |port, _|
         dev_client(port, &.get(at.call("/%ED%95%9C%EA%B8%80/"))).body.should contain("HANGUL")
-        dev_client(port, &.get(at.call("/한글/"))).body.should contain("HANGUL")
+        # Crystal >= 1.22 rejects a raw non-ASCII request target on both the
+        # client and the server side; browsers always send it percent-encoded.
+        {% if compare_versions(Crystal::VERSION, "1.22.0") < 0 %}
+          dev_client(port, &.get(at.call("/한글/"))).body.should contain("HANGUL")
+        {% end %}
       end
     end
 
@@ -205,6 +210,42 @@ end
 
         raw.scan(/^HTTP\/1\.1 /m).size.should eq(3)
         raw.scan(/NOT FOUND PAGE/).size.should eq(1)
+      end
+    end
+
+    it "sends no body for HEAD of a static file, with or without live reload" do
+      [true, false].each do |live_reload|
+        with_dev_server(base_path: mount || "", live_reload: live_reload) do |port, _|
+          socket = TCPSocket.new("127.0.0.1", port)
+          socket.read_timeout = 5.seconds
+          begin
+            socket << "HEAD #{at.call("/large.txt")} HTTP/1.1\r\nHost: h\r\n\r\n"
+            socket << "HEAD #{at.call("/guide/")} HTTP/1.1\r\nHost: h\r\n\r\n"
+            socket << "GET #{at.call("/missing")} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"
+            socket.flush
+            raw = socket.gets_to_end
+          ensure
+            socket.close
+          end
+
+          raw.scan(/^HTTP\/1\.1 /m).size.should eq(3)
+          raw.should contain("Content-Length: 40000")
+          raw.should_not contain("aaaa")
+          raw.should_not contain("GUIDE")
+          raw.scan(/NOT FOUND PAGE/).size.should eq(1)
+        end
+      end
+    end
+
+    it "reports the range length for a HEAD with Range" do
+      with_dev_server(base_path: mount || "") do |port, _|
+        headers = HTTP::Headers{"Range" => "bytes=0-9"}
+        head = dev_client(port, &.head(at.call("/large.txt"), headers))
+        get = dev_client(port, &.get(at.call("/large.txt"), headers))
+
+        head.status_code.should eq(206)
+        get.body.bytesize.should eq(10)
+        head.headers["Content-Length"].should eq(get.headers["Content-Length"]? || "10")
       end
     end
 

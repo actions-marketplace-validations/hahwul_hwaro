@@ -1,6 +1,7 @@
 require "base64"
 require "digest/sha256"
 require "file_utils"
+require "uri"
 require "json"
 require "../../core/build/parallel"
 require "../../models/config"
@@ -101,7 +102,12 @@ module Hwaro
         # Bump to invalidate incremental OG caches when the renderer's
         # design changes without any config change (it feeds
         # compute_config_hash). rev 2: 2026-07 typography + style redesign.
-        RENDER_REVISION = 2
+        # rev 3: 2026-09 logo keeps its aspect ratio inside the LOGO_SIZE box.
+        # rev 4: 2026-10 PNG titles hard-break segments wider than the line.
+        # rev 5: 2026-10 untitled pages headline the site title; the masthead
+        # and editorial kickers are XML-escaped; JPEG backgrounds and logos
+        # honour their EXIF orientation.
+        RENDER_REVISION = 5
 
         # `default` ("masthead"): eyebrow on top, title anchored high.
         MASTHEAD_EYEBROW_Y    =  96 # eyebrow baseline
@@ -332,7 +338,7 @@ module Hwaro
             # system font (which also covers Latin) so titles don't render as
             # blank "tofu" boxes. A user-set font_path always takes precedence.
             needs_cjk = ai.font_path.nil? &&
-                        pages.any? { |p| contains_cjk?(p.title) || contains_cjk?(p.description || "") }
+                        pages.any? { |p| contains_cjk?(display_title(p, config)) || contains_cjk?(p.description || "") }
 
             font_ctx = OgPngRenderer.load_fonts(ai.font_path, prefer_cjk: needs_cjk)
             png_available = !font_ctx.nil?
@@ -356,14 +362,14 @@ module Hwaro
           # Resolve absolute paths for logo and background image
           logo_abs_path = nil
           if logo_path = ai.logo
-            abs = logo_path.starts_with?("/") ? logo_path : File.join(Dir.current, logo_path)
-            logo_abs_path = abs if File.exists?(abs)
+            abs = File.expand_path(logo_path)
+            logo_abs_path = abs if File.file?(abs)
           end
 
           bg_abs_path = nil
           if bg_image_path = ai.background_image
-            abs = bg_image_path.starts_with?("/") ? bg_image_path : File.join(Dir.current, bg_image_path)
-            bg_abs_path = abs if File.exists?(abs)
+            abs = File.expand_path(bg_image_path)
+            bg_abs_path = abs if File.file?(abs)
           end
 
           # Pre-compute base64 data URIs once for SVG rendering.
@@ -374,7 +380,10 @@ module Hwaro
 
           # Pre-decode and resize images once for PNG rendering
           if png_available
-            cached_logo = OgPngRenderer.load_image(logo_abs_path, LOGO_SIZE, LOGO_SIZE) if logo_abs_path
+            # `fit: true` — LOGO_SIZE is a bounding box, not a target shape;
+            # a non-square logo must keep its aspect ratio (the SVG renderer
+            # already does, via `<image>`'s default preserveAspectRatio).
+            cached_logo = OgPngRenderer.load_image(logo_abs_path, LOGO_SIZE, LOGO_SIZE, fit: true) if logo_abs_path
             cached_bg = OgPngRenderer.load_image(bg_abs_path, WIDTH, HEIGHT) if bg_abs_path
           end
 
@@ -469,10 +478,15 @@ module Hwaro
           # touched by exactly one worker. The font context, cached
           # logo/bg, and base layer are read-only after build.
           unless pending.empty?
-            config_struct = Hwaro::Core::Build::ParallelConfig.new(enabled: parallel)
-            processor = Hwaro::Core::Build::Parallel(Tuple(Models::Page, String), Bool).new(config_struct)
+            # Workers print nothing: each returns its PNG-fallback warning,
+            # if any, and the results come back in page order, so the
+            # warnings and debug lines print in the same order on every
+            # build however the workers interleave.
+            config_struct = Hwaro::Core::Build::ParallelConfig.new(enabled: parallel, wake_idle: true)
+            processor = Hwaro::Core::Build::Parallel(Tuple(Models::Page, String), String?).new(config_struct)
             results = processor.process(pending) do |item, _idx|
               page, slug = item
+              fallback_warning = nil
               if format == "png" && png_available
                 png_filename = "#{slug}.png"
                 png_path = File.join(img_dir, png_filename)
@@ -484,7 +498,7 @@ module Hwaro
                   svg = render_svg(page, config, logo_data_uri, bg_data_uri)
                   Hwaro::Utils::FileSafe.atomic_write(File.join(img_dir, svg_filename), svg)
                   page.image = "/#{ai.output_dir}/#{svg_filename}"
-                  Logger.warn "  PNG render failed for #{slug}, falling back to SVG"
+                  fallback_warning = "  PNG render failed for #{slug}, falling back to SVG"
                 end
               else
                 svg_filename = "#{slug}.svg"
@@ -492,7 +506,6 @@ module Hwaro
                 Hwaro::Utils::FileSafe.atomic_write(File.join(img_dir, svg_filename), svg)
                 page.image = "/#{ai.output_dir}/#{svg_filename}"
               end
-              Logger.debug "  OG image: #{page.image}" if verbose
 
               # Cooperative yielding for responsiveness during heavy OG
               # generation (especially PNG) when running in a background
@@ -510,7 +523,14 @@ module Hwaro
               if (_idx + 1) % PNG_YIELD_INTERVAL == 0
                 Fiber.yield
               end
-              true
+              fallback_warning
+            end
+            results.each do |result|
+              next unless result.success
+              if warning = result.value
+                Logger.warn warning
+              end
+              Logger.debug "  OG image: #{pending[result.index][0].image}" if verbose
             end
             # Surface render/I-O failures (e.g. File.write raising on disk full /
             # permission). Without this, an exception is swallowed by the worker
@@ -524,6 +544,7 @@ module Hwaro
             generated = results.count(&.success)
           end
 
+          prune_orphaned_images(img_dir, output_dir, old_entries, new_entries, verbose) unless partial
           save_manifest(manifest_path, config_hash, new_entries)
 
           if generated > 0 || skipped > 0
@@ -555,8 +576,16 @@ module Hwaro
 
         # Pages auto-OG generation applies to (mirrors the Pass-1 filters,
         # minus the custom-image skip which callers evaluate themselves).
+        #
+        # A page that publishes no file of its own — it lost an output-path
+        # collision, or its URL traverses out of the output directory — has
+        # nothing to advertise a card for, and its `page.url`-derived slug
+        # produced names like `posts-..-..-escape.png`. An `unpublished`
+        # page (future/expired kept by a preview flag) follows the draft
+        # rule: it renders for preview but stays out of generated assets.
         def self.eligible_for_auto_image?(page : Models::Page) : Bool
-          !page.draft && !page.generated && page.render
+          !page.draft && !page.generated && page.render &&
+            !page.output_suppressed && !page.unpublished
         end
 
         # True when `image` was assigned by auto-OG generation — it points
@@ -568,6 +597,13 @@ module Hwaro
         def self.auto_assigned?(image : String?, ai : Models::AutoImageConfig) : Bool
           return false unless image
           image.starts_with?("/#{ai.output_dir.strip("/")}/")
+        end
+
+        # The headline of a card: the page title, or the site title for an
+        # untitled page (the blog scaffold's home page has `title = ""`) —
+        # the fallback og:title, feeds and llms.txt already apply.
+        def self.display_title(page : Models::Page, config : Models::Config) : String
+          page.title.strip.empty? ? config.title : page.title
         end
 
         # The OG image slug for a page. Uses the URL-based slug to avoid
@@ -583,10 +619,27 @@ module Hwaro
         # a short stable hash of the URL so each distinct URL owns a path.
         # `seen_slugs` (slug => owning page.url) carries that disambiguation
         # state across calls within one pass.
+        # Longest bare slug: + ".svg"/".png" (4) + "-<8 hex>" collision suffix (9)
+        # stays under the 255-byte NAME_MAX.
+        MAX_SLUG_BYTES = 240
+
         def self.slug_for(page : Models::Page, seen_slugs : Hash(String, String)) : String
-          url_slug = page.url.gsub("/", "-").strip("-")
+          # The slug becomes a file name AND a URL path segment, so it must not
+          # hold a percent escape: a page URL carries `#`/`?` as `%23`/`%3F`
+          # (Page#url=), and the file literally named `posts-c%23-tips.png`
+          # was requested as the decoded `posts-c#-tips.png` — a 404 og:image.
+          # Decode, then fold the two characters a URL path can't hold raw.
+          url = page.url
+          url = URI.decode(url).scrub.gsub(/[#?]/, "-") if url.includes?('%')
+          url_slug = url.gsub("/", "-").strip("-")
           slug = url_slug.empty? ? Utils::TextUtils.slugify(page.title) : url_slug
           slug = "page" if slug.empty?
+          # The slug is the whole URL, so a deep one can exceed NAME_MAX once
+          # the extension (4) and a collision suffix (9) are added; the page
+          # then silently lost its og:image. Longer slugs are cut and tagged
+          # with a digest of the full URL; every slug that already worked is
+          # untouched.
+          slug = Utils::TextUtils.bound_slug(slug, page.url, MAX_SLUG_BYTES)
 
           if (owner = seen_slugs[slug]?) && owner != page.url
             slug = "#{slug}-#{Digest::SHA256.hexdigest(page.url)[0, 8]}"
@@ -643,12 +696,12 @@ module Hwaro
         # Render an SVG image for a page
         def self.render_svg(page : Models::Page, config : Models::Config, logo_data_uri : String? = nil, bg_data_uri : String? = nil) : String
           ai = config.og.auto_image
-          bg = escape_attr(ai.background)
-          text_color = escape_attr(ai.text_color)
-          accent = escape_attr(ai.accent_color)
-          secondary = escape_attr(resolve_secondary(ai))
+          bg = Utils::TextUtils.escape_xml(ai.background)
+          text_color = Utils::TextUtils.escape_xml(ai.text_color)
+          accent = Utils::TextUtils.escape_xml(ai.accent_color)
+          secondary = Utils::TextUtils.escape_xml(resolve_secondary(ai))
           style = ai.style
-          site_name = escape_xml(config.title)
+          site_name = Utils::TextUtils.escape_xml(config.title)
 
           # Style-tuned default type scale unless the user raised it explicitly.
           font_size = Math.max(ai.font_size, 1)
@@ -695,7 +748,8 @@ module Hwaro
           chars_per_line = Math.max((text_w / (font_size * 0.55)).to_i, 1)
           desc_chars = Math.max((text_w / (desc_size * 0.55)).to_i, 1)
 
-          title_lines = balanced_word_wrap(page.title, chars_per_line)
+          title = display_title(page, config)
+          title_lines = balanced_word_wrap(title, chars_per_line)
           # The band style draws the title inside a fixed-height color band;
           # cap the lines so a long title can't overflow the band invisibly.
           title_cap = case style
@@ -764,7 +818,7 @@ module Hwaro
               # Fallback: reference logo as URL (file not found or not pre-computed)
               logo_url = logo.lchop("static/")
               logo_url = logo_url.starts_with?("/") ? logo_url : "/#{logo_url}"
-              logo_svg = %(<image href="#{escape_attr(logo_url)}" x="#{logo_x}" y="#{logo_y}" width="#{LOGO_SIZE}" height="#{LOGO_SIZE}" />)
+              logo_svg = %(<image href="#{Utils::TextUtils.escape_xml(logo_url)}" x="#{logo_x}" y="#{logo_y}" width="#{LOGO_SIZE}" height="#{LOGO_SIZE}" />)
             end
           end
 
@@ -797,7 +851,7 @@ module Hwaro
             # the composition for poster-style depth. Kept on-canvas and
             # width-capped so a long first word can't run off both sides.
             if style == "hero"
-              if ghost = page.title.split(/\s+/).first?
+              if ghost = title.split(/\s+/).first?
                 unless ghost.empty?
                   ghost_size = (font_size * 2.6).to_i
                   approx_w = (ghost.size * ghost_size * 0.62).to_i
@@ -806,7 +860,7 @@ module Hwaro
                   svg << %(<text x="#{text_x - 10}" y="#{ghost_top + (ghost_size * 0.78).to_i}" )
                   svg << %(font-family="#{SVG_DISPLAY_FONT}" )
                   svg << %(font-size="#{ghost_size}" font-weight="700" letter-spacing="4" fill="#{text_color}" opacity="0.06">)
-                  svg << escape_xml(ghost.upcase)
+                  svg << Utils::TextUtils.escape_xml(ghost.upcase)
                   svg << %(</text>\n)
                 end
               end
@@ -830,7 +884,7 @@ module Hwaro
               if ai.show_title && !site_name.empty?
                 svg << %(<text x="#{MARGIN_X}" y="#{MASTHEAD_EYEBROW_Y}" font-family="#{SVG_DISPLAY_FONT}" )
                 svg << %(font-size="#{MASTHEAD_EYEBROW_SIZE}" font-weight="700" letter-spacing="2" fill="#{accent}">)
-                svg << site_name.upcase
+                svg << Utils::TextUtils.escape_xml(config.title.upcase)
                 svg << %(</text>\n)
               else
                 svg << %(<rect x="#{MARGIN_X}" y="#{MASTHEAD_EYEBROW_Y - 6}" width="48" height="6" fill="#{accent}" />\n)
@@ -841,7 +895,7 @@ module Hwaro
             if style == "editorial" && ai.show_title && !site_name.empty?
               svg << %(<text x="#{MARGIN_X}" y="#{EDITORIAL_KICKER_Y}" font-family="#{SVG_DISPLAY_FONT}" )
               svg << %(font-size="#{EDITORIAL_KICKER_SIZE}" font-weight="700" letter-spacing="2" fill="#{accent}">)
-              svg << site_name.upcase
+              svg << Utils::TextUtils.escape_xml(config.title.upcase)
               svg << %(</text>\n)
             end
 
@@ -863,7 +917,7 @@ module Hwaro
               svg << %(<text x="#{x}" y="#{y}"#{title_anchor}#{title_tracking} )
               svg << %(font-family="#{title_font}" )
               svg << %(font-size="#{font_size}" font-weight="700" fill="#{title_fill}">)
-              svg << escape_xml(line)
+              svg << Utils::TextUtils.escape_xml(line)
               # Terminal: blinking-cursor block after the last title line.
               if style == "terminal" && i == title_lines.size - 1
                 svg << %(<tspan fill="#{accent}">&#x2588;</tspan>)
@@ -900,7 +954,7 @@ module Hwaro
                 svg << %(<text x="#{desc_x}" y="#{y}"#{desc_anchor} )
                 svg << %(font-family="#{SVG_DISPLAY_FONT}" )
                 svg << %(font-size="#{desc_size}" font-weight="500" fill="#{text_color}" opacity="#{desc_opacity}">)
-                svg << escape_xml(line)
+                svg << Utils::TextUtils.escape_xml(line)
                 svg << %(</text>\n)
               end
               desc_last_y = desc_start_y + (desc_lines.size - 1) * desc_line_h
@@ -1343,12 +1397,15 @@ module Hwaro
         end
 
         # Convert a file to a data URI with base64 encoding
-        def self.file_to_data_uri(file_path : String) : String
+        def self.file_to_data_uri(file_path : String) : String?
           ext = File.extname(file_path).downcase
           mime = MIME_TYPES[ext]? || "application/octet-stream"
           data = File.open(file_path, "rb", &.getb_to_end)
           encoded = Base64.strict_encode(data)
           "data:#{mime};base64,#{encoded}"
+        rescue ex : IO::Error
+          Logger.warn "OG image asset unreadable (#{file_path}): #{ex.message}"
+          nil
         end
 
         # Compute logo (x, y) for a given position string.
@@ -1459,11 +1516,6 @@ module Hwaro
           capped
         end
 
-        # Cap a `band`-style title to the lines that fit the band.
-        def self.cap_band_title(lines : Array(String), font_size : Int32) : Array(String)
-          cap_lines(lines, band_line_capacity(font_size))
-        end
-
         # A quiet hairline color derived from the background: slightly
         # lighter on dark backgrounds, slightly darker on light ones.
         def self.neutral_line_hex(bg_hex : String) : String
@@ -1508,7 +1560,7 @@ module Hwaro
         # cached images forever.
         def self.asset_digest(path : String?) : String
           return "" unless path
-          abs = path.starts_with?("/") ? path : File.join(Dir.current, path)
+          abs = File.expand_path(path)
           return "" unless File.exists?(abs)
           Digest::SHA256.new.file(abs).hexfinal
         rescue IO::Error
@@ -1520,10 +1572,71 @@ module Hwaro
           Digest::SHA256.hexdigest("#{page.title}|#{page.description}|#{page.url}")
         end
 
+        # Delete the images of slugs the manifest recorded and this build no
+        # longer claims — a page that was deleted, renamed, turned into a
+        # draft, or given a custom `image` in its front matter.
+        #
+        # `hwaro build` without `--cache` wipes the output directory, so this
+        # only shows on a warm `--cache` build (and on `serve`, which preserves
+        # its output): the PNG for a removed page stayed in `og-images/`
+        # forever, which is the orphaning the manifest's own comment describes.
+        # Pass 1 records EVERY eligible page in `new_entries` before the
+        # cache-hit short-circuit, so an unchanged page's image is never
+        # mistaken for an orphan.
+        #
+        # Never in partial mode: those calls deliberately carry the previous
+        # manifest forward because they only saw a slice of the pages.
+        private def self.prune_orphaned_images(img_dir : String, output_dir : String, old_entries : Hash(String, String), new_entries : Hash(String, String), verbose : Bool) : Nil
+          removed = 0
+          old_entries.each_key do |slug|
+            next if new_entries.has_key?(slug)
+            {"#{slug}.png", "#{slug}.svg"}.each do |filename|
+              path = File.join(img_dir, filename)
+              next unless File.file?(path)
+              next unless Utils::OutputGuard.within_output_dir?(path, output_dir)
+              begin
+                File.delete(path)
+                removed += 1
+                Logger.debug "  OG image: removed stale #{path}" if verbose
+              rescue ex : File::Error
+                # Bookkeeping: a stale image left behind must never fail a
+                # build whose pages all generated correctly.
+                Logger.debug "  OG image: could not remove stale #{path}: #{ex.message}"
+              end
+            end
+          end
+          Logger.info "  Removed #{removed} stale OG image(s)" if removed > 0
+        end
+
+        # The files the last `generate` call left published: every image its
+        # manifest records (PNG or the SVG fallback, whichever is on disk) and
+        # the manifest itself. The hook claims them with the builder, so the
+        # Finalize prune removes them once a build stops generating — the
+        # generator's own manifest prune never runs when auto images are
+        # switched off or `--skip-og-image` is passed, and a warm `--cache`
+        # build then kept publishing every image a cold build no longer has.
+        def self.published_outputs(config : Models::Config, output_dir : String) : Array(String)
+          ai = config.og.auto_image
+          return [] of String if output_dir_escapes?(ai, output_dir)
+          img_dir = File.join(output_dir, ai.output_dir)
+          manifest_path = File.join(img_dir, ".og_manifest.json")
+          return [] of String unless File.file?(manifest_path)
+          outputs = [manifest_path]
+          _, entries = load_manifest(manifest_path)
+          entries.each_key do |slug|
+            {"#{slug}.png", "#{slug}.svg"}.each do |filename|
+              path = File.join(img_dir, filename)
+              outputs << path if File.file?(path)
+            end
+          end
+          outputs
+        end
+
         # Load the OG manifest file. Returns {config_hash, entries}.
         def self.load_manifest(manifest_path : String) : Tuple(String, Hash(String, String))
           return {"", {} of String => String} unless File.exists?(manifest_path)
-          data = JSON.parse(File.read(manifest_path))
+          # Valid JSON that is not an object (`[]`, `null`) makes `Any#[]?` raise.
+          return {"", {} of String => String} unless data = JSON.parse(File.read(manifest_path)).as_h?
           config_hash = data["config_hash"]?.try(&.as_s?) || ""
           entries = {} of String => String
           if e = data["entries"]?.try(&.as_h?)
@@ -1553,14 +1666,6 @@ module Hwaro
             end
           end
           File.write(manifest_path, json)
-        end
-
-        private def self.escape_xml(text : String) : String
-          Utils::TextUtils.escape_xml(text)
-        end
-
-        private def self.escape_attr(text : String) : String
-          Utils::TextUtils.escape_xml(text)
         end
       end
     end

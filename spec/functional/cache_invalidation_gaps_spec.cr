@@ -1,4 +1,4 @@
-require "./support/build_helper"
+require "../support/build_helper"
 
 # =============================================================================
 # `build --cache` must converge on the same bytes a clean build produces.
@@ -222,6 +222,9 @@ describe "cache: static files whose mtime moves backwards" do
         File.write("templates/index.html", "{{ content }}")
         File.write("templates/page.html", "{{ content }}")
         File.write("static/app.js", "VERSION_A")
+        # Settled, not written a moment ago: a source mtime inside its
+        # timestamp tick is not stamped onto the copy (racy-git, #857).
+        File.touch("static/app.js", Time.utc - 1.hour)
 
         cached_build
         source_mtime = File.info("static/app.js").modification_time
@@ -235,6 +238,48 @@ describe "cache: static files whose mtime moves backwards" do
         File.touch("public/app.js", source_mtime)
         cached_build
         File.read("public/app.js").should eq("SENTINEL!")
+      end
+    end
+  end
+end
+
+# #859: a copy is stamped with the source mtime, so a same-size rewrite in
+# the tick the copy was made in matches it exactly. Touching both sides to a
+# settled time is that rewrite, seen by a build that runs 2s or more later.
+describe "cache: copies made while their source mtime was racy" do
+  it "byte-compares them once the source settles, then trusts the stamp again" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content/post")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("static")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("content/post/index.md", "---\ntitle: Post\n---\nPost")
+        File.write("templates/index.html", "{{ content }}")
+        File.write("templates/page.html", "{{ content }}")
+        files = {"static/app.js" => "public/app.js", "content/post/data.txt" => "public/post/data.txt"}
+        files.each_key { |src| File.write(src, "VERSION_A") }
+
+        cached_build
+        settled = Time.utc - 1.hour
+        files.each do |src, dest|
+          File.read(dest).should eq("VERSION_A")
+          File.write(src, "VERSION_B")
+          File.touch(src, settled)
+          File.touch(dest, settled)
+        end
+
+        cached_build
+        files.each_value { |dest| File.read(dest).should eq("VERSION_B") }
+
+        # Settled copies are trusted again: a same-length sentinel survives.
+        files.each_value do |dest|
+          File.write(dest, "SENTINEL!")
+          File.touch(dest, settled)
+        end
+        cached_build
+        files.each_value { |dest| File.read(dest).should eq("SENTINEL!") }
       end
     end
   end
@@ -278,6 +323,213 @@ describe "cache: alternating output directories" do
         before = File.info("A/about/index.html").modification_time
         cached_build("A")
         File.info("A/about/index.html").modification_time.should eq(before)
+      end
+    end
+  end
+end
+
+describe "cache: data files read through load_data()" do
+  it "re-renders when a data/*.csv changes" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("data")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        # `site.data` deliberately never exposes CSV, so the only way to read
+        # one is load_data() — which is exactly the path the digest missed.
+        File.write("templates/index.html",
+          %({% set rows = load_data(path="data/team.csv") %}) +
+          "{% for row in rows %}CELL:{{ row[0] }};{% endfor %}")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("data/team.csv", "name\nAlice\n")
+
+        cached_build
+        File.read("public/index.html").should contain("CELL:Alice;")
+
+        File.write("data/team.csv", "name\nZORBA\n")
+        cached_build
+        File.read("public/index.html").should contain("CELL:ZORBA;")
+        File.read("public/index.html").should_not contain("CELL:Alice;")
+      end
+    end
+  end
+
+  # The example above flaked on CI: the data digest DID move and the page DID
+  # re-render, but load_data() answered from its process-wide memo, which is
+  # keyed by millisecond mtime — and a rewrite that lands inside the same
+  # filesystem timestamp tick (ext4's coarse clock, 1–10ms) keeps the previous
+  # mtime. The memo must not outlive the build that filled it. Pinning the
+  # mtime explicitly makes the same-tick case deterministic.
+  it "re-renders from the new bytes when a data/*.csv is rewritten within one mtime tick" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("data")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("templates/index.html",
+          %({% set rows = load_data(path="data/team.csv") %}) +
+          "{% for row in rows %}CELL:{{ row[0] }};{% endfor %}")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("data/team.csv", "name\nAlice\n")
+
+        cached_build
+        File.read("public/index.html").should contain("CELL:Alice;")
+
+        stamp = File.info("data/team.csv").modification_time
+        File.write("data/team.csv", "name\nZORBA\n") # same size
+        File.touch("data/team.csv", stamp)           # same mtime
+        cached_build
+        File.read("public/index.html").should contain("CELL:ZORBA;")
+        File.read("public/index.html").should_not contain("CELL:Alice;")
+      end
+    end
+  end
+end
+
+describe "cache: static files edited inside the mtime tolerance" do
+  it "re-copies a same-size static edit made right after the previous build" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("static")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("templates/index.html", "{{ content }}")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("static/app.css", "body { color: #fff; }\n")
+
+        cached_build
+        File.read("public/app.css").should eq("body { color: #fff; }\n")
+
+        # Same byte size, mtime moved by well under MTIME_SKIP_TOLERANCE —
+        # the shape of any quick edit-save-rebuild cycle. The old tolerance
+        # window swallowed it and kept publishing the previous bytes.
+        source_mtime = File.info("static/app.css").modification_time
+        File.write("static/app.css", "body { color: #eee; }\n")
+        File.touch("static/app.css", source_mtime + 200.milliseconds)
+
+        cached_build
+        File.read("public/app.css").should eq("body { color: #eee; }\n")
+      end
+    end
+  end
+
+  # Racy-git (#857): the copy stamped the destination with the source mtime,
+  # so a same-size rewrite inside the source's timestamp tick (serve rebuilds
+  # within ms of a save) matched exactly and was skipped. A future mtime is
+  # never safely old, so the pinned rewrite is clock-independent.
+  it "re-copies a same-size static edit that kept the source mtime" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("static")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("templates/index.html", "{{ content }}")
+        File.write("templates/page.html", "{{ content }}")
+        tick = Time.utc + 1.hour
+        File.write("static/s.css", "body{color:#fff}\n")
+        File.touch("static/s.css", tick)
+
+        cached_build
+        File.read("public/s.css").should eq("body{color:#fff}\n")
+
+        File.write("static/s.css", "body{color:#eee}\n")
+        File.touch("static/s.css", tick)
+        cached_build
+        File.read("public/s.css").should eq("body{color:#eee}\n")
+      end
+    end
+  end
+
+  # Sync tools (rsync, `aws s3 sync`) decide on size + mtime, so a copy must
+  # carry its source's true mtime — also when that mtime is still inside its
+  # timestamp tick, where the racy-git rule applies at check time instead.
+  it "stamps static and bundle copies with the source mtime, even a just-written one" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content/bund")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("static")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("content/bund/index.md", "---\ntitle: B\n---\nb")
+        File.write("templates/index.html", "{{ content }}")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("static/s.css", "body{}\n")
+        File.write("content/bund/app.js", "one()")
+
+        cached_build
+        File.info("public/s.css").modification_time.should eq(File.info("static/s.css").modification_time)
+        File.info("public/bund/app.js").modification_time.should eq(File.info("content/bund/app.js").modification_time)
+      end
+    end
+  end
+
+  it "still skips a byte-identical static file whose mtime drifted inside the tolerance" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content")
+        FileUtils.mkdir_p("templates")
+        FileUtils.mkdir_p("static")
+        File.write("content/index.md", "---\ntitle: Home\n---\nHome")
+        File.write("templates/index.html", "{{ content }}")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("static/app.css", "body { color: #fff; }\n")
+
+        cached_build
+        # A coarse destination filesystem stores a truncated copy of the
+        # stamped source mtime; the bytes still match, so the copy must
+        # still be skipped. Simulated by drifting the destination stamp.
+        dest_mtime = File.info("public/app.css").modification_time
+        File.touch("public/app.css", dest_mtime - 1.second)
+        marker = File.info("public/app.css").modification_time
+
+        cached_build
+        File.info("public/app.css").modification_time.should eq(marker)
+      end
+    end
+  end
+end
+
+# A section index lists its child sections (`section.pages` entries and
+# `section.subsections`), so retitling a child section must re-render the
+# parent. The warm-build filter only treated sections as page-set dependent,
+# and a child `_index.md` edit moves the SECTION set — the parent (and the
+# homepage, for a top-level section) kept the old title.
+describe "cache: parent section listings follow child section edits" do
+  it "re-renders the parent and the homepage when a child section is retitled" do
+    Dir.mktmpdir do |dir|
+      Dir.cd(dir) do
+        File.write("config.toml", CACHE_CONFIG)
+        FileUtils.mkdir_p("content/a/b")
+        FileUtils.mkdir_p("templates")
+        File.write("content/_index.md", "+++\ntitle = \"Home\"\n+++\n")
+        File.write("content/a/_index.md", "+++\ntitle = \"A\"\n+++\n")
+        File.write("content/a/b/_index.md", "+++\ntitle = \"B\"\n+++\n")
+        File.write("templates/page.html", "{{ content }}")
+        File.write("templates/section.html",
+          "{% for p in section.pages %}[{{ p.title }}]{% endfor %}{% for s in section.subsections %}<{{ s.title }}>{% endfor %}")
+
+        cached_build
+        File.read("public/index.html").should eq("[A]<A>")
+        File.read("public/a/index.html").should eq("[B]<B>")
+
+        File.write("content/a/_index.md", "+++\ntitle = \"A2\"\n+++\n")
+        File.write("content/a/b/_index.md", "+++\ntitle = \"B2\"\n+++\n")
+        File.touch("content/a/_index.md", Time.local + 2.seconds)
+        File.touch("content/a/b/_index.md", Time.local + 2.seconds)
+        cached_build
+
+        File.read("public/index.html").should eq("[A2]<A2>")
+        File.read("public/a/index.html").should eq("[B2]<B2>")
       end
     end
   end

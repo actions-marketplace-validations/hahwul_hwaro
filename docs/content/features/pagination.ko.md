@@ -37,8 +37,11 @@ paginate_path = "page"
 
 | 필드 | 타입 | 기본값 | 설명 |
 |-------|------|---------|-------------|
-| paginate | int | — | 페이지당 항목 수 |
+| paginate | int | — | 페이지당 항목 수(`paginate_by`도 별칭으로 허용). `0` 이하면 이 섹션의 페이지네이션을 끕니다 |
+| pagination_enabled | bool | — | 이 섹션의 페이지네이션을 켜거나 끕니다. `paginate`와 사이트 전역 `[pagination]` 설정보다 우선합니다 |
 | paginate_path | string | "page" | 페이지 URL 패턴 |
+
+별도의 `template`을 지정한 섹션도 `paginate`(또는 `pagination_enabled = true`)를 설정하면 페이지네이션이 적용되며, 해당 템플릿에서 `section_list`, `pagination`, `paginator`를 사용할 수 있습니다. 설정하지 않으면 사이트 전역 `[pagination]`이 켜져 있어도 커스텀 템플릿은 모든 페이지를 그대로 나열합니다.
 
 ### 생성되는 URL
 
@@ -167,12 +170,12 @@ paginate_path = "page"
 
 ## 페이지가 많을 때의 줄임표
 
-페이지가 7개를 넘으면 내장 페이지네이션 내비게이션이 UI를 간결하게 유지하기 위해 줄임표(`...`)를 자동으로 넣습니다. 현재 페이지를 중심으로 페이지 번호 5개의 슬라이딩 윈도가 표시되고, 첫 페이지와 마지막 페이지는 항상 보입니다.
+페이지가 7개를 넘으면 내장 페이지네이션 내비게이션이 UI를 간결하게 유지하기 위해 줄임표(`…`)를 자동으로 넣습니다. 현재 페이지를 중심으로 페이지 번호 5개의 슬라이딩 윈도가 표시되고, 첫 페이지와 마지막 페이지는 항상 보입니다.
 
 예를 들어 20페이지 중 5페이지에서는:
 
 ```
-« Prev  1 ... 3  4  [5]  6  7 ... 20  Next »
+Prev  1 … 3  4  [5]  6  7 … 20  Next
 ```
 
 ## SEO 링크
@@ -202,7 +205,7 @@ name = "tags"
 paginate_by = 20
 ```
 
-각 항목 목록(예: `/tags/crystal/`)이 20개씩 페이지로 나뉘고, 이후 페이지는 `/tags/crystal/page/2/`에 생성됩니다. 택소노미 템플릿에서도 동일한 `pagination`, `paginator` 템플릿 변수를 사용할 수 있습니다.
+각 항목 목록(예: `/tags/crystal/`)이 20개씩 페이지로 나뉘고, 이후 페이지는 `/tags/crystal/page/2/`에 생성됩니다. 택소노미 템플릿에서도 동일한 `pagination`, `pagination_obj`, `paginator` 템플릿 변수를 사용할 수 있습니다. 항목 페이지의 `content`는 페이지 목록 뒤에 페이지네이션 내비게이션이 이미 붙어 있으므로, `content` 대신 `paginator.pages`로 목록을 직접 만들 때만 `{{ pagination }}`을 출력하세요.
 
 ## CSS 예시
 
