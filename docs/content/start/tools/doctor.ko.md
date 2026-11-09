@@ -103,21 +103,30 @@ hwaro doctor --json
 
 **구조 진단:**
 
-- `_index.md`가 없는 섹션 디렉터리
+- `_index.md`가 없는 섹션 디렉터리(`content/tags/` 같은 택소노미 디렉터리는
+  빌드가 `/tags/`를 직접 만들므로 제외)
+- 맞는 항목 페이지가 없는 `content/tags/<dir>/_index.md`. 대개 `<dir>`을
+  항목의 URL 슬러그가 아니라 철자 그대로 썼거나, 그 항목을 초안, 무시된
+  페이지, 다른 언어 페이지만 달고 있는 경우입니다
+  (`taxonomy-term-file-unmatched`. `path`나 `[permalinks]`로 다른 곳에 옮긴
+  섹션은 제외)
 
 **번역 보고** (언어가 둘 이상인 사이트):
 
 - 기본 언어에는 있지만 다른 설정 언어에는 대응 페이지가 없는 페이지나 섹션
   (`translation-missing`)
 - 기본 언어 원본이 없는 번역 (`translation-orphan`)
+- 같은 언어의 두 페이지가 같은 `translation_key`를 씀
+  (`translation-key-collision`, warning): 빌드는 한 페이지만 연결합니다(출력되는 페이지가
+  헤드리스나 `redirect_to` 페이지보다 먼저, 그다음은 경로 순)
 
-페이지는 빌드가 `page.translations`를 만들 때와 똑같이 짝지어집니다 (언어
-접미사를 뺀 기본 이름이 같으면 한 묶음이므로 `about.md`, `about.en.md`,
+페이지는 빌드가 `page.translations`를 만들 때와 똑같이 짝지어집니다 (`translation_key`가
+있으면 그 키로, 없으면 언어 접미사를 뺀 기본 이름이 같으면 한 묶음이므로 `about.md`, `about.en.md`,
 `about.ko.md`는 서로 짝). 기본 빌드가 게시하는 페이지만 셈하므로, 초안이나
 미래 날짜 페이지는 번역이 있다고도 없다고도 보지 않습니다. 헤드리스
 (`render = false`, 섹션 `[cascade]`로 적용된 경우 포함)나 `redirect_to` 페이지는
 빌드가 `page.translations`와 hreflang에서 빼므로 번역을 요구하지도, 번역으로
-세지도 않습니다. 둘 다 `info`
+세지도 않습니다. 누락 번역과 원본 없는 번역은 `info`
 수준이라 `--strict`가 부분 번역 때문에 실패하지 않습니다. 사람용 보고서는 언어별로
 묶어 개수와 함께 보여 줍니다.
 
@@ -251,13 +260,14 @@ ignore = [
 | `deployment-target-undefined` | config | deployment.target에 대응하는 `[[deployment.targets]]` 없음 |
 | `related-taxonomy-undefined` | config | `[related]`가 정의되지 않은 택소노미를 참조 |
 | `menu-parent-undefined` | config | 메뉴 항목의 `parent`가 같은 메뉴의 identifier와 맞지 않음 |
-| `version-path-missing` | config | `[[versions.list]]` 경로가 `content/` 아래에 없음 |
+| `version-path-missing` | config | `[[versions.list]]` 경로가 `content/` 아래에 없거나 `[content] ignore`로 제외됨 |
 | `config-path-missing` | config | 참조한 파일이 존재하지 않음 |
 | `config-dir-missing` | config | 참조한 디렉터리가 존재하지 않음 |
 | `build-output-unusable` | config | `[build] output_dir`로 라우트를 검증할 수 없음 (없거나 `hwaro serve` 출력) |
 | `build-output-stale` | config | 소스보다 오래된 빌드 출력으로 라우트를 통과시킴 |
 | `sass-dir-not-scanned` | config | 빌드가 스캔하지 않는 루트 `sass/` 디렉터리에 SCSS 파일이 있음 |
 | `sass-disabled-with-sources` | config | `[sass]`가 꺼진 상태에서 `static/` 아래에 SCSS 엔트리 파일이 있음 |
+| `highlight-lexer-invalid` | config | `[highlight] lexers_dir`의 문법 파일을 불러오지 못함 (읽기 실패, 잘못된 XML·정규식, `<name>` 누락), 앞선 파일과 이름이 겹침, 또는 강조할 때에야 드러나는 결함이 있음 (없는 상태 참조, `<include>` 순환, `pattern` 없는 `<token>` 규칙, 음수 `<pop>`, 없는 `<using lexer>`, 잘못된 `<filename>` 글롭) |
 | `missing-config-*` | config_missing | 설정 섹션 누락 (예: `missing-config-pwa`) |
 | `template-dir-missing` | template | 템플릿 디렉터리를 찾을 수 없음 ✗ |
 | `template-required-missing` | template | `page.html`(또는 `default.html`) 누락 ✗ |
@@ -271,8 +281,11 @@ ignore = [
 | `content-template-missing` | content | 프론트 매터의 `template` / `page_template` / `[cascade] template`이 없는 템플릿을 가리킴 |
 | `content-schema-violation` | content | 프론트 매터가 `[[content.schema]]`를 위반 ✗ |
 | `structure-missing-index` | structure | `_index.md`가 없는 섹션 |
+| `content-ignore-hides-sections` | structure | `[content] ignore` 패턴이 섹션의 `_index.md`를 숨기는데 그 섹션의 페이지는 여전히 빌드됨 |
+| `taxonomy-term-file-unmatched` | structure | `content/<taxonomy>/<dir>/_index.md`에 맞는 항목 페이지가 없어(`<dir>`이 항목의 URL 슬러그가 아니거나, 그 언어의 게시 페이지 중 그 항목을 단 것이 없음) 일반 섹션으로 게시됨 |
 | `translation-missing` | i18n | 설정된 언어에 대응 페이지가 없는 페이지나 섹션 |
 | `translation-orphan` | i18n | 기본 언어 원본이 없는 번역 |
+| `translation-key-collision` | i18n | 같은 언어의 두 페이지가 같은 `translation_key`를 씀. 한 페이지만 연결됨(출력되는 페이지 우선, 그다음 경로 순) |
 
 어떤 규칙 ID와도 맞지 않는 항목은 "효과 없음" 경고로 알려주므로, 오타가 조용히
 넘어가지 않습니다.

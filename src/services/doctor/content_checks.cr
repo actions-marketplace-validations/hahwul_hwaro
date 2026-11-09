@@ -38,7 +38,182 @@ module Hwaro
         # `docs/_index.md` collides with the latest version's root, and
         # without it the build writes a redirect stub there.
         version_parents = config.versions.list.map(&.parent_dir).reject(&.empty?).to_set
+        check_broad_ignore_patterns(issues, config)
+        # Nor is a taxonomy directory (`content/tags/`): the build generates
+        # `/tags/` itself and replaces an authored `tags/_index.md`, warning.
+        config.taxonomies.each { |taxonomy| version_parents << taxonomy.name }
         walk_section_dirs(@content_dir, issues, index_names(config), version_parents)
+
+        # A `tags/<dir>/_index.md` no term page takes (usually `<dir>` spelled
+        # as the term rather than its URL slug) quietly publishes as a section.
+        term_metadata(config).strays.each do |stray|
+          taxonomy = Path[stray.path].parts[0]
+          message = if stray.known_term
+                      "No term page #{stray.url} is generated: no published page in this file's language carries that term, so it publishes as an ordinary section"
+                    else
+                      "Matches no term page of taxonomy #{taxonomy}: no page carries a term with the URL slug \"#{Path[stray.url].basename}\", so it publishes as an ordinary section; name its directory after the term's URL slug (/#{taxonomy}/<slug>/) to describe that term page"
+                    end
+          issues << Issue.new(id: "taxonomy-term-file-unmatched", level: :info, category: "structure", file: stray.file, message: message)
+        end
+      end
+
+      # Content-relative paths of the `_index` files a default build reads as
+      # taxonomy term metadata (Content::Taxonomies.match_term_metadata, over
+      # the published files with their front-matter terms and URLs). Empty
+      # without a candidate (`term_metadata_path?`), which skips the parse.
+      # Terms a section `[cascade]` hands down count, as in the build; output
+      # collisions don't — doctor approximates, the build decides. Computed
+      # once per run (two checks read it). The candidates no term page takes
+      # are `strays`, minus those a `path` or `[permalinks]` rule moves away
+      # from `<lang>/<taxonomy>/<dir>/` on purpose.
+      private def term_metadata(config : Models::Config) : TermMetadata
+        @term_metadata ||= compute_term_metadata(config)
+      end
+
+      private def compute_term_metadata(config : Models::Config) : TermMetadata
+        none = TermMetadata.new(Set(String).new, [] of StrayTermFile)
+        return none if config.taxonomies.empty? || !Dir.exists?(@content_dir)
+        listed = ContentLister.new(@content_dir, GeneratedContent.infos(@content_dir, @content_ignore.rules), @content_ignore).list_all
+        infos = listed.select(&.published?)
+        relative = ->(info : ContentInfo) { info.generated_from ? info.path : Path[info.path].relative_to(@content_dir).to_s }
+        return none unless infos.any? { |info| Content::Taxonomies.term_metadata_path?(relative.call(info), config) }
+
+        default = config.default_language
+        menus = MenuScope.new(config)
+        pages = [] of Models::Page
+        sections = [] of Models::Section
+        drafts = [] of Models::Page # read for their terms only (`known_term`)
+        candidates = [] of {Models::Section, String}
+        previous = Logger.level
+        Logger.level = Logger::Level::Error # the build reports front-matter warnings
+        begin
+          listed.each do |info|
+            path = relative.call(info)
+            next if !info.published? && File.basename(path).starts_with?("_index.")
+            file = info.generated_from ? File.join(@content_dir, info.path) : info.path
+            data = begin
+              Processor::Markdown.parse(info.generated_source || File.read(file), file)
+            rescue Hwaro::HwaroError | File::Error
+              next
+            end
+            language = menus.filename_language(file)
+            language = nil if language == default
+            if File.basename(path).starts_with?("_index.")
+              section = Models::Section.new(path)
+              section.language = language
+              section.url = Utils::PermalinkResolver.resolve_url_lenient(path, config, slug: data[:slug], custom_path: data[:custom_path],
+                language: language, date: data[:date], title: data[:title], version: config.versions.for_path(path))[0]
+              section.cascade = data[:cascade]
+              sections << section
+              candidates << {section, file} if data[:custom_path].nil? && Content::Taxonomies.term_metadata_path?(path, config)
+            else
+              page = Models::Page.new(path)
+              page.language = language
+              page.render = data[:render]
+              page.tags = data[:tags]
+              page.taxonomies = data[:taxonomies]
+              page.authors = data[:authors]
+              page.front_matter_keys = data[:front_matter_keys]
+              page.version = config.versions.for_path(path)
+              (info.published? ? pages : drafts) << page
+            end
+          end
+          builder = Core::Build::Builder.new
+          cascade_map = builder.build_cascade_map(sections)
+          (pages + drafts).each { |page| builder.apply_cascade_to(page, cascade_map) } unless cascade_map.empty?
+        ensure
+          Logger.level = previous
+        end
+        files = Content::Taxonomies.match_term_metadata(pages, sections, config).keys.to_set
+        unmatched = candidates.compact_map do |section, file|
+          next if files.includes?(section.path)
+          taxonomy = Path[section.path].parts[0]
+          prefix = "#{section.language.try { |code| "/#{code}" }}/#{taxonomy}/"
+          slug = section.url.lchop(prefix).rchop("/")
+          # Moved by a `[permalinks]` rule: not meant to be a term page.
+          next if !section.url.starts_with?(prefix) || slug.empty? || slug.includes?('/')
+          {section, file, taxonomy, slug}
+        end
+        return TermMetadata.new(files, [] of StrayTermFile) if unmatched.empty?
+
+        # Every term slug some page carries, in any language, drafts and
+        # `[content] ignore`d pages included.
+        slugs = Set({String, String}).new
+        add_slugs = ->(page : Models::Page) do
+          config.taxonomies.each { |t| page.taxonomy_values(t.name).each { |term| slugs << {t.name, Utils::TextUtils.safe_slugify(term)} } }
+        end
+        (pages + drafts).each { |page| add_slugs.call(page) }
+        unless @content_ignore.empty?
+          Logger.level = Logger::Level::Error
+          begin
+            ContentWalk.find_content_files(@content_dir, ContentWalk::Ignore.none).each do |file|
+              next unless @content_ignore.ignored?(file)
+              data = begin
+                Processor::Markdown.parse(File.read(file), file)
+              rescue Hwaro::HwaroError | File::Error
+                next
+              end
+              page = Models::Page.new(file)
+              page.tags = data[:tags]
+              page.taxonomies = data[:taxonomies]
+              page.authors = data[:authors]
+              add_slugs.call(page)
+            end
+          ensure
+            Logger.level = previous
+          end
+        end
+        TermMetadata.new(files, unmatched.map { |section, file, taxonomy, slug| StrayTermFile.new(section.path, file, section.url, slugs.includes?({taxonomy, slug})) })
+      end
+
+      # A pattern that hides a section's `_index.*` while pages of that
+      # section still build: the section page and its listing are gone. Each
+      # pattern is tested against the real index files.
+      #
+      # `["_*"]` (or `**/_*`, `blog/_*`) usually means "underscore folders",
+      # but without a trailing `/` it matches files too: the advice is the
+      # folders-only form. A pattern naming index files itself
+      # (`notes/_index.md`, `**/_index*`) is deliberate, so it gets an info
+      # line saying which index it hides instead.
+      private def check_broad_ignore_patterns(issues : Array(Issue), config : Models::Config) : Nil
+        patterns = config.content_files.ignore
+        return if patterns.empty?
+
+        indexes = [] of String
+        built_dirs = Set(String).new
+        ContentWalk.find_content_files(@content_dir, ContentWalk::Ignore.none).each do |file|
+          if File.basename(file).starts_with?("_index.")
+            indexes << file
+          elsif !@content_ignore.ignored?(file)
+            # Every folder above a page that builds holds that page.
+            dir = File.dirname(file)
+            loop do
+              break unless built_dirs.add?(dir)
+              parent = File.dirname(dir)
+              break if parent == dir
+              dir = parent
+            end
+          end
+        end
+        return if indexes.empty?
+
+        patterns.each do |pattern|
+          probe = Models::ContentFilesConfig.new
+          probe.ignore = [pattern]
+          rules = @content_ignore.with_rules(probe)
+          hidden = indexes.select { |index| rules.ignored?(index) && built_dirs.includes?(File.dirname(index)) }
+          next if hidden.empty?
+
+          named = hidden.first(3).join(", ") + (hidden.size > 3 ? ", …" : "")
+          last = pattern.rstrip('/').split('/').last
+          if last.includes?("_index") || last.each_char.none?(&.in?('*', '?', '[', '{'))
+            issues << Issue.new(id: "content-ignore-hides-sections", level: :info, category: "structure", file: @config_path,
+              message: "[content] ignore pattern \"#{pattern}\" hides the section index #{named}; its pages still build, without a section page")
+          else
+            issues << Issue.new(id: "content-ignore-hides-sections", level: :warning, category: "structure", file: @config_path,
+              message: "[content] ignore pattern \"#{pattern}\" also hides section index files whose pages still build (#{named}); end it with / to match folders only (\"#{pattern.rstrip('/')}/\")")
+          end
+        end
       end
 
       # The base names that count as an index page for this site: always
@@ -68,6 +243,7 @@ module Hwaro
         Dir.each_child(root) do |entry|
           next if entry.starts_with?(".") || entry.starts_with?("_")
           child = File.join(root, entry)
+          next if content_ignored?(child)
           # A symlinked directory can close a cycle (`ln -s .. content/x/y`),
           # and this walk follows it: `File.directory?` resolves the link, so
           # the recursion only stops when the kernel gives up at MAXSYMLINKS
@@ -113,8 +289,14 @@ module Hwaro
       # case-insensitively, like `ReadContent`: a `*.{md,markdown}` glob
       # missed `Post.MD`, which the build publishes.
       private def dir_contains_markdown?(dir : String) : Bool
-        Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "**", "*")) { |path| return true if ContentWalk.markdown?(path) }
+        Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "**", "*")) { |path| return true if ContentWalk.markdown?(path) && !content_ignored?(path) }
         false
+      end
+
+      # Hidden by the site's `[content] ignore`: never a page, so never a
+      # finding either.
+      private def content_ignored?(path : String) : Bool
+        @content_ignore.ignored?(path)
       end
 
       # Returns true if the directory contains markdown files anywhere
@@ -124,11 +306,12 @@ module Hwaro
       # bundles rather than true sections.
       private def dir_has_markdown_in_subdirs?(dir : String, index_names : Set(String)) : Bool
         # Any markdown deeper than direct children of this dir?
-        Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "*", "*")) { |path| return true if ContentWalk.markdown?(path) }
+        Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "*", "*")) { |path| return true if ContentWalk.markdown?(path) && !content_ignored?(path) }
 
         # Any direct markdown file that is *not* an index page?
         Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "*")) do |path|
           next unless ContentWalk.markdown?(path)
+          next if content_ignored?(path)
           return true unless index_names.includes?(markdown_stem(File.basename(path)))
         end
 
@@ -138,16 +321,21 @@ module Hwaro
       # True when `dir` holds a section index (`_index.md`, or a declared
       # per-language spelling such as `_index.ko.md`).
       private def section_index?(dir : String, index_names : Set(String)) : Bool
-        return true if File.exists?(File.join(dir, "_index.md")) ||
-                       File.exists?(File.join(dir, "_index.markdown"))
+        return true if visible_file?(File.join(dir, "_index.md")) ||
+                       visible_file?(File.join(dir, "_index.markdown"))
         # Only a multilingual site has more spellings to look for, and only
         # then is the extra glob per directory worth paying for.
         return false if index_names.size <= 2
 
         Dir.glob(File.join(Utils::PathUtils.glob_escape(dir), "_index.*.{md,markdown}")) do |path|
+          next if content_ignored?(path)
           return true if index_names.includes?(markdown_stem(File.basename(path)))
         end
         false
+      end
+
+      private def visible_file?(path : String) : Bool
+        File.exists?(path) && !content_ignored?(path)
       end
 
       # `index.ko.md` -> "index.ko". Only the markdown extension is
@@ -192,7 +380,7 @@ module Hwaro
         # glob skipped `Post.MD`, so doctor reported a clean site the build
         # then failed on), and lstat-first so a symlink cycle
         # (`ln -s loop.md content/loop.md`) can't raise ELOOP out of the run.
-        files = ContentWalk.find_content_files(@content_dir)
+        files = ContentWalk.find_content_files(@content_dir, @content_ignore)
         return if files.empty?
 
         menus = MenuScope.new(config)
@@ -206,7 +394,7 @@ module Hwaro
 
       # `[[content.schema]]` violations, one error per violation.
       private def check_content_schema(issues : Array(Issue), config : Models::Config)
-        Doctor.content_schema_results(@content_dir, config).each do |_, result|
+        Doctor.content_schema_results(@content_dir, config, @content_ignore).each do |_, result|
           issues.concat(result.violations.map { |v| Doctor.schema_issue(v) })
         end
       end
@@ -222,7 +410,7 @@ module Hwaro
       # pages), with section cascades resolved by the build's own
       # `build_cascade_map` / `merged_cascade_for`. {file, result} per
       # checked page, in path order. Shared by doctor and `tool validate`.
-      def self.content_schema_results(content_dir : String, config : Models::Config) : Array({String, Content::FrontMatterSchema::Result})
+      def self.content_schema_results(content_dir : String, config : Models::Config, ignore : ContentWalk::Ignore = ContentWalk.ignore_rules(content_dir)) : Array({String, Content::FrontMatterSchema::Result})
         results = [] of {String, Content::FrontMatterSchema::Result}
         return results if config.content_schema.empty? || !Dir.exists?(content_dir)
 
@@ -234,7 +422,7 @@ module Hwaro
           menus = MenuScope.new(config)
           sections = [] of Models::Section
           pages = [] of {Models::Page, String, String, Hash(String, Models::ExtraValue), Bool}
-          ContentLister.new(content_dir, GeneratedContent.infos(content_dir)).list_all.each do |info|
+          ContentLister.new(content_dir, GeneratedContent.infos(content_dir, ignore.rules), ignore).list_all.each do |info|
             generated = !info.generated_from.nil?
             relative = generated ? info.path : Path[info.path].relative_to(content_dir).to_s
             file = generated ? File.join(content_dir, info.path) : info.path
@@ -309,7 +497,7 @@ module Hwaro
         # build (`products/blue.ko.md` ↔ generated `products/blue.md`), so they
         # count as originals; they have no file to report as untranslated.
         generated = {} of String => String
-        entries = ContentLister.new(@content_dir, GeneratedContent.infos(@content_dir)).list_all.select(&.published?).sort_by!(&.path).map do |info|
+        entries = ContentLister.new(@content_dir, GeneratedContent.infos(@content_dir, @content_ignore.rules), @content_ignore).list_all.select(&.published?).sort_by!(&.path).map do |info|
           relative = info.generated_from ? info.path : Path[info.path].relative_to(@content_dir).to_s
           file = info.generated_from ? File.join(@content_dir, info.path) : info.path
           info.generated_source.try { |source| generated[file] = source }
@@ -317,10 +505,22 @@ module Hwaro
           page = File.basename(relative).starts_with?("_index.") ? Models::Section.new(relative) : Models::Page.new(relative)
           language = menus.filename_language(file)
           page.language = language == default ? nil : language
+          page.version = config.versions.for_path(relative) # scopes `translation_key`
           {page, file}
         end
         apply_render_state(entries, generated)
-        Content::Multilingual.link_translations!(entries.map(&.[0]), config)
+        # A file that describes a term page is headless in the build, which
+        # is what link_translations! pairs on: a matched `_index.md` is then
+        # nobody's original, and each language's term page exists anyway.
+        term_files = term_metadata(config).files
+        entries.each { |page, _| page.render = false if term_files.includes?(page.path) } unless term_files.empty?
+        files = entries.to_h { |page, file| {page.path, file} }
+        losers = Set(String).new
+        Content::Multilingual.link_translations!(entries.map(&.[0]), config).each do |c|
+          losers << c.loser.path
+          issues << Issue.new(id: "translation-key-collision", level: :warning, category: "i18n", file: files[c.loser.path],
+            message: "translation_key #{c.key.inspect} is already used by the '#{c.code}' page #{files[c.winner.path]} — not linked as a translation", language: c.code)
+        end
 
         # Grouped per language, in configured order.
         others.each do |other|
@@ -328,6 +528,8 @@ module Hwaro
             # A page the build never writes (or that only redirects) needs no
             # translation, and is no one's missing counterpart.
             next if !page.render || page.has_redirect?
+            # A collision loser is reported once, as the collision.
+            next if losers.includes?(page.path)
             code = Content::Multilingual.language_code(page, config)
             codes = page.translations.empty? ? [code] : page.translations.map(&.code)
             if code == default && !codes.includes?(other)
@@ -357,6 +559,7 @@ module Hwaro
             end
             page.render = data[:render]
             page.redirect_to = data[:redirect_to]
+            page.translation_key = data[:translation_key]
             page.front_matter_keys = data[:front_matter_keys]
             {page, data[:cascade]}
           end

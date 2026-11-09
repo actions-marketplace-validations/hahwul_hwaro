@@ -39,6 +39,20 @@ module Hwaro
         # isn't rewritten.
         IMAGE_ATTR_RE = /(!\[[^\]]*\]\([^)]*\))\{([^{}]+)\}/
 
+        # True when the attribute block's `{` at byte `brace` of `line` is
+        # backslash-escaped (an odd run of `\` right before it): `\{#id}` is
+        # literal text, `\\{#id}` still an id block. Checked here, not in
+        # HEADING_ID_RE / HEADING_ATTR_RE: a per-character escape alternation
+        # in their text group exhausts the JIT stack on long heading lines.
+        # Also read by Includes, whose heading lookups must agree with the id.
+        def escaped_brace?(line : String, brace : Int32) : Bool
+          run = 0
+          while brace - run > 0 && line.byte_at(brace - run - 1) == '\\'.ord
+            run += 1
+          end
+          run.odd?
+        end
+
         # Engine-generated marker comments (footnote data blocks, shortcode
         # placeholders) start with this prefix and must pass through the
         # transforming passes verbatim: a footnote body containing `~~x~~` or
@@ -47,6 +61,13 @@ module Hwaro
         # are neutralized to `<!-- HWARO-` (with a space) by
         # preprocess_footnotes before this prefix check can match them.
         ENGINE_MARKER_PREFIX = "<!--HWARO-"
+
+        # A line the transforming passes leave verbatim. A shortcode
+        # placeholder followed by text is not one: that text is the author's
+        # Markdown, as it would be with the call mid-line.
+        private def engine_marker_line?(line : String) : Bool
+          line.starts_with?(ENGINE_MARKER_PREFIX) && !InlineMarkdown::SHORTCODE_PLACEHOLDER_LEADS_TEXT_RE.matches?(line)
+        end
 
         # Unified fence-aware line processor.
         # This allows multiple extensions (heading_ids + strikethrough, etc.)
@@ -63,7 +84,7 @@ module Hwaro
           String.build do |io|
             tracker = FenceTracker.new
             content.each_line(chomp: false) do |line|
-              if tracker.fence_line?(line) || line.starts_with?(ENGINE_MARKER_PREFIX)
+              if tracker.fence_line?(line) || engine_marker_line?(line)
                 io << line
               else
                 io << yield(line)
@@ -75,7 +96,7 @@ module Hwaro
         # Quote-aware attrs (a `>` inside a quoted value must not end the
         # tag); the id checks guard with `(?<![\w-])` so `data-id=` never
         # counts as the element's id.
-        HEADING_TAG_FOR_HID_RE = /<(h[1-6])((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)<\/\1>/m
+        HEADING_TAG_FOR_HID_RE = /<(h[1-6])(#{Utils::TextUtils::HTML_TAG_ATTRS})>(.*?)<\/\1>/m
         HID_MARKER_RE          = /<!--HID:([\w][\w:-]*)-->/
         EXISTING_ID_RE         = /(?<![\w-])id\s*=\s*"[^"]*"/i
         ANY_ID_ATTR_PRESENT_RE = /(?<![\w-])id\s*=/i

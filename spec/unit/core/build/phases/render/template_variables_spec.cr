@@ -46,6 +46,48 @@ describe "hreflang on paginated listings" do
       File.read("public/posts/page/2/index.html").should_not contain("hreflang")
     end
   end
+
+  it "names the default-language page as x-default on every translation, head and sitemap alike" do
+    build_site(
+      "title = \"T\"\nbase_url = \"https://ex.com\"\ndefault_language = \"en\"\n\n[sitemap]\nenabled = true\n\n[languages.en]\nlanguage_name = \"English\"\n\n[languages.ko]\nlanguage_name = \"한국어\"\n",
+      content_files: {
+        "about.md"    => "+++\ntitle = \"About\"\n+++\n",
+        "about.ko.md" => "+++\ntitle = \"소개\"\n+++\n",
+        "solo.md"     => "+++\ntitle = \"Solo\"\n+++\n",
+      },
+      template_files: {"page.html" => "{{ hreflang_tags }}"},
+    ) do
+      x_default = %(<link rel="alternate" hreflang="x-default" href="https://ex.com/about/">)
+      File.read("public/about/index.html").should contain(x_default)
+      File.read("public/ko/about/index.html").should contain(x_default)
+      File.read("public/solo/index.html").should_not contain("hreflang")
+      File.read("public/sitemap.xml").scan(%(hreflang="x-default" href="https://ex.com/about/")).size.should eq(2)
+    end
+  end
+end
+
+describe "page.permalink on pager pages" do
+  # page/2/ printed page 1's permalink while `page.url` was its own.
+  it "is the pager's own absolute URL, for sections and taxonomy terms" do
+    build_site(
+      "title = \"T\"\nbase_url = \"https://example.com/sub\"\n\n[[taxonomies]]\nname = \"tags\"\npaginate_by = 1\n",
+      content_files: {
+        "blog/_index.md" => "+++\ntitle = \"Blog\"\npaginate = 1\n+++\n",
+        "blog/a.md"      => "+++\ntitle = \"A\"\ndate = 2024-01-01\ntags = [\"x\"]\n+++\n",
+        "blog/b.md"      => "+++\ntitle = \"B\"\ndate = 2024-01-02\ntags = [\"x\"]\n+++\n",
+      },
+      template_files: {
+        "page.html"          => "P",
+        "section.html"       => "{{ page.url }}|{{ page.permalink }}|{{ page_permalink }}",
+        "taxonomy.html"      => "",
+        "taxonomy_term.html" => "{{ page.url }}|{{ page.permalink }}|{{ page_permalink }}",
+      },
+    ) do
+      File.read("public/blog/index.html").should eq("/blog/|https://example.com/sub/blog/|https://example.com/sub/blog/")
+      File.read("public/blog/page/2/index.html").should eq("/blog/page/2/|https://example.com/sub/blog/page/2/|https://example.com/sub/blog/page/2/")
+      File.read("public/tags/x/page/2/index.html").should start_with("/tags/x/page/2/|https://example.com/sub/tags/x/page/2/|https://example.com/sub/tags/x/page/2/")
+    end
+  end
 end
 
 describe "resize_image with a page-bundle image" do
@@ -188,6 +230,27 @@ describe "seo.twitter_card" do
       plain.should start_with("summary|")
       plain.should contain(%(name="twitter:card" content="summary"))
       File.read("public/pic/index.html").should start_with("summary_large_image|")
+    end
+  end
+end
+
+describe "page.path" do
+  # The page being rendered carries the same source path as its entry in a
+  # listing; templates must not see it empty only on the page itself.
+  it "is set on the current page as on its listing entry" do
+    build_site(
+      "title = \"T\"\nbase_url = \"http://localhost\"\n",
+      content_files: {
+        "blog/_index.md" => "+++\ntitle = \"Blog\"\n+++\n",
+        "blog/post.md"   => "+++\ntitle = \"Post\"\n+++\n",
+      },
+      template_files: {
+        "page.html"    => "[{{ page.path }}]",
+        "section.html" => "{% for p in section.pages %}[{{ p.path }}]{% endfor %}",
+      },
+    ) do
+      File.read("public/blog/post/index.html").should eq("[blog/post.md]")
+      File.read("public/blog/index.html").should eq("[blog/post.md]")
     end
   end
 end

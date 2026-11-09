@@ -25,7 +25,7 @@ module Hwaro
         # flat element (generated spans never contain tags); the attribute
         # scan is quote-aware so a `>` inside a quoted value doesn't end
         # the opening tag early.
-        HTML_CODE_SPAN_RE = /<code(?:\s(?:[^>"']|"[^"]*"|'[^']*')*)?>[^<]*<\/code>/
+        HTML_CODE_SPAN_RE = /<code(?:\s#{Utils::TextUtils::HTML_TAG_ATTRS})?>[^<]*<\/code>/
 
         # Placeholder emitted by transform_outside_code_spans for a stashed
         # code span; the capture is the span's index.
@@ -74,7 +74,7 @@ module Hwaro
             tracker = FenceTracker.new
             chunk = String::Builder.new
             content.each_line(chomp: false) do |line|
-              if tracker.fence_line?(line) || line.starts_with?(ENGINE_MARKER_PREFIX)
+              if tracker.fence_line?(line) || engine_marker_line?(line)
                 if chunk.bytesize > 0
                   io << stash_math_chunk(chunk.to_s, store)
                   chunk = String::Builder.new
@@ -246,7 +246,7 @@ module Hwaro
             tracker = FenceTracker.new
             in_html_block = false
             content.each_line(chomp: false) do |line|
-              if tracker.fence_line?(line) || line.starts_with?(ENGINE_MARKER_PREFIX)
+              if tracker.fence_line?(line) || engine_marker_line?(line)
                 # Mirrors stash_math's chunk boundaries: block state resets.
                 in_html_block = false
                 io << line

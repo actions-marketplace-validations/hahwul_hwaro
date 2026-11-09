@@ -85,6 +85,8 @@ toc = true
 | assets | Array<String> |
 | subsections | Array<Section> |
 
+이 객체에는 `top_level`, `date`, `draft`, `is_index`, `language`, `weight`, `transparent`, `sort_by`, `reverse`, `paginate`, `pagination_enabled`와 (지정했다면) `translation_key`도 있습니다. [데이터 모델 › 목록 속 섹션 객체](/ko/templates/data-model/#목록-속-섹션-객체)를 참고하세요.
+
 **예시:**
 
 ```jinja
@@ -205,7 +207,7 @@ toc = true
 | 속성 | 타입 | 설명 |
 |----------|------|--------------|
 | name | String | 표시 레이블 |
-| url | String | 아무것도 붙지 않은 루트 상대 경로, 또는 손대지 않은 외부 URL |
+| url | String | 아무것도 붙지 않은 루트 상대 경로, 또는 손대지 않은 외부 URL. `url` 없는 엔트리(그룹 제목)는 빈 문자열 |
 | href | String | 내부 링크면 `url`에 `base_path`를 적용한 값, 외부면 그대로 — `<a href>`에는 이 값을 사용 |
 | identifier | String | 메뉴 안에서 고유한 키 |
 | weight | Int | 정렬 순서 |
@@ -417,7 +419,8 @@ base_url이 포함된 URL을 생성합니다.
 
 | 이름 | 타입 | 설명 |
 |------|------|-------------|
-| format | String? | 날짜 포맷 문자열(선택, 기본값 `%Y-%m-%d %H:%M:%S`) |
+| format | String? | 날짜 포맷 문자열(선택, 기본값 `%Y-%m-%d %H:%M:%S`, `none`이나 정의되지 않은 변수일 때도 기본값) |
+| locale | String? | 월·요일·오전/오후 이름을 번역([`date` 필터](/ko/templates/filters/#날짜-포맷)와 같음, 선택) |
 
 **반환값:** String
 
@@ -456,6 +459,7 @@ base_url이 포함된 URL을 생성합니다.
 | height | Int | 요청 높이(픽셀, 0 = 원본) |
 | op | String | `fit`(기본값), `fill`, `crop` — [자르기와 채우기](/ko/features/image-processing/#자르기와-채우기) 참고 |
 | anchor | String | `fill`/`crop`이 남길 위치: `center`(기본값), `top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right` |
+| format | String | `auto`(기본값, 원본 포맷) 또는 `webp`(대소문자 무관). `fit`이면 [WebP 변형](/ko/features/image-processing/#webp-출력)을 반환합니다(없으면 원본 포맷 변형). `fill`/`crop`이면 변형을 WebP로 씁니다 |
 
 **반환값:** 다음 속성을 가진 객체:
 

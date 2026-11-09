@@ -338,6 +338,12 @@ describe Hwaro::Utils::TextUtils do
   end
 
   describe ".escape_xml" do
+    it "drops the U+FFFE/U+FFFF noncharacters XML forbids" do
+      Hwaro::Utils::TextUtils.escape_xml("a\uFFFEb\uFFFFc").should eq("abc")
+      Hwaro::Utils::TextUtils.escape_xml("a\uFFFE&").should eq("a&amp;")
+      Hwaro::Utils::TextUtils.escape_xml("，￼").should eq("，￼")
+    end
+
     it "escapes ampersand" do
       Hwaro::Utils::TextUtils.escape_xml("Tom & Jerry").should eq("Tom &amp; Jerry")
     end
@@ -505,6 +511,11 @@ describe Hwaro::Utils::TextUtils do
       it "does not end a tag at a > inside a quoted attribute" do
         Hwaro::Utils::TextUtils.strip_html(%(<img src="/a.png" alt="Home > Docs" width="10"> Tail)).should eq("Tail")
         Hwaro::Utils::TextUtils.strip_html(%(<a title='a > b' href="x">link</a>)).should eq("link")
+      end
+
+      it "drops a <script> with tens of thousands of quoted attributes without exhausting the regex stack" do
+        html = %(<script #{%(a="" ) * 30_000}>var x = 1;</script>Tail)
+        Hwaro::Utils::TextUtils.strip_html(html).should eq("Tail")
       end
 
       it "keeps a < that does not start a tag as text" do

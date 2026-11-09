@@ -49,6 +49,7 @@ Welcome to my blog.
 | redirect_to | string | — | 섹션을 렌더링하는 대신 이 URL(또는 `@/blog/post.md` 같은 `@/` 콘텐츠 경로)로 가는 HTML 리다이렉트 페이지 생성 |
 | draft | bool | false | 프로덕션에서 제외 |
 | weight | int | 0 | 섹션 정렬 순서 |
+| translation_key | string | — | 디렉터리 이름이 다른 섹션 번역을 연결. [번역 키](/ko/features/multilingual/#번역-키) 참고 |
 | cascade | table | — | 하위 항목이 상속하는 기본값 ([캐스케이드](#캐스케이드) 참고) |
 
 ## 캐스케이드
@@ -197,7 +198,7 @@ content/
 | section.pages | Array<Page> | 현재 섹션 목록에 표시되는 페이지 |
 | section.pages_count | Int | `section.pages`의 항목 수 |
 | section.list | String | 미리 렌더링된 HTML 목록(`section_list`와 동일한 값) |
-| section.subsections | Array<Section> | 직계 하위 섹션(`title`, `description`, `url`, `pages_count`). `weight`, 경로 순으로 정렬되며, 루트 `_index.md`에서는 최상위 섹션 |
+| section.subsections | Array<Section> | 직계 하위 섹션. 각 항목은 `get_section()`이 반환하는 전체 섹션 객체(`title`, `url`, `pages`, `pages_count`, `subsections` 등, [데이터 모델 › 목록 속 섹션 객체](/ko/templates/data-model/#목록-속-섹션-객체) 참고)입니다. `weight`, 경로 순으로 정렬되며, 루트 `_index.md`에서는 최상위 섹션 |
 | section.assets | Array<String> | 섹션과 함께 둔 에셋 |
 | section.page_template | String | 하위 페이지의 기본 템플릿 이름 |
 | section.paginate_path | String | 페이지네이션 경로 세그먼트 |

@@ -91,23 +91,12 @@ module Hwaro
             !value_empty?(target.raw)
           end
 
-          regex_cache = {} of String => Regex
-          regex_mutex = Mutex.new
-          max_regex_cache_size = 256
-
           # Test if a string matches a regex
           # Usage: {% if asset is matching("[.](jpg|png)$") %}
           @env.tests["matching"] = Crinja.test do
             regex_str = arguments.varargs.first?.try(&.to_s) || ""
             begin
-              regex = regex_mutex.synchronize do
-                # Evict oldest entry when cache is full
-                if regex_cache.size >= max_regex_cache_size && !regex_cache.has_key?(regex_str)
-                  regex_cache.delete(regex_cache.first_key)
-                end
-                regex_cache[regex_str] ||= Regex.new(regex_str)
-              end
-              target.to_s.matches?(regex)
+              target.to_s.matches?(Filters::StringFilters.regex(regex_str))
             rescue ArgumentError
               false
             end
@@ -127,22 +116,22 @@ module Hwaro
 
         private def register_now_function
           # now() function - returns current time
-          @env.functions["now"] = Crinja.function({format: nil}) do
+          @env.functions["now"] = Crinja.function({format: nil, locale: nil}) do
             format = arguments["format"]
-            time = Time.local
+            # An undefined variable is no format, like `none`. The default
+            # format prints no names, so its locale is never looked up (an
+            # unknown one does not warn).
+            default = format.none? || format.undefined?
+            format = default ? CLOCK_DEFAULT_FORMAT : format.to_s
+            locale = default ? "" : Filters::DateFilters.locale_arg(arguments["locale"])
             # The page is only as fresh as this format's text: a `--cache`
             # build re-renders it once the formatted clock moves.
-            TemplateEngine.record_clock_read(format.none? ? CLOCK_DEFAULT_FORMAT : format.to_s)
-
-            if format.none?
-              Crinja::Value.new(time.to_s(CLOCK_DEFAULT_FORMAT))
-            else
-              # Same guard as the `date` filter: a malformed format string
-              # (`now(format="%")`) makes Crystal's `Time#to_s` raise a bare
-              # `IndexError`, which is not a `Crinja::Error` and so kills the
-              # build with `Index out of bounds` and no template file:line.
-              Crinja::Value.new(Filters::DateFilters.format_time(time, format.to_s))
-            end
+            TemplateEngine.record_clock_read(format)
+            # Same guard as the `date` filter: a malformed format string
+            # (`now(format="%")`) makes Crystal's `Time#to_s` raise a bare
+            # `IndexError`, which is not a `Crinja::Error` and so kills the
+            # build with `Index out of bounds` and no template file:line.
+            Crinja::Value.new(Filters::DateFilters.format_time(Time.local, format, locale))
           end
         end
 
@@ -215,8 +204,13 @@ module Hwaro
           @env.functions["get_section"] = Crinja.function({path: ""}) do
             path_arg = arguments["path"].to_s
             path_arg = path_arg.unicode_normalize(:nfc) unless path_arg.ascii_only?
-            # "blog", "/blog", "blog/" and "/blog/" all name the same section.
-            url_key = "/#{path_arg.strip('/')}/"
+            # "blog", "/blog", "blog/" and "/blog/" all name the same section:
+            # each map is tried with the argument, the URL, then the bare
+            # name, so a ko page's "/blog" finds the ko section (url
+            # /ko/blog/) rather than falling through to the en one whose URL
+            # is "/blog/", while a URL still wins over another section's name.
+            name_key = path_arg.strip('/')
+            url_key = "/#{name_key}/"
 
             # A section name can occur in every language variant. Resolve an
             # ambiguous name in the current page's language before falling
@@ -233,7 +227,7 @@ module Hwaro
                 next unless candidate_map = language_maps[candidate]?
                 next unless candidate_map.raw.is_a?(Hash)
                 raw_candidate_map = candidate_map.raw.as(Hash)
-                if found = raw_candidate_map[path_arg]? || raw_candidate_map[url_key]?
+                if found = raw_candidate_map[path_arg]? || raw_candidate_map[url_key]? || raw_candidate_map[name_key]?
                   return found
                 end
               end
@@ -243,7 +237,7 @@ module Hwaro
             sections_map = env.resolve("__sections_by_key__")
             if !sections_map.raw.nil? && sections_map.raw.is_a?(Hash)
               raw_map = sections_map.raw.as(Hash)
-              found = raw_map[path_arg]? || raw_map[url_key]?
+              found = raw_map[path_arg]? || raw_map[url_key]? || raw_map[name_key]?
               found || Crinja::Value.new(nil)
             else
               # Fallback to linear search O(N) if map is not available
@@ -410,7 +404,12 @@ module Hwaro
           # box out unscaled) write a dedicated variant at render time,
           # positioned by `anchor`; `width`/`height` are then the written
           # file's. See ImageHooks.op_variant.
-          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0, op: "fit", anchor: "center"}) do
+          #
+          # `format="webp"` picks the WebP copy instead: for `fit` the
+          # pre-generated variant (`[image_processing] formats`), falling
+          # back to the source-format one when there is none; for `fill` /
+          # `crop` the variant is written as WebP.
+          @env.functions["resize_image"] = Crinja.function({path: "", width: 0, height: 0, op: "fit", anchor: "center", format: "auto"}) do
             path = arguments["path"].to_s
             # Lenient coercion: shortcode arguments are always Strings, so a
             # `width="800"` forwarded from `{% img(width="800") %}` must resize
@@ -428,6 +427,12 @@ module Hwaro
             if op != "fit" && (width <= 0 || height <= 0)
               raise Crinja::RuntimeError.new("resize_image: op=#{op.inspect} needs both width and height")
             end
+            # Case-insensitive like `[image_processing] formats`.
+            format = arguments["format"].to_s.strip.downcase
+            unless format == "auto" || Models::ImageProcessingConfig::VALID_FORMATS.includes?(format)
+              raise Crinja::RuntimeError.new("resize_image: unknown format #{format.inspect} (expected one of: auto, #{Models::ImageProcessingConfig::VALID_FORMATS.join(", ")})")
+            end
+            variant_format = format == "auto" ? nil : format
 
             base_url = env.resolve("base_url").to_s
 
@@ -464,7 +469,7 @@ module Hwaro
               source = Content::Hooks::ImageHooks.resolve_source(normalized)
               TemplateEngine.record_file_read(source || File.join("static", normalized))
               page_path = env.resolve("__page_path__").raw.as?(String)
-              made = source.try { |src| Content::Hooks::ImageHooks.op_variant(normalized, src, width, height, op, anchor, page_path) }
+              made = source.try { |src| Content::Hooks::ImageHooks.op_variant(normalized, src, width, height, op, anchor, page_path, variant_format) }
               return Crinja::Value.new({
                 "url"    => Crinja::Value.new(base_url.rstrip("/") + URI.encode_path(made.try(&.[0]) || normalized) + suffix),
                 "width"  => Crinja::Value.new(made.try(&.[1]) || width),
@@ -482,12 +487,13 @@ module Hwaro
             # Serve re-renders the page too: its LQIP / dominant colour are
             # printed data (see ImageHooks.watch_render_source).
             if Content::Hooks::ImageHooks.processing_active?
-              Content::Hooks::ImageHooks.watch_render_source(normalized).try { |source| TemplateEngine.record_file_read(source) }
+              Content::Hooks::ImageHooks.watch_render_source(normalized) { |src| TemplateEngine.record_file_read(src) }
             end
 
             # Try to find a resized variant from the image hooks map
             variant = if width > 0
-                        Content::Hooks::ImageHooks.find_closest_variant(normalized, width)
+                        variant_format.try { |f| Content::Hooks::ImageHooks.find_closest_variant(normalized, width, f) } ||
+                          Content::Hooks::ImageHooks.find_closest_variant(normalized, width)
                       end
 
             final_url = if resized = variant
@@ -554,6 +560,9 @@ module Hwaro
         # render worker has its own env.
         @@render_reads = Set(String).new
         @@render_reads_mutex = Mutex.new
+        # Bumped by every `take_render_reads`: a caller that records the same
+        # reads on every call can record them once per record instead.
+        @@render_reads_generation = 0_u64
 
         ENV_READ_PREFIX  = "env:"
         FILE_READ_PREFIX = "file:"
@@ -580,7 +589,29 @@ module Hwaro
         end
 
         def self.record_render_read(key : String) : Nil
-          @@render_reads_mutex.synchronize { @@render_reads << key }
+          @@render_reads_mutex.synchronize { @@render_reads << key if @@render_reads_paused == 0 }
+        end
+
+        # Nesting depth of `without_render_reads`.
+        @@render_reads_paused = 0
+
+        # Run the block without recording its reads. For outputs every build
+        # renders again, cached or not (the 404 page, taxonomy pages, user
+        # feed templates): their reads key no cached page, and the cold build
+        # records the reads before it renders them. A serve pass recording
+        # them read as "moved during serve" (record_serve_cache_keys), so the
+        # next `serve --cache` start rendered every page. Nothing else
+        # renders while these run.
+        def self.without_render_reads(&)
+          @@render_reads_mutex.synchronize { @@render_reads_paused += 1 }
+          yield
+        ensure
+          # A memo handed out while paused (image_hooks' variant paths) went
+          # unrecorded: hand it out again.
+          @@render_reads_mutex.synchronize do
+            @@render_reads_paused -= 1
+            @@render_reads_generation &+= 1
+          end
         end
 
         # Record a file read by its project-relative path (the cache outlives
@@ -593,9 +624,14 @@ module Hwaro
           record_render_read(FILE_READ_PREFIX + normalized)
         end
 
+        def self.render_reads_generation : UInt64
+          @@render_reads_mutex.synchronize { @@render_reads_generation }
+        end
+
         # Everything recorded since the last call, and start a new record.
         def self.take_render_reads : Set(String)
           @@render_reads_mutex.synchronize do
+            @@render_reads_generation &+= 1
             taken = @@render_reads
             @@render_reads = Set(String).new
             taken

@@ -74,6 +74,42 @@ end
 
 describe Hwaro::Content::Seo::Amp do
   describe ".convert_to_amp" do
+    it "keeps only the <img> of a <picture>" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      html = %(<html><head></head><body><picture><source type="image/webp" srcset="/a_400w.webp 400w" sizes="100vw"><img src="/a.png" alt="a" width="4" height="3"></picture></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should_not contain("<picture")
+      result.should_not contain("<source")
+      result.should contain(%(<amp-img src="/a.png"))
+    end
+
+    it "drops a <source> whose attribute value contains '>'" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      html = %(<html><head></head><body><picture><source media="(width > 600px)" srcset="/a_400w.webp 400w"><img src="/a.png" alt="a" width="4" height="3"></picture></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should_not contain("<source")
+      result.should_not contain("600px)")
+      result.should contain(%(<amp-img src="/a.png"))
+    end
+
+    it "converts an <img> with a 100k-character unquoted src" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+      config.base_url = "https://example.com"
+      data = "data:image/gif;base64,#{"A" * 100_000}"
+      html = %(<html><head></head><body><picture data-x=#{"b" * 100_000}><source srcset=#{"c" * 100_000}><img src=#{data} width="4" height="3"></picture></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should_not contain("<source")
+      result.should contain(%(<amp-img src=#{data} width="4" height="3" layout="responsive"></amp-img>))
+    end
+
     it "adds amp attribute to html tag" do
       page = Hwaro::Models::Page.new("test.md")
       page.url = "/test/"
@@ -127,6 +163,38 @@ describe Hwaro::Content::Seo::Amp do
         result.should contain(%(src="/posts/b1/cover.png"))
         result.should contain(%(href="/posts/b2/"))
       end
+
+      it "resolves single-quoted and unquoted values too" do
+        page = Hwaro::Models::Page.new("posts/b1/index.md")
+        page.url = "/posts/b1/"
+        config = Hwaro::Models::Config.new
+        config.base_url = "https://example.com"
+
+        sq = %(<html><head></head><body><img src='cover.png' width="1" height="1"> <img src=cover.png width="1" height="1"> <a href='../b2/'>o</a></body></html>)
+        result = Hwaro::Content::Seo::Amp.convert_to_amp(sq, page, config)
+        result.should contain(%(src='https://example.com/posts/b1/cover.png'))
+        result.should contain(%(src=https://example.com/posts/b1/cover.png ))
+        result.should contain(%(href='https://example.com/posts/b2/'))
+      end
+    end
+
+    it "converts an <img> between upper-case raw-text elements" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      html = %(<html><head></head><body><TEXTAREA>x</TEXTAREA><img src="/b.png" width="4" height="3"><textarea>y</textarea></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, Hwaro::Models::Config.new)
+      result.should contain(%(<amp-img src="/b.png"))
+      result.should_not contain("<img")
+    end
+
+    it "leaves an <img> inside a textarea or script as text" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      html = %(<html><head><script type="application/ld+json">{"x":"<img src=\\"a.png\\">"}</script></head><body><textarea><img src="a.png"></textarea><img src="b.png"></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, Hwaro::Models::Config.new)
+      result.should contain(%(<textarea><img src="a.png"></textarea>))
+      result.should contain(%({"x":"<img src=\\"a.png\\">"}))
+      result.should contain(%(<amp-img src="/test/b.png"))
     end
 
     it "converts img to amp-img with fill layout when no dimensions" do
@@ -314,6 +382,24 @@ describe Hwaro::Content::Seo::Amp do
       result.should_not contain("alert(1)")
     end
 
+    # Regression: the removal ended a script only at an exact `</script>`, so
+    # one closed by `</script >` ran on to the next script's end and took the
+    # page content between with it; `<script-loader>` opened one too.
+    it "removes a script closed with whitespace, and only that script" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+
+      html = %(<html><head></head><body><script>a()</script ><p>Keep one</p><SCRIPT>b()</SCRIPT\n>) +
+             %(<script-loader>w</script-loader><p>Keep two</p><script>c()</script></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should contain("<p>Keep one</p>")
+      result.should contain("<script-loader>w</script-loader><p>Keep two</p>")
+      result.should_not contain("a()")
+      result.should_not contain("b()")
+      result.should_not contain("c()")
+    end
+
     it "removes multiline script tags" do
       page = Hwaro::Models::Page.new("test.md")
       page.url = "/test/"
@@ -371,6 +457,22 @@ describe Hwaro::Content::Seo::Amp do
       custom.should_not contain("@layer")
     end
 
+    # Regression: a theme <style> ended only at an exact `</style>`, so one
+    # closed by `</style >` was folded into amp-custom together with the page
+    # up to the next one; `<style-x>` opened one too.
+    it "folds a theme style closed with whitespace, and only that style" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      html = "<html><head><style>a{color:red}</style ></head><body><p>Keep me</p><style>b{}</style>" \
+             "<style-x>c</style-x><p>Keep two</p></body></html>"
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, Hwaro::Models::Config.new)
+      custom = result[/<style amp-custom>([\s\S]*?)<\/style>/, 1]
+      custom.should contain("a{color:red}")
+      custom.should contain("b{}")
+      custom.should_not contain("Keep")
+      result.should contain("<body><p>Keep me</p><style-x>c</style-x><p>Keep two</p></body>")
+    end
+
     # Regression: the codepen shortcode / CodePen embed snippet (height only,
     # allowfullscreen="true", frameborder="no") became an invalid amp-iframe.
     it "converts a height-only embed iframe into a valid amp-iframe" do
@@ -387,6 +489,36 @@ describe Hwaro::Content::Seo::Amp do
       tag.should_not contain(%(="true"))
     end
 
+    it "reads <link>, <video> and <iframe> tags whose quoted values contain '>'" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+
+      html = %(<html><head><link rel="stylesheet" href="/wide.css" media="(width >= 600px)"></head><body>) +
+             %(<video title="a > b" src="/v.mp4"></video><iframe title="Map > Seoul" src="https://example.com/e"></iframe></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should_not contain("wide.css")
+      result.should_not contain("600px")
+      result.should contain(%(<amp-video title="a > b" src="/v.mp4" layout="responsive"></amp-video>))
+      result.should contain(%(<amp-iframe title="Map > Seoul" src="https://example.com/e" layout="responsive"))
+    end
+
+    it "keeps stray apostrophes in unquoted values from merging <link>, <iframe> and <video> tags" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+
+      html = %(<html><head><link rel="stylesheet" href="/s.css" title=Bob's><meta name="x" content="it's"></head><body>) +
+             %(<iframe src="https://example.com/e" title=Bob's></iframe><p>It's</p>) +
+             %(<video src="/v.mp4" title=Mom's controls></video></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should_not contain("/s.css")
+      result.should contain(%(<meta name="x" content="it's">))
+      result.should contain(%(<amp-iframe src="https://example.com/e" title=Bob's layout="responsive"))
+      result.should contain(%(</amp-iframe><p>It's</p><amp-video src="/v.mp4" title=Mom's controls layout="responsive"></amp-video>))
+      result.should contain("amp-video-0.1.js")
+    end
+
     it "converts iframe to amp-iframe" do
       page = Hwaro::Models::Page.new("test.md")
       page.url = "/test/"
@@ -396,6 +528,52 @@ describe Hwaro::Content::Seo::Amp do
       result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
       result.should contain("<amp-iframe")
       result.should_not contain("<iframe")
+    end
+
+    # Regression: only an exact `</iframe>` / `</video>` ended the element, so
+    # one closed by `</iframe >` swallowed the content up to the next one.
+    it "converts an iframe or video closed with whitespace, and only that element" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+
+      html = %(<html><head></head><body><iframe src="https://a.com/x"></iframe ><p>One</p>) +
+             %(<iframe src="https://b.com/y"></iframe><video src="/a.mp4"></VIDEO\n><p>Two</p><video src="/b.mp4"></video></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should contain("</amp-iframe><p>One</p><amp-iframe")
+      result.should contain("</amp-video><p>Two</p><amp-video")
+      result.should_not contain("<iframe")
+      result.should_not contain("<video")
+    end
+
+    # Regression: the end tag's tail ended at its first `>`, even one inside
+    # a quoted value.
+    it "ends an end tag at its own `>`, past a quoted value" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+
+      html = %(<html><head></head><body><iframe src="https://a.com/x"></iframe foo="a>b"><p>One</p>) +
+             %(<script>a()</script x='c>d'><p>Two</p></body></html>)
+      result = Hwaro::Content::Seo::Amp.convert_to_amp(html, page, config)
+      result.should contain(%(</amp-iframe><p>One</p>))
+      result.should contain("<p>Two</p>")
+      result.should_not contain(%(b">))
+      result.should_not contain(%(d'>))
+    end
+
+    # Regression: every candidate end tag with no `>` rescanned to the end of
+    # the page.
+    it "scans candidate end tags in linear time" do
+      page = Hwaro::Models::Page.new("test.md")
+      page.url = "/test/"
+      config = Hwaro::Models::Config.new
+      # No `>` after the script opener: a real page always has one, which
+      # hid the cost (and let the old tail run on to it).
+      noise = "<html><head></head><body><script>" + "</script a=\"" * 40_000
+      started = Time.instant
+      Hwaro::Content::Seo::Amp.convert_to_amp(noise, page, config)
+      (Time.instant - started).should be < 1.second
     end
 
     it "adds a sandbox attribute and amp-iframe extension script" do

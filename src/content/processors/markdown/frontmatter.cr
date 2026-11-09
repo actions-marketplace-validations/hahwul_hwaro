@@ -27,7 +27,7 @@ module Hwaro
           "sort_by", "reverse", "authors", "in_search_index", "insert_anchor_links",
           "page_template", "paginate_path", "redirect_to", "weight", "categories",
           "series", "series_weight", "expires", "paginate_by", "taxonomies",
-          "cascade", "menus", "menu",
+          "cascade", "menus", "menu", "translation_key",
         }
 
         # Warn about unknown front-matter keys that look like typos of known keys.
@@ -86,11 +86,11 @@ module Hwaro
           # with no `key:` line) must keep its FULL content — assigning
           # match[2] up front silently dropped the first block.
           if match = raw_content.match(TOML_FRONT_MATTER_REGEX)
-            if result = extract_from_toml(match[1], file_path, declared_keys)
+            if result = extract_from_toml(match[1], file_path, declared_keys, raw_content)
               markdown_content = match[2]
             end
           elsif match = raw_content.match(YAML_FRONT_MATTER_REGEX)
-            if result = extract_from_yaml(match[1], file_path, declared_keys)
+            if result = extract_from_yaml(match[1], file_path, declared_keys, raw_content)
               markdown_content = match[2]
             elsif yaml_empty_front_matter?(match[1])
               # `---\n---` / comment-only blocks are EMPTY front matter:
@@ -155,6 +155,7 @@ module Hwaro
               expires:             result[:expires],
               cascade:             result[:cascade],
               menus:               result[:menus],
+              translation_key:     result[:translation_key],
             }
           else
             # No front matter found — return defaults
@@ -195,6 +196,7 @@ module Hwaro
               expires:             nil.as(Time?),
               cascade:             {} of String => Models::ExtraValue,
               menus:               {} of String => Models::MenuRegistration,
+              translation_key:     nil.as(String?),
             }
           end
         end
@@ -248,7 +250,7 @@ module Hwaro
         end
 
         # Extract front matter fields from TOML content
-        private def extract_from_toml(raw : String, file_path : String, declared_keys : Set(String)? = nil)
+        private def extract_from_toml(raw : String, file_path : String, declared_keys : Set(String)?, content : String)
           toml_fm = begin
             TOML.parse(raw)
           rescue ex
@@ -262,7 +264,7 @@ module Hwaro
             end
             raise Hwaro::HwaroError.new(
               code: Hwaro::Errors::HWARO_E_CONTENT,
-              message: "Invalid TOML frontmatter in #{file_path}: #{ex.message}",
+              message: "Invalid TOML frontmatter in #{file_path}: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}",
               hint: "Check TOML frontmatter between `+++` fences",
             )
           end
@@ -309,13 +311,13 @@ module Hwaro
           end
           raise Hwaro::HwaroError.new(
             code: Hwaro::Errors::HWARO_E_CONTENT,
-            message: "Invalid TOML frontmatter in #{file_path}: #{ex.message}",
+            message: "Invalid TOML frontmatter in #{file_path}: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}",
             hint: "Check TOML frontmatter between `+++` fences",
           )
         end
 
         # Extract front matter fields from YAML content
-        private def extract_from_yaml(raw : String, file_path : String, declared_keys : Set(String)? = nil)
+        private def extract_from_yaml(raw : String, file_path : String, declared_keys : Set(String)?, content : String)
           yaml_fm = begin
             YAML.parse(raw)
           rescue ex
@@ -334,7 +336,7 @@ module Hwaro
             return unless yaml_front_matter_like?(raw)
             raise Hwaro::HwaroError.new(
               code: Hwaro::Errors::HWARO_E_CONTENT,
-              message: "Invalid YAML frontmatter in #{file_path}: #{ex.message}",
+              message: "Invalid YAML frontmatter in #{file_path}: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}",
               hint: "Check YAML frontmatter between `---` fences",
             )
           end
@@ -365,7 +367,7 @@ module Hwaro
           end
           warn_typo_keys(unknown_keys, file_path, declared_keys)
 
-          front_matter_keys = yaml_fm.as_h?.try(&.keys).try { |ks| ks.compact_map(&.as_s?) } || [] of String
+          front_matter_keys = yaml_fm.as_h?.try(&.keys).try(&.compact_map(&.as_s?)) || [] of String
           taxonomies = extract_taxonomies(yaml_fm, front_matter_keys, file_path)
           tags = fm_string_array(yaml_fm, "tags", file_path)
           tags = taxonomies["tags"]? || tags if tags.empty?
@@ -386,7 +388,7 @@ module Hwaro
           end
           raise Hwaro::HwaroError.new(
             code: Hwaro::Errors::HWARO_E_CONTENT,
-            message: "Invalid YAML frontmatter in #{file_path}: #{ex.message}",
+            message: "Invalid YAML frontmatter in #{file_path}: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}",
             hint: "Check YAML frontmatter between `---` fences",
           )
         end
@@ -693,6 +695,7 @@ module Hwaro
             tags:                tags,
             cascade:             cascade,
             menus:               extract_menus(fm),
+            translation_key:     fm_value?(fm, "translation_key", file_path).try(&.strip),
           }
         end
 

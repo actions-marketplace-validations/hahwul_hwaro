@@ -184,6 +184,34 @@ describe Hwaro::Services::ContentValidator do
       end
     end
 
+    it "sees an alt attribute after a quoted attribute value containing '>'" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+        File.write(File.join(content_dir, "gt.md"),
+          %(---\ntitle: Post\ndescription: Desc\n---\n\n<img title="Home > Docs" alt="Logo" src="/a.png">\n<img title='a>b' src="/b.png">\n))
+
+        issues = Hwaro::Services::ContentValidator.new(content_dir).run
+
+        alt_issues = issues.select { |i| i.id == "content-alt-text-missing" }
+        alt_issues.map(&.message).should eq([%(Image missing alt text: <img title='a>b' src="/b.png">)])
+      end
+    end
+
+    it "keeps a stray apostrophe in an unquoted alt from hiding the next image" do
+      Dir.mktmpdir do |dir|
+        content_dir = File.join(dir, "content")
+        FileUtils.mkdir_p(content_dir)
+        File.write(File.join(content_dir, "stray.md"),
+          %(---\ntitle: Post\ndescription: Desc\n---\n\n<img src="/a.png" alt=Bob's>\n<img src="/b.png">\n<p>it's</p>\n))
+
+        issues = Hwaro::Services::ContentValidator.new(content_dir).run
+
+        alt_issues = issues.select { |i| i.id == "content-alt-text-missing" }
+        alt_issues.map(&.message).should eq([%(Image missing alt text: <img src="/b.png">)])
+      end
+    end
+
     it "ignores images with alt text in code blocks" do
       Dir.mktmpdir do |dir|
         content_dir = File.join(dir, "content")
@@ -706,7 +734,7 @@ private def validator_issues(body : String, files : Hash(String, String) = {} of
     File.write(File.join(content_dir, "source.md"), "---\ntitle: Source\ndescription: Desc\n---\n\n#{body}\n")
     issues = Hwaro::Services::ContentValidator.new(content_dir).run
   end
-  issues.select { |i| i.file.try(&.ends_with?("source.md")) }
+  issues.select(&.file.try(&.ends_with?("source.md")))
 end
 
 private def alt_messages(body : String) : Array(String)

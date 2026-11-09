@@ -133,7 +133,10 @@ module Hwaro
                 # destination cannot contain a raw space (`[t](/a b/)` is not
                 # a link), and a page whose slug or filename has one used to
                 # come out exactly that way.
+                # An unbalanced `)` (`slug = "foo)bar"`) would end the link
+                # destination early, so parentheses are escaped too.
                 link = Utils::TextUtils.encode_url_path(base_url.empty? ? p.url : "#{base_url}#{p.url}")
+                  .gsub('(', "%28").gsub(')', "%29")
                 # The root index commonly has `title = ""` so its heading
                 # falls through to the site title; without this fallback
                 # the homepage rendered as `- [](url)` (no link label).
@@ -227,7 +230,13 @@ module Hwaro
               url = page.url
               absolute_url = Utils::TextUtils.encode_url_path(base_url.empty? ? url : "#{base_url}#{url}")
               str << "URL: " << absolute_url << "\n"
-              str << "Source: content/" << page.path << "\n"
+              # A `[[content.generate]]` page has no file under content/;
+              # name the data it was generated from instead.
+              if synthesis = page.synthesis
+                str << "Source: " << synthesis.origin << "\n"
+              else
+                str << "Source: content/" << page.path << "\n"
+              end
 
               if config.multilingual?
                 lang = page.language || config.default_language

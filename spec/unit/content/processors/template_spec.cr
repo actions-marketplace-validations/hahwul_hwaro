@@ -1,4 +1,5 @@
 require "../../../spec_helper"
+require "../../../support/build_helper"
 
 # Builds a minimal `__menus__` Crinja value shape ({lang => {menu_name =>
 # [{"name" => ...}]}}) for the `get_menu function` tests below — just
@@ -309,6 +310,16 @@ describe Hwaro::Content::Processors::TemplateEngine do
       result.should eq(Time.local.year.to_s)
     end
 
+    it "treats an undefined now() format like none" do
+      Hwaro::Content::Processors::TemplateEngine.take_render_reads
+      render_crinja("{{ now(format=missing) }}").should match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+      Hwaro::Content::Processors::TemplateEngine.take_render_reads.should eq(Set{"clock:%Y-%m-%d %H:%M:%S"})
+    end
+
+    it "does not look up the locale of a now() without a format" do
+      with_captured_log { render_crinja("{{ now(locale='xx-now') }}") }.should_not contain("unknown locale")
+    end
+
     it "processes env function with set variable" do
       ENV["HWARO_TPL_TEST"] = "analytics-123"
       vars = {} of String => Crinja::Value
@@ -564,5 +575,28 @@ describe "resize_image op/anchor validation" do
   it "keeps the default fit call unchanged" do
     render_crinja(%({{ resize_image(path="/a.png", width=10).url }}|{{ resize_image(path="/a.png", width=10, op="fit", anchor="top").width }}),
       {"base_url" => Crinja::Value.new("https://example.com")}).should eq("https://example.com/a.png|10")
+  end
+end
+
+describe "get_section path forms" do
+  # On a ko page "blog" found the ko section, but "blog/" and "/blog"
+  # missed it (its URL is /ko/blog/) and matched the en one's "/blog/".
+  it "resolves every spelling in the current page's language" do
+    build_site(
+      "title = \"T\"\nbase_url = \"https://example.com/sub\"\ndefault_language = \"en\"\n\n[languages.en]\nweight = 1\n\n[languages.ko]\nweight = 2\n",
+      content_files: {
+        "blog/_index.md"    => "+++\ntitle = \"Blog\"\n+++\n",
+        "blog/_index.ko.md" => "+++\ntitle = \"블로그\"\n+++\n",
+        "about.md"          => "+++\ntitle = \"About\"\n+++\n",
+        "about.ko.md"       => "+++\ntitle = \"소개\"\n+++\n",
+      },
+      template_files: {
+        "page.html"    => %({% for p in ["blog", "blog/", "/blog", "/blog/"] %}[{{ get_section(path=p).title }}]{% endfor %}),
+        "section.html" => "",
+      },
+    ) do
+      File.read("public/ko/about/index.html").should eq("[블로그][블로그][블로그][블로그]")
+      File.read("public/about/index.html").should eq("[Blog][Blog][Blog][Blog]")
+    end
   end
 end

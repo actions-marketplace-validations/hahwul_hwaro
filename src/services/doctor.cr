@@ -95,11 +95,15 @@ module Hwaro
       # `--env` / HWARO_ENV: the config.<env>.toml overlay `check_config`
       # merges, so doctor validates what `build --env X` will load.
       @env : String?
+      # The loaded config's `[content] ignore` rules (set by `run`): the
+      # content checks skip what the build never reads.
+      @content_ignore = ContentWalk::Ignore.none
 
       def initialize(@content_dir : String = "content", @config_path : String = "config.toml", @templates_dir : String = "templates", @static_dir : String = "static", @env : String? = nil)
       end
 
       def run : Array(Issue)
+        @term_metadata = nil
         issues = [] of Issue
         config = check_config(issues)
         template_names = check_templates(issues)
@@ -109,6 +113,7 @@ module Hwaro
           check_content_schema(issues, config)
           check_translations(issues, config)
           check_referenced_paths(issues, config)
+          check_lexers(issues, config)
           check_sass(issues, config)
         end
         @observed_blocking_ids = issues.map(&.id).to_set & ALL_BLOCKING_IDS
@@ -140,6 +145,15 @@ module Hwaro
       # production builder configures aren't needed to detect tag/syntax
       # mistakes.
       @template_parse_env : Crinja?
+      # Memo of term_metadata for one `run`.
+      @term_metadata : TermMetadata? = nil
+
+      # `files`: the `_index` files a build reads as term metadata.
+      # `strays`: the other candidates that publish as ordinary sections.
+      record TermMetadata, files : Set(String), strays : Array(StrayTermFile)
+      # `known_term`: some page or draft, in any language, carries a term of
+      # this taxonomy whose URL slug is the file's directory.
+      record StrayTermFile, path : String, file : String, url : String, known_term : Bool
     end
   end
 end

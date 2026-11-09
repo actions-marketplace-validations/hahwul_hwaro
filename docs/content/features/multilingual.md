@@ -32,7 +32,7 @@ weight = 3
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| default_language | string | "en" | Default language code |
+| default_language | string | "en" | Default language code (a blank value warns and keeps `"en"`) |
 | language_name | string | the language code | Human-readable language name |
 | weight | int | 1 | Sort order (lower = first) |
 | generate_feed | bool | true | Generate the RSS/Atom/JSON feed for this language |
@@ -86,7 +86,30 @@ Hwaro automatically links translated pages based on their filenames. Pages with 
 
 For example, `hello.md`, `hello.ko.md`, and `hello.ja.md` are all linked as translations.
 
-To find pages that are not translated yet, run `hwaro doctor`: on a site with more than one language it lists, per language, every page or section missing a translation and every translation without a default-language original, using the same pairing. See [doctor](/start/tools/doctor/#what-it-checks).
+### Translation Keys
+
+When the file names differ per language, set the same `translation_key` in each translation's front matter (Hugo's `translationKey`):
+
+```
+content/
+├── about.md         # translation_key = "about"
+└── 소개.ko.md        # translation_key = "about"
+```
+
+```toml
++++
+title = "소개"
+translation_key = "about"
++++
+```
+
+Pages that share a key are translations of each other: they get each other in `page.translations`, the hreflang tags and the sitemap alternates. The key replaces file-name pairing for the page that sets it, so set it on every translation of the page: `about.md` with a key and `about.ko.md` without one are not linked. Keys only pair pages inside one version of [versioned docs](/features/versioned-docs/), so `v1/` and `v2/` may reuse the same keys.
+
+A blank key (`translation_key = ""`) counts as unset; a value that is not a string is ignored with a warning. If two pages of the same language share a key, one is linked: a page that is written (not `render = false`, not a `redirect_to` stub) before one that is not, then the one whose path sorts first (byte order). The build and `hwaro doctor` (`translation-key-collision`) warn about the other, which then has no translations; a headless or `redirect_to` page is never linked, so sharing a key with one is not reported.
+
+Templates read the key as `page.translation_key` (also on the pages of a listing). It is a built-in field, so it is no longer in `page.extra`: a template that read `page.extra.translation_key` should read `page.translation_key` instead.
+
+To find pages that are not translated yet, run `hwaro doctor`: on a site with more than one language it lists, per language, every page or section missing a translation and every translation without a default-language original, using the same pairing (translation keys included). See [doctor](/start/tools/doctor/#what-it-checks).
 
 ### Template Variables
 
@@ -99,7 +122,7 @@ Access translation data in templates:
     {% if t.is_current %}
       <span class="active">{{ t.code | upper }}</span>
     {% else %}
-      <a href="{{ t.url }}">{{ t.code | upper }}</a>
+      <a href="{{ base_url }}{{ t.url }}">{{ t.code | upper }}</a>
     {% endif %}
   {% endfor %}
 </nav>
@@ -150,7 +173,10 @@ Output:
 <link rel="alternate" hreflang="en" href="https://example.com/about/">
 <link rel="alternate" hreflang="ko" href="https://example.com/ko/about/">
 <link rel="alternate" hreflang="ja" href="https://example.com/ja/about/">
+<link rel="alternate" hreflang="x-default" href="https://example.com/about/">
 ```
+
+The last tag, `x-default`, points at the default-language version: it is the fallback search engines show visitors whose language matches none of the alternates. It is left out when the page has no default-language version. `sitemap.xml` lists the same alternates, `x-default` included.
 
 ### Combined SEO Tags
 
@@ -178,6 +204,12 @@ Access the current page's language in templates:
 {% endif %}
 ```
 
+Pass it to the `date` filter to print month and weekday names in the page's language (`5 mars 2024` on a French page, `5 марта 2024` on a Russian one). [Date Formatting](/templates/filters/#date-formatting) lists the built-in locales:
+
+```jinja
+<time>{{ page.date | date(format="%-d %B %Y", locale=page.language) }}</time>
+```
+
 ## Scaffolding with Multilingual
 
 Create a new site with multilingual support:
@@ -199,7 +231,7 @@ This generates the configuration and sample content files for each specified lan
   <ul>
     {% for t in page.translations %}
     <li>
-      <a href="{{ t.url }}"{% if t.is_current %} class="current"{% endif %}>
+      <a href="{{ base_url }}{{ t.url }}"{% if t.is_current %} class="current"{% endif %}>
         {{ t.code | upper }}
       </a>
     </li>
@@ -245,7 +277,7 @@ This generates the configuration and sample content files for each specified lan
       {% if t.is_current %}
         <strong>{{ t.code }}</strong>
       {% else %}
-        <a href="{{ t.url }}">{{ t.code }}</a>
+        <a href="{{ base_url }}{{ t.url }}">{{ t.code }}</a>
       {% endif %}
     {% endfor %}
   </nav>

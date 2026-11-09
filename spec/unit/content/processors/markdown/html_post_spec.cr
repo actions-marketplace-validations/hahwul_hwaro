@@ -21,6 +21,13 @@ describe Hwaro::Content::Processors::Markdown do
       html.should contain(%(<img loading="lazy" src="a.png"))
     end
 
+    it "see headings and images between upper-case raw-text elements" do
+      content = "<SCRIPT>a();</SCRIPT>\n\n## Mid\n\n![pic](a.png)\n\n<script>b();</script>\n"
+      html, toc = Hwaro::Processor::Markdown.render(content, lazy_loading: true)
+      toc.map(&.id).should eq(["mid"])
+      html.should contain(%(<img loading="lazy" src="a.png"))
+    end
+
     it "find raw-text elements in time linear in their count" do
       t = Time.instant
       spans = Hwaro::Content::Processors::MarkdownExtensions.raw_text_spans("<!-- c --><script>x</script>" * 40_000)
@@ -62,9 +69,56 @@ describe Hwaro::Content::Processors::Markdown do
       html.should contain(%("<h2>B</h2>"))
       html.should contain("<h2>C</h2>")
     end
+
+    # Regression: an unterminated inline `<script>` ended the shared scan, so
+    # the comments after it went unlisted and a commented-out heading got an
+    # id, an anchor and a TOC entry.
+    it "still skip a commented-out heading after an unterminated raw-text opener" do
+      content = "Use a <script> tag.\n\n## A\n\n<!--\n<h2>Hidden</h2>\n-->\n\n## B"
+      html, toc = Hwaro::Content::Processors::Markdown.new.render_with_anchors(content, anchor_style: "after")
+      toc.map(&.id).should eq(["a", "b"])
+      html.should contain("<h2>Hidden</h2>")
+    end
+
+    # Regression: the comment scan did not skip script bodies, so a `"<!--"`
+    # JS string opened a comment running to the next `-->` and every heading
+    # between lost its id and TOC entry.
+    it "open no comment at a `<!--` inside a script body or a quoted value" do
+      content = "<script>var i = s.indexOf(\"<!--\");</script>\n\n## First\n\n" \
+                "<a title=\"<!--\">x</a>\n\n## Second\n\n<!-- note -->\n\n<!--\n<h2>Hidden</h2>\n-->\n"
+      html, toc = Hwaro::Content::Processors::Markdown.new.render_with_anchors(content, anchor_style: "after")
+      toc.map(&.id).should eq(["first", "second"])
+      html.should contain(%(<h2 id="first">))
+      html.should contain("<h2>Hidden</h2>")
+    end
+  end
+
+  describe "long unquoted attribute values" do
+    it "insert an anchor into a heading whose attributes hold a 100k-character value" do
+      content = %(<h2 data-x=#{"A" * 100_000} id="long">Long</h2>\n\n<h2 id="next" title="a>b">Next</h2>\n)
+      html, toc = Hwaro::Content::Processors::Markdown.new.render_with_anchors(content, safe: false, anchor_style: "after")
+      toc.map(&.id).should eq(["long", "next"])
+      html.should contain(%(<a class="anchor" href="#long"))
+      html.should contain(%(<a class="anchor" href="#next"))
+    end
+
+    it "id a heading whose attributes hold a 100k-character value" do
+      content = %(<h2 data-x=#{"A" * 100_000}>Long</h2>\n\n## Next\n)
+      html, toc = Hwaro::Processor::Markdown.render(content, safe: false)
+      toc.map(&.id).should eq(["long", "next"])
+      html.should contain(%( id="long">Long</h2>))
+    end
   end
 
   describe "lazy loading and external links" do
+    it "lazy-load an <img> with a 100k-character unquoted src" do
+      content = "<img src=data:image/gif;base64,#{"A" * 100_000}>\n\n<img loading=eager src=b.png>\n\n<img data-loading=x src=c.png />\n"
+      html, _ = Hwaro::Processor::Markdown.render(content, lazy_loading: true, safe: false)
+      html.should contain(%(<img loading="lazy" src=data:image/gif;base64,AAAA))
+      html.should contain(%(<img loading=eager src=b.png>))
+      html.should contain(%(<img loading="lazy" data-loading=x src=c.png />))
+    end
+
     it "leave <img>/<a> strings inside a script alone" do
       md_config = Hwaro::Models::MarkdownConfig.new
       md_config.external_links_target_blank = true

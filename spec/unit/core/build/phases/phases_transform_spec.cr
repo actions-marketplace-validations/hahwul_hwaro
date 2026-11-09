@@ -1,5 +1,6 @@
 require "../../../../spec_helper"
 require "../../../../../src/core/build/builder"
+require "../../../../support/build_helper"
 
 # Reopen Builder to expose private Transform helpers for testing.
 module Hwaro::Core::Build
@@ -58,15 +59,19 @@ module Hwaro::Core::Build
   end
 end
 
+# Each fixture gets a URL of its own (the parse phase's job): pages sharing
+# one collide, and a collision loser is no one's neighbour.
 private def make_section(path : String, name : String) : Hwaro::Models::Section
   s = Hwaro::Models::Section.new(path)
   s.section = name
+  s.url = "/#{path}/"
   s
 end
 
 private def make_page(path : String, section : String = "") : Hwaro::Models::Page
   p = Hwaro::Models::Page.new(path)
   p.section = section
+  p.url = "/#{path}/"
   p
 end
 
@@ -129,6 +134,36 @@ describe Hwaro::Core::Build::Phases::Transform do
       root.subsections.should be_empty
     end
 
+    # `docs/_index.md` (en only) + `docs/guide/_index.md` and its `.ko`
+    # translation: the ko guide fell back to the en parent and was listed in
+    # the English `section.subsections` / `get_section().subsections`.
+    it "does not list a translated subsection under a default-language parent" do
+      config = <<-TOML
+        title = "T"
+        base_url = "https://example.com/sub"
+        default_language = "en"
+        [languages.en]
+        weight = 1
+        [languages.ko]
+        weight = 2
+        TOML
+      content = {
+        "docs/_index.md"          => "+++\ntitle = \"Docs\"\n+++\n",
+        "docs/guide/_index.md"    => "+++\ntitle = \"Guide\"\n+++\n",
+        "docs/guide/_index.ko.md" => "+++\ntitle = \"가이드\"\n+++\n",
+      }
+      templates = {
+        "section.html" => "S:{% for s in section.subsections %}[{{ s.title }}]{% endfor %}" \
+                          "|G:{% for s in get_section(path=\"docs\").subsections %}[{{ s.title }}]{% endfor %}",
+        "page.html" => "{{ content }}",
+      }
+      build_site(config, content_files: content, template_files: templates) do
+        File.read("public/docs/index.html").should eq("S:[Guide]|G:[Guide]")
+        # The ko guide still renders, its breadcrumb still reaching the en parent.
+        File.exists?("public/ko/docs/guide/index.html").should be_true
+      end
+    end
+
     it "links page ancestors based on section path" do
       options = Hwaro::Config::Options::BuildOptions.new(output_dir: "public")
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
@@ -179,6 +214,37 @@ describe Hwaro::Core::Build::Phases::Transform do
   end
 
   describe "#link_page_navigation" do
+    # ko pages in a section with no `_index.ko.md`: `section.pages` sorted
+    # them by the en section's `sort_by = "weight"`, prev/next by date.
+    it "orders untranslated-section pages like section.pages" do
+      config = <<-TOML
+        title = "T"
+        base_url = "https://example.com/sub"
+        default_language = "en"
+        [languages.en]
+        weight = 1
+        [languages.ko]
+        weight = 2
+        TOML
+      content = {
+        "blog/_index.md" => "+++\ntitle = \"Blog\"\nsort_by = \"weight\"\n+++\n",
+        "blog/a.ko.md"   => "+++\ntitle = \"KA\"\nweight = 2\ndate = \"2024-01-02\"\n+++\n",
+        "blog/b.ko.md"   => "+++\ntitle = \"KB\"\nweight = 1\ndate = \"2024-01-01\"\n+++\n",
+        "blog/c.ko.md"   => "+++\ntitle = \"KC\"\nweight = 3\ndate = \"2023-01-01\"\n+++\n",
+      }
+      templates = {
+        "page.html" => "{% for p in section.pages %}[{{ p.title }}]{% endfor %}" \
+                       "|L={% if page.lower %}{{ page.lower.title }}{% endif %}" \
+                       "|H={% if page.higher %}{{ page.higher.title }}{% endif %}",
+        "section.html" => "",
+      }
+      build_site(config, content_files: content, template_files: templates) do
+        # section.pages leaves the current page out.
+        File.read("public/ko/blog/c/index.html").should eq("[KB][KA]|L=KA|H=")
+        File.read("public/ko/blog/b/index.html").should eq("[KA][KC]|L=|H=KA")
+      end
+    end
+
     it "links pages with lower/higher in flat reading order" do
       options = Hwaro::Config::Options::BuildOptions.new(output_dir: "public")
       ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
@@ -595,6 +661,31 @@ describe Hwaro::Core::Build::Phases::Transform do
       orders[0].size.should eq(7)
       orders[0].first.should eq("index.md")
     end
+
+    # A root `_index.md` was weight-sorted among the top-level sections, so
+    # `01-intro/` (path sorts before `_index.md`) came before the homepage.
+    it "leads with a root _index.md, then its pages, then the sections" do
+      root = make_section("_index.md", "")
+      intro = make_section("01-intro/_index.md", "01-intro")
+      about = make_page("about.md", "")
+      b1 = make_page("01-intro/b1.md", "01-intro")
+
+      options = Hwaro::Config::Options::BuildOptions.new(output_dir: "public")
+      ctx = Hwaro::Core::Lifecycle::BuildContext.new(options)
+      ctx.site = Hwaro::Models::Site.new(Hwaro::Models::Config.new)
+      ctx.sections = [intro, root]
+      ctx.pages = [b1, about]
+      Hwaro::Core::Build::Builder.new.test_link_page_navigation(ctx)
+
+      root.lower.should be_nil
+      chain = [] of String
+      page = root.as(Hwaro::Models::Page)
+      while page
+        chain << page.path
+        page = page.higher
+      end
+      chain.should eq(["_index.md", "about.md", "01-intro/_index.md", "01-intro/b1.md"])
+    end
   end
 
   describe "#relink_navigation_for_sections" do
@@ -946,6 +1037,81 @@ describe Hwaro::Core::Build::Phases::Transform do
 
       result.should eq(Hwaro::Core::Lifecycle::HookResult::Continue)
       site.pages.size.should eq(1)
+    end
+  end
+end
+
+describe "Transform: output-URL collision losers" do
+  # `b.md` takes slug "red" and wins /posts/red/ (it sorts first); `red.md`
+  # loses the URL and writes nothing, so no page may link it as a
+  # neighbour, series member, related post or backlink.
+  it "keeps a page that loses its URL out of prev/next, series, related and backlinks" do
+    config = <<-TOML
+      title = "T"
+      base_url = "http://localhost"
+
+      [[taxonomies]]
+      name = "tags"
+
+      [related]
+      enabled = true
+      taxonomies = ["tags"]
+
+      [series]
+      enabled = true
+
+      [content]
+      backlinks = true
+      TOML
+    front = ->(title : String, weight : Int32, extra : String) {
+      "+++\ntitle = \"#{title}\"\nweight = #{weight}\ntags = [\"x\"]\nseries = \"s\"\n#{extra}+++\n"
+    }
+    content = {
+      "posts/_index.md" => "+++\ntitle = \"Posts\"\nsort_by = \"weight\"\n+++\n",
+      "posts/a.md"      => front.call("A", 1, ""),
+      "posts/b.md"      => front.call("B", 2, "slug = \"red\"\n"),
+      "posts/c.md"      => front.call("C", 4, ""),
+      "posts/red.md"    => front.call("Red", 3, "") + "[a](/posts/a/)\n",
+    }
+    templates = {
+      "page.html" => "{{ page.title }}|L={{ page.lower.title }}|H={{ page.higher.title }}" \
+                     "|S={% for s in page.series_pages %}{{ s.title }},{% endfor %}" \
+                     "|R={% for r in page.related_posts %}{{ r.title }},{% endfor %}" \
+                     "|B={% for b in page.backlinks %}{{ b.title }},{% endfor %}",
+      "section.html" => "{{ section.title }}",
+    }
+    log = with_captured_log do
+      build_site(config, content_files: content, template_files: templates) do
+        File.read("public/posts/red/index.html").should start_with("B|L=A|H=C|")
+        File.read("public/posts/c/index.html").should start_with("C|L=B|")
+        {"a", "red", "c"}.each do |slug|
+          html = File.read("public/posts/#{slug}/index.html")
+          html.should contain("|S=A,B,C,|")
+          html.should_not contain("Red")
+        end
+      end
+    end
+    log.should contain("Duplicate output path '/posts/red/' — 'posts/red.md' collides with 'posts/b.md' and is not written")
+  end
+
+  # `<!-- more -->` summaries render before Transform; a summary shortcode
+  # reading `page.backlinks` printed none in a cold build, and the right
+  # count once serve re-rendered it.
+  it "fills backlinks before the summaries render" do
+    config = %(title = "T"\nbase_url = "http://localhost"\n[content]\nbacklinks = true\n)
+    content = {
+      "_index.md" => "+++\ntitle = \"Home\"\n+++\n",
+      "a.md"      => "+++\ntitle = \"A\"\n+++\n{{ bl() }}\n<!-- more -->\nrest",
+      "b.md"      => "+++\ntitle = \"B\"\n+++\n[a](@/a.md)",
+    }
+    templates = {
+      "index.html"         => "{% for p in site.pages %}[{{ p.title }}:{{ p.summary }}]{% endfor %}",
+      "page.html"          => "{{ content }}",
+      "shortcodes/bl.html" => "BL={{ page.backlinks | length }}",
+    }
+    build_site(config, content_files: content, template_files: templates) do
+      File.read("public/a/index.html").should contain("BL=1")
+      File.read("public/index.html").should contain("[A:BL=1")
     end
   end
 end

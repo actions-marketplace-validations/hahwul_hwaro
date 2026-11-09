@@ -21,7 +21,8 @@ module Hwaro
 
           ->(source : String, context : Hash(String, Crinja::Value)) do
             env = create_fresh_crinja_env
-            env.from_string(source).render(context)
+            # Rendered by every build, so its reads key nothing.
+            Content::Processors::TemplateEngine.without_render_reads { env.from_string(source).render(context) }
           end
         end
 
@@ -33,6 +34,14 @@ module Hwaro
           templates = @templates
           return false unless templates
           Content::Seo::Feeds::FEED_TEMPLATE_KEYS.values.any? { |key| templates.has_key?(key) }
+        end
+
+        # Must a warm `--cache` build regenerate the feeds even when no page
+        # rendered? Yes while an override template exists, and on the build
+        # after any template change: deleting `rss.xml.jinja` touches no
+        # page, and skipping kept the override's output on disk forever.
+        def feeds_need_regeneration? : Bool
+          feed_template_present? || (@cache.try(&.templates_changed?) || false)
         end
 
         # Remember what this feed generation published and, on a serve pass
@@ -90,7 +99,9 @@ module Hwaro
             ai = site.config.og.auto_image
             if ai.enabled && !opts.skip_og_image && !(ai.lazy_generate && opts.serve_mode)
               begin
-                Content::Seo::OgImage.generate(pages, site.config, output_dir, verbose, parallel: false)
+                cwd = Dir.current
+                Content::Seo::OgImage.generate(pages, site.config, output_dir, verbose, parallel: false,
+                  static_copied: ->(path : String) { static_copied_output?(path, cwd) })
               rescue ex
                 # Same warn-and-continue contract as the surface pool below —
                 # a transient OG failure must not skip cache.save / reload.

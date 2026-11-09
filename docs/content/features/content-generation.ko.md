@@ -56,6 +56,8 @@ taxonomies = { tags = "categories" }                    # 선택
 | `description` | 아니요 | 페이지 설명 필드/템플릿. |
 | `taxonomies` | 아니요 | `taxonomy = "스펙"` 테이블. 배열 필드는 모든 원소를 term으로, 스칼라는 하나를, `null`/`""`은 아무것도 기여하지 않습니다. |
 
+이 표에 없는 키는 규칙 이름과 함께 경고를 남기고 무시됩니다. 필수 키가 없거나, 값의 타입이 틀리거나, 한 규칙에 `body`와 `body_template`을 함께 쓰면 설정 오류(`HWARO_E_CONFIG`)입니다.
+
 ## 템플릿에서 레코드 전체 쓰기
 
 템플릿은 소스 레코드 전체를 `page.extra.item`으로 보므로 필드마다 규칙에 매핑할 필요가 없습니다.
@@ -71,11 +73,11 @@ taxonomies = { tags = "categories" }                    # 선택
 
 ## 충돌
 
-경로가 겹치면 항상 작성한 파일이 이깁니다. `content/products/red-widget.md`가 있으면 같은 슬러그의 생성 페이지는 경고와 함께 버려지며, 반대 방향은 없습니다. 두 레코드가 같은 슬러그를 만들면 두 레코드를 지목하며 빌드가 실패합니다.
+경로가 겹치면 항상 작성한 파일이 이깁니다. `content/products/red-widget.md`(또는 그 초안, 리프 번들 `red-widget/index.md`, 같은 URL로 게시되는 하위 섹션 `red-widget/_index.md`, 다국어 사이트의 기본 언어 표기 `red-widget.en.md`)가 있으면 같은 슬러그의 생성 페이지는 경고와 함께 버려지며, 반대 방향은 없습니다. 버려진 페이지는 어느 페이지의 이전/다음(`page.lower`/`page.higher`), 시리즈, 관련 글, 백링크에도 나오지 않고 목록, 사이트맵, 피드, 검색에서도 빠집니다. 두 레코드가 같은 슬러그를 만들면 두 레코드를 지목하며 빌드가 실패합니다.
 
 ## 리빌드와 캐시
 
-생성 콘텐츠는 데이터와 함께 움직입니다. `data/` 파일 수정(또는 `[[data.remote]]` 페이로드 변경)은 config 수정과 같은 방식으로 캐시된 페이지를 무효화하고, `hwaro serve`는 데이터 수정 시 리빌드합니다. `build --cache`에서 생성 페이지는 항상 다시 렌더링됩니다. 지문을 만들 소스 파일이 없기 때문입니다. 작성 페이지의 캐시 동작은 그대로입니다.
+생성 콘텐츠는 데이터와 함께 움직입니다. `data/` 파일 수정(또는 `[[data.remote]]` 페이로드 변경)은 config 수정과 같은 방식으로 캐시된 페이지를 무효화하고, `hwaro serve`는 데이터를 수정하거나, `body_template` 또는 그 템플릿이나 인라인 템플릿 값이 include하는 partial을 수정하면 리빌드합니다. `build --cache`에서 생성 페이지는 항상 다시 렌더링됩니다. 지문을 만들 소스 파일이 없기 때문입니다. 작성 페이지의 캐시 동작은 그대로입니다.
 
 레코드가 데이터에서 사라지면 다음 빌드의 페이지 집합에서도 사라지고, 이전에 쓴 파일도 출력 디렉터리에서 삭제됩니다. 작성 파일을 삭제했을 때와 마찬가지로 `build --cache`와 `hwaro serve` 모두 같습니다.
 
@@ -88,7 +90,7 @@ taxonomies = { tags = "categories" }                    # 선택
 모든 실패는 규칙, 레코드(1부터, 데이터 순서), 고칠 내용을 지목합니다.
 
 ```
-Error [HWARO_E_CONTENT]: [[content.generate]] "products.items": record #37: missing field 'skuu' (available: categories, name, price, released, sku).
+Error [HWARO_E_CONTENT]: [[content.generate]] "products.items": record #37: slug: missing field 'skuu' (available: categories, description_md, name, price, released, sku).
 ```
 
 `source`가 없거나 배열이 아닌 규칙도 빌드를 실패시킵니다. 오타가 조용히 0개의 페이지를 생성하는 일은 없어야 합니다.

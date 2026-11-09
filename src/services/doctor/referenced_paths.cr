@@ -78,7 +78,10 @@ module Hwaro
       # publishes it — `ReadContent`'s rule. Anything else under `content/`
       # never reaches the site at that path.
       private def published_content_file?(config : Models::Config, url_path : String) : Bool
-        return false unless File.file?(File.join(@content_dir, url_path))
+        source = File.join(@content_dir, url_path)
+        return false unless File.file?(source)
+        # `[content] ignore` hides it from the build, raw `.json`/`.xml` too.
+        return false if @content_ignore.ignored?(source)
         ext = File.extname(url_path).downcase
         return true if ext == ".json" || ext == ".xml"
         config.content_files.enabled? && config.content_files.publish?(url_path)
@@ -114,7 +117,13 @@ module Hwaro
         # content source or a built output page.
         emit_route = ->(label : String, value : String) do
           before = issues.size
-          emit_missing(issues, label, value, resolver: ->(s : String) { path_resolves?(s) || route_resolves?(s, oracle) }, id: "config-path-missing", kind: "file")
+          # Decoded like the build's precache check (Pwa.precache_file_path):
+          # `/a%20b.css` names `a b.css`.
+          resolver = ->(s : String) do
+            decoded = URI.decode(s.split(/[?#]/, 2).first)
+            path_resolves?(decoded) || route_resolves?(decoded, oracle)
+          end
+          emit_missing(issues, label, value, resolver: resolver, id: "config-path-missing", kind: "file")
           unresolved_routes += 1 if issues.size > before
         end
 
@@ -250,6 +259,26 @@ module Hwaro
         end
       end
 
+      # `[highlight] lexers_dir`: the build only warns (and falls back to
+      # plain output) when the directory is missing or a grammar does not
+      # parse; doctor reports the same through the build's own parser.
+      # Anchored next to config.toml, like check_sass. Client mode never
+      # reads the grammars, so there is nothing to check.
+      private def check_lexers(issues : Array(Issue), config : Models::Config)
+        return unless (dir = config.highlight.lexers_dir) && config.highlight.enabled && config.highlight.server?
+        path = Utils::PathUtils.absolute?(dir) ? dir : Path[File.dirname(@config_path), dir].normalize.to_s
+        unless Dir.exists?(path)
+          issues << Issue.new(id: "config-dir-missing", level: :warning, category: "config", file: @config_path,
+            message: "[highlight] lexers_dir: #{dir} — directory not found")
+          return
+        end
+        _, problems, _ = Content::Processors::CustomLexers.scan(path)
+        problems.each do |file, message|
+          issues << Issue.new(id: "highlight-lexer-invalid", level: :warning, category: "config", file: file,
+            message: "syntax grammar #{message}")
+        end
+      end
+
       # Strip query string and fragment off a config-style path so values
       # like `/images/og.png?v=2` or `/og.png#anchor` resolve against the
       # underlying file rather than failing.
@@ -304,7 +333,10 @@ module Hwaro
                                  File.join(slug, "_index.markdown"),
                                ]
                              end
-        return true if content_candidates.any? { |c| File.exists?(File.join(@content_dir, c)) }
+        return true if content_candidates.any? do |candidate|
+                         source = File.join(@content_dir, candidate)
+                         File.exists?(source) && !@content_ignore.ignored?(source)
+                       end
 
         # A prior build's output (`[build] output_dir`, "public" by default):
         # a pretty route lands

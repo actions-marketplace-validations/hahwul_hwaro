@@ -85,6 +85,8 @@ a specific language variant.
 | assets | Array<String> |
 | subsections | Array<Section> |
 
+The object also carries `top_level`, `date`, `draft`, `is_index`, `language`, `weight`, `transparent`, `sort_by`, `reverse`, `paginate`, `pagination_enabled` and, when set, `translation_key`. See [Data Model › Section Objects in Lists](/templates/data-model/#section-objects-in-lists).
+
 **Examples:**
 
 ```jinja
@@ -205,7 +207,7 @@ Access a named menu's resolved entry tree ([Menus](/features/menus/)):
 | Property | Type | Description |
 |----------|------|--------------|
 | name | String | Display label |
-| url | String | Bare root-relative path, or untouched external URL |
+| url | String | Bare root-relative path, or untouched external URL. Empty for an entry without `url` (a group heading) |
 | href | String | `url` with `base_path` applied (internal) or unchanged (external) — use this in `<a href>` |
 | identifier | String | Unique key within the menu |
 | weight | Int | Sort order |
@@ -417,7 +419,8 @@ Get current datetime:
 
 | Name | Type | Description |
 |------|------|-------------|
-| format | String? | Date format string (optional; default `%Y-%m-%d %H:%M:%S`) |
+| format | String? | Date format string (optional; default `%Y-%m-%d %H:%M:%S`, also used for `none` or an undefined variable) |
+| locale | String? | Translates month, weekday and AM/PM names, as in the [`date` filter](/templates/filters/#date-formatting) (optional) |
 
 **Returns:** String
 
@@ -456,6 +459,7 @@ Returns a resized image variant. When [image processing](/features/image-process
 | height | Int | Requested height in pixels (0 = original) |
 | op | String | `fit` (default), `fill` or `crop` — see [Crop and Fill](/features/image-processing/#crop-and-fill) |
 | anchor | String | Where `fill`/`crop` keep the image: `center` (default), `top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right` |
+| format | String | `auto` (default, the source's format) or `webp`, in any case. With `fit`, returns the [WebP variant](/features/image-processing/#webp-output) (falling back to the source-format one). With `fill`/`crop`, writes the variant as WebP |
 
 **Returns:** Object with properties:
 

@@ -11,8 +11,11 @@ module Hwaro
         # Attribute scans here and below are quote-aware (a `>` inside a
         # quoted value, e.g. title="a > b", is legal HTML5 and must not end
         # the tag) and the `id` key uses a `(?<![\w-])` guard so `data-id=`
-        # never counts as the element's id.
-        ANCHOR_LINK_REGEX = /<(h[1-6])((?:[^>"']|"[^"]*"|'[^']*')*?(?<![\w-])id="([^"]+)"(?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)<\/\1>/m
+        # never counts as the element's id. Possessive, so a long unquoted
+        # value (an inline `data-x=…`) does not exhaust the PCRE JIT stack:
+        # the prefix stops only at an `i` that starts a non-empty `id="…"`,
+        # the first one the lazy `(?:…)*?id="…"` scan would have taken.
+        ANCHOR_LINK_REGEX = /<(h[1-6])((?:[^>"'i]++|(?<![\w-])i(?!d="[^"]++")|(?<=[\w-])i|"[^"]*+"|'[^']*+')*+(?<![\w-])id="([^"]+)"#{Utils::TextUtils::HTML_TAG_ATTRS})>(.*?)<\/\1>/m
 
         # Regex for post_process_html — lightweight replacements for XML.parse_html
         # Matches <h1>…</h1> through <h6>…</h6>, capturing tag name, level digit, attributes, and inner HTML
@@ -24,11 +27,16 @@ module Hwaro
         # heading's id and leaving the real one with none, which also broke
         # the render-hooks convergence invariant (HookedRenderer#heading gets
         # this right).
-        HEADING_TAG_REGEX = /<(h([1-6]))(\s(?:[^>"']|"[^"]*"|'[^']*')*)?>(.*?)<\/h\2>/mi
+        HEADING_TAG_REGEX = /<(h([1-6]))(\s#{Utils::TextUtils::HTML_TAG_ATTRS})?>(.*?)<\/h\2>/mi
         # Matches <img ...> tags that do NOT already have a loading= attribute
         # (the lookahead is quote-aware too, so a loading= sitting after a
         # quoted `>` is still seen, and `data-loading=` doesn't count).
-        IMG_LAZY_REGEX = /<img(?!(?:[^>"']|"[^"]*"|'[^']*')*(?<![\w-])loading\s*=)((?:[^>"']|"[^"]*"|'[^']*')*?)\s*\/?>/i
+        # Both scans are possessive, so a long unquoted value (an inline
+        # `src=data:…`) does not exhaust the PCRE JIT stack: the lookahead
+        # stops only at an `l` that starts `loading=`, and the capture stops
+        # at the whitespace / `/` before the closing `>` as the lazy
+        # `(?:…)*?\s*\/?>` did.
+        IMG_LAZY_REGEX = /<img(?!(?:[^>"'l]++|(?<![\w-])l(?!oading\s*=)|(?<=[\w-])l|"[^"]*+"|'[^']*+')*+(?<![\w-])loading\s*=)((?:[^>"'\s\/]++|\s++(?!\/?>)|\/(?!>)|"[^"]*+"|'[^']*+')*+)\s*\/?>/i
         # Extracts id="value" from an attribute string
         ID_ATTR_REGEX = /(?<![\w-])id\s*=\s*["']([^"']+)["']/
 
@@ -51,41 +59,18 @@ module Hwaro
         # code blocks and code spans are already immune — markd entity-escapes
         # `<` there, so `&lt;h2&gt;` never matches and `&lt;!--` never opens a
         # span here either.
+        #
+        # One scan finds both, as a browser parses them: a `"<!--"` JS string
+        # opens no comment (a separate comment scan hid every heading up to
+        # the next `-->`), a `<script` inside a comment opens no body, and an
+        # `"<h2>…</h2>"` JS string gets no `id="…"` (which ends the string) or
+        # TOC entry. An UNTERMINATED `<!--` or raw-text element masks nothing
+        # (it is far more likely a stray sequence than a runaway comment).
+        # The spans come sorted and disjoint, so `in_comment?` can
+        # binary-search: a linear scan per heading was quadratic on a page
+        # with thousands of headings and scripts.
         private def html_comment_spans(html : String) : Array(Range(Int32, Int32))
-          spans = [] of Range(Int32, Int32)
-          pos = 0
-          while open = Utils::ByteScan.byte_index(html, "<!--", pos)
-            close = Utils::ByteScan.byte_index(html, "-->", open + 4)
-            # An UNTERMINATED `<!--` is deliberately NOT treated as a comment
-            # running to end of input. In practice a lone `<!--` this deep in
-            # rendered HTML is far more likely to be a stray sequence inside a
-            # raw attribute value — which browsers do not treat as a comment at
-            # all — than a runaway comment, and masking to EOF there would strip
-            # ids and TOC entries from headings that render perfectly well.
-            break unless close
-            spans << (open...(close + 3))
-            pos = close + 3
-          end
-
-          # `<script>`/`<style>`/`<textarea>` bodies are text, not markup: an
-          # `"<h2>…</h2>"` JS string must not get an `id="…"` (which ends the
-          # string) or a TOC entry. Unterminated ones are left alone, as above.
-          spans.concat(MarkdownExtensions.raw_text_spans(html))
-
-          # Sorted and merged (the two passes overlap and interleave) so
-          # `in_comment?` can binary-search: a linear scan per heading was
-          # quadratic on a page with thousands of headings and scripts.
-          spans.sort_by!(&.begin)
-          merged = [] of Range(Int32, Int32)
-          spans.each do |span|
-            last = merged.last?
-            if last && span.begin <= last.end
-              merged[-1] = last.begin...span.end if span.end > last.end
-            else
-              merged << span
-            end
-          end
-          merged
+          MarkdownExtensions.raw_text_spans(html, comments: true)
         end
 
         # True when a match starting at `offset` (a BYTE offset, as reported by

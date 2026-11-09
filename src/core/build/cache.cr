@@ -295,6 +295,11 @@ module Hwaro
         @current_template_hash : String = ""
         @current_config_hash : String = ""
 
+        # True when this build's template set differs from the one the cache
+        # recorded (an edit, an addition or a deletion). Read by outputs that
+        # no page's dependency closure covers, such as a deleted feed override.
+        getter? templates_changed : Bool = false
+
         # True when in-memory state diverges from what's on disk, so #save
         # can skip rewriting the whole JSON on no-op warm builds. Set under
         # @mutex wherever entries or metadata actually change.
@@ -339,6 +344,7 @@ module Hwaro
 
           invalidated = false
           output_key = Cache.output_dir_key(output_dir)
+          @templates_changed = !@metadata.template_hash.empty? && @metadata.template_hash != template_hash
 
           output_dir_changed = false
           if !@metadata.output_dir.empty? && !output_key.empty? && @metadata.output_dir != output_key
@@ -390,6 +396,11 @@ module Hwaro
         # `CacheMetadata#render_input_keys`).
         def render_input_keys : Array(String)
           @mutex.synchronize { @metadata.render_input_keys.dup }
+        end
+
+        # The render-inputs digest the last build recorded.
+        def render_inputs_hash : String
+          @mutex.synchronize { @metadata.render_inputs_hash }
         end
 
         # Compare the current render-inputs digest (computed over

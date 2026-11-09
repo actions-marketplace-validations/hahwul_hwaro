@@ -156,7 +156,7 @@ module Hwaro
             return ParsedFrontmatter.new(result, tag_strs)
           rescue ex
             issues << Issue.new(id: "content-frontmatter-toml-error", level: :error, category: "content", file: file_path,
-              message: "TOML frontmatter parse error: #{ex.message}")
+              message: "TOML frontmatter parse error: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}")
             return
           end
         elsif match = content.match(YAML_FRONTMATTER_RE)
@@ -205,7 +205,7 @@ module Hwaro
             # block that looks like front matter is reported as broken.
             return unless Utils::FrontmatterScanner.yaml_front_matter_like?(match[1])
             issues << Issue.new(id: "content-frontmatter-yaml-error", level: :error, category: "content", file: file_path,
-              message: "YAML frontmatter parse error: #{ex.message}")
+              message: "YAML frontmatter parse error: #{Utils::FrontmatterScanner.parse_error_message(ex, content)}")
             return
           end
         elsif Utils::FrontmatterScanner.json_start?(content)
@@ -335,7 +335,8 @@ module Hwaro
         end
       end
 
-      HTML_IMG_RE = /<img(\s[^>]*)?\/?>/i
+      # Quote-aware: `title="a > b"` does not end the tag before its alt.
+      HTML_IMG_RE = /<img(\s#{Utils::TextUtils::HTML_TAG_ATTRS_QUOTED_VALUES})?\/?>/i
 
       # One HTML attribute: its name, then an optional `=value` (quoted or
       # not). Consuming each value whole is what keeps `title="x alt=y"`

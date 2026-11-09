@@ -32,7 +32,7 @@ weight = 3
 
 | 키 | 타입 | 기본값 | 설명 |
 |-----|------|---------|-------------|
-| default_language | string | "en" | 기본 언어 코드 |
+| default_language | string | "en" | 기본 언어 코드(빈 값이면 경고 후 `"en"`을 유지) |
 | language_name | string | 언어 코드 | 사람이 읽는 언어 이름 |
 | weight | int | 1 | 정렬 순서(낮을수록 앞) |
 | generate_feed | bool | true | 해당 언어의 RSS/Atom/JSON 피드 생성 여부 |
@@ -86,7 +86,30 @@ Hwaro는 파일 이름을 기준으로 번역된 페이지를 자동으로 연�
 
 예를 들어 `hello.md`, `hello.ko.md`, `hello.ja.md`는 모두 번역 관계로 연결됩니다.
 
-아직 번역되지 않은 페이지는 `hwaro doctor`로 찾을 수 있습니다. 언어가 둘 이상인 사이트에서는 같은 짝짓기 규칙으로, 번역이 없는 페이지·섹션과 기본 언어 원본이 없는 번역을 언어별로 보여 줍니다. [doctor](/ko/start/tools/doctor/#검사-항목)를 참고하세요.
+### 번역 키
+
+언어마다 파일 이름이 다르다면 각 번역의 프론트 매터에 같은 `translation_key`를 지정합니다(Hugo의 `translationKey`):
+
+```
+content/
+├── about.md         # translation_key = "about"
+└── 소개.ko.md        # translation_key = "about"
+```
+
+```toml
++++
+title = "소개"
+translation_key = "about"
++++
+```
+
+키가 같은 페이지들은 서로의 번역이 되어 `page.translations`, hreflang 태그, 사이트맵 대체 링크에 서로 들어갑니다. 키를 지정한 페이지는 파일 이름 대신 키로만 짝지어지므로, 한 페이지의 모든 번역에 키를 지정하세요. 키가 있는 `about.md`와 키가 없는 `about.ko.md`는 연결되지 않습니다. [버전별 문서](/ko/features/versioned-docs/)에서는 키가 같은 버전 안에서만 짝지어지므로 `v1/`과 `v2/`에서 같은 키를 다시 써도 됩니다.
+
+빈 키(`translation_key = ""`)는 지정하지 않은 것으로 보고, 문자열이 아닌 값은 경고와 함께 무시됩니다. 같은 언어의 두 페이지가 같은 키를 쓰면 한 페이지만 연결됩니다. 실제로 출력되는 페이지(`render = false`도 `redirect_to` 페이지도 아닌 페이지)가 먼저이고, 그다음은 경로가 먼저 정렬되는(바이트 순) 페이지입니다. 나머지 페이지는 번역 없이 남으며 빌드와 `hwaro doctor`(`translation-key-collision`)가 경고합니다. 헤드리스나 `redirect_to` 페이지는 원래 연결되지 않으므로, 이런 페이지와 키가 겹쳐도 알리지 않습니다.
+
+템플릿에서는 `page.translation_key`로 키를 읽습니다(목록의 페이지에서도 마찬가지). 내장 필드이므로 더 이상 `page.extra`에 들어가지 않습니다. `page.extra.translation_key`를 읽던 템플릿은 `page.translation_key`로 바꾸세요.
+
+아직 번역되지 않은 페이지는 `hwaro doctor`로 찾을 수 있습니다. 언어가 둘 이상인 사이트에서는 같은 짝짓기 규칙(번역 키 포함)으로, 번역이 없는 페이지·섹션과 기본 언어 원본이 없는 번역을 언어별로 보여 줍니다. [doctor](/ko/start/tools/doctor/#검사-항목)를 참고하세요.
 
 ### 템플릿 변수
 
@@ -99,7 +122,7 @@ Hwaro는 파일 이름을 기준으로 번역된 페이지를 자동으로 연�
     {% if t.is_current %}
       <span class="active">{{ t.code | upper }}</span>
     {% else %}
-      <a href="{{ t.url }}">{{ t.code | upper }}</a>
+      <a href="{{ base_url }}{{ t.url }}">{{ t.code | upper }}</a>
     {% endif %}
   {% endfor %}
 </nav>
@@ -150,7 +173,10 @@ Hwaro는 다국어 페이지의 캐노니컬 링크 태그를 생성합니다:
 <link rel="alternate" hreflang="en" href="https://example.com/about/">
 <link rel="alternate" hreflang="ko" href="https://example.com/ko/about/">
 <link rel="alternate" hreflang="ja" href="https://example.com/ja/about/">
+<link rel="alternate" hreflang="x-default" href="https://example.com/about/">
 ```
+
+마지막 `x-default` 태그는 기본 언어 버전을 가리킵니다. 검색엔진은 방문자의 언어가 어느 대체 언어와도 맞지 않을 때 이 페이지를 보여줍니다. 기본 언어 버전이 없는 페이지에는 붙지 않습니다. `sitemap.xml`에도 `x-default`를 포함해 같은 대체 링크가 들어갑니다.
 
 ### SEO 태그 결합
 
@@ -178,6 +204,12 @@ Hwaro는 다국어 페이지의 캐노니컬 링크 태그를 생성합니다:
 {% endif %}
 ```
 
+`date` 필터에 넘기면 월과 요일 이름을 페이지 언어로 출력합니다(프랑스어 페이지는 `5 mars 2024`, 러시아어 페이지는 `5 марта 2024`). 내장 로케일 목록은 [날짜 포맷](/ko/templates/filters/#날짜-포맷)을 참고하세요.
+
+```jinja
+<time>{{ page.date | date(format="%-d %B %Y", locale=page.language) }}</time>
+```
+
 ## 다국어 스캐폴드
 
 다국어를 지원하는 새 사이트를 만듭니다:
@@ -199,7 +231,7 @@ hwaro init mysite --include-multilingual en,ko,ja
   <ul>
     {% for t in page.translations %}
     <li>
-      <a href="{{ t.url }}"{% if t.is_current %} class="current"{% endif %}>
+      <a href="{{ base_url }}{{ t.url }}"{% if t.is_current %} class="current"{% endif %}>
         {{ t.code | upper }}
       </a>
     </li>
@@ -245,7 +277,7 @@ hwaro init mysite --include-multilingual en,ko,ja
       {% if t.is_current %}
         <strong>{{ t.code }}</strong>
       {% else %}
-        <a href="{{ t.url }}">{{ t.code }}</a>
+        <a href="{{ base_url }}{{ t.url }}">{{ t.code }}</a>
       {% endif %}
     {% endfor %}
   </nav>

@@ -40,6 +40,8 @@ Your content in **Markdown**.
 
 JSON은 파일 맨 앞에서 처음으로 짝이 맞는 `{...}`가 프론트 매터가 되며, 별도 구분자가 필요 없습니다. 파일은 반드시 `{`로 시작해야 합니다(앞 공백 불가).
 
+`content/` 아래의 `.md`, `.markdown` 파일은 프론트 매터가 없어도 모두 페이지가 됩니다. `README.md`나 노트 템플릿처럼 사이트에 넣지 않을 파일은 [`[content] ignore`](/ko/start/config/#콘텐츠-파일-제외)에 적으세요.
+
 ## 프론트 매터
 
 ### 필수
@@ -69,7 +71,7 @@ JSON은 파일 맨 앞에서 처음으로 짝이 맞는 `{...}`가 프론트 매
 | slug | string | 커스텀 URL 슬러그 |
 | path | string | 커스텀 URL 경로 |
 | aliases | array | 이 페이지로 리다이렉트할 URL 목록 |
-| authors | array | 작성자 이름 |
+| authors | array | 작성자 ID, `data/authors.*`와 대조([사이트 작성자](/ko/templates/data-model/#사이트-작성자) 참고) |
 | toc | bool | 목차 표시 |
 | in_search_index | bool | 검색 포함 여부 |
 | in_sitemap | bool | 사이트맵 포함 여부 |
@@ -79,7 +81,9 @@ JSON은 파일 맨 앞에서 처음으로 짝이 맞는 `{...}`가 프론트 매
 | expires | date | 이 날짜 이후 자동 제외 |
 | series | string | 묶음용 시리즈 이름 |
 | series_weight | int | 시리즈 내 정렬 순서 |
+| translation_key | string | 파일 이름이 다른 번역을 연결. 키가 같은 페이지끼리 서로의 번역이 됨. [번역 키](/ko/features/multilingual/#번역-키) 참고 |
 | menus | string / array / table | 페이지를 내비게이션 메뉴에 등록(`menu`는 별칭). [메뉴](/ko/features/menus/) 참고 |
+| taxonomies | table | Zola 스타일 택소노미 항목 테이블(`[taxonomies]` 아래 `tags = [...]`). [택소노미](/ko/writing/taxonomies/) 참고 |
 | extra | table | 커스텀 메타데이터 |
 
 타입이 틀린 필드(`draft = "true"`, `weight = "5"`, `date = 20240315`, `categories = "News"`)는 변환 없이 무시되며, 빌드가 파일과 키를 담아 경고합니다. 특히 `draft = "true"`는 초안이 아니므로 발행됩니다. `draft = true`로 쓰세요.

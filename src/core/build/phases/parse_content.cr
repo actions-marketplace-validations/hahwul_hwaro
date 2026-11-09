@@ -17,7 +17,12 @@ module Hwaro::Core::Build::Phases::ParseContent
 
     # Link multilingual translations between pages/sections (for language switchers)
     if config = ctx.config
-      Content::Multilingual.link_translations!(ctx.all_pages, config)
+      # First, while nothing downstream has read `render` yet: translations,
+      # navigation, listings, output claims, the cache fingerprints and every
+      # discovery surface then see a matched term `_index.md` as headless.
+      mark_term_metadata(ctx.sections, match_term_files(ctx.pages, ctx.sections, config))
+      @translation_key_collisions.clear
+      warn_translation_key_collisions(Content::Multilingual.link_translations!(ctx.all_pages, config))
       Content::Versions.link!(ctx.all_pages, config)
     end
 
@@ -35,12 +40,43 @@ module Hwaro::Core::Build::Phases::ParseContent
       # A full build reports each ambiguous wikilink again; serve rebuilds don't.
       @wikilink_warnings.clear
       refresh_wikilink_index(ctx.all_pages, site)
+      # A summary shortcode reads the site's pages (`get_page`,
+      # `get_section(...).pages`) like the body's does, and Transform
+      # publishes them only after this pass: publish them now, or the cold
+      # build's summaries print what serve's (post-Transform) ones don't.
+      # Transform reassigns the same arrays.
+      site.pages = ctx.pages
+      site.sections = ctx.sections
+      site.build_lookup_index
+      # Pages linking to each page (`[content] backlinks`), which a summary
+      # shortcode can print, as serve's re-rendered summaries do.
+      compute_backlinks(site) if site.config.backlinks
       # The image hooks have not run yet: rerender_image_summaries redoes
       # the summaries they change once the resize map is filled.
       render_page_summaries(ctx.all_pages, site, templates, ctx.options.highlight && site.config.highlight.enabled, images_ready: false)
+      # The shortcode contexts above cached page values (every page, through
+      # the globals, and each page's neighbours) as they stand now — before
+      # Transform and the BeforeRender hooks fill fields such as `image`
+      # (og:auto_image). Render must build its own.
+      @cache_manager.clear("page_crinja_value", "section_pages_crinja", "section_assets_crinja",
+        "series_crinja", "ancestors_crinja", "related_posts_crinja", reset_stats: false)
     end
 
     Lifecycle::HookResult::Continue
+  end
+
+  # Warn about each collision not reported since the last full build, and
+  # remember the current set: a serve relink that keeps a collision says
+  # nothing, one that introduces it (or brings it back) warns once.
+  private def warn_translation_key_collisions(collisions : Array(Content::Multilingual::KeyCollision)) : Nil
+    current = Set({String, String}).new
+    collisions.each do |c|
+      pair = {c.loser.path, c.winner.path}
+      current << pair
+      next if @translation_key_collisions.includes?(pair)
+      Logger.warn "content/#{c.loser.path}: translation_key #{c.key.inspect} is already used by the '#{c.code}' page content/#{c.winner.path} — this page is not linked as a translation."
+    end
+    @translation_key_collisions = current
   end
 
   # Render each page's `<!-- more -->` summary through the same sub-pipeline
@@ -57,13 +93,11 @@ module Hwaro::Core::Build::Phases::ParseContent
   # `link_targets` is the page set internal `@/` links may point at —
   # defaults to `pages`, which is correct for the full build (all pages) but
   # must be passed explicitly by incremental callers that re-render only a
-  # subset. It can't come from `site.pages`: Transform populates that AFTER
-  # this runs in the full build (`site.pages = ctx.pages`, transform.cr).
+  # subset.
   #
-  # `global_vars` is a compute-once optimization for post-Transform callers
-  # (run_rerender). When nil, build_template_variables self-heals by building
-  # globals per shortcode-bearing page — cheap during the full-build call
-  # (site.pages is still empty pre-Transform) but O(site) per page after.
+  # `global_vars` is a compute-once optimization for callers that already
+  # hold them (run_rerender). When nil, they are built from `site` once, on
+  # the first summary shortcode that needs them.
   #
   # `images_ready` is false only before the BeforeRender `image:resize`
   # hook has filled the resize map: `<img>` then get no srcset/dimensions
@@ -92,6 +126,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     global_vars : Hash(String, Crinja::Value)? = nil,
     images_ready : Bool = true,
     rerender : Bool = false,
+    readers_pass : Bool = false,
   )
     md_config = site.config.markdown
     pages_by_path : Hash(String, Models::Page)? = nil
@@ -111,6 +146,14 @@ module Hwaro::Core::Build::Phases::ParseContent
     # render that poisoned nil-summary value (the raw markdown chunk) for
     # the rest of the build.
     recomputed_paths = [] of String
+    globals_memo = global_vars
+    globals = -> do
+      memo = globals_memo
+      memo ? memo : (globals_memo = build_global_vars(site))
+    end
+    # Taken before anything below is assigned, so a summary shortcode reads
+    # the same snapshot of the other summaries whatever the page order.
+    globals.call if global_vars.nil? && pages.any? { |p| summary_shortcodes?(p) }
 
     # The excerpt is a second markdown render of every page, so it is only
     # computed when something can print it. When that answer changed since
@@ -121,11 +164,9 @@ module Hwaro::Core::Build::Phases::ParseContent
     auto_read = auto_summary_read?(site, link_targets)
     if !(previous = @auto_summary_read).nil? && previous != auto_read
       covered = pages.map(&.path).to_set
-      # Built once here: each shortcode page would otherwise build its own.
-      flip_globals = global_vars || build_global_vars(site)
       link_targets.each do |page|
         next if covered.includes?(page.path) || page.summary || page.extract_summary
-        recomputed_paths << page.path if assign_auto_summary(page, site, templates, flip_globals, auto_read)
+        recomputed_paths << page.path if assign_auto_summary(page, site, templates, globals, auto_read)
       end
     end
     @auto_summary_read = auto_read
@@ -143,7 +184,7 @@ module Hwaro::Core::Build::Phases::ParseContent
           # No marker: the automatic body excerpt, unless a description
           # already provides the summary (precedence: marker > description >
           # excerpt). Recorded in recomputed_paths for the same cache reason.
-          recomputed_paths << page.path if assign_auto_summary(page, site, templates, global_vars, auto_read)
+          recomputed_paths << page.path if assign_auto_summary(page, site, templates, globals, auto_read)
           next
         end
         # The marker wins: drop an excerpt a serve rerender left on this
@@ -155,7 +196,7 @@ module Hwaro::Core::Build::Phases::ParseContent
         summary_md = complete_summary_chunk(summary_md, page.raw_content, md_config.footnotes)
         summary_md = expand_includes(summary_md, page, site)
         processed = if content_may_contain_shortcodes?(summary_md)
-                      context = build_template_variables(page, site, "", "", "", global_vars: global_vars)
+                      context = build_template_variables(page, site, "", "", "", global_vars: globals.call)
                       process_shortcodes_jinja(summary_md, templates, context, shortcode_results)
                     else
                       summary_md
@@ -196,6 +237,32 @@ module Hwaro::Core::Build::Phases::ParseContent
         @section_pages_url_index_cache.clear
       end
     end
+
+    # A summary shortcode printing ANOTHER page's summary (or word count)
+    # read the snapshot taken before this pass, where a summary recomputed
+    # here was still empty. Redo those once against the summaries just
+    # assigned — one level deep: a chain of such summaries is not resolved.
+    return if readers_pass
+    readers = pages.select { |p| summary_reads_page_summaries?(p, templates) }
+    unless readers.empty?
+      render_page_summaries(readers, site, templates, use_highlight, link_targets: link_targets,
+        images_ready: images_ready, rerender: true, readers_pass: true)
+    end
+  end
+
+  # The summary source (`<!-- more -->` chunk, else the body an excerpt is
+  # cut from) may call a shortcode.
+  private def summary_shortcodes?(page : Models::Page) : Bool
+    content_may_contain_shortcodes?(page.summary || page.raw_content)
+  end
+
+  # The shortcodes in a page's summary source read a content-derived field
+  # (`summary`, `word_count`, …) off another page — see relation_page_fields.
+  private def summary_reads_page_summaries?(page : Models::Page, templates : Hash(String, String)) : Bool
+    return false unless summary_shortcodes?(page)
+    names = page_shortcode_templates(page)
+    return false if names.empty? && @template_deps
+    relation_page_fields(closure_blob(names, templates)).content_derived
   end
 
   # Redo the ParseContent summaries the BeforeRender image hooks change:
@@ -286,7 +353,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     page : Models::Page,
     site : Models::Site,
     templates : Hash(String, String),
-    global_vars : Hash(String, Crinja::Value)?,
+    globals : Proc(Hash(String, Crinja::Value)),
     read : Bool,
   ) : Bool
     # `had` — a page object recomputed in place (serve rerender) whose
@@ -310,7 +377,7 @@ module Hwaro::Core::Build::Phases::ParseContent
     md_config = site.config.markdown
     shortcode_results = {} of String => String
     processed = if content_may_contain_shortcodes?(raw)
-                  context = build_template_variables(page, site, "", "", "", global_vars: global_vars)
+                  context = build_template_variables(page, site, "", "", "", global_vars: globals.call)
                   process_shortcodes_jinja(raw, templates, context, shortcode_results)
                 else
                   raw
@@ -429,16 +496,16 @@ module Hwaro::Core::Build::Phases::ParseContent
   end
 
   # Every published non-page file an `![[embed]]` can name, as
-  # `{relative path, URL}`: bundle assets of published pages, `[content.files]`
-  # outside withheld bundles, and `static/`.
-  private def published_embed_files(pages : Array(Models::Page), config : Models::Config) : Array({String, String})
-    files = [] of {String, String}
+  # `{relative path, URL, language}`: bundle assets of published pages,
+  # `[content.files]` outside withheld bundles, and `static/`.
+  private def published_embed_files(pages : Array(Models::Page), config : Models::Config) : Array(Content::Processors::Wikilinks::Index::FileEntry)
+    files = [] of Content::Processors::Wikilinks::Index::FileEntry
     pages.each do |page|
       next if page.assets.empty?
       bundle = File.dirname(page.path)
       base = page.url.ends_with?('/') ? page.url : "#{page.url}/"
       page.assets.each do |asset|
-        files << {asset, "#{base}#{asset.lchop("#{bundle}/")}"} if publishable_source_file?(File.join("content", asset))
+        files << {asset, "#{base}#{asset.lchop("#{bundle}/")}", page.language} if publishable_source_file?(File.join("content", asset))
       end
     end
     if config.content_files.enabled? && Dir.exists?("content")
@@ -448,14 +515,14 @@ module Hwaro::Core::Build::Phases::ParseContent
       Dir.glob("content/**/*") do |file|
         rel = file.lchop("content/")
         next if withheld_content_file?(rel, withheld)
-        files << {rel, "/#{rel}"} if config.content_files.publish?(rel) && publishable_source_file?(file)
+        files << {rel, "/#{rel}", nil} if config.content_files.publish?(rel) && publishable_source_file?(file)
       end
     end
     if Dir.exists?("static")
       Dir.glob("static/**/*") do |file|
         rel = file.lchop("static/")
         next if config.static.excluded?(rel) || config.sass_source?(rel)
-        files << {rel, "/#{rel}"} if publishable_source_file?(file)
+        files << {rel, "/#{rel}", nil} if publishable_source_file?(file)
       end
     end
     files
@@ -855,6 +922,69 @@ module Hwaro::Core::Build::Phases::ParseContent
     end
   end
 
+  # Content::Taxonomies.match_term_metadata over the pages that will publish:
+  # a page that loses its URL to another (a dry run of the render phase's
+  # claims, which run later) puts no term page up. A matched file is
+  # headless and claims nothing; an unmatched one publishes and claims its
+  # URL — and may beat the only page carrying some other term — so the
+  # claims and the match are iterated until they agree.
+  protected def match_term_files(pages : Array(Models::Page), sections : Array(Models::Section), config : Models::Config) : Hash(String, Content::Taxonomies::TermFile)
+    matches = {} of String => Content::Taxonomies::TermFile
+    candidates, others = sections.partition { |s| Content::Taxonomies.term_metadata_path?(s.path, config) }
+    return matches if candidates.empty?
+    # ponytail: fixed-point loop, capped; a site needs chained collisions
+    # between term files and pages to take more than two rounds.
+    4.times do
+      writers = (pages + others + candidates.reject { |s| matches.has_key?(s.path) }).as(Array(Models::Page))
+      losers = output_losers(writers)
+      found = Content::Taxonomies.match_term_metadata(losers.empty? ? pages : pages.reject { |p| losers.includes?(p.path) }, sections, config)
+      break if found == matches
+      matches = found
+    end
+    matches
+  end
+
+  # Make each `content/<taxonomy>/<slug>/_index.md` that matched a generated
+  # term page (Content::Taxonomies.match_term_metadata) headless: the term
+  # page carries its values, and only the term page publishes the URL. Its
+  # URL becomes the term page's, so its aliases and `get_section` point
+  # there. A section no term page takes is left exactly as parsed.
+  protected def mark_term_metadata(sections : Array(Models::Section), matches : Hash(String, Content::Taxonomies::TermFile)) : Nil
+    return if matches.empty?
+    sections.each do |section|
+      next unless file = matches[section.path]?
+      section.render = false
+      section.term_page_url = file.url
+      if winner = file.shadowed_by
+        Logger.warn "content/#{section.path} is ignored: content/#{winner} already describes the term page #{file.url}. Remove one of them."
+        next
+      end
+      section.term_metadata = true
+      unless section.url == file.url
+        section.url = file.url
+        section.permalink = nil
+      end
+      if section.front_matter_keys.includes?("template")
+        Logger.warn "content/#{section.path}: `template` is ignored — a taxonomy term page renders with taxonomy_term.html (or taxonomy.html, page.html)."
+      end
+      dropped = section.front_matter_keys.select { |key| TERM_PAGE_IGNORED_KEYS.includes?(key) }
+      unless dropped.empty?
+        Logger.warn "content/#{section.path}: #{dropped.map { |key| "`#{key}`" }.join(", ")} #{dropped.size == 1 ? "does" : "do"} not apply to a taxonomy term page — it takes title, description, image, extra and aliases from this file; set sitemap, pagination and feeds on the taxonomy in [[taxonomies]]."
+      end
+    end
+  end
+
+  # Section front-matter keys that govern a section's own page output, which
+  # a matched term file no longer has (Content::Taxonomies#render_taxonomy_term
+  # reads only title/description/image/extra/aliases and the body). `template`
+  # has its own warning above. `sort_by`/`reverse` are not here: they still
+  # order the ordinary pages nested in the term directory (`section.pages`,
+  # prev/next).
+  private TERM_PAGE_IGNORED_KEYS = Set{
+    "in_sitemap", "in_search_index", "paginate", "paginate_by", "paginate_path",
+    "pagination_enabled", "generate_feeds", "redirect_to",
+  }
+
   # Template lookups are keyed by extension-stripped names ("section", not
   # "section.html"), but users coming from Zola write `template = "section.html"`
   # in frontmatter. Strip the known template extensions here so both spellings
@@ -912,7 +1042,9 @@ module Hwaro::Core::Build::Phases::ParseContent
     page.title = data[:title]
     page.description = data[:description]
     page.image = data[:image]
-    if data[:image].nil? && (prev = previous_image)
+    # A page just set `render = false` gets none: a full build never
+    # generates one for it, and no file would answer the URL.
+    if data[:image].nil? && data[:render] && (prev = previous_image)
       if (cfg = @config) && cfg.og.auto_image.enabled && Content::Seo::OgImage.auto_assigned?(prev, cfg.og.auto_image)
         page.image = prev
       end
@@ -934,6 +1066,8 @@ module Hwaro::Core::Build::Phases::ParseContent
     page.front_matter_keys = data[:front_matter_keys]
     page.taxonomy_name = nil
     page.taxonomy_term = nil
+    page.term_page_url = nil
+    page.term_metadata = false
 
     # New fields assignment
     page.authors = data[:authors]
@@ -957,6 +1091,7 @@ module Hwaro::Core::Build::Phases::ParseContent
 
     # Redirect support — applies to both regular pages and sections
     page.redirect_to = data[:redirect_to]
+    page.translation_key = data[:translation_key]
 
     # `[git]` metadata + date fallbacks. Must run before calculate_page_url
     # so a `[permalinks]` date token can resolve from a git-derived `date`.
@@ -1212,7 +1347,8 @@ module Hwaro::Core::Build::Phases::ParseContent
   # Merge ancestor cascades (root → leaf) for `page` and apply the values the
   # page did not set itself. Also stamps `page.cascade_fingerprint` so the
   # build cache invalidates descendants when a parent cascade changes.
-  protected def apply_cascade_to(page : Models::Page, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue)))
+  # Public for doctor, which resolves cascaded taxonomy terms the same way.
+  def apply_cascade_to(page : Models::Page, cascade_map : Hash(Tuple(String, String), Hash(String, Models::ExtraValue)))
     merged = merged_cascade_for(page, cascade_map)
     page.cascade_fingerprint = merged.empty? ? "" : cascade_fingerprint(merged)
     return if merged.empty?

@@ -161,6 +161,13 @@ module Hwaro
             aliases = array_string_value(data, "aliases")
             fields["aliases"] = aliases unless aliases.empty?
 
+            # Hugo's `translationKey` links translations whatever their file
+            # names; hwaro spells it `translation_key`. Hugo stringifies a
+            # number (`translationKey = 42` is "42"), so the importer does too.
+            if translation_key = string_value(data, "translationkey")
+              fields["translation_key"] = translation_key
+            end
+
             # Hugo's `url` sets the page's whole published path; dropping it
             # moved the page and broke every link to it.
             apply_source_url(fields, string_value(data, "url"), file_path)
@@ -249,9 +256,11 @@ module Hwaro
           #
           # A branch bundle (`docs/_index.md`) publishes its sibling files the
           # same way, and every translation of a bundle sits in one directory,
-          # so the directory is copied once per run.
+          # so the directory is copied once per run. A leaf bundle's resources
+          # include its subdirectories (`images/cover.png`); a branch
+          # bundle's subdirectories are its child sections.
           if dest_path && (leaf_bundle || (base_name == "_index" && !section.empty?)) && @copied_asset_dirs.add?(File.dirname(file_path))
-            copy_bundle_assets(File.dirname(file_path), File.dirname(dest_path), output_dir, verbose, force)
+            copy_bundle_assets(File.dirname(file_path), File.dirname(dest_path), output_dir, verbose, force, recursive: leaf_bundle)
           end
 
           return :skipped unless written
@@ -331,6 +340,9 @@ module Hwaro
             # The spelling `downcase_keys` kept wins, as for mapped keys.
             next if key != lower && source.has_key?(lower)
             next if MAPPED_KEYS.includes?(lower)
+            # Mapped when it reads as a string (a number too: Hugo applies
+            # `cast.ToString`); any other value stays in [extra].
+            next if lower == "translationkey" && mapped.has_key?("translation_key")
             case lower
             when "params" then params = value.as_h?
             when "extra"  then own_extra = value.as_h?

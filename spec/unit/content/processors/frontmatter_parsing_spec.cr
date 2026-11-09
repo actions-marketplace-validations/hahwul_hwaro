@@ -1235,6 +1235,15 @@ describe Hwaro::Content::Processors::Markdown do
       (err.message || "").should contain("test.md")
     end
 
+    # Regression: the position was counted from the block, one line above
+    # where the bad line sits in the file.
+    it "reports the error's line in the file, not in the front-matter block" do
+      err = expect_raises(Hwaro::HwaroError) { processor.parse("+++\ntitle = \"ok\"\nbad = \"x\n+++\nbody\n", "test.md") }
+      (err.message || "").should match(/ at 3:\d+\z/)
+      err = expect_raises(Hwaro::HwaroError) { processor.parse("---\ntitle: ok\ntags: [a\n---\nbody\n", "test.md") }
+      (err.message || "").should contain("flow sequence at line 3, column 7")
+    end
+
     it "raises HWARO_E_CONTENT for invalid YAML when a file path is given" do
       raw = <<-MD
         ---
@@ -2305,6 +2314,34 @@ describe Hwaro::Content::Processors::Markdown do
 
     it "keeps an explicitly empty title" do
       processor.parse("+++\ntitle = \"\"\n+++\nBody\n")[:title].should eq("")
+    end
+  end
+
+  describe "translation_key" do
+    it "reads it from TOML, YAML and JSON front matter" do
+      processor.parse("+++\ntitle = \"A\"\ntranslation_key = \"about\"\n+++\nx")[:translation_key].should eq("about")
+      processor.parse("---\ntitle: A\ntranslation_key: about\n---\nx")[:translation_key].should eq("about")
+      processor.parse(%({"title": "A", "translation_key": "about"}\nx))[:translation_key].should eq("about")
+    end
+
+    it "strips it, treats a blank one as unset and keeps it out of extra" do
+      result = processor.parse("+++\ntranslation_key = \" about \"\n+++\nx")
+      result[:translation_key].should eq("about")
+      result[:extra].has_key?("translation_key").should be_false
+      processor.parse("+++\ntranslation_key = \"  \"\n+++\nx")[:translation_key].should be_nil
+      processor.parse("+++\ntitle = \"A\"\n+++\nx")[:translation_key].should be_nil
+      processor.parse("no front matter")[:translation_key].should be_nil
+    end
+
+    it "warns about and ignores a value that is not a string" do
+      log = with_captured_log do
+        processor.parse("+++\ntranslation_key = 42\n+++\nx", "a.md")[:translation_key].should be_nil
+        processor.parse("---\ntranslation_key: [a]\n---\nx", "b.md")[:translation_key].should be_nil
+        processor.parse(%({"translation_key": true}\nx), "c.md")[:translation_key].should be_nil
+      end
+      log.should contain("a.md: `translation_key` must be a string — ignored.")
+      log.should contain("b.md: `translation_key` must be a string — ignored.")
+      log.should contain("c.md: `translation_key` must be a string — ignored.")
     end
   end
 end

@@ -49,6 +49,7 @@ Welcome to my blog.
 | redirect_to | string | — | Write an HTML redirect page to this URL (or an `@/` content path such as `@/blog/post.md`) instead of rendering the section |
 | draft | bool | false | Exclude from production |
 | weight | int | 0 | Section sort order |
+| translation_key | string | — | Links section translations whose directory names differ. See [Translation Keys](/features/multilingual/#translation-keys) |
 | cascade | table | — | Defaults inherited by descendants (see [Cascade](#cascade)) |
 
 ## Cascade
@@ -206,7 +207,7 @@ When rendering a section page (`_index.md`), these variables are available:
 | section.pages | Array<Page> | Pages shown in the current section list |
 | section.pages_count | Int | Number of items in `section.pages` |
 | section.list | String | Pre-rendered HTML list (same value as `section_list`) |
-| section.subsections | Array<Section> | Direct child sections (`title`, `description`, `url`, `pages_count`), ordered by `weight` then path. On the root `_index.md` these are the top-level sections |
+| section.subsections | Array<Section> | Direct child sections, each the full section object `get_section()` returns (`title`, `url`, `pages`, `pages_count`, `subsections`, …; see [Data Model › Section Objects in Lists](/templates/data-model/#section-objects-in-lists)), ordered by `weight` then path. On the root `_index.md` these are the top-level sections |
 | section.assets | Array<String> | Colocated section assets |
 | section.page_template | String | Default template name for child pages |
 | section.paginate_path | String | Pagination path segment |

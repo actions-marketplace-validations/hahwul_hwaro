@@ -19,13 +19,18 @@ module Hwaro::Core::Build
   end
 end
 
+# Also starts from no WebP variants: a build earlier in the process may
+# have left some (`with_webp_map` adds them back on purpose).
 private def with_resize_map(map, &)
   prior = Hwaro::Content::Hooks::ImageHooks.resize_map
+  prior_formats = Hwaro::Content::Hooks::ImageHooks.format_maps
   Hwaro::Content::Hooks::ImageHooks.set_resize_map(map)
+  Hwaro::Content::Hooks::ImageHooks.set_format_maps({} of String => Hash(String, Hash(Int32, String)))
   begin
     yield
   ensure
     Hwaro::Content::Hooks::ImageHooks.set_resize_map(prior)
+    Hwaro::Content::Hooks::ImageHooks.set_format_maps(prior_formats)
   end
 end
 
@@ -45,7 +50,137 @@ SAMPLE_MAP = {
   "/posts/foo/photo.png" => {400 => "/posts/foo/photo_400w.png", 800 => "/posts/foo/photo_800w.png"},
 }
 
+private def with_webp_map(map, &)
+  prior = Hwaro::Content::Hooks::ImageHooks.format_maps
+  Hwaro::Content::Hooks::ImageHooks.set_format_maps({"webp" => map})
+  begin
+    yield
+  ensure
+    Hwaro::Content::Hooks::ImageHooks.set_format_maps(prior)
+  end
+end
+
+WEBP_MAP = {
+  "/posts/foo/photo.png" => {400 => "/posts/foo/photo_400w.webp", 800 => "/posts/foo/photo_800w.webp"},
+}
+
 describe "Responsive content images" do
+  describe "with WebP variants" do
+    it "wraps the image in <picture> with a WebP source" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+            %(<p><img src="photo.png" alt="A"></p>), bundle_page, enabled_config)
+          out.should eq(%(<p><picture><source type="image/webp" srcset="/posts/foo/photo_400w.webp 400w, /posts/foo/photo_800w.webp 800w" sizes="100vw">) +
+                        %(<img srcset="/posts/foo/photo_400w.png 400w, /posts/foo/photo_800w.png 800w" sizes="100vw" src="photo.png" alt="A"></picture></p>))
+        end
+      end
+    end
+
+    it "gives the source the image's own sizes" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+            %(<img src="photo.png" sizes='(min-width: 40em) 50vw, 100vw'>), bundle_page, enabled_config)
+          out.should contain(%(<source type="image/webp" srcset="/posts/foo/photo_400w.webp 400w, /posts/foo/photo_800w.webp 800w" sizes='(min-width: 40em) 50vw, 100vw'>))
+        end
+      end
+    end
+
+    it "leaves an image inside an authored <picture> and one with its own srcset alone" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          html = %(<picture><source srcset="/x.avif" type="image/avif"><img src="photo.png"></picture><img src="photo.png" srcset="photo.png 1x">)
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, enabled_config)
+          out.should_not contain("image/webp")
+          out.scan("<picture").size.should eq(1)
+        end
+      end
+    end
+
+    it "keeps an attribute value containing '>' inside the wrapped <img>" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+            %(<img alt="Home > Docs" src="photo.png">), bundle_page, enabled_config)
+          out.should start_with("<picture><source")
+          out.should end_with(%( alt="Home > Docs" src="photo.png"></picture>))
+        end
+      end
+    end
+
+    it "adds no <picture> when the widest width has no WebP copy" do
+      with_resize_map({"/posts/foo/photo.png" => {400 => "/posts/foo/photo_400w.png", 17_000 => "/posts/foo/photo_17000w.png"}}) do
+        with_webp_map({"/posts/foo/photo.png" => {400 => "/posts/foo/photo_400w.webp"}}) do
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(%(<img src="photo.png">), bundle_page, enabled_config)
+          out.should_not contain("<picture")
+          out.should contain("photo_17000w.png 17000w")
+        end
+      end
+    end
+
+    it "wraps an image that follows a closed authored <picture>" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          html = %(<picture><img src="other.png"></picture><img src="photo.png">)
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, enabled_config)
+          out.should contain(%(</picture><picture><source type="image/webp"))
+        end
+      end
+    end
+
+    it "measures authored <picture> spans per chunk around a <script>" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          html = %(<script>var s = "<img>";</script><picture><img src="photo.png"></picture><img src="photo.png">)
+          out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, enabled_config)
+          out.scan(%(<source type="image/webp")).size.should eq(1)
+          out.should contain(%(</picture><picture><source type="image/webp"))
+        end
+      end
+    end
+
+    it "ignores <picture> tags inside comments, and an unclosed <picture>" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          builder = Hwaro::Core::Build::Builder.new
+          commented = builder.test_apply_responsive_images(
+            %(<!-- <picture> --><img src="photo.png"><!-- </picture> -->), bundle_page, enabled_config)
+          commented.should contain(%(--><picture><source type="image/webp"))
+          unclosed = builder.test_apply_responsive_images(
+            %(<picture><img src="other.png"><p>text</p><img src="photo.png">), bundle_page, enabled_config)
+          unclosed.should contain(%(<p>text</p><picture><source type="image/webp"))
+          # A closing tag in a comment does not end a real <picture> early.
+          inside = builder.test_apply_responsive_images(
+            %(<picture><!-- </picture> --><img src="photo.png"></picture>), bundle_page, enabled_config)
+          inside.should_not contain("image/webp")
+        end
+      end
+    end
+
+    it "recognises an authored <PICTURE> in any case, but not custom elements named picture-*" do
+      with_resize_map(SAMPLE_MAP) do
+        with_webp_map(WEBP_MAP) do
+          upper = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+            %(<PICTURE><source srcset="/x.avif" type="image/avif"><img src="photo.png"></PICTURE>), bundle_page, enabled_config)
+          upper.should_not contain("image/webp")
+          custom = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+            %(<picture-gallery></picture-gallery><img src="photo.png">), bundle_page, enabled_config)
+          custom.should contain(%(<picture><source type="image/webp"))
+        end
+      end
+    end
+
+    it "adds no <picture> when image processing is off" do
+      with_webp_map(WEBP_MAP) do
+        config = Hwaro::Models::Config.new
+        config.image_processing.dimensions = true
+        out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(%(<img src="photo.png">), bundle_page, config)
+        out.should_not contain("<picture")
+      end
+    end
+  end
+
   it "adds srcset + sizes to a relative content image with variants" do
     with_resize_map(SAMPLE_MAP) do
       out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
@@ -87,6 +222,36 @@ describe "Responsive content images" do
       out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
         %(<img src="https://cdn.example.com/posto.png">), bundle_page, enabled_config)
       out.should_not contain("srcset")
+    end
+  end
+
+  it "gives an <img> inside an authored <picture> its srcset but no WebP wrap" do
+    with_resize_map(SAMPLE_MAP) do
+      with_webp_map(WEBP_MAP) do
+        html = %(<picture><source media="(min-width: 800px)" srcset="/wide.png"><img src="photo.png" alt="Art"></picture>)
+        Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, enabled_config).should eq(
+          %(<picture><source media="(min-width: 800px)" srcset="/wide.png">) +
+          %(<img srcset="/posts/foo/photo_400w.png 400w, /posts/foo/photo_800w.png 800w" sizes="100vw" src="photo.png" alt="Art"></picture>))
+      end
+    end
+  end
+
+  it "scans a 100k-character unquoted src without exhausting the regex stack" do
+    with_resize_map(SAMPLE_MAP) do
+      with_webp_map(WEBP_MAP) do
+        html = %(<p><img src=data:image/gif;base64,#{"A" * 100_000}></p><img src="photo.png">)
+        out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, enabled_config)
+        out.should start_with(html.split("<img src=\"")[0])
+        out.should contain(%(<img srcset="/posts/foo/photo_400w.png 400w))
+      end
+    end
+  end
+
+  it "picks up a src after an attribute value containing '>'" do
+    with_resize_map(SAMPLE_MAP) do
+      out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
+        %(<img alt="a > b" src="photo.png">), bundle_page, enabled_config)
+      out.should eq(%(<img srcset="/posts/foo/photo_400w.png 400w, /posts/foo/photo_800w.png 800w" sizes="100vw" alt="a > b" src="photo.png">))
     end
   end
 
@@ -139,6 +304,24 @@ describe "Content image dimensions" do
       out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(
         %(<p><img src="/img/a.png" alt="A"></p>), bundle_page, dimensions_config)
       out.should eq(%(<p><img width="6" height="3" src="/img/a.png" alt="A"></p>))
+    end
+  end
+
+  it "leaves an <img> inside <script>, <style> or <textarea> alone" do
+    with_image_project do
+      html = %(<script>var t = "<img src='/img/a.png'>";</script><textarea><img src="/img/a.png"></textarea>) +
+             %(<style>/* <img src="/img/a.png"> */</style><img src="/img/a.png">)
+      out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, dimensions_config)
+      out.should eq(%(<script>var t = "<img src='/img/a.png'>";</script><textarea><img src="/img/a.png"></textarea>) +
+                    %(<style>/* <img src="/img/a.png"> */</style><img width="6" height="3" src="/img/a.png">))
+    end
+  end
+
+  it "still sizes images after an uppercase or attribute-quoted raw-text opener" do
+    with_image_project do
+      html = %(<TEXTAREA>x</TEXTAREA><a title="<textarea>">t</a><img src="/img/a.png"><textarea>y</textarea>)
+      out = Hwaro::Core::Build::Builder.new.test_apply_responsive_images(html, bundle_page, dimensions_config)
+      out.should contain(%(<img width="6" height="3" src="/img/a.png">))
     end
   end
 

@@ -4,10 +4,11 @@
 # - stb_image.h        (decode JPG/PNG/BMP/GIF/TGA/PSD/HDR/PIC)
 # - stb_image_write.h  (encode JPG/PNG/BMP)
 # - stb_image_resize2.h (high-quality resize)
+# and WebpEncoder (pure Crystal) for the optional `.webp` copies.
 #
-# Only JPG/PNG/BMP are supported for output because stb_image_write
-# can only encode those formats. GIF/TGA/PSD/HDR can be decoded but
-# not written back, so they are excluded from IMAGE_EXTENSIONS.
+# Sources are JPG/PNG/BMP: what stb can both read and write back.
+# GIF/TGA/PSD/HDR can be decoded but not written back, and stb cannot
+# decode WebP at all, so they are excluded from IMAGE_EXTENSIONS.
 #
 # Usage in templates:
 #   {{ resize_image(path="images/photo.jpg", width=800, height=600) }}
@@ -20,6 +21,7 @@
 
 require "base64"
 require "../../ext/stb_bindings"
+require "./webp_encoder"
 require "../../models/config"
 
 module Hwaro
@@ -122,7 +124,7 @@ module Hwaro
                 return if resized.null?
               end
               Hwaro::Utils::FileSafe.mkdir_p(File.dirname(dest))
-              return unless write_image(dest, File.extname(source).downcase, out_w, out_h, channels.to_i32, out_pixels, quality.clamp(1, 100))
+              return unless write_image(dest, File.extname(dest).downcase, out_w, out_h, channels.to_i32, out_pixels, quality.clamp(1, 100))
               {out_w, out_h}
             ensure
               LibC.free(out_pixels.as(Void*))
@@ -256,6 +258,10 @@ module Hwaro
         # `authored` (when given) is asked about each `<name>_<w>w.<ext>` this
         # would write: true means a file the site itself publishes under that
         # name, which is left alone — that width is simply not generated.
+        #
+        # `extra` names further output formats by its keys (`"webp"`); each
+        # width is then also written as `<name>_<w>w.<format>` from the same
+        # resized pixels, and the format's `width => path` map is filled in.
         def resize_and_lqip(
           source : String,
           dest_dir : String,
@@ -264,6 +270,7 @@ module Hwaro
           lqip_width : Int32 = 32,
           lqip_quality : Int32 = 20,
           authored : Proc(String, Bool)? = nil,
+          extra : Hash(String, Hash(Int32, String))? = nil,
         ) : {Hash(Int32, String), String?, String}
           result_map = {} of Int32 => String
           lqip_uri = nil
@@ -319,10 +326,19 @@ module Hwaro
                   Hwaro::Utils::FileSafe.atomic_copy(source, dest)
                   result_map[actual] = dest
                 end
+                # Another format cannot be copied: encode the source as is.
+                extra.try &.each do |format, map|
+                  name = "#{basename}_#{actual}w.#{format}"
+                  next if map.has_key?(actual) || authored.try(&.call(name))
+                  dest = File.join(dest_dir, name)
+                  map[actual] = dest if write_image(dest, ".#{format}", src_w, src_h, channels.to_i32, pixels, quality)
+                end
                 next
               end
 
-              next if authored.try(&.call("#{basename}_#{width}w#{ext}"))
+              want = !authored.try(&.call("#{basename}_#{width}w#{ext}"))
+              formats = extra.try(&.keys.reject { |format| authored.try(&.call("#{basename}_#{width}w.#{format}")) }) || [] of String
+              next unless want || formats.present?
               dest = File.join(dest_dir, "#{basename}_#{width}w#{ext}")
               pixel_count = out_w.to_i64 * out_h.to_i64
               next if pixel_count > MAX_PIXELS
@@ -338,12 +354,19 @@ module Hwaro
                   stbir_layout(channels)
                 )
                 unless resized.null?
-                  if write_image(dest, ext, out_w, out_h, channels.to_i32, out_pixels, quality)
+                  if want && write_image(dest, ext, out_w, out_h, channels.to_i32, out_pixels, quality)
                     result_map[width] = dest
                   end
+                  formats.each do |format|
+                    format_dest = File.join(dest_dir, "#{basename}_#{width}w.#{format}")
+                    if extra && write_image(format_dest, ".#{format}", out_w, out_h, channels.to_i32, out_pixels, quality)
+                      extra[format][width] = format_dest
+                    end
+                  end
 
-                  # Keep the smallest variant alive as LQIP source
-                  if lqip_width > 0 && smallest_pixels.null?
+                  # Keep the smallest variant alive as LQIP source (one the
+                  # source format writes, so extra formats never move it)
+                  if want && lqip_width > 0 && smallest_pixels.null?
                     smallest_pixels = out_pixels
                     smallest_w = out_w
                     smallest_h = out_h
@@ -380,10 +403,20 @@ module Hwaro
 
         PNG_SIGNATURE = Bytes[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
 
+        # Read the start of `path` into `header`; the byte count read.
+        # Unbuffered: a buffered File allocates a 32 KiB read buffer for this
+        # one small read, per image per build (6 MiB of garbage for 200).
+        private def read_header(path : String, header : Bytes) : Int32
+          File.open(path) do |io|
+            io.read_buffering = false
+            io.read(header)
+          end
+        end
+
         # PNG: width/height are big-endian UInt32s at offsets 16/20 (IHDR).
         private def png_dimensions(path : String) : {Int32, Int32}?
           header = Bytes.new(24)
-          read = File.open(path, &.read(header))
+          read = read_header(path, header)
           return if read < 24
           return unless header[0, 8] == PNG_SIGNATURE
           width = IO::ByteFormat::BigEndian.decode(UInt32, header[16, 4])
@@ -515,7 +548,7 @@ module Hwaro
         # header size is not measured.
         private def bmp_dimensions(path : String) : {Int32, Int32}?
           header = Bytes.new(26)
-          read = File.open(path, &.read(header))
+          read = read_header(path, header)
           return if read < 26
           return unless header[0] == 0x42 && header[1] == 0x4D
           dib_size = IO::ByteFormat::LittleEndian.decode(UInt32, header[14, 4])
@@ -538,7 +571,7 @@ module Hwaro
         # little-endian UInt16s at offsets 6/8.
         private def gif_dimensions(path : String) : {Int32, Int32}?
           header = Bytes.new(10)
-          return if File.open(path, &.read(header)) < 10
+          return if read_header(path, header) < 10
           return unless String.new(header[0, 6]).in?("GIF87a", "GIF89a")
           width = IO::ByteFormat::LittleEndian.decode(UInt16, header[6, 2]).to_i32
           height = IO::ByteFormat::LittleEndian.decode(UInt16, header[8, 2]).to_i32
@@ -552,7 +585,7 @@ module Hwaro
         #   VP8X (extended): 24-bit LE (value - 1) canvas size at 24/27.
         private def webp_dimensions(path : String) : {Int32, Int32}?
           header = Bytes.new(30)
-          return if File.open(path, &.read(header)) < 30
+          return if read_header(path, header) < 30
           return unless String.new(header[0, 4]) == "RIFF" && String.new(header[8, 4]) == "WEBP"
           width, height = case String.new(header[12, 4])
                           when "VP8 "
@@ -682,6 +715,16 @@ module Hwaro
                    LibStb.stbi_write_jpg(tmp, w, h, channels, data.as(Void*), quality) != 0
                  when ".bmp"
                    LibStb.stbi_write_bmp(tmp, w, h, channels, data.as(Void*)) != 0
+                 when ".webp"
+                   # Always lossy (99 at most): `quality = 100` asks for the
+                   # best JPEG, and lossless WebP of a photo is far larger.
+                   pixels = Bytes.new(data, w.to_i64 * h * channels, read_only: true)
+                   if webp = WebpEncoder.encode(pixels, w, h, channels, Math.min(quality, 99))
+                     File.write(tmp, webp)
+                     true
+                   else
+                     false
+                   end
                  else
                    false
                  end

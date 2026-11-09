@@ -161,12 +161,14 @@ jobs:
 
           # 3. With GITHUB_ACTIONS set, run the real action path end to end.
           #    OUT_DIR is deliberately not the default, so this also covers the
-          #    build writing where the deploy step will look for it.
+          #    build writing where the deploy step will look for it, and
+          #    BUILD_ONLY is capitalised: un-normalised, `True` fell through to
+          #    the tokenless deploy and failed on `git push`.
           docker run --rm -v "$PWD/smoke":/github/workspace -w /github/workspace \
             -e GITHUB_ACTIONS=true \
             -e GITHUB_REPOSITORY="$REPO" \
             -e GITHUB_ACTOR="$ACTOR" \
-            -e BUILD_ONLY=true \
+            -e BUILD_ONLY=True \
             -e OUT_DIR=dist \
             hwaro:ci
 
@@ -194,6 +196,10 @@ jobs:
       # the cached URLs 404 until the runner image is rebuilt.
       - name: Refresh apt index
         run: sudo apt-get update -q
+      # dwebp: the WebP encoder specs decode their output with libwebp and
+      # compare it bit for bit (they mark themselves pending without it).
+      - name: Install the WebP reference decoder
+        run: sudo apt-get install -y -q webp
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: ${{ matrix.crystal-version }}

@@ -56,6 +56,8 @@ Every value spec (`slug`, `title`, `body`, `date`, `description`, and each `taxo
 | `description` | no | Field or template for the page description. |
 | `taxonomies` | no | Table of `taxonomy = "spec"`. A field holding an array contributes every element as a term; a scalar contributes one; `null`/`""` contributes none. |
 
+A key not in this table is ignored with a warning naming the rule. A missing required key, a value of the wrong type, or both `body` and `body_template` in one rule is a config error (`HWARO_E_CONFIG`).
+
 ## The Whole Record in Templates
 
 Templates see the full source record as `page.extra.item`, so there is no need to map every field through the rule:
@@ -71,11 +73,11 @@ Templates see the full source record as `page.extra.item`, so there is no need t
 
 ## Collisions
 
-An authored file always wins a contested path: if `content/products/red-widget.md` exists, a generated page for the same slug is dropped with a warning, never the other way around. Two records producing the same slug fail the build, naming both records.
+An authored file always wins a contested path: if `content/products/red-widget.md` exists (or a draft of it, its leaf bundle `red-widget/index.md`, a subsection `red-widget/_index.md` that publishes the same URL, or on a multilingual site the default-language spelling `red-widget.en.md`), a generated page for the same slug is dropped with a warning, never the other way around. A dropped page is no one's prev/next (`page.lower`/`page.higher`), series member, related post or backlink, and stays out of listings, the sitemap, feeds and search. Two records producing the same slug fail the build, naming both records.
 
 ## Rebuilds and Caching
 
-Generated content moves with its data. Editing a `data/` file (or a changed `[[data.remote]]` payload) invalidates cached pages the same way a config edit does, and `hwaro serve` triggers a rebuild on data edits. Under `build --cache`, generated pages are always re-rendered (they have no source file to fingerprint), while authored pages keep their cache behavior.
+Generated content moves with its data. Editing a `data/` file (or a changed `[[data.remote]]` payload) invalidates cached pages the same way a config edit does, and `hwaro serve` triggers a rebuild on data edits, and on edits to a `body_template` or to a partial that it or an inline template spec includes. Under `build --cache`, generated pages are always re-rendered (they have no source file to fingerprint), while authored pages keep their cache behavior.
 
 If a record disappears from the data, its page is gone from the next build's page set, and its previously written file is removed from the output directory, under `build --cache` and `hwaro serve` alike, as for a deleted authored file.
 
@@ -88,7 +90,7 @@ If a record disappears from the data, its page is gone from the next build's pag
 Every failure names the rule, the record (1-based, in data order) and what to fix:
 
 ```
-Error [HWARO_E_CONTENT]: [[content.generate]] "products.items": record #37: missing field 'skuu' (available: categories, name, price, released, sku).
+Error [HWARO_E_CONTENT]: [[content.generate]] "products.items": record #37: slug: missing field 'skuu' (available: categories, description_md, name, price, released, sku).
 ```
 
 A rule whose `source` is missing or not an array fails the build too. A typo must never silently generate zero pages.

@@ -125,6 +125,53 @@ describe "Hwaro::Services::Doctor translations" do
     end
   end
 
+  # gh#891: every language generates its own term page; the file only
+  # decorates it, so a missing or lone translation is no one's gap.
+  it "skips taxonomy term _index files" do
+    config = TRANSLATIONS_CONFIG + %(\n[[taxonomies]]\nname = "tags"\n)
+    summarize(translation_issues({
+      "a.md"                 => PAGE,
+      "a.ko.md"              => PAGE,
+      "a.ja.md"              => PAGE,
+      "b.md"                 => "+++\ntitle = \"B\"\ntags = [\"rust\"]\n+++\n",
+      "b.ko.md"              => "+++\ntitle = \"B\"\ntags = [\"go\"]\n+++\n",
+      "b.ja.md"              => PAGE,
+      "tags/rust/_index.md"  => PAGE,
+      "tags/go/_index.ko.md" => PAGE,
+    }, config)).should be_empty
+  end
+
+  it "still checks a taxonomy-directory section no term page takes" do
+    config = TRANSLATIONS_CONFIG.sub(%(language_name = "Korean"), %(language_name = "Korean"\ntaxonomies = []))
+    config += %(\n[[taxonomies]]\nname = "tags"\n)
+    summarize(translation_issues({
+      "a.md"                    => "+++\ntitle = \"A\"\ntags = [\"rust\"]\n+++\n",
+      "a.ko.md"                 => "+++\ntitle = \"A\"\ntags = [\"rust\"]\n+++\n",
+      "a.ja.md"                 => PAGE,
+      "tags/notes/_index.md"    => PAGE,
+      "tags/notes/_index.ja.md" => PAGE,
+      "tags/rust/_index.ko.md"  => PAGE,
+    }, config)).should eq([
+      "ko translation-missing tags/notes/_index.md",
+      "ko translation-orphan tags/rust/_index.ko.md",
+    ])
+  end
+
+  # The matched `_index.md` is headless in the build, so the ko section that
+  # no ko term page takes has no original to pair with.
+  it "reports a term-directory translation whose original describes a term page" do
+    config = TRANSLATIONS_CONFIG.sub(%(language_name = "Korean"), %(language_name = "Korean"\ntaxonomies = []))
+    config += %(\n[[taxonomies]]\nname = "tags"\n)
+    summarize(translation_issues({
+      "a.md"                   => "+++\ntitle = \"A\"\ntags = [\"rust\"]\n+++\n",
+      "a.ko.md"                => PAGE,
+      "a.ja.md"                => "+++\ntitle = \"A\"\ntags = [\"rust\"]\n+++\n",
+      "tags/rust/_index.md"    => PAGE,
+      "tags/rust/_index.ja.md" => PAGE,
+      "tags/rust/_index.ko.md" => PAGE,
+    }, config)).should eq(["ko translation-orphan tags/rust/_index.ko.md"])
+  end
+
   it "reports nothing on a single-language site" do
     translation_issues({"a.md" => PAGE, "a.ko.md" => PAGE}, %(title = "T"\nbase_url = "https://example.com"\n)).should be_empty
   end
@@ -139,5 +186,42 @@ describe "Hwaro::Services::Doctor translations" do
     JSON.parse(issue.to_json)["language"].should eq("ko")
     other = Hwaro::Services::Issue.new(id: "title-default", level: :warning, category: "config", file: nil, message: "m")
     JSON.parse(other.to_json).as_h.has_key?("language").should be_false
+  end
+end
+
+describe "Hwaro::Services::Doctor translation_key" do
+  it "pairs pages by translation_key and warns about a same-language collision" do
+    issues = translation_issues({
+      "about.md"    => "+++\ntitle = \"About\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ko.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ja.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+      "zz.ko.md"    => "+++\ntitle = \"Z\"\ntranslation_key = \"about\"\n+++\n",
+    })
+    # The loser is reported once, as the collision, not again as an orphan.
+    summarize(issues).should eq(["ko translation-key-collision zz.ko.md"])
+    collision = issues.find!(&.id.==("translation-key-collision"))
+    collision.level.should eq(:warning)
+    collision.message.should contain(%(translation_key "about" is already used by the 'ko' page))
+  end
+
+  it "does not ask a default-language collision loser for translations" do
+    issues = translation_issues({
+      "about.md"    => "+++\ntitle = \"About\"\ntranslation_key = \"about\"\n+++\n",
+      "zzz.md"      => "+++\ntitle = \"Z\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ko.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ja.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+    })
+    summarize(issues).should eq(["en translation-key-collision zzz.md"])
+  end
+
+  it "does not report a collision with a page that is never linked anyway" do
+    issues = translation_issues({
+      "about.md"    => "+++\ntitle = \"About\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ko.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+      "intro.ja.md" => "+++\ntitle = \"Intro\"\ntranslation_key = \"about\"\n+++\n",
+      "old.ko.md"   => "+++\ntitle = \"Old\"\ntranslation_key = \"about\"\nrender = false\n+++\n",
+      "moved.ko.md" => "+++\ntitle = \"Moved\"\ntranslation_key = \"about\"\nredirect_to = \"/ko/intro/\"\n+++\n",
+    })
+    summarize(issues).should be_empty
   end
 end

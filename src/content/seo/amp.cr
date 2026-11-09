@@ -179,6 +179,19 @@ module Hwaro
         # images; amp-img rejects both the same way.
         AMP_DISALLOWED_ATTR_RE = /\s+(?:loading|decoding|fetchpriority)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+)/i
 
+        # Quote-aware tag scans: `media="(width >= 600px)"` or
+        # `title="a > b"` does not end the tag.
+        AMP_LINK_TAG_RE = /<link\b#{Utils::TextUtils::HTML_TAG_ATTRS_QUOTED_VALUES}>/i
+        # What follows an end tag's name, through its `>`, in any form
+        # (`</iframe >`, `</iframe x="a>b">`): an exact one ran on to the next
+        # element's. A quote opens a value only after `=`, as in a start tag.
+        # Neither runs past a `<`: every `</iframe` before an unclosed tail
+        # rescanned to the end of the page (quadratic).
+        AMP_END_TAG_TAIL = %q((?:[\s\/](?:[^<>=]++|=\s*+"[^"<]*+"|=\s*+'[^'<]*+'|=)*+)?>)
+        AMP_VIDEO_RE     = /<video(#{Utils::TextUtils::HTML_TAG_ATTRS_QUOTED_VALUES})>(.*?)<\/video#{AMP_END_TAG_TAIL}/mi
+        AMP_IFRAME_RE    = /<iframe(#{Utils::TextUtils::HTML_TAG_ATTRS_QUOTED_VALUES})>(.*?)<\/iframe#{AMP_END_TAG_TAIL}/mi
+        AMP_SCRIPT_RE    = /<script(?=[\s\/>])(?![^>]*type=["']application\/ld\+json["'])(?![^>]*src=["']https:\/\/cdn\.ampproject\.org)[^>]*>[\s\S]*?<\/script#{AMP_END_TAG_TAIL}/mi
+
         private def self.strip_non_amp_attributes(attrs : String) : String
           attrs.gsub(AMP_DISALLOWED_ATTR_RE, "")
         end
@@ -279,15 +292,18 @@ module Hwaro
           # cdn.ampproject.org). Use [\s\S]*? instead of .*? to match across
           # newlines. An `async` attribute is NOT an exemption: it let every
           # third-party async script (analytics, the tweet shortcode's
-          # widgets.js) through, and AMP forbids all of them.
-          result = result.gsub(/<script(?![^>]*type=["']application\/ld\+json["'])(?![^>]*src=["']https:\/\/cdn\.ampproject\.org)[^>]*>[\s\S]*?<\/script>/mi, "")
+          # widgets.js) through, and AMP forbids all of them. A script ends at
+          # its end tag in any form (`</script >`) — an exact `</script>` ran
+          # on through the page to the next one — and `<script-loader>` is
+          # not one.
+          result = result.gsub(AMP_SCRIPT_RE, "")
 
           # Remove disallowed external stylesheets. AMP forbids
           # `<link rel="stylesheet">` except from allowlisted font providers;
           # all other CSS must live in a single `<style amp-custom>`. Without
           # this the site CSS and highlight.js/KaTeX CDN links make every AMP
           # page fail validation.
-          result = result.gsub(/<link\b[^>]*>/i) do |tag|
+          result = result.gsub(AMP_LINK_TAG_RE) do |tag|
             if tag =~ /rel=["']stylesheet["']/i
               href = tag.match(/href=["']([^"']*)["']/i).try(&.[1]) || ""
               AMP_FONT_PROVIDERS.any? { |provider| href.includes?(provider) } ? tag : ""
@@ -304,70 +320,86 @@ module Hwaro
           result = result.gsub(/\s+style=(?:"[^"]*"|'[^']*')/i, "")
           result = result.gsub(/\s+on\w+=(?:"[^"]*"|'[^']*')/i, "")
 
-          # Convert <img> to <amp-img>. Quote-aware attribute scan (same
-          # pattern as IMG_LAZY_REGEX in markdown.cr): a `>` inside a quoted
-          # attribute value (legal HTML5, e.g. alt="Home > Docs") must not be
-          # treated as the tag end, or the conversion emits a broken
-          # `<amp-img … alt="Home ></amp-img> Docs" />`.
-          result = result.gsub(/<img((?:[^>"']|"[^"]*"|'[^']*')*?)\s*\/?>/mi) do
-            # `[^>]*` greedily swallows the self-closing slash from `<img … />`,
-            # which would otherwise be appended mid-tag as
-            # `<amp-img … / layout="…">` — invalid AMP. Strip a trailing slash.
-            attrs = strip_non_amp_attributes($1.sub(/\s*\/\s*$/, ""))
-            has_width = attrs.includes?("width=")
-            has_height = attrs.includes?("height=")
-
-            if has_width && has_height
-              # Explicit dimensions: use responsive layout
-              unless attrs.includes?("layout=")
-                attrs += %( layout="responsive")
-              end
-              %(<amp-img#{attrs}></amp-img>)
-            else
-              # No dimensions: use fill layout inside a positioned container
-              attrs += %( layout="fill") unless attrs.includes?("layout=")
-              %(<div class="amp-img-container"><amp-img#{attrs}></amp-img></div>)
-            end
-          end
-
-          # A block-level <div class="amp-img-container"> placed directly inside
-          # a <p> (Markdown wraps a standalone image in a paragraph) is invalid
-          # HTML. Unwrap any <p> whose sole child is that container div.
-          result = result.gsub(/<p>(\s*<div class="amp-img-container">[\s\S]*?<\/div>\s*)<\/p>/mi) { $1 }
-
-          # Convert <video> to <amp-video>
+          # Element conversions skip `<script>`/`<style>`/`<textarea>` bodies:
+          # they are text, and an `<img>` sample in a textarea (or a JS
+          # string) must not turn into visible `<amp-img>` markup.
           needs_amp_video = false
-          result = result.gsub(/<video([^>]*)>(.*?)<\/video>/mi) do
-            needs_amp_video = true
-            %(<amp-video#{strip_non_amp_attributes($1)} layout="responsive">#{$2}</amp-video>)
-          end
-
-          # Convert <iframe> to <amp-iframe>
           needs_amp_iframe = false
-          result = result.gsub(/<iframe([^>]*)>(.*?)<\/iframe>/mi) do
-            needs_amp_iframe = true
-            # Capture both groups before any inner match: `$~` is per-scope,
-            # so the src lookup below would otherwise clobber `$2`.
-            attrs = normalize_iframe_attributes(strip_non_amp_attributes($1))
-            inner = $2
-            unless attrs.includes?("layout=")
-              # `responsive` needs both dimensions. A height-only embed (the
-              # codepen shortcode, CodePen's own embed snippet) is full-width
-              # by design, which is what `fixed-height` means.
-              height_only = !attrs.matches?(/\swidth\s*=/i) && attrs.matches?(/\sheight\s*=/i)
-              attrs += height_only ? %( layout="fixed-height") : %( layout="responsive")
+          result = Processors::MarkdownExtensions.outside_raw_text(result) do |chunk|
+            # <picture>/<source> are not AMP elements: keep only the <img>
+            # fallback (the WebP sources `formats = ["webp"]` adds, or an
+            # author's own picture), which the next step turns into amp-img.
+            # Quote-aware like the <img> scan below (`media="(width > 600px)"`).
+            chunk = chunk.gsub(/<picture\b(?:[^>"']++|"[^"]*+"|'[^']*+')*+>([\s\S]*?)<\/picture\s*>/i) do |_, m|
+              m[1].gsub(/<source\b(?:[^>"']++|"[^"]*+"|'[^']*+')*+>/i, "")
             end
-            # amp-iframe requires a sandbox attribute; add a sane default when
-            # the source <iframe> didn't carry one.
-            unless attrs.includes?("sandbox=")
-              # Matches quoted and unquoted (legal HTML5) attribute values.
-              # A miss yields "", which same_origin_src? treats as
-              # same-origin — the conservative direction.
-              src = attrs.match(/\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i)
-                .try { |m| m[1]? || m[2]? || m[3]? } || ""
-              attrs += sandbox_for(src, config.base_url)
+
+            # Convert <img> to <amp-img>. Quote-aware attribute scan (same
+            # pattern as IMG_LAZY_REGEX in markdown.cr): a `>` inside a quoted
+            # attribute value (legal HTML5, e.g. alt="Home > Docs") must not be
+            # treated as the tag end, or the conversion emits a broken
+            # `<amp-img … alt="Home ></amp-img> Docs" />`. Possessive (same
+            # matches as the lazy `(?:…)*?\s*\/?>` it replaces), so a long
+            # unquoted `src=data:…` does not exhaust the PCRE JIT stack.
+            chunk = chunk.gsub(/<img((?:[^>"'\s\/]++|\s++(?!\/?>)|\/(?!>)|"[^"]*+"|'[^']*+')*+)\s*\/?>/mi) do
+              # `[^>]*` greedily swallows the self-closing slash from `<img … />`,
+              # which would otherwise be appended mid-tag as
+              # `<amp-img … / layout="…">` — invalid AMP. Strip a trailing slash.
+              attrs = strip_non_amp_attributes($1.sub(/\s*\/\s*$/, ""))
+              has_width = attrs.includes?("width=")
+              has_height = attrs.includes?("height=")
+
+              if has_width && has_height
+                # Explicit dimensions: use responsive layout
+                unless attrs.includes?("layout=")
+                  attrs += %( layout="responsive")
+                end
+                %(<amp-img#{attrs}></amp-img>)
+              else
+                # No dimensions: use fill layout inside a positioned container
+                attrs += %( layout="fill") unless attrs.includes?("layout=")
+                %(<div class="amp-img-container"><amp-img#{attrs}></amp-img></div>)
+              end
             end
-            %(<amp-iframe#{attrs}>#{inner}</amp-iframe>)
+
+            # A block-level <div class="amp-img-container"> placed directly inside
+            # a <p> (Markdown wraps a standalone image in a paragraph) is invalid
+            # HTML. Unwrap any <p> whose sole child is that container div.
+            chunk = chunk.gsub(/<p>(\s*<div class="amp-img-container">[\s\S]*?<\/div>\s*)<\/p>/mi) { $1 }
+
+            # Convert <video> to <amp-video>
+            chunk = chunk.gsub(AMP_VIDEO_RE) do
+              needs_amp_video = true
+              %(<amp-video#{strip_non_amp_attributes($1)} layout="responsive">#{$2}</amp-video>)
+            end
+
+            # Convert <iframe> to <amp-iframe>
+            chunk = chunk.gsub(AMP_IFRAME_RE) do
+              needs_amp_iframe = true
+              # Capture both groups before any inner match: `$~` is per-scope,
+              # so the src lookup below would otherwise clobber `$2`.
+              attrs = normalize_iframe_attributes(strip_non_amp_attributes($1))
+              inner = $2
+              unless attrs.includes?("layout=")
+                # `responsive` needs both dimensions. A height-only embed (the
+                # codepen shortcode, CodePen's own embed snippet) is full-width
+                # by design, which is what `fixed-height` means.
+                height_only = !attrs.matches?(/\swidth\s*=/i) && attrs.matches?(/\sheight\s*=/i)
+                attrs += height_only ? %( layout="fixed-height") : %( layout="responsive")
+              end
+              # amp-iframe requires a sandbox attribute; add a sane default when
+              # the source <iframe> didn't carry one.
+              unless attrs.includes?("sandbox=")
+                # Matches quoted and unquoted (legal HTML5) attribute values.
+                # A miss yields "", which same_origin_src? treats as
+                # same-origin — the conservative direction.
+                src = attrs.match(/\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i)
+                  .try { |m| m[1]? || m[2]? || m[3]? } || ""
+                attrs += sandbox_for(src, config.base_url)
+              end
+              %(<amp-iframe#{attrs}>#{inner}</amp-iframe>)
+            end
+            chunk
           end
 
           # Mandatory extension scripts for amp-iframe / amp-video. These must be
@@ -407,9 +439,10 @@ module Hwaro
             # blocks, and fold it into the single amp-custom injected below.
             # Done only on this path so the CSS is never stripped without being
             # re-injected (a theme that already ships its own boilerplate keeps
-            # its <style> blocks untouched).
+            # its <style> blocks untouched). A block ends at its end tag in any
+            # form (`</style >`), and `<style-x>` is not one.
             theme_css = [] of String
-            result = result.gsub(/<style(?![^>]*amp-boilerplate)(?![^>]*amp-custom)[^>]*>([\s\S]*?)<\/style>/mi) do
+            result = result.gsub(/<style(?=[\s\/>])(?![^>]*amp-boilerplate)(?![^>]*amp-custom)[^>]*>([\s\S]*?)<\/style#{AMP_END_TAG_TAIL}/mi) do
               theme_css << $1
               ""
             end

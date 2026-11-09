@@ -20,7 +20,7 @@ disallow_paths = ["drafts/**", "**/_*"]
 
 | 키 | 타입 | 기본값 | 설명 |
 |-----|------|---------|-------------|
-| allow_extensions | array | [] | 게시할 파일 확장자 |
+| allow_extensions | array | [] | 게시할 파일 확장자. 이 목록이 비어 있지 않으면 게시가 켜집니다 (`extensions`도 별칭으로 사용 가능) |
 | disallow_extensions | array | [] | 제외할 파일 확장자 |
 | disallow_paths | array | [] | 제외할 경로의 글롭(glob) 패턴 |
 
@@ -70,7 +70,7 @@ content/
 allow_extensions = ["jpg", "jpeg", "png", "gif", "svg", "webp"]
 ```
 
-확장자는 정규화되므로 `"jpg"`와 `".jpg"` 둘 다 쓸 수 있습니다.
+확장자는 정규화되므로 `"jpg"`와 `".jpg"` 둘 다 쓸 수 있으며, 대소문자를 구분하지 않습니다(`photo.JPG`는 `"jpg"`에 일치). `.md` 파일은 이 방식으로 복사되지 않습니다.
 
 ### 차단 목록
 
@@ -100,6 +100,8 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 | `private/**` | `content/private/` 아래 모든 파일 |
 
 경로는 `content/` 디렉터리 기준 상대 경로로 매칭됩니다. 거부 규칙(`disallow_extensions`, `disallow_paths`)은 `allow_extensions` 설정 여부와 관계없이 페이지 번들 안의 파일에도 적용됩니다.
+
+`disallow_paths`는 마크다운이 아닌 파일에만 적용됩니다. 마크다운까지 포함해 경로를 사이트에서 완전히 빼려면(`README.md`, `_templates/` 폴더 등) [`[content] ignore`](/ko/start/config/#콘텐츠-파일-제외)를 사용하세요. 같은 패턴을 쓰며, 제외된 파일은 페이지도, 번들 에셋도, 발행 파일도 되지 않습니다.
 
 ## 콘텐츠 파일 참조
 

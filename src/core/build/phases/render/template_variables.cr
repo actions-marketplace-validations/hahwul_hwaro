@@ -46,6 +46,9 @@ module Hwaro::Core::Build::Phases::Render
     vars["__page_path__"] = Crinja::Value.new(page.path)
     vars["taxonomy_name"] = Crinja::Value.new(page.taxonomy_name || "")
     vars["taxonomy_term"] = Crinja::Value.new(page.taxonomy_term || "")
+    # A term page's authored `_index.md` body ("" without one); see
+    # Content::Taxonomies.match_term_metadata.
+    vars["term_content"] = Crinja::Value.new(page.content) if page.generated && page.taxonomy_term
     default_lang = config.default_language
     page_language = page.language || default_lang
     vars["page_language"] = Crinja::Value.new(page_language)
@@ -69,10 +72,20 @@ module Hwaro::Core::Build::Phases::Render
 
     # Generate permalink only if not already set
     page.generate_permalink(config.base_url) unless page.permalink
+    # A later pager (`/blog/page/2/`) is its own URL: its permalink follows
+    # `page.url` (effective_url), not page 1's stored one.
+    permalink = if effective_url == page.url
+                  page.permalink || ""
+                else
+                  "#{config.base_url.rstrip('/')}#{Utils::PathUtils.root_relative(effective_url)}"
+                end
 
     # Reuse cached Crinja arrays for tags/authors/assets/extra/translations
     # (avoids per-page .map allocation)
-    cached_page_val = cached_page_crinja_value(page, default_lang)
+    # Not for generated taxonomy pages: `/tags/x/` and `/ko/tags/x/` share
+    # one path but not their term `_index.md` values (`extra`), and nothing
+    # else reads them through the cache.
+    cached_page_val = page.generated ? build_page_crinja_value(page, default_lang) : cached_page_crinja_value(page, default_lang)
     cached_raw = cached_page_val.raw.as(Hash)
     tags_crinja = cached_raw["tags"].as(Crinja::Value)
     authors_crinja = cached_raw["authors"].as(Crinja::Value)
@@ -121,6 +134,7 @@ module Hwaro::Core::Build::Phases::Render
 
     # Page object with all properties
     page_obj = {
+      "path"         => Crinja::Value.new(page.path),
       "title"        => Crinja::Value.new(page.title),
       "description"  => Crinja::Value.new(page.description || ""),
       "url"          => Crinja::Value.new(effective_url),
@@ -144,11 +158,11 @@ module Hwaro::Core::Build::Phases::Render
       "taxonomies"        => cached_raw["taxonomies"].as(Crinja::Value),
       "assets"            => assets_crinja,
       "extra"             => extra_crinja,
-      "summary"           => Crinja::Value.new(page.summary_html || page.effective_summary || ""),
+      "summary"           => Crinja::Value.new(page.template_summary),
       "summary_truncated" => Crinja::Value.new(page.summary_truncated),
       "word_count"        => Crinja::Value.new(page.word_count),
       "reading_time"      => Crinja::Value.new(page.reading_time),
-      "permalink"         => Crinja::Value.new(page.permalink || ""),
+      "permalink"         => Crinja::Value.new(permalink),
       "weight"            => Crinja::Value.new(page.weight),
       "git"               => cached_raw["git"].as(Crinja::Value),
       "in_search_index"   => Crinja::Value.new(page.in_search_index),
@@ -229,16 +243,17 @@ module Hwaro::Core::Build::Phases::Render
       page_obj["version"] = cached_raw["version"].as(Crinja::Value)
       page_obj["version_links"] = cached_raw["version_links"].as(Crinja::Value)
     end
+    cached_raw["translation_key"]?.try { |key| page_obj["translation_key"] = key.as(Crinja::Value) }
     vars["page"] = Crinja::Value.new(page_obj)
     # Which source file is rendering: `resize_image(op=…)` records the
     # variant it writes as this page's derived output (ImageHooks.op_variant).
     vars["__page_path__"] = Crinja::Value.new(page.path)
 
     # Flat variables for new properties
-    vars["page_summary"] = Crinja::Value.new(page.summary_html || page.effective_summary || "")
+    vars["page_summary"] = Crinja::Value.new(page.template_summary)
     vars["page_word_count"] = Crinja::Value.new(page.word_count)
     vars["page_reading_time"] = Crinja::Value.new(page.reading_time)
-    vars["page_permalink"] = Crinja::Value.new(page.permalink || "")
+    vars["page_permalink"] = Crinja::Value.new(permalink)
     vars["page_authors"] = authors_crinja
     vars["page_tags"] = tags_crinja
     vars["page_weight"] = Crinja::Value.new(page.weight)

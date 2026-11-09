@@ -153,6 +153,21 @@ describe Hwaro::Content::Seo::Llms do
       end
     end
 
+    it "percent-encodes parentheses so a `)` in a URL cannot end the link" do
+      config = Hwaro::Models::Config.new
+      config.llms.enabled = true
+      config.base_url = "https://example.com"
+      page = Hwaro::Models::Page.new("posts/p.md")
+      page.title = "Paren"
+      page.url = "/posts/foo)bar/"
+      page.section = "posts"
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Llms.generate(config, [page], output_dir)
+        File.read(File.join(output_dir, "llms.txt")).should contain("- [Paren](https://example.com/posts/foo%29bar/)\n")
+      end
+    end
+
     # Regression: page-bundle leaves (`foo/bar/index.md`) are `Models::Page`
     # with `is_index == true`, indistinguishable from a section `_index.md`
     # by `is_index` alone. The listing filter keyed off `is_index`, so on a
@@ -631,6 +646,29 @@ describe Hwaro::Content::Seo::Llms do
 
         content = File.read(File.join(output_dir, "llms-full.txt"))
         content.should contain("Source: content/blog/hello.md")
+      end
+    end
+
+    it "names the data origin as the source of a [[content.generate]] page" do
+      config = Hwaro::Models::Config.new
+      config.llms.enabled = true
+      config.llms.full_enabled = true
+      config.title = "Test Site"
+      config.llms.instructions = ""
+
+      page = Hwaro::Models::Page.new("reports/2026-08.md")
+      page.title = "August"
+      page.url = "/reports/2026-08/"
+      page.render = true
+      page.raw_content = "Report body"
+      page.synthesis = Hwaro::Models::Page::Synthesis.new("", Crinja::Value.new(nil), "data.reports")
+
+      Dir.mktmpdir do |output_dir|
+        Hwaro::Content::Seo::Llms.generate_full([page], config, output_dir)
+
+        content = File.read(File.join(output_dir, "llms-full.txt"))
+        content.should contain("Source: data.reports\n")
+        content.should_not contain("Source: content/")
       end
     end
 

@@ -49,7 +49,7 @@ Validation (all of these fail the build with `HWARO_E_CONFIG`):
 - Exactly one entry is `latest = true`. If none is marked, the **first** entry is the latest; two or more marked entries are an error.
 - `search`, `feeds` and `taxonomies` accept only `"latest"` or `"all"`.
 
-`hwaro doctor` warns (`version-path-missing`) when a version points at a content directory that does not exist.
+`hwaro doctor` warns (`version-path-missing`) when a version points at a content directory that does not exist, or at one that [`[content] ignore`](/start/config/#ignoring-content-files) hides.
 
 ## Content Structure
 
@@ -132,7 +132,7 @@ Available on every page of a versioned site. It is a list (`{% for v in versions
 | `versions.all` | The same list as a plain array |
 | `versions.size` | Number of versions |
 
-Like `page.url`, every URL above is site-relative, so prefix it with `{{ base_url }}` (or `{{ base_path }}`) in links so [subpath deployments](/start/config/#site-settings) work.
+Like `page.url`, every URL above is site-relative, so prefix it with `{{ base_url }}` in links so [subpath deployments](/start/config/#site-settings) work.
 
 ## Version Switcher Example
 
@@ -226,7 +226,7 @@ const hits = results.filter((r) => !r.version || r.version === current);
 
 - `[versions]` is part of the config hash and version membership is part of the page-set fingerprint, so `hwaro build --cache` rebuilds what changes when you move a file between version directories, add a counterpart (the other version's `version_links` flips `exists`) or change the switches.
 - `hwaro serve` builds versioned sites like any other; edits inside a version directory are picked up incrementally.
-- `hwaro doctor` reports `version-path-missing` for a `[[versions.list]]` entry whose directory is absent.
+- `hwaro doctor` reports `version-path-missing` for a `[[versions.list]]` entry whose directory is absent or ignored.
 
 ## Not Included
 

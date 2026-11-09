@@ -107,22 +107,31 @@ hwaro doctor --json
 
 **Structure diagnostics:**
 
-- Section directories missing `_index.md`
+- Section directories missing `_index.md` (never a taxonomy directory such as
+  `content/tags/`: the build generates `/tags/` itself)
+- A `content/tags/<dir>/_index.md` that matches no term page, usually because
+  `<dir>` is the term's spelling rather than its URL slug, or because only
+  drafts, ignored pages or other languages carry the term
+  (`taxonomy-term-file-unmatched`; a section that `path` or `[permalinks]`
+  moves elsewhere is left alone)
 
 **Translation report** (sites with more than one language):
 
 - A page or section that exists in the default language but has no
   counterpart in another configured language (`translation-missing`)
 - A translation with no default-language original (`translation-orphan`)
+- Two pages of one language sharing a `translation_key`
+  (`translation-key-collision`, warning): the build links only one, a written page
+  before a headless or `redirect_to` one, then the first path
 
-Pages are paired exactly as the build pairs `page.translations` (same base
-name without the language suffix, so `about.md`, `about.en.md` and
-`about.ko.md` belong together), and only pages a default build publishes
+Pages are paired exactly as the build pairs `page.translations` (their
+`translation_key`, else the same base name without the language suffix, so
+`about.md`, `about.en.md` and `about.ko.md` belong together), and only pages a default build publishes
 count: a draft or future-dated page neither has nor provides a translation.
 A headless (`render = false`, also from a section `[cascade]`) or `redirect_to`
 page is never asked for a translation and does not count as one, because the
 build leaves it out of `page.translations` and hreflang.
-Both are `info` level, so `--strict` never fails on a partial translation.
+Missing and orphaned translations are `info` level, so `--strict` never fails on a partial translation.
 The human report groups them per language with counts:
 
 ```
@@ -257,13 +266,14 @@ Rows marked ✗ are error level and **cannot** be ignored.
 | `deployment-target-undefined` | config | deployment.target names no `[[deployment.targets]]` |
 | `related-taxonomy-undefined` | config | `[related]` references an undefined taxonomy |
 | `menu-parent-undefined` | config | Menu entry's `parent` matches no identifier in that menu |
-| `version-path-missing` | config | A `[[versions.list]]` path does not exist under `content/` |
+| `version-path-missing` | config | A `[[versions.list]]` path does not exist under `content/`, or `[content] ignore` hides it |
 | `config-path-missing` | config | Referenced file does not exist |
 | `config-dir-missing` | config | Referenced directory does not exist |
 | `build-output-unusable` | config | `[build] output_dir` could not validate a route (absent, or `hwaro serve` output) |
 | `build-output-stale` | config | A route was accepted from build output older than the sources |
 | `sass-dir-not-scanned` | config | SCSS files under a root `sass/` directory, which the build never scans |
 | `sass-disabled-with-sources` | config | SCSS entry files under `static/` while `[sass]` is off |
+| `highlight-lexer-invalid` | config | A grammar file in `[highlight] lexers_dir` is not loaded (unreadable, bad XML or regex, missing `<name>`), loses a name to an earlier file, or has a defect that would only surface while highlighting (an undefined state, an `<include>` cycle, a pattern-less `<token>` rule, a negative `<pop>`, an unknown `<using lexer>`, an invalid `<filename>` glob) |
 | `missing-config-*` | config_missing | Missing config section (e.g. `missing-config-pwa`) |
 | `template-dir-missing` | template | Templates directory not found ✗ |
 | `template-required-missing` | template | `page.html` (or `default.html`) missing ✗ |
@@ -277,8 +287,11 @@ Rows marked ✗ are error level and **cannot** be ignored.
 | `content-template-missing` | content | Front matter `template` / `page_template` / `[cascade] template` names a missing template |
 | `content-schema-violation` | content | Front matter violates its `[[content.schema]]` ✗ |
 | `structure-missing-index` | structure | Section missing _index.md |
+| `content-ignore-hides-sections` | structure | A `[content] ignore` pattern hides a section's `_index.md` while the section's pages still build |
+| `taxonomy-term-file-unmatched` | structure | A `content/<taxonomy>/<dir>/_index.md` matches no generated term page (`<dir>` is not a term's URL slug, or no published page in its language carries the term), so it publishes as an ordinary section |
 | `translation-missing` | i18n | Page or section has no counterpart in a configured language |
 | `translation-orphan` | i18n | Translation has no default-language original |
+| `translation-key-collision` | i18n | Two pages of one language share a `translation_key`; only one is linked (a written page first, then path order) |
 
 An entry that matches no rule id is reported as having no effect, so a typo
 in this list never passes silently.

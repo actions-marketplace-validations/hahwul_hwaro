@@ -43,7 +43,7 @@ module Hwaro
           rescue ex
             errors += 1
             content_errors += 1 if front_matter_error?(ex)
-            Logger.warn "Error exporting #{file_path}: #{ex.message}"
+            Logger.warn "Error exporting #{file_path}: #{front_matter_error_message(ex, file_path)}"
           end
 
           # Every non-Markdown file the build publishes keeps its place under
@@ -126,6 +126,12 @@ module Hwaro
                 hugo_fields[key] = value
               else
                 hugo_fields["expiryDate"] = value
+              end
+            when "translation_key"
+              if authored?(flattened, "translationKey")
+                hugo_fields[key] = value
+              else
+                hugo_fields["translationKey"] = value
               end
             when "template"
               # Hugo picks a page's template from `layout` (the inverse of

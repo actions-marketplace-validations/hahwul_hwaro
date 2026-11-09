@@ -115,12 +115,24 @@ module Hwaro
         removed_files = [] of String
         config_changed = false
         config_files = [] of String
+        # Explicit read sources, listed once per diff and only when an ignored
+        # path shows up (see content_ignored?).
+        read_sources = [] of Set(String)
+        hidden = ->(path : String) do
+          if content_ignored?(path)
+            sources = read_sources.first? || explicit_read_sources.tap { |found| read_sources << found }
+            !sources.includes?(path)
+          else
+            false
+          end
+        end
 
         # --- Files that exist in both snapshots but with different stamps ---
         new_mtimes.each do |path, new_stamp|
-          if old_stamp = old_mtimes[path]?
-            next if old_stamp == new_stamp # unchanged
-
+          old_stamp = old_mtimes[path]?
+          next if old_stamp == new_stamp # unchanged (cheapest test first)
+          next if hidden.call(path)
+          if old_stamp
             if watched_config_file?(path)
               # A config stamp that moved only because OUR OWN last build
               # rewrote it byte-identically is the #760 config loop:
@@ -155,7 +167,7 @@ module Hwaro
 
         # --- Files that existed before but are now gone ---
         old_mtimes.each_key do |path|
-          next if new_mtimes.has_key?(path)
+          next if new_mtimes.has_key?(path) || hidden.call(path)
           # An include source outside the roots leaves the snapshot when no
           # page includes it any more; a deleted one keeps a MISSING_STAMP.
           removed_files << path if watched_root_path?(path) || watched_config_file?(path)
@@ -172,6 +184,27 @@ module Hwaro
           config_changed: config_changed,
           config_files: config_files,
         )
+      end
+
+      # A `content/` path the last build's `[content] ignore` hides. The build
+      # never discovers it, so editing, adding or removing it is no change —
+      # unless a page reads it by name (`include_md`, `include_code`, a
+      # literal `load_data()`; a transclusion never can, since it resolves
+      # pages and an ignored file is none): a partials folder is a fine
+      # thing to ignore, and its edits must still re-render the pages that
+      # include it. The snapshots keep stamping every path, so editing the
+      # patterns (a config change: full rebuild) never reads as a burst of
+      # adds or removals.
+      private def content_ignored?(path : String) : Bool
+        return false unless path.starts_with?("content/")
+        !!@builder.config.try(&.content_files.ignored?(path.lchop("content/")))
+      end
+
+      # Project-relative files the last build read by name.
+      private def explicit_read_sources : Set(String)
+        sources = @builder.load_data_sources
+        @builder.include_sources.each { |path| sources << Path.posix(path).normalize.to_s }
+        sources
       end
 
       # Put a modified path into the right bucket.
@@ -201,7 +234,14 @@ module Hwaro
         static : Array(String),
         data : Array(String),
       )
-        if path.starts_with?("content/")
+        if lexers_path?(path)
+          data << path
+        elsif content_ignored?(path)
+          # Only a file a page reads by name gets here (see content_ignored?).
+          # It is no page, so like an include source outside the roots it
+          # takes the data bucket's full rebuild.
+          data << path
+        elsif path.starts_with?("content/")
           if markdown_source?(path)
             content << path
           else
@@ -239,8 +279,8 @@ module Hwaro
       #   rebuild on the save AFTER that recovered.
       # - Previous failure: the pages a failed rebuild left stale are not
       #   re-selected when the next event touches an unrelated file.
-      # - A `[[content.generate]]` body template (or a partial it includes):
-      #   bodies render when the pages are generated, which only a full build
+      # - A `[[content.generate]]` body template, or a partial it or an inline
+      #   template spec includes: bodies render when the pages are generated, which only a full build
       #   does — the re-render strategies left generated pages on the old body.
       private def effective_strategy(changeset : ChangeSet, output_dir : String) : Symbol
         strategy = changeset.rebuild_strategy
@@ -266,7 +306,7 @@ module Hwaro
 
         if !changeset.modified_templates.empty? &&
            @builder.generate_body_template_changed?(changeset.modified_templates)
-          Logger.info "  A [[content.generate]] body template changed — running a full rebuild to regenerate the pages."
+          Logger.info "  A template a [[content.generate]] rule renders changed — running a full rebuild to regenerate the pages."
           return :full
         end
 
@@ -348,22 +388,35 @@ module Hwaro
       #   build's own writes as source changes;
       # - anything a fixed root already covers, which would stamp the same
       #   files twice per scan.
+      #
+      # `[highlight] lexers_dir` is resolved the same way: grammar files feed
+      # every highlighted page, so their edits take the data bucket's full
+      # rebuild (see lexers_path?).
       private def resolve_extra_watch_roots(config : Models::Config?, output_dir : String) : Array(String)
         roots = [] of String
-        return roots unless config && config.assets.enabled
-
-        source_dir = Path[config.assets.source_dir].normalize.to_s
-        return roots if source_dir.empty? || source_dir == "." || Utils::PathUtils.escapes_parent?(source_dir)
-        return roots if Utils::PathUtils.absolute?(source_dir)
-
+        return roots unless config
         output = Path[output_dir].normalize.to_s
-        return roots if source_dir == output ||
-                        source_dir.starts_with?("#{output}/") ||
-                        output.starts_with?("#{source_dir}/")
-        return roots if Server::WATCH_ROOTS.any? { |r| source_dir == r || source_dir.starts_with?("#{r}/") }
-
-        roots << source_dir
+        add_watch_root(roots, config.assets.source_dir, output) if config.assets.enabled
+        config.highlight.lexers_dir.try { |dir| add_watch_root(roots, dir, output) }
         roots
+      end
+
+      private def add_watch_root(roots : Array(String), dir : String, output : String) : Nil
+        dir = Path[dir].normalize.to_s
+        return if dir.empty? || dir == "." || Utils::PathUtils.escapes_parent?(dir)
+        return if Utils::PathUtils.absolute?(dir)
+        return if dir == output || dir.starts_with?("#{output}/") || output.starts_with?("#{dir}/")
+        return if Server::WATCH_ROOTS.any? { |r| dir == r || dir.starts_with?("#{r}/") }
+        roots << dir unless roots.includes?(dir)
+      end
+
+      # Is `path` a grammar file under `[highlight] lexers_dir`? Checked
+      # before every other bucket, since the directory may sit under a fixed
+      # root (`data/lexers`) or share an extra root with the assets sources.
+      private def lexers_path?(path : String) : Bool
+        return false unless dir = @builder.config.try(&.highlight.lexers_dir)
+        dir = Path[dir].normalize.to_s
+        dir != "." && path.starts_with?("#{dir}/")
       end
 
       # Is `path` under a fixed or config-resolved watch root?

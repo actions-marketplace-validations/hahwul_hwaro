@@ -144,7 +144,7 @@ describe "search split_by_heading" do
       "docs/v2/a.md"      => "+++\ntitle = \"A2\"\n+++\n## New Api\n\nx\n",
       "docs/v1/a.md"      => "+++\ntitle = \"A1\"\n+++\n## Old Api\n\nx\n",
     }) do |dir|
-      headings = records(dir).compact_map { |r| r["heading"]?.try(&.as_s) }
+      headings = records(dir).compact_map(&.["heading"]?.try(&.as_s))
       headings.should contain("New Api")
       headings.should_not contain("Old Api")
       records(dir).find! { |r| r["heading"]? == "New Api" }["version"].should eq("v2")
@@ -158,6 +158,18 @@ describe "search split_by_heading" do
     sections[0][:body].should eq("<p>c</p>")
     sections[1][:body].should eq("d")
     Hwaro::Content::Search.heading_sections("<p>none</p>").should be_empty
+  end
+
+  it "reads the id after a quoted attribute value containing '>'" do
+    html = %(<h2 title="a > b" id="sec">Sec</h2><p>x</p>)
+    sections = Hwaro::Content::Search.heading_sections(html)
+    sections.map { |s| {s[:id], s[:heading], s[:body]} }.should eq([{"sec", "Sec", "<p>x</p>"}])
+  end
+
+  it "keeps a stray apostrophe in an unquoted value from merging sections" do
+    html = %(<h2 id="a" title=Bob's>A</h2><p>it's</p><h2 id="b">B</h2><p>y</p>)
+    sections = Hwaro::Content::Search.heading_sections(html)
+    sections.map { |s| {s[:id], s[:heading], s[:body]} }.should eq([{"a", "A", "<p>it's</p>"}, {"b", "B", "<p>y</p>"}])
   end
 
   it "ignores headings inside HTML comments" do

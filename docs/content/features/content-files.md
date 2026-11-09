@@ -20,7 +20,7 @@ disallow_paths = ["drafts/**", "**/_*"]
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| allow_extensions | array | [] | File extensions to publish |
+| allow_extensions | array | [] | File extensions to publish. Publishing is on while this list is non-empty (`extensions` is accepted as an alias) |
 | disallow_extensions | array | [] | File extensions to exclude |
 | disallow_paths | array | [] | Glob patterns for paths to exclude |
 
@@ -70,7 +70,7 @@ Only files with extensions in `allow_extensions` are published:
 allow_extensions = ["jpg", "jpeg", "png", "gif", "svg", "webp"]
 ```
 
-Extensions are normalized, so both `"jpg"` and `".jpg"` are accepted.
+Extensions are normalized, so both `"jpg"` and `".jpg"` are accepted, and matching ignores case (`photo.JPG` matches `"jpg"`). `.md` files are never copied this way.
 
 ### Deny List
 
@@ -100,6 +100,8 @@ disallow_paths = ["drafts/**", "**/_*", "private/**"]
 | `private/**` | All files under `content/private/` |
 
 Paths are matched relative to the `content/` directory. The deny rules (`disallow_extensions` and `disallow_paths`) also keep files out of page bundles, with or without `allow_extensions`.
+
+`disallow_paths` only covers non-Markdown files. To keep a path out of the site entirely, Markdown included (a `README.md`, a `_templates/` folder), use [`[content] ignore`](/start/config/#ignoring-content-files). It takes the same patterns, and an ignored file is never a page, a bundle asset or a published file.
 
 ## Referencing Content Files
 

@@ -27,8 +27,7 @@ module Hwaro::Core::Build::Phases::Transform
     # Compute related posts based on taxonomy similarity
     compute_related_posts(site) if site.config.related.enabled
 
-    # Pages linking to each page (`[content] backlinks`)
-    compute_backlinks(site) if site.config.backlinks
+    # `page.backlinks` were filled in ParseContent, before the summaries.
 
     # Build optimized lookup indices
     site.build_lookup_index
@@ -70,13 +69,27 @@ module Hwaro::Core::Build::Phases::Transform
   ) : Array(Array(Models::Page))
     sections_by_lang = sections.group_by { |s| {s.language || default_lang, s.version.try(&.name)} }
     pages_by_lang = pages.group_by { |p| {p.language || default_lang, p.version.try(&.name)} }
+    losers = output_losers((pages + sections).as(Array(Models::Page)))
+    # Every language's sections, for sort settings a partition lacks.
+    all_sections = {} of {String, String?} => Models::Section
+    sections.each { |s| all_sections[{s.section, s.language}] ||= s }
 
     (sections_by_lang.keys | pages_by_lang.keys).map do |key|
-      build_language_reading_order(
+      order = build_language_reading_order(
         sections_by_lang[key]? || [] of Models::Section,
         pages_by_lang[key]? || [] of Models::Page,
-        key[0], default_lang)
+        key[0], default_lang, all_sections)
+      losers.empty? ? order : order.reject { |p| losers.includes?(p.path) }
     end
+  end
+
+  # Paths of the pages that lose their output URL to another page and so
+  # publish nothing: no one's prev/next, series neighbour, related post or
+  # backlink. A dry run of the render phase's claims, which run after these
+  # relationships are linked — the stored `output_suppressed` is unset on a
+  # cold build and the last pass's in serve.
+  private def site_output_losers(site : Models::Site) : Set(String)
+    output_losers((site.pages + site.sections).as(Array(Models::Page)))
   end
 
   private def build_language_reading_order(
@@ -84,6 +97,7 @@ module Hwaro::Core::Build::Phases::Transform
     pages : Array(Models::Page),
     lang : String,
     default_lang : String,
+    all_sections : Hash({String, String?}, Models::Section),
   ) : Array(Models::Page)
     # Build sections lookup
     sections_by_path = {} of String => Models::Section
@@ -105,9 +119,12 @@ module Hwaro::Core::Build::Phases::Transform
       pages_by_section[section] << page
     end
 
-    # Sort pages within each section using the section's sort_by setting
+    # Sort pages within each section using the section's sort_by setting.
+    # A section with no `_index` in this language sorts by the
+    # default-language one's settings — the fallback Site#section_for gives
+    # `section.pages`, which must list them in the same order.
     pages_by_section.each do |section_name, section_pages|
-      section = sections_by_path[section_name]?
+      section = sections_by_path[section_name]? || lookup_ancestor_section(all_sections, section_name, lang, default_lang)
       sort_by = section.try(&.sort_by) || "date"
       reverse = section.try(&.reverse) || false
       sorted = Utils::SortUtils.sort_pages(section_pages, sort_by, reverse)
@@ -125,11 +142,16 @@ module Hwaro::Core::Build::Phases::Transform
     # append_orphan_pages skips a known section's pages — so it dropped out
     # of prev/next entirely. With every parent present this is exactly the
     # literal top-level set, so complete trees keep their reading order.
+    #
+    # The root `_index.md` (section "") leads, as a root `index.md` does in
+    # append_orphan_pages: it is the homepage, not a sibling to sort by
+    # weight among the top-level sections. Its own pages follow it.
     top_sections = sections.select do |s|
       idx = s.section.rindex('/')
       idx.nil? || !sections_by_path.has_key?(s.section[0, idx])
     end
-    top_sections.sort! { |a, b| compare_sections_by_weight(a, b) }
+    root_sections, top_sections = top_sections.partition(&.section.empty?)
+    top_sections = root_sections + top_sections.sort! { |a, b| compare_sections_by_weight(a, b) }
 
     # Recursively flatten sections into reading order
     flat_list = [] of Models::Page
@@ -213,10 +235,9 @@ module Hwaro::Core::Build::Phases::Transform
         pages.each { |p| result << p }
       end
 
-      # Recurse into subsections (sorted by weight). Subsection links may
-      # cross languages — build_subsections attaches a translated subsection
-      # to the default-language parent when its own language has no parent
-      # `_index` — so keep only this language's subtree.
+      # Recurse into subsections (sorted by weight). build_subsections links
+      # only same-language, same-version children; the filter keeps the
+      # walk inside this partition regardless.
       # The root section's subsections are the top-level sections, which the
       # caller already walks as `top_sections` — recursing would list them twice.
       if section.subsections.size > 0 && !section.section.empty?
@@ -276,12 +297,16 @@ module Hwaro::Core::Build::Phases::Transform
         next
       end
 
-      # Link to the immediate parent section when it exists (same-language first).
-      # Never across a version boundary: an unversioned `docs/_index.md` is
-      # not the parent of `docs/v1/_index.md` in any listing, and a version
-      # root's breadcrumb stops at the version.
+      # Link to the immediate parent section when it exists. Same language
+      # only, like the root branch above: the lookup falls back to the
+      # default-language parent (right for breadcrumbs), but listing a
+      # translated subsection there put `가이드` beside `Guide` in the English
+      # `section.subsections`. Never across a version boundary either: an
+      # unversioned `docs/_index.md` is not the parent of `docs/v1/_index.md`
+      # in any listing, and a version root's breadcrumb stops at the version.
       parent_path = path_parts[0..-2].join("/")
       if (parent = lookup_ancestor_section(sections_by_path, parent_path, section.language, default_lang)) &&
+         (parent.language || default_lang) == (section.language || default_lang) &&
          parent.version.same?(section.version)
         parent.add_subsection(section)
       end
@@ -587,8 +612,9 @@ module Hwaro::Core::Build::Phases::Transform
     # Rebuild groups only for affected series
     default_lang = site.config.default_language
     groups = {} of {String, String, String} => Array(Models::Page)
+    losers = site_output_losers(site)
     site.pages.each do |page|
-      next if page.draft || page.unpublished || !page.render
+      next if page.draft || page.unpublished || !page.render || losers.includes?(page.path)
       if (key = series_group_key(page, default_lang)) && affected_series.includes?(key[0])
         (groups[key] ||= [] of Models::Page) << page
       end
@@ -626,7 +652,8 @@ module Hwaro::Core::Build::Phases::Transform
 
     taxonomy_names = config.taxonomies
     limit = config.limit
-    all_pages = site.pages.select { |p| related_candidate?(p) }
+    losers = site_output_losers(site)
+    all_pages = site.pages.select { |p| related_candidate?(p) && !losers.includes?(p.path) }
 
     # Build inverted index first (needed for both candidate discovery and scoring)
     inverted, index_of = build_related_index(all_pages, taxonomy_names)
@@ -782,7 +809,7 @@ module Hwaro::Core::Build::Phases::Transform
           "date"              => Crinja::Value.new(p.date.try(&.to_s("%Y-%m-%d")) || ""),
           "description"       => Crinja::Value.new(p.description || ""),
           "image"             => Crinja::Value.new(p.image || ""),
-          "summary"           => Crinja::Value.new(p.summary_html || p.effective_summary || ""),
+          "summary"           => Crinja::Value.new(p.template_summary),
           "summary_truncated" => Crinja::Value.new(p.summary_truncated),
           "tags"              => Crinja::Value.new(p.tags.map { |t| Crinja::Value.new(t) }),
           "reading_time"      => Crinja::Value.new(p.reading_time),
@@ -841,9 +868,10 @@ module Hwaro::Core::Build::Phases::Transform
   private def compute_series(site : Models::Site)
     default_lang = site.config.default_language
     groups = {} of {String, String, String} => Array(Models::Page)
+    losers = site_output_losers(site)
 
     site.pages.each do |page|
-      next if page.draft || page.unpublished || !page.render
+      next if page.draft || page.unpublished || !page.render || losers.includes?(page.path)
       if key = series_group_key(page, default_lang)
         (groups[key] ||= [] of Models::Page) << page
       end
@@ -946,7 +974,8 @@ module Hwaro::Core::Build::Phases::Transform
     taxonomy_names = config.taxonomies
     limit = config.limit
     return if limit <= 0
-    pages = site.pages.select { |p| related_candidate?(p) }
+    losers = site_output_losers(site)
+    pages = site.pages.select { |p| related_candidate?(p) && !losers.includes?(p.path) }
 
     inverted, _ = build_related_index(pages, taxonomy_names)
     scores = Array(Int32).new(pages.size, 0)
@@ -1010,11 +1039,13 @@ module Hwaro::Core::Build::Phases::Transform
   private def compute_backlinks(site : Models::Site) : Nil
     pages = (site.pages + site.sections).as(Array(Models::Page))
     pages_by_path = build_pages_by_path(site)
+    losers = site_output_losers(site)
+    # A URL is the page that publishes it, not a collision loser that sorts first.
     by_url = {} of String => Models::Page
-    pages.each { |p| by_url[p.url] ||= p }
+    pages.each { |p| by_url[p.url] ||= p unless losers.includes?(p.path) }
     incoming = {} of String => Array(Models::Page)
     pages.each do |source|
-      next unless source.render
+      next if !source.render || losers.includes?(source.path)
       outbound_link_targets(source, pages_by_path, by_url, site.config.base_path).each do |target|
         next if target.same?(source) || target.language != source.language
         (incoming[target.path] ||= [] of Models::Page) << source

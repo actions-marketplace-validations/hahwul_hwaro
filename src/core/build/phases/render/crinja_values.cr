@@ -61,7 +61,7 @@ module Hwaro::Core::Build::Phases::Render
       "language"          => Crinja::Value.new(p.language || default_language),
       "translations"      => Crinja::Value.new(translations),
       "weight"            => Crinja::Value.new(p.weight),
-      "summary"           => Crinja::Value.new(p.summary_html || p.effective_summary || ""),
+      "summary"           => Crinja::Value.new(p.template_summary),
       "summary_truncated" => Crinja::Value.new(p.summary_truncated),
       "word_count"        => Crinja::Value.new(p.word_count),
       "reading_time"      => Crinja::Value.new(p.reading_time),
@@ -85,6 +85,9 @@ module Hwaro::Core::Build::Phases::Render
           h[k] = Utils::CrinjaUtils.from_extra(v)
         }),
     } of String => Crinja::Value
+    # Only on pages that set it, so other page objects keep their exact key
+    # set (`page | tojson`).
+    p.translation_key.try { |key| hash["translation_key"] = Crinja::Value.new(key) }
     # `page.version` / `page.version_links` exist only on versioned sites
     # (`[[versions.list]]`), so unversioned page objects keep their exact
     # key set (a `page | tojson` dump stays byte-identical).

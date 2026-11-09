@@ -207,6 +207,15 @@ module Hwaro
       # own sitemap points at.
       property output_suppressed : Bool = false
 
+      # A `content/<taxonomy>/<slug>/_index.md` matched to the term page this
+      # build generates at `term_page_url` (Content::Taxonomies.
+      # match_term_metadata). Such a section is headless: `term_metadata` (the
+      # file that won that page) lends it its title, description, extra,
+      # image, body and aliases; a losing duplicate only stays unpublished.
+      # Set after parsing (Builder#mark_term_metadata), reset by every parse.
+      property term_page_url : String? = nil
+      property term_metadata : Bool = false
+
       # Runtime / Computed Properties
       property content : String
       property raw_content : String
@@ -221,6 +230,10 @@ module Hwaro
       property is_index : Bool    # Is this an index file?
       property language : String? # Language code (e.g. "en", "ko", nil for default)
       property translations : Array(TranslationLink)
+      # Front matter `translation_key`: pages sharing it (within one version)
+      # are translations of each other, whatever their file names. Nil
+      # groups by file name (Content::Multilingual.link_translations!).
+      property translation_key : String? = nil
       # Documentation version this page belongs to (`[[versions.list]]`),
       # resolved from its content directory in ReadContent; nil for
       # unversioned content. See Content::Versions.
@@ -460,7 +473,7 @@ module Hwaro
         @assets = Dir.glob(File.join(Utils::PathUtils.glob_escape(page_dir), "**", "*")).sort!.compact_map do |file|
           next unless File.file?(file)
           next if Core::Build::Phases::ReadContent::PAGE_EXTENSIONS.includes?(File.extname(file).downcase)
-          next if nested_bundle?(page_dir, file, content_dir, bundle_dirs)
+          next if nested_bundle?(page_dir, file, content_dir, bundle_dirs, content_files)
 
           relative = Path[file].relative_to(content_dir).to_s
           # Honor [content.files] so the bundle path can't bypass the user's
@@ -489,11 +502,13 @@ module Hwaro
       # `index.md`/`_index.md` probe, `bundle_dirs` membership catches
       # translated-only bundles (`index.ko.md`) whose assets would otherwise
       # be re-published by every ancestor bundle.
-      private def nested_bundle?(page_dir : String, file : String, content_dir : String, bundle_dirs : Set(String)?) : Bool
+      # An index `[content] ignore` hides is no bundle: the build never reads
+      # it, so its directory stays an ordinary part of this bundle.
+      private def nested_bundle?(page_dir : String, file : String, content_dir : String, bundle_dirs : Set(String)?, content_files : ContentFilesConfig? = nil) : Bool
         dir = File.dirname(file)
         while dir != page_dir && dir.size > page_dir.size
-          return true if File.exists?(File.join(dir, "index.md")) ||
-                         File.exists?(File.join(dir, "_index.md"))
+          return true if visible_index?(dir, "index.md", content_dir, content_files) ||
+                         visible_index?(dir, "_index.md", content_dir, content_files)
           if bundle_dirs
             return true if bundle_dirs.includes?(Path[dir].relative_to(content_dir).to_s)
           end
@@ -502,6 +517,11 @@ module Hwaro
           dir = parent
         end
         false
+      end
+
+      private def visible_index?(dir : String, name : String, content_dir : String, content_files : ContentFilesConfig?) : Bool
+        index = File.join(dir, name)
+        File.exists?(index) && !content_files.try(&.ignored?(Path[index].relative_to(content_dir).to_s))
       end
 
       # Calculate word count from raw content
@@ -606,6 +626,15 @@ module Hwaro
       # `{{ page.summary | safe }}` keeps working for every source.
       def effective_summary : String?
         @summary || @description || auto_summary_html
+      end
+
+      # `page.summary` as templates see it: the rendered summary, else the
+      # description or excerpt. Never the raw `<!-- more -->` chunk — its
+      # shortcodes and Markdown unrendered — which is all a page has before
+      # the summary pass renders it (and what a summary shortcode reading
+      # that page would otherwise publish).
+      def template_summary : String
+        summary_html || (@summary ? nil : effective_summary) || ""
       end
 
       # The automatic excerpt as HTML: text is escaped (it was decoded from
